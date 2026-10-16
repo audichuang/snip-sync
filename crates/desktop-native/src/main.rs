@@ -23077,6 +23077,164 @@ mod tests {
 			});
 		}
 
+		/// One commit of two files: a small one (listed, so shown, first) and
+		/// a big one the retained budget will refuse once it is held.
+		fn open_commit_of_small_and_big(
+			cx: &mut TestAppContext,
+		) -> (
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			tempfile::TempDir,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			fs::write(alpha.join("a_small.txt"), "small\n").unwrap();
+			fs::write(alpha.join("z_big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "two files"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.display_commits().iter().any(|c| c.subject == "two files")
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "two files")
+					.expect("commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the commit's first file diff", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& commit_preview_shown(m)
+						&& m.commit_view.commit_files.len() == 2
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the first listed file is shown",
+				);
+			});
+			(model, cx, ws)
+		}
+
+		/// A commit file the retained budget refuses leaves the previous diff
+		/// shown, so the selection must keep naming that diff's file and no
+		/// error root may be set: a selection that points at a file nothing
+		/// shows is the state a refused Project read already avoids.
+		#[gpui::test]
+		fn a_commit_file_the_budget_refuses_keeps_the_shown_diffs_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			click_probed(&model, cx, "commit-file:z_big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.preview.as_ref().and_then(|p| p.path.as_deref()),
+					Some("a_small.txt"),
+				);
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the selection names a file nothing shows",
+				);
+				assert!(
+					m.preview_error_root.is_none(),
+					"an error root was set for a diff that shows no error",
+				);
+			});
+		}
+
+		/// The same refusal on a file of a browsed commit tree: the shown
+		/// diff keeps its own file selected, and the Project tree's row does
+		/// not take over the commit view's selection.
+		#[gpui::test]
+		fn a_tree_file_the_budget_refuses_keeps_the_shown_diffs_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			let sha = model.read_with(cx, |m, _| {
+				let id = m.selected_commit.clone().expect("a commit");
+				crate::multi_log::split_id(&id).0.to_string()
+			});
+			click_probed(&model, cx, &format!("btn-browse-tree:{sha}"));
+			settle_until(cx, "the commit tree", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("rev-row:z_big.txt").is_some()
+					})
+				})
+			});
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			click_probed(&model, cx, "rev-row:z_big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the selection names a file nothing shows",
+				);
+				assert!(
+					m.preview_error_root.is_none() && m.preview_error.is_none()
+				);
+			});
+		}
+
+		/// A refresh while a file read is held back drops that read; the
+		/// diff still shown keeps its own selection (#230): the reload used
+		/// to forget the snapshot and leave the discarded read's path as the
+		/// selection, with no commit selected over a commit's diff.
+		#[gpui::test]
+		fn a_reload_that_keeps_the_preview_keeps_its_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			open_project_tool(&model, cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			click_probed(&model, cx, "tree-row:a_small.txt");
+			settle(cx);
+			model.update(cx, |m, _| m.e2e_read_delay = None);
+			click_probed(&model, cx, "btn-refresh");
+			settle_until(cx, "the reload to settle", |cx| {
+				model.read_with(cx, |m, _| {
+					m.changes_loaded && !m.preview_loading && m.history_loaded
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff is shown");
+				assert!(
+					m.selected_file.is_none(),
+					"the discarded read's path is selected: {:?}",
+					m.selected_file,
+				);
+				assert!(
+					m.selected_commit.is_some(),
+					"a commit's diff is shown with no commit selected",
+				);
+				assert!(!m.commit_view.commit_files.is_empty());
+			});
+		}
+
 		/// The budget's refusal puts the whole selection back, the
 		/// multi-selection with it (#230): a file list that outlived its
 		/// `log_selected` named origins past its end, so a copy took the
