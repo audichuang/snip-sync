@@ -7242,6 +7242,69 @@ mod new_dir_tests {
 		assert!(b.is_dir(), "another folder in its place is not ours");
 	}
 
+	/// Restores the process umask when dropped. Safe to change here: each
+	/// test is its own process under nextest.
+	#[cfg(unix)]
+	struct UmaskGuard(nix::sys::stat::Mode);
+
+	#[cfg(unix)]
+	impl UmaskGuard {
+		fn set(mask: u32) -> Self {
+			use nix::sys::stat::{umask, Mode};
+			Self(umask(Mode::from_bits_truncate(mask as _)))
+		}
+	}
+
+	#[cfg(unix)]
+	impl Drop for UmaskGuard {
+		fn drop(&mut self) {
+			nix::sys::stat::umask(self.0);
+		}
+	}
+
+	/// Under umask 0444 the file made is write-only: no permission to read
+	/// it must not make it "not ours", or the row skips it and leaves an
+	/// empty file with nothing written.
+	#[cfg(unix)]
+	#[test]
+	fn a_new_file_that_umask_leaves_unreadable_is_still_written() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws);
+		let guard = UmaskGuard::set(0o444);
+		let result = plan.apply(&sel);
+		drop(guard);
+		let result = result.unwrap();
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 0, "{result:?}");
+		assert!(result.errors.is_empty(), "{result:?}");
+		let path = ws.join("a.txt");
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+		assert_eq!(fs::read_to_string(&path).unwrap(), "A\n");
+	}
+
+	/// The same file, after a failed write: taking it back needs no read
+	/// permission either.
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_empty_file_made_is_taken_back() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_tmp, ws) = tmp();
+		let path = ws.join("new.txt");
+		let file = fs::File::create(&path).unwrap();
+		let key = DirKey::of_file(&file).unwrap();
+		drop(file);
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o222)).unwrap();
+		let modified = fs::symlink_metadata(&path)
+			.and_then(|info| info.modified())
+			.ok();
+		let reserved = restore::Reserved { key, modified };
+		let mut made = Made::default();
+		made.file(&path, &reserved, "new.txt");
+		made.release_file(&path);
+		assert!(!path.exists(), "an empty write-only file made is ours");
+	}
+
 	/// A6: a symlink put where the folder was just made is stale, and nothing
 	/// reaches what it points at.
 	#[cfg(unix)]
