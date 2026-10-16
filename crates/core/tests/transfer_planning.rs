@@ -9068,3 +9068,55 @@ fn test_one_identity_for_new_folders_in_consent_requested_and_mkdir() {
 		}
 	}
 }
+
+/// P3c: a plan with no folder the user named keeps the spellings the
+/// payload wrote (ClipCode's too): `Dir/a.txt` and `dir/b.txt` pasted into
+/// an existing folder are two paths, each as written, even on a filesystem
+/// that folds case.
+#[test]
+fn test_a_plan_without_a_named_folder_keeps_the_payload_spellings() {
+	let (_tmp, ws) = canonical_tmp();
+	let repo = ws.join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&repo));
+	let plan = plan_placed(
+		&ws,
+		"// file: Dir/a.txt\nA\n// file: dir/b.txt\nB\n",
+		&mapping,
+	);
+	let rels: Vec<&str> = plan
+		.create_operations()
+		.iter()
+		.map(|op| op.relative_path.as_str())
+		.collect();
+	assert_eq!(rels, vec!["Dir/a.txt", "dir/b.txt"]);
+	assert_eq!(
+		plan.create_operations()[1].absolute_path,
+		repo.join("dir/b.txt")
+	);
+}
+
+/// P3d: two spellings of one new folder are one folder, so an outside
+/// `create_dir` of it, in any spelling, makes the plan stale: Apply refuses
+/// and writes nothing.
+#[test]
+fn test_an_outside_create_of_a_two_spelling_folder_makes_apply_stale() {
+	for outside in ["new", "NEW", "nEw"] {
+		let (_tmp, ws) = canonical_tmp();
+		let ci = test_dir_case_insensitive(&ws);
+		if !ci && outside == "nEw" {
+			continue;
+		}
+		let (mapping, text) = two_spellings(&ws, "new", "NEW");
+		let plan = plan_placed(&ws, text, &mapping);
+		let sel = confirmed(&plan, RestoreSelection::default());
+		fs::create_dir(ws.join(outside)).unwrap();
+		let before = scan_tree(&ws);
+		let err = plan.apply(&sel).unwrap_err();
+		assert!(
+			matches!(err, TransferError::StaleDestination { .. }),
+			"{outside}: {err:?}"
+		);
+		assert_eq!(scan_tree(&ws), before, "{outside}: wrote something");
+	}
+}
