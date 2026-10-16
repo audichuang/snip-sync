@@ -112,56 +112,6 @@ fn destination_changed(change: &StaleChange) -> Msg {
 	}
 }
 
-/// The e2e token of a destination change: what drivers read on
-/// `PASTE_STALE_DETECTED`, independent of the dictionary's key names. A
-/// change that names no created or deleted file reads as modified.
-#[cfg(test)]
-pub fn stale_log_token(change: &StaleChange) -> &'static str {
-	match change {
-		StaleChange::Created { .. } => "stale_created",
-		StaleChange::Deleted { .. } => "stale_deleted",
-		StaleChange::Modified { .. }
-		| StaleChange::Repository
-		| StaleChange::Preview => "stale_modified",
-	}
-}
-
-/// The token of a failed Apply's message on the `PASTE_STALE_DETECTED`
-/// line: a stable e2e contract, never a dictionary key that a rename could
-/// change. A destination change reads as its `stale_*` token; any other
-/// reason a file apply failed for (a worker's stale refusal, an engine
-/// error) reads `stale_modified`; the paste messages of the app itself keep
-/// their own names.
-pub fn apply_log_token(msg: &Msg) -> &'static str {
-	match msg.key {
-		"stale_created" => "stale_created",
-		"stale_deleted" => "stale_deleted",
-		key => APP_APPLY_KEYS
-			.iter()
-			.copied()
-			.find(|app| *app == key)
-			.unwrap_or("stale_modified"),
-	}
-}
-
-/// Every message the app builds itself on the Apply path
-/// (`PasteApplyPlan::execute` and `execute_commit`). They keep their own
-/// names on `PASTE_STALE_DETECTED`; anything else is worded from a reason.
-pub const APP_APPLY_KEYS: [&str; 12] = [
-	"paste_repo_busy",
-	"paste_outcome_unknown",
-	"paste_err_destination",
-	"paste_err_destination_not_dir",
-	"paste_err_plan",
-	"error_open_repo",
-	"commit_replay_refused",
-	"commit_replay_partial",
-	"commit_replay_partial_refused",
-	"commit_subset_rejected",
-	"commit_overwrite_required",
-	"mapping_required",
-];
-
 /// A failure's wording, headline and trailing datum.
 fn headed(key: &'static str, datum: &str) -> Msg {
 	Msg::detail(Msg::new(key, []), datum)
@@ -440,45 +390,4 @@ pub fn clipboard_read_failed(e: &arboard::Error) -> Msg {
 		0,
 		clip_fault_msg(snip_core::clip::fault(e)),
 	)
-}
-
-#[cfg(test)]
-mod log_token_tests {
-	use super::*;
-
-	/// `PASTE_STALE_DETECTED` is read by drivers: each destination change
-	/// prints the token develop printed, whatever the dictionary names the
-	/// sentence.
-	#[test]
-	fn stale_detected_token_is_stable_for_every_change() {
-		let cases = [
-			(StaleChange::Created { rel: "a".into() }, "stale_created"),
-			(StaleChange::Deleted { rel: "a".into() }, "stale_deleted"),
-			(StaleChange::Modified { rel: "a".into() }, "stale_modified"),
-			(StaleChange::Repository, "stale_modified"),
-			(StaleChange::Preview, "stale_modified"),
-		];
-		for (change, token) in cases {
-			assert_eq!(stale_log_token(&change), token);
-			let msg = reason_msg(&Reason::DestinationChanged {
-				change: change.clone(),
-			});
-			assert_eq!(apply_log_token(&msg), token, "{change:?}");
-		}
-	}
-
-	#[test]
-	fn other_apply_failures_print_stable_tokens() {
-		for key in APP_APPLY_KEYS {
-			assert_eq!(apply_log_token(&Msg::new(key, [])), key);
-		}
-		for msg in [
-			reason_msg(&Reason::Cancelled),
-			reason_msg(&Reason::Refused {
-				code: ErrorCode::Stale,
-			}),
-		] {
-			assert_eq!(apply_log_token(&msg), "stale_modified");
-		}
-	}
 }
