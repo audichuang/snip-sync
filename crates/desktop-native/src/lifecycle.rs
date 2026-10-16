@@ -465,6 +465,46 @@ mod tests {
 		);
 	}
 
+	/// Enabled with `register_read` and `register_mutating` (#191): the
+	/// token decides the kind, so a read holding one is always cancelled on
+	/// a close and a read holding none is always drained.
+	#[cfg(any())]
+	#[test]
+	fn a_read_with_a_token_is_cancelled_and_one_without_is_drained() {
+		let mut life = fresh();
+		let now = Instant::now();
+		let token = CancelToken::new();
+		let cancellable = life.register_read(Some(token.clone())).1;
+		let drained = life.register_read(None).1;
+		assert_eq!(
+			life.live_kinds(),
+			[JobKind::CancellableRead, JobKind::UncancellableRead]
+		);
+		assert_eq!(life.live_jobs_with_cancel(), 1);
+		assert_eq!(
+			life.request(Intent::CloseWorkspace, now),
+			Request::Accepted
+		);
+		assert!(token.is_cancelled());
+		drop(cancellable);
+		assert_eq!(
+			life.poll_at(now, GitLoad::idle()),
+			Step::Draining,
+			"a read with no token is drained, not cancelled"
+		);
+		drop(drained);
+		assert_eq!(
+			life.poll_at(now, GitLoad::idle()),
+			Step::Ready(Intent::CloseWorkspace)
+		);
+
+		let mut life = fresh();
+		let _write = life.register_mutating().1;
+		assert_eq!(life.live_kinds(), [JobKind::Mutating]);
+		assert_eq!(life.live_jobs_with_cancel(), 0);
+		assert_eq!(life.request(Intent::Quit, now), Request::RefusedApplying);
+	}
+
 	#[test]
 	fn leaked_slot_and_timeout_are_not_drained() {
 		let mut life = fresh();

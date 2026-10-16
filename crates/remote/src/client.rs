@@ -4884,7 +4884,14 @@ mod tests {
 		.unwrap_err();
 		let text = err.to_string();
 		assert!(
-			matches!(err, RemoteError::Stalled { received: 0, .. }),
+			matches!(
+				err,
+				RemoteError::Stalled {
+					received: 0,
+					ended: WaitEnd::Silence,
+					..
+				}
+			),
 			"{err:?}"
 		);
 		assert!(text.contains("did not answer in time"), "{text}");
@@ -4987,6 +4994,295 @@ mod tests {
 		}
 		// The pipe stays open until the assertions have run.
 		drop(w);
+	}
+
+	/// A pipe-fed connection whose exchange is in flight, as the pump needs
+	/// for a reply of several frames: with no call in flight it ends after
+	/// the first whole frame (it reads that as unsolicited). Returns the
+	/// pipe's write end and the queue count of frames the pump has retained.
+	fn pipe_conn() -> (Connection, io::PipeWriter, Arc<AtomicUsize>) {
+		let (r, w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		in_flight.store(true, Ordering::SeqCst);
+		let mut conn = test_conn(
+			Box::new(std::io::sink()),
+			frames,
+			Arc::clone(&retained),
+			in_flight,
+		);
+		conn.last_byte = last_byte;
+		(conn, w, retained)
+	}
+
+	/// Waits, bounded, until the pump has queued `n` frames.
+	fn wait_for_retained(retained: &AtomicUsize, n: usize) {
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while retained.load(Ordering::Relaxed) < n {
+			assert!(Instant::now() < end, "the pump never queued {n} frames");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	fn frame_bytes(response: &Response) -> Vec<u8> {
+		let mut bytes = Vec::new();
+		write_frame(&mut bytes, response).unwrap();
+		bytes
+	}
+
+	/// The frames of a 64 KiB `Text` reply sent as two chunks and a join.
+	fn chunked_text_frames() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+		let json = serde_json::to_string(&Response::Text {
+			content: Some("x".repeat(64 * 1024)),
+		})
+		.unwrap();
+		let (first, second) = json.split_at(json.len() / 2);
+		(
+			frame_bytes(&Response::Chunk { data: first.into() }),
+			frame_bytes(&Response::Chunk {
+				data: second.into(),
+			}),
+			frame_bytes(&Response::Joined),
+		)
+	}
+
+	/// A pause between the frames of one reply is silence the reply has
+	/// already begun: it gets the long bound, as a pause inside a frame does
+	/// (#191). The first chunk was consumed when the pause began, so a bound
+	/// that reset at every consumed frame treated the pause as a new wait.
+	#[test]
+	fn a_reply_paused_between_chunk_frames_outlasts_the_idle_bound() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let (first, second, joined) = chunked_text_frames();
+		let producer = std::thread::spawn(move || {
+			if w.write_all(&first).is_err() {
+				return;
+			}
+			std::thread::sleep(scaled(Duration::from_millis(900)));
+			let _ = w.write_all(&second);
+			let _ = w.write_all(&joined);
+		});
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect(
+			"a pause between a reply's frames within the bound must succeed",
+		);
+		match reply {
+			Response::Text { content } => {
+				assert_eq!(content.map(|c| c.len()), Some(64 * 1024));
+			}
+			other => panic!("expected Text, got {other:?}"),
+		}
+		assert_eq!(frames, 3);
+		producer.join().unwrap();
+	}
+
+	/// After a heartbeat the worker is alive and working: silence from there
+	/// ends only at the long bound, not at the short one that guards a
+	/// connection that never answered (#191).
+	#[test]
+	fn a_reply_silent_after_a_heartbeat_ends_only_at_the_long_bound() {
+		let (mut conn, mut w, retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		w.write_all(&pending).unwrap();
+		wait_for_retained(&retained, 1);
+		let idle = scaled(Duration::from_millis(100));
+		let mut frames = 0;
+		let started = Instant::now();
+		let err = exchange(
+			&mut conn,
+			None,
+			idle,
+			started + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.unwrap_err();
+		match err {
+			RemoteError::Stalled {
+				received,
+				ended: WaitEnd::Silence,
+				..
+			} => assert_eq!(received, pending.len() as u64),
+			other => panic!("expected a Silence stall, got {other:?}"),
+		}
+		assert!(
+			started.elapsed() >= idle * 5,
+			"the wait after a heartbeat must outlast the idle bound, ended after {:?}",
+			started.elapsed()
+		);
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the wait must still end, took {:?}",
+			started.elapsed()
+		);
+		assert_eq!(frames, 1);
+		// The pipe stays open until the assertions have run.
+		drop(w);
+	}
+
+	/// The same pause after a heartbeat that ends in the answer: a worker
+	/// that heartbeats and then answers late is not stalled.
+	#[test]
+	fn a_reply_paused_after_a_heartbeat_outlasts_the_idle_bound() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		let text = frame_bytes(&Response::Text {
+			content: Some("done".into()),
+		});
+		let producer = std::thread::spawn(move || {
+			if w.write_all(&pending).is_err() {
+				return;
+			}
+			std::thread::sleep(scaled(Duration::from_millis(900)));
+			let _ = w.write_all(&text);
+		});
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect("a pause after a heartbeat within the bound must succeed");
+		assert!(
+			matches!(reply, Response::Text { content: Some(ref c) } if c == "done"),
+			"{reply:?}"
+		);
+		assert_eq!(frames, 2);
+		producer.join().unwrap();
+	}
+
+	/// The call's own time limit ends a reply that keeps flowing, and says
+	/// how much arrived and for how long, like a silence does (#191).
+	#[test]
+	fn the_call_deadline_with_bytes_flowing_reports_bytes_and_time() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let bytes = frame_bytes(&Response::Text {
+			content: Some("x".repeat(1024 * 1024)),
+		});
+		// Detached: the frame takes longer than the call, and the producer
+		// ends when the pipe's reader is gone.
+		std::thread::spawn(move || {
+			for piece in bytes.chunks(16 * 1024) {
+				if w.write_all(piece).is_err() {
+					return;
+				}
+				std::thread::sleep(scaled(Duration::from_millis(50)));
+			}
+		});
+		let mut frames = 0;
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_secs(1)),
+			Instant::now() + scaled(Duration::from_millis(600)),
+			&mut frames,
+		)
+		.unwrap_err();
+		let text = err.to_string();
+		match err {
+			RemoteError::Stalled {
+				received,
+				elapsed,
+				ended: WaitEnd::Deadline,
+				..
+			} => {
+				assert!(received > 0, "received {received}");
+				assert!(
+					elapsed >= scaled(Duration::from_millis(500)).as_secs_f64(),
+					"elapsed {elapsed}"
+				);
+			}
+			other => panic!("expected a Deadline stall, got {other:?}"),
+		}
+		assert!(text.contains("bytes"), "{text}");
+		assert!(text.contains("time limit"), "{text}");
+	}
+
+	/// The deadline check after a frame arrives reports progress too: here a
+	/// heartbeat is already queued when the call's time is up.
+	#[test]
+	fn a_frame_past_the_deadline_reports_bytes_and_time() {
+		let (mut conn, mut w, retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		w.write_all(&pending).unwrap();
+		wait_for_retained(&retained, 1);
+		let mut frames = 0;
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_secs(1)),
+			Instant::now(),
+			&mut frames,
+		)
+		.unwrap_err();
+		match err {
+			RemoteError::Stalled {
+				received,
+				ended: WaitEnd::Deadline,
+				..
+			} => assert_eq!(received, pending.len() as u64),
+			other => panic!("expected a Deadline stall, got {other:?}"),
+		}
+		assert_eq!(frames, 1);
+		drop(w);
+	}
+
+	/// Enabled with `silence_budget` (#191): a reply not yet begun gets the
+	/// idle bound, one that has begun REPLY_IDLE_FACTOR times it.
+	#[cfg(any())]
+	#[test]
+	fn silence_budget_by_reply_state() {
+		let idle = Duration::from_millis(300);
+		for (started, expected) in
+			[(false, idle), (true, idle * REPLY_IDLE_FACTOR)]
+		{
+			assert_eq!(silence_budget(idle, started), expected);
+		}
+	}
+
+	#[test]
+	fn stalled_text_names_how_the_wait_ended() {
+		let stall = |ended| RemoteError::Stalled {
+			silent: 5.0,
+			received: 1234,
+			elapsed: 6.0,
+			ended,
+		};
+		let silence = stall(WaitEnd::Silence).to_string();
+		let deadline = stall(WaitEnd::Deadline).to_string();
+		for text in [&silence, &deadline] {
+			assert!(
+				text.starts_with("the worker did not answer in time"),
+				"{text}"
+			);
+			assert!(text.contains("1234 bytes"), "{text}");
+		}
+		assert!(silence.contains("no data for"), "{silence}");
+		assert!(deadline.contains("time limit passed"), "{deadline}");
+	}
+
+	/// A timeout keeps its progress when a Git caller reads it: the CLI
+	/// prints this text, and 90 s was never what elapsed (#191).
+	#[test]
+	fn remote_timeouts_keep_their_progress_as_git_errors() {
+		let stalled = GitError::from(RemoteError::Stalled {
+			silent: 5.0,
+			received: 1234,
+			elapsed: 6.0,
+			ended: WaitEnd::Silence,
+		});
+		assert!(stalled.to_string().contains("1234 bytes"), "{stalled}");
+		assert!(matches!(stalled.reason(), Reason::TimedOut), "{stalled:?}");
+		let bare = GitError::from(RemoteError::TimedOut);
+		assert!(!bare.to_string().contains("90s"), "{bare}");
+		assert!(matches!(bare.reason(), Reason::TimedOut), "{bare:?}");
 	}
 
 	#[test]

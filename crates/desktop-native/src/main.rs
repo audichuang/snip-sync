@@ -13172,6 +13172,60 @@ mod tests {
 			assert_no_snip_in_zh(&err);
 		}
 
+		/// A remote file's preview read polls the tab's token, so the
+		/// lifecycle must record it as a read a close cancels, not one it
+		/// has to drain (#191). Only a local working-file read polls none.
+		#[gpui::test]
+		fn a_remote_file_preview_is_a_cancellable_job(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("notes")).unwrap();
+			fs::write(shared.join("notes/n.txt"), "N\n").unwrap();
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the Project tree to load", |cx| {
+				model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+				})
+			});
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/n.txt").is_some()
+					})
+				})
+			});
+			// The read finishes at once; the held timer keeps the job live.
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(hold));
+			click_probed(&model, cx, "ws-tree-row:notes/n.txt");
+			let (kinds, with_token) = model.read_with(cx, |m, _| {
+				(
+					m.lifecycle.live_kinds(),
+					m.lifecycle.live_jobs_with_cancel(),
+				)
+			});
+			assert!(
+				!kinds.contains(&crate::lifecycle::JobKind::UncancellableRead),
+				"a remote preview read polls a token, yet it is recorded as one the lifecycle must drain: {kinds:?}"
+			);
+			assert!(with_token >= 1, "a close cancels no live job: {kinds:?}");
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the preview to end", |cx| {
+				model.read_with(cx, |m, _| !m.preview_loading)
+			});
+		}
+
 		/// A scan failure shown in 繁中 follows a switch to English: the
 		/// banner and the status line word the reason again (#208).
 		#[cfg(unix)]

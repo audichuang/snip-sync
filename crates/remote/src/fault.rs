@@ -211,3 +211,79 @@ impl FaultBook {
 		self.seen.get(&kind).copied().unwrap_or(0)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn read(workspace: &str) -> Request {
+		Request::Read {
+			workspace: workspace.into(),
+			path: "a.txt".into(),
+		}
+	}
+
+	fn delay() -> Fault {
+		Fault::Delay(Duration::from_millis(5))
+	}
+
+	#[test]
+	fn fault_rules_spend_skip_then_times_and_match_workspace() {
+		let mut book = FaultBook::default();
+		book.add(FaultRule {
+			on: Match::Any,
+			workspace: None,
+			skip: 1,
+			times: 2,
+			fault: delay(),
+		});
+		assert_eq!(book.take(&read("w")), None);
+		assert_eq!(book.take(&read("w")), Some(delay()));
+		assert_eq!(book.take(&read("w")), Some(delay()));
+		assert_eq!(book.take(&read("w")), None);
+		assert_eq!(book.seen(RequestKind::Read), 4);
+		assert_eq!(book.seen(RequestKind::Stat), 0);
+
+		book.clear();
+		book.add(FaultRule {
+			on: Match::Kind(RequestKind::Read),
+			workspace: Some("w".into()),
+			skip: 0,
+			times: 5,
+			fault: delay(),
+		});
+		// Another workspace, and another kind, do not match.
+		assert_eq!(book.take(&read("other")), None);
+		assert_eq!(
+			book.take(&Request::Stat {
+				workspace: "w".into(),
+				path: "a.txt".into(),
+			}),
+			None
+		);
+		assert_eq!(book.take(&read("w")), Some(delay()));
+		// The counts survive a clear and keep counting.
+		assert_eq!(book.seen(RequestKind::Read), 6);
+	}
+
+	#[test]
+	fn every_request_kind_is_listed_once() {
+		assert_eq!(ALL_REQUEST_KINDS.len(), 24);
+		let distinct: std::collections::HashSet<_> =
+			ALL_REQUEST_KINDS.iter().collect();
+		assert_eq!(distinct.len(), ALL_REQUEST_KINDS.len());
+		for request in [
+			read("w"),
+			Request::FrameJoin,
+			Request::Hello {
+				version: 1,
+				name: "t".into(),
+				max_version: None,
+			},
+		] {
+			assert!(ALL_REQUEST_KINDS.contains(&request.kind()));
+		}
+		assert_eq!(read("w").workspace(), Some("w"));
+		assert_eq!(Request::FrameJoin.workspace(), None);
+	}
+}
