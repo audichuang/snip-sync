@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -79,6 +80,11 @@ pub struct Preview {
 	pub widest: usize,
 	/// Diff layout, built once from `lines`.
 	pub diff: Option<DiffRows>,
+	/// The repository this text was read from. It travels with the text:
+	/// whatever the model's selection says meanwhile (a read of another
+	/// repo's file is in flight, the Log moved on), the text on screen still
+	/// belongs to this repo. `None` for text with no repo (a paste item).
+	pub root: Option<PathBuf>,
 }
 
 impl Preview {
@@ -103,7 +109,8 @@ impl Preview {
 			.saturating_add(
 				self.lines.capacity() * std::mem::size_of::<Range<u32>>(),
 			)
-			.saturating_add(self.notice.as_ref().map_or(0, Msg::heap_bytes));
+			.saturating_add(self.notice.as_ref().map_or(0, Msg::heap_bytes))
+			.saturating_add(self.root.as_ref().map_or(0, PathBuf::capacity));
 		if let Some(diff) = &self.diff {
 			bytes = bytes
 				.saturating_add(
@@ -178,7 +185,14 @@ impl Preview {
 			notice,
 			widest,
 			diff,
+			root: None,
 		}
+	}
+
+	/// This text, read from repository `root`.
+	pub fn with_root(mut self, root: Option<PathBuf>) -> Self {
+		self.root = root;
+		self
 	}
 
 	pub fn line(&self, ix: usize) -> &str {
@@ -1386,7 +1400,8 @@ impl WorkbenchModel {
 				text,
 				true,
 				p.lang,
-			);
+			)
+			.with_root(p.root.clone());
 			if let Some(d) = n.diff.as_mut().filter(|_| tail_done) {
 				d.trailing = false;
 			}

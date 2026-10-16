@@ -1072,8 +1072,6 @@ pub struct WorkbenchModel {
 	pub changes_generation: u64,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
-	/// Repo the shown preview was read from, with `preview_identity`.
-	pub preview_root: Option<(PathBuf, usize)>,
 	/// Repo of the failed preview load when `preview_error` is Some.
 	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1100,11 +1098,6 @@ pub struct WorkbenchModel {
 }
 
 impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
-
-/// Identity of a shown preview's text, as `reader.rs` compares it.
-pub(crate) fn preview_identity(p: &Preview) -> usize {
-	Arc::as_ptr(&p.text) as *const u8 as usize
-}
 
 /// Everything a file read takes from the model while it is in flight, so a
 /// refusal by the retained budget can name the still shown preview again.
@@ -1582,7 +1575,6 @@ impl WorkbenchModel {
 			changes_generation: 0,
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
-			preview_root: None,
 			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
@@ -1606,28 +1598,14 @@ impl WorkbenchModel {
 		model
 	}
 
-	/// The repo the shown preview came from: a log commit's own repo, the
-	/// Changes row's repo, else the open repo.
+	/// The repo the shown text was read from: the preview carries it, so no
+	/// selection or commit view that moves on while a read is in flight
+	/// changes it. A failed read names the repo it was read from; with
+	/// nothing from a repo shown, the open repo.
 	pub fn preview_root(&self) -> Option<PathBuf> {
-		if self.preview.is_none() && self.preview_error.is_some() {
-			if let Some(root) = &self.preview_error_root {
-				return Some(root.clone());
-			}
-		}
-		match (&self.preview_root, &self.preview) {
-			(_, Some(p))
-				if matches!(
-					p.source,
-					PreviewSource::CommitDiff { .. }
-						| PreviewSource::Compare { .. }
-				) =>
-			{
-				self.commit_view
-					.log_commit_root
-					.clone()
-					.or_else(|| self.repo_root())
-			}
-			(Some((root, id)), Some(p)) if *id == preview_identity(p) => {
+		match (&self.preview, &self.preview_error_root) {
+			(Some(p), _) => p.root.clone().or_else(|| self.repo_root()),
+			(None, Some(root)) if self.preview_error.is_some() => {
 				Some(root.clone())
 			}
 			_ => self.repo_root(),
@@ -1641,11 +1619,7 @@ impl WorkbenchModel {
 			return None;
 		}
 		match (&self.preview, &self.preview_error) {
-			(Some(p), _) => self
-				.preview_root
-				.as_ref()
-				.filter(|(_, id)| *id == preview_identity(p))
-				.map(|(root, _)| root.clone()),
+			(Some(p), _) => p.root.clone(),
 			(None, Some(_)) => self.preview_error_root.clone(),
 			(None, None) => None,
 		}
@@ -2159,9 +2133,7 @@ impl WorkbenchModel {
 				p.fingerprint()
 			);
 		}
-		// The caller that read it names its repo again after installing.
 		self.held_selection = None;
-		self.preview_root = None;
 		self.preview_error_root = None;
 		self.preview = Some(p);
 		self.preview_loading = false;
@@ -2175,7 +2147,6 @@ impl WorkbenchModel {
 	pub(crate) fn clear_preview(&mut self) {
 		self.held_selection = None;
 		self.preview = None;
-		self.preview_root = None;
 		self.preview_error_root = None;
 		self.paste.release_ordinary();
 	}
@@ -2646,7 +2617,6 @@ impl WorkbenchModel {
 		}
 		self.changes_generation = self.changes_generation.wrapping_add(1);
 		self.changes_queue.clear_pending();
-		self.preview_root = None;
 		self.preview_error_root = None;
 		self.paste.invalidate_job();
 		if !self.paste_busy() {
@@ -4521,12 +4491,12 @@ impl WorkbenchModel {
 					}
 					return;
 				}
-				if model.apply_source_preview(file_path.clone(), result) {
+				if model.apply_source_preview(
+					file_path.clone(),
+					shown_root.clone(),
+					result,
+				) {
 					model.held_selection = None;
-					model.preview_root = model
-						.preview
-						.as_ref()
-						.map(|p| (shown_root, preview_identity(p)));
 					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
 					if model.mode == "preview" {
 						ready_marker("PREVIEW");
@@ -4661,27 +4631,28 @@ impl WorkbenchModel {
 	pub fn apply_source_preview(
 		&mut self,
 		path: String,
+		root: PathBuf,
 		result: Result<(browser::SourcePreview, PreviewSource), PreviewErr>,
 	) -> bool {
 		match result {
 			Ok((p, source)) => {
 				if !p.patch.is_empty() {
-					self.set_preview(Preview::new(
-						source,
-						Some(path),
-						p.patch,
-						true,
-						Language::Diff,
-					))
+					self.set_preview(
+						Preview::new(
+							source,
+							Some(path),
+							p.patch,
+							true,
+							Language::Diff,
+						)
+						.with_root(Some(root)),
+					)
 				} else if let Some(content) = p.content {
 					let lang = Language::from_path_or_ext(&path, false);
-					self.set_preview(Preview::new(
-						source,
-						Some(path),
-						content,
-						false,
-						lang,
-					))
+					self.set_preview(
+						Preview::new(source, Some(path), content, false, lang)
+							.with_root(Some(root)),
+					)
 				} else {
 					self.show_preview_error(Msg::new("error_binary", [path]));
 					false

@@ -2658,6 +2658,7 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let hold = bg.clone();
 		let delay = self.e2e_log_read_delay;
+		let shown_root = root.clone();
 		self.spawn_owned(cx, Some(cancel.clone()), async move {
 			let res = bg
 				.spawn(async move {
@@ -2764,6 +2765,7 @@ impl WorkbenchModel {
 								model.commit_view.commit_file_sel.clear();
 								model.apply_source_preview(
 									path,
+									shown_root,
 									p.map(|p| (p, preview_source)),
 								);
 							}
@@ -2906,6 +2908,7 @@ impl WorkbenchModel {
 				}
 				if model.apply_source_preview(
 					path.clone(),
+					err_root.clone(),
 					res.map(|p| (p, psource)),
 				) {
 					app_log!("[APP:PREVIEW_LOADED: {}]", path);
@@ -3183,6 +3186,7 @@ impl WorkbenchModel {
 		self.preview_error = None;
 		app_log!("[APP:TREE_FILE_SELECTED: {}]", path);
 		let (sha_bg, path_bg) = (sha.clone(), path.clone());
+		let shown_root = root.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -3211,13 +3215,16 @@ impl WorkbenchModel {
 				match res {
 					Ok(BlobText::Text(s)) => {
 						let lang = Language::from_path_or_ext(&path, false);
-						if model.set_preview(Preview::new(
-							PreviewSource::CommitFile { sha: sha.clone() },
-							Some(path.clone()),
-							s,
-							false,
-							lang,
-						)) {
+						if model.set_preview(
+							Preview::new(
+								PreviewSource::CommitFile { sha: sha.clone() },
+								Some(path.clone()),
+								s,
+								false,
+								lang,
+							)
+							.with_root(Some(shown_root)),
+						) {
 							app_log!("[APP:PREVIEW_LOADED: {}]", path);
 						} else if model.preview.is_some()
 							&& model.preview_error.is_none()
