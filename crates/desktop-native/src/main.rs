@@ -6239,14 +6239,10 @@ impl WorkbenchModel {
 		self.selected_file = None;
 		self.selected_file_source = None;
 		self.selected_file_root = None;
-		self.selected_commit = None;
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
-		self.reset_commit_view();
-		// The Log's read no longer owns the preview: its selection is gone
-		// (L6 of `invariants`).
-		self.preview_pending_from_log = false;
+		// The one place the Log's selection is dropped: the commit view, the
+		// details read still in flight and the preview's owner go with it
+		// (L6 and L8 of `invariants`).
+		self.clear_commit_selection();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
 	}

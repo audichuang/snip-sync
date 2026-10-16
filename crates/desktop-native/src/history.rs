@@ -1623,7 +1623,7 @@ impl WorkbenchModel {
 
 	/// Drops every commit selection and the details, files and previews that
 	/// came from it, so a selection that left the list leaves nothing stale.
-	fn clear_commit_selection(&mut self) {
+	pub(crate) fn clear_commit_selection(&mut self) {
 		// `preview_pending_from_log` names the owner of the latest read and
 		// only a file read resets it, so it is not tied to `preview_loading`:
 		// an error that cleared the loading flag must not leave the Log's
