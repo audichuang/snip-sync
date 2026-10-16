@@ -1313,10 +1313,10 @@ impl Env {
 			return Step::Key("ctrl-r".into());
 		}
 		// The path just typed into the add-repo field is submitted next.
-		if self.just_typed_add_repo {
-			if c.fields.iter().any(|f| f.0 == "input-add-repo") {
-				return Step::Submit("input-add-repo".into());
-			}
+		if self.just_typed_add_repo
+			&& c.fields.iter().any(|f| f.0 == "input-add-repo")
+		{
+			return Step::Submit("input-add-repo".into());
 		}
 		// A fault waits for a request it matches: the gesture after it is
 		// mostly one that sends requests.
@@ -1438,7 +1438,7 @@ impl Env {
 			}
 			ActKind::Fs if self.lane == Lane::Paste => {
 				return Step::Fs(FsEdit::NewRepo {
-					name: *pick(rng, &["c", "d", "e"]).expect("a name"),
+					name: pick(rng, &["c", "d", "e"]).expect("a name"),
 				});
 			}
 			ActKind::Fs => {
