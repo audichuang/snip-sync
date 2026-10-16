@@ -1454,7 +1454,7 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
                 ]
 
             def wait_line(self, pred: Any, start: int = 0, timeout: float = 10) -> tuple[int, float, str]:
-                return 0, 0.0, "id=left-list x=0"
+                return 0, 0.0, "[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]"
 
             def focus(self, wid: str) -> None:
                 return None
@@ -1487,7 +1487,7 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
                 # The pre-scroll paint wait (0.5s) and the first wheel get no reaction.
                 if timeout < 1 or self.wheels == 1:
                     raise NativeBenchError("timed out waiting for app log line")
-                return 0, 0.0, "id=left-list x=0"
+                return 0, 0.0, "[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]"
 
             def focus(self, wid: str) -> None:
                 return None
