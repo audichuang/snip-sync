@@ -324,3 +324,38 @@ fn fuzz_regression_switching_the_repo_drops_the_details_read_in_flight(
 		invariants::assert_holds(m, cx, &[L6, L8]);
 	});
 }
+
+/// L6, L8: opening a file takes the Log's selection off the model (its
+/// preview is replaced), and the details read of the commit that was selected
+/// must not land on the Log it left: it did, on a view with no selection
+/// (found by `fuzz_local_workbench_keeps_derived_state`: click a Log row, then
+/// a Changes row before the details arrive).
+#[gpui::test]
+fn fuzz_regression_a_details_read_does_not_land_on_a_selection_a_file_took(
+	cx: &mut TestAppContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	let alpha = repo(ws.path(), "alpha", &[]);
+	fs::write(alpha.join("a.txt"), "one").unwrap();
+	git(&alpha, &["add", "."]);
+	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| !m.commits.is_empty() && !m.is_loading)
+	});
+	// One turn of the event loop: the details read has not run when the file
+	// is opened.
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx);
+		assert!(m.selected_commit.is_some());
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.selected_commit.is_none(), "the file takes the selection");
+	});
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.selected_commit.is_none());
+		invariants::assert_holds(m, cx, &[L6, L8]);
+	});
+}
