@@ -2649,6 +2649,16 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 	forged.freshness.requested_dirs = Some([evil.clone()].into());
 	assert_eq!(refused(send(&forged, &agreed)), ErrorCode::BadRequest);
 
+	// So is a placed tail outside it.
+	let mut forged = planned.expect();
+	forged.freshness.placed_tails = Some(vec![evil.join("x")]);
+	assert_eq!(refused(send(&forged, &agreed)), ErrorCode::BadRequest);
+
+	// A tail that is not the one the worker places again is stale.
+	let mut moved = planned.expect();
+	moved.freshness.placed_tails = Some(vec![real.join("other")]);
+	assert_eq!(refused(send(&moved, &agreed)), ErrorCode::Stale);
+
 	// A shrunken list is not the plan the worker makes again.
 	let mut shrunk = planned.expect();
 	shrunk.freshness.requested_dirs = Some(Default::default());

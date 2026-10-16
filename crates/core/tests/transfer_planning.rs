@@ -8689,9 +8689,10 @@ fn test_a_plan_without_a_tail_records_no_requested_dirs() {
 	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
 	let fresh = plan.destination_freshness();
 	assert!(fresh.requested_dirs.is_none());
-	assert!(!serde_json::to_string(fresh)
-		.unwrap()
-		.contains("requested_dirs"));
+	assert!(fresh.placed_tails.is_none());
+	let wire = serde_json::to_string(fresh).unwrap();
+	assert!(!wire.contains("requested_dirs"));
+	assert!(!wire.contains("placed_tails"));
 	assert_eq!(plan.new_dirs().requested, Vec::<PathBuf>::new());
 	assert_eq!(plan.new_dirs().incidental, vec![ws.join("sub")]);
 }

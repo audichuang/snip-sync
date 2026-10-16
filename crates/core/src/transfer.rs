@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
-use crate::foldernames::NewFolderNames;
+use crate::foldernames::{DirKey, FolderId, LiveFolders, NewFolderNames};
 use crate::format::{
 	self, BorrowedPayloadOptions, ChangeType, ParsedEntry, PayloadFile,
 };
@@ -1016,6 +1016,16 @@ pub struct DestinationFreshnessSnapshot {
 	/// peer).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub requested_dirs: Option<HashSet<PathBuf>>,
+	/// Every level of each placed folder's tail (the primary destination's
+	/// and each prefix's), spelled as it was resolved (`anchor/t1`,
+	/// `anchor/t1/t2`, ...), sorted, each once: what did not exist when the
+	/// user placed the folder. Apply holds the plan to these, apart from
+	/// how planning classified the folders (`requested_dirs`): a level that
+	/// exists is stale, and one a kept row needs is made only with consent
+	/// (`RestoreSelection::confirmed_new_dirs`, matched by folder identity
+	/// as well as by path). `None`: no tail, or an older peer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub placed_tails: Option<Vec<PathBuf>>,
 }
 
 impl DestinationFreshnessSnapshot {
@@ -1077,6 +1087,14 @@ impl DestinationFreshnessSnapshot {
 				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
 					dirs.capacity(),
 				));
+			for dir in dirs {
+				bytes = bytes.saturating_add(dir.capacity());
+			}
+		}
+		if let Some(dirs) = &self.placed_tails {
+			bytes = bytes.saturating_add(
+				dirs.capacity() * std::mem::size_of::<PathBuf>(),
+			);
 			for dir in dirs {
 				bytes = bytes.saturating_add(dir.capacity());
 			}
@@ -1173,6 +1191,7 @@ impl DestinationFreshnessSnapshot {
 			missing_dirs: Some(missing_dirs),
 			symlinked_dirs: Some(symlinked_dirs),
 			requested_dirs: None,
+			placed_tails: None,
 		})
 	}
 
@@ -1224,6 +1243,7 @@ impl DestinationFreshnessSnapshot {
 			missing_dirs: None,
 			symlinked_dirs: None,
 			requested_dirs: None,
+			placed_tails: None,
 		})
 	}
 
@@ -1238,7 +1258,10 @@ impl DestinationFreshnessSnapshot {
 	/// that the preview saw and is gone (replaced by a plain folder) is a
 	/// change. A worker checks the old snapshot and then plans again, so a
 	/// shrunken list would let the new plan, checked later against itself
-	/// only, write where the preview did not show.
+	/// only, write where the preview did not show. `placed_tails` must be
+	/// equal when the preview recorded them: the worker resolves the
+	/// folders again, and a tail that came out different means a level of
+	/// it appeared in between.
 	pub fn matches_preview(&self, preview: &Self) -> bool {
 		self.roots == preview.roots
 			&& self.target_files == preview.target_files
@@ -1254,6 +1277,10 @@ impl DestinationFreshnessSnapshot {
 				.requested_dirs
 				.as_ref()
 				.is_none_or(|then| self.requested_dirs.as_ref() == Some(then))
+			&& preview
+				.placed_tails
+				.as_ref()
+				.is_none_or(|then| self.placed_tails.as_ref() == Some(then))
 	}
 
 	/// Every folder a write is rooted in still resolves to the canonical
@@ -1335,16 +1362,21 @@ impl DestinationFreshnessSnapshot {
 			}
 		}
 
-		if self.missing_dirs.is_some() || self.requested_dirs.is_some() {
+		if self.missing_dirs.is_some()
+			|| self.requested_dirs.is_some()
+			|| self.placed_tails.is_some()
+		{
 			// A folder the user named (a destination, an import path) is
 			// strict: whatever is there now, it was not there when the
 			// preview put this destination under an anchor, so the paths the
-			// rows show are not the ones a write would reach.
+			// rows show are not the ones a write would reach. Every level of
+			// a placed tail is such a folder, however planning classified it.
 			let mut missing: Vec<&PathBuf> = self
 				.missing_dirs
 				.iter()
-				.chain(self.requested_dirs.iter())
 				.flatten()
+				.chain(self.requested_dirs.iter().flatten())
+				.chain(self.placed_tails.iter().flatten())
 				.collect();
 			missing.sort();
 			missing.dedup();
@@ -1352,7 +1384,11 @@ impl DestinationFreshnessSnapshot {
 				let requested = self
 					.requested_dirs
 					.as_ref()
-					.is_some_and(|dirs| dirs.contains(dir));
+					.is_some_and(|dirs| dirs.contains(dir))
+					|| self
+						.placed_tails
+						.as_ref()
+						.is_some_and(|dirs| dirs.contains(dir));
 				match fs::symlink_metadata(dir) {
 					Ok(meta) if meta.file_type().is_dir() && !requested => {}
 					Ok(_) => {
@@ -1855,21 +1891,29 @@ impl TransferImportPlan {
 		// Stale outranks a missing consent: a plan that changed is previewed
 		// again, and the agreement to the old one is not carried over.
 		let new = self.new_dirs_for(selection);
-		let unconfirmed: Vec<PathBuf> = new
+		let mut unconfirmed: Vec<PathBuf> = new
 			.requested
 			.iter()
 			.filter(|d| !selection.confirmed_new_dirs.contains(*d))
 			.cloned()
 			.collect();
+		// The classification above is planning's, read off the disk as it
+		// was then, and the disk can change before Apply. What lets a
+		// folder the user named be made is this instead: each level of a
+		// placed tail that a kept row needs is agreed to, told by what the
+		// disk says now.
+		for dir in self.unagreed_placed_tails(selection) {
+			if !unconfirmed.contains(&dir) {
+				unconfirmed.push(dir);
+			}
+		}
 		if !unconfirmed.is_empty() {
 			return Err(TransferError::NewDirsNotConfirmed {
 				dirs: unconfirmed,
 			});
 		}
-		// Only `new.requested` is made here, and the check above made sure
-		// each of them is agreed to. Whether a folder the user named is in
-		// `requested` at all is decided when planning (`foldernames`), by
-		// the identity of the folder; nothing at this point can tell.
+		// Only `new.requested` is made here, and the checks above made sure
+		// each of them, and every placed tail a row needs, is agreed to.
 		let made = self.make_requested_dirs(&new.requested)?;
 
 		let mut result = restore::execute_restore_plan_observed(
@@ -1885,14 +1929,87 @@ impl TransferImportPlan {
 		Ok(result)
 	}
 
+	/// The levels of the placed tails (`placed_tails`) that a create
+	/// `selection` keeps needs and `selection.confirmed_new_dirs` does not
+	/// agree to, one spelling per folder. Runs after `revalidate`, so no
+	/// level exists and each one's nearest existing folder is its anchor.
+	/// A level is needed when a kept create's path passes through it: the
+	/// same path, or the same folder to make (`LiveFolders`: the existing
+	/// folder above it as the filesystem's object, the names below folded
+	/// when that filesystem folds). An agreement counts the same two ways.
+	fn unagreed_placed_tails(
+		&self,
+		selection: &RestoreSelection,
+	) -> Vec<PathBuf> {
+		let Some(tails) = &self.destination_freshness.placed_tails else {
+			return Vec::new();
+		};
+		if tails.is_empty() {
+			return Vec::new();
+		}
+		let mut live = LiveFolders::default();
+		let tail_ids: Vec<Option<FolderId>> =
+			tails.iter().map(|dir| live.id_of(dir)).collect();
+		let mut needed = vec![false; tails.len()];
+		let mut seen: HashSet<&Path> = HashSet::new();
+		for (i, op) in self.create_operations().iter().enumerate() {
+			if op.existed || selection.unchecked_creates.contains(&i) {
+				continue;
+			}
+			let mut dir = op.absolute_path.parent();
+			while let Some(d) = dir {
+				// A folder seen before had its ancestors seen with it.
+				if !seen.insert(d) {
+					break;
+				}
+				let Some(id) = live.id_of(d) else {
+					break;
+				};
+				for (j, tail) in tails.iter().enumerate() {
+					if tail.as_path() == d || tail_ids[j].as_ref() == Some(&id)
+					{
+						needed[j] = true;
+					}
+				}
+				dir = d.parent();
+			}
+		}
+		let agreed: HashSet<FolderId> = selection
+			.confirmed_new_dirs
+			.iter()
+			.filter_map(|dir| live.id_of(dir))
+			.collect();
+		let mut reported: HashSet<FolderId> = HashSet::new();
+		let mut out = Vec::new();
+		for (j, tail) in tails.iter().enumerate() {
+			if !needed[j] || selection.confirmed_new_dirs.contains(tail) {
+				continue;
+			}
+			match &tail_ids[j] {
+				Some(id) if agreed.contains(id) => {}
+				Some(id) => {
+					if reported.insert(id.clone()) {
+						out.push(tail.clone());
+					}
+				}
+				None => out.push(tail.clone()),
+			}
+		}
+		out
+	}
+
 	/// Makes `dirs` (shallow to deep), one level at a time, under the lock
 	/// and after `revalidate`. A failure at any level takes back the levels
-	/// already made, and nothing is written.
+	/// already made, and nothing is written. Two spellings of one folder
+	/// (two aliases of its parent) make it once: a level already there is
+	/// this Apply's own when it is the object this Apply just made, and
+	/// someone else's (stale) otherwise.
 	fn make_requested_dirs(
 		&self,
 		dirs: &[PathBuf],
 	) -> Result<Vec<PathBuf>, TransferError> {
 		let mut made: Vec<PathBuf> = Vec::new();
+		let mut made_objects: HashSet<DirKey> = HashSet::new();
 		for dir in dirs {
 			let step = (|| -> Result<(), TransferError> {
 				// The planner refuses such a folder first (`PlacedRoot::resolve`,
@@ -1906,11 +2023,19 @@ impl TransferImportPlan {
 				}
 				new_dir_hook(NewDirStage::BeforeCreate, dir)?;
 				match fs::create_dir(dir) {
-					Ok(()) => made.push(dir.clone()),
+					Ok(()) => {
+						made.push(dir.clone());
+						if let key @ DirKey::Object(..) = DirKey::of(dir) {
+							made_objects.insert(key);
+						}
+					}
 					Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+						if made_objects.contains(&DirKey::of(dir)) {
+							return Ok(());
+						}
 						return Err(self
 							.destination_freshness
-							.created_where_a_folder_was_needed(dir))
+							.created_where_a_folder_was_needed(dir));
 					}
 					Err(e) => return Err(TransferError::Io(e)),
 				}
@@ -4416,6 +4541,19 @@ pub fn plan_import_parsed_with(
 			destination_freshness.requested_dirs = Some(requested);
 		}
 	}
+	// What Apply holds the plan to, whatever the classification above made
+	// of it: the tails as the folders were placed.
+	let mut placed_tails: Vec<PathBuf> = mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+		.flat_map(PlacedRoot::new_chain)
+		.collect();
+	if !placed_tails.is_empty() {
+		placed_tails.sort();
+		placed_tails.dedup();
+		destination_freshness.placed_tails = Some(placed_tails);
+	}
 
 	Ok((
 		TransferImportPlan {
@@ -5084,6 +5222,7 @@ fn capture_replay_freshness(
 		missing_dirs: None,
 		symlinked_dirs: None,
 		requested_dirs: None,
+		placed_tails: None,
 	})
 }
 
@@ -6885,7 +7024,7 @@ mod placed_consent_tests {
 		let plan = plan_import(
 			"// file: a.txt\nA\n",
 			"",
-			&[ws.clone()],
+			std::slice::from_ref(&ws),
 			&ImportMapping::with_primary(placed),
 		)
 		.unwrap();
@@ -6914,6 +7053,39 @@ mod placed_consent_tests {
 		assert_eq!(fs::read_to_string(ws.join("new/sub/a.txt")).unwrap(), "A");
 	}
 
+	/// The agreement names the tail through another spelling of the folder
+	/// above it (the macOS data volume's firmlink): it is the same folder,
+	/// and agreed to.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn an_agreement_through_another_spelling_of_the_anchor_counts() {
+		let (_tmp, ws) = tmp();
+		let mut alias = PathBuf::from("/System/Volumes/Data");
+		alias.push(ws.strip_prefix("/").unwrap());
+		fs::metadata(&alias).expect("the data volume's firmlink is there");
+		let placed = PlacedRoot::resolve(None, &ws.join("new")).unwrap();
+		let plan = plan_import(
+			"// file: a.txt\nA\n",
+			"",
+			std::slice::from_ref(&ws),
+			&ImportMapping::with_primary(placed),
+		)
+		.unwrap();
+		let mut freshness = plan.destination_freshness().clone();
+		freshness.requested_dirs = None;
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			plan.restore_plan().clone(),
+			freshness,
+		);
+		let agreed = RestoreSelection {
+			confirmed_new_dirs: [alias.join("new")].into(),
+			..Default::default()
+		};
+		plan.apply(&agreed).unwrap();
+		assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
+	}
+
 	/// Two spellings of one folder to make (here through a symlink to the
 	/// folder above): the second `mkdir` meets the folder this Apply just
 	/// made, which is not someone else's.
@@ -6926,7 +7098,7 @@ mod placed_consent_tests {
 		let plan = plan_import(
 			"// file: a.txt\nA\n",
 			"",
-			&[ws.clone()],
+			std::slice::from_ref(&ws),
 			&ImportMapping::with_primary(placed),
 		)
 		.unwrap();
