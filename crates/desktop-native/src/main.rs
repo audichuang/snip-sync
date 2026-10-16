@@ -29534,6 +29534,58 @@ mod tests {
 				assert!(!probed(&model, cx, "paste-dest-left"));
 			}
 
+			/// The engine suggests dropping `sub/` for a folder named `sub`,
+			/// then refuses the plan as it stands: a regular file `sub` is
+			/// where the directory `sub/` would go. The refusal keeps the
+			/// suggestion, so [Adjust paths] on the panel recovers the paste.
+			#[gpui::test]
+			fn a_refused_new_destination_still_offers_the_adjustment(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				fs::create_dir(ws.join("sub")).unwrap();
+				fs::write(ws.join("sub/sub"), "a file named like its folder")
+					.unwrap();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(
+					&model,
+					cx,
+					"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+				);
+				assert!(executable(&model, cx), "valid where it was opened");
+
+				click_probed(&model, cx, "ws-tree-row:sub");
+				click_probed(&model, cx, "paste-dest-left");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("sub"));
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(!plan.executable());
+					assert!(plan.error.is_some(), "the engine refused it");
+				});
+				assert!(
+					cx.debug_bounds("paste-restore-base").is_some(),
+					"the refusal lost the way back: no [Adjust paths]"
+				);
+
+				click_probed(&model, cx, "paste-adjust");
+				landed(&model, cx);
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(plan.executable(), "{:?}", plan.error);
+					assert_eq!(
+						plan.items
+							.iter()
+							.map(|i| i.path.clone())
+							.collect::<Vec<_>>(),
+						vec!["a.ts".to_string()]
+					);
+				});
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("sub/a.ts")).as_deref(), Some("x"));
+			}
+
 			/// `multi_repo_ws` plus folders whose names begin or end with a
 			/// space, or are nothing else (a real name on a real disk), next
 			/// to the plain ones they would be mistaken for. Unix only: Win32

@@ -943,6 +943,68 @@ mod tests {
 		assert_eq!(err.key, "preview_memory_limit");
 	}
 
+	/// The engine suggests dropping `sub/` for a folder named `sub`, then
+	/// refuses the plan as it stands (a regular file `sub` is where the
+	/// directory `sub/` would go). The refusal lands with the suggestion:
+	/// [Adjust paths] is what recovers, and it plans (#240).
+	#[test]
+	fn a_retarget_the_engine_refuses_keeps_the_restore_base_hint() {
+		let ws = tempfile::tempdir().unwrap();
+		let first = ws.path().join("first");
+		let sub = ws.path().join("sub");
+		for dir in [&first, &sub] {
+			std::fs::create_dir(dir).unwrap();
+			git_init(dir);
+		}
+		std::fs::write(sub.join("sub"), "a file named like the folder")
+			.unwrap();
+		let payload = "// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+		let mut session = landed(payload, &first, None);
+		assert!(session.plan().unwrap().executable());
+		let Remapped::Ready(request) =
+			session.retarget(sub.clone(), Vec::new(), 2, None)
+		else {
+			panic!("a plan is open");
+		};
+		run_retarget(&mut session, request);
+		let Polled::Settled {
+			landed: Some(Landed::Shown { retargeted, .. }),
+			..
+		} = session.poll(false, None)
+		else {
+			panic!("the refusal lands as a shell");
+		};
+		assert!(retargeted);
+		let plan = session.plan().unwrap();
+		assert_eq!(plan.destination, sub);
+		assert!(!plan.executable());
+		assert!(plan.error.is_some(), "the engine's refusal");
+		assert!(
+			plan.restore_hint().is_some(),
+			"the suggestion that recovers was thrown away with the plan"
+		);
+		let Remapped::Ready(request) = session.adjust_paths(true, None) else {
+			panic!("the hint is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		assert!(matches!(
+			session.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+		let plan = session.plan().unwrap();
+		assert!(plan.executable(), "{:?}", plan.error);
+		assert_eq!(
+			plan.items
+				.iter()
+				.map(|i| i.path.as_str())
+				.collect::<Vec<_>>(),
+			["a.ts"]
+		);
+	}
+
 	#[test]
 	fn cancelling_a_preview_keeps_a_held_replay_read_in_repaste_admission() {
 		use snip_core::commits::{
