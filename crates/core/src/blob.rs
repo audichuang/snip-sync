@@ -45,7 +45,7 @@ impl CatFile {
 
 	fn request(&mut self, object: &str) -> Result<(), GitError> {
 		let Some(stdin) = self.session.begin() else {
-			return Err(GitError::Malformed("cat-file stdin closed".into()));
+			return Err(GitError::Diagnostic("cat-file stdin closed"));
 		};
 		let sent = stdin
 			.write_all(format!("{object}\n").as_bytes())
@@ -84,7 +84,7 @@ impl CatFile {
 		if size > max {
 			skip_body(s, size).map_err(|e| {
 				if e.kind() == io::ErrorKind::UnexpectedEof {
-					GitError::Malformed("cat-file body truncated".into())
+					GitError::Diagnostic("cat-file body truncated")
 				} else {
 					s.error(e)
 				}
@@ -413,7 +413,7 @@ impl BlobReader {
 		}
 		match self.open.as_mut() {
 			Some((_, cat)) => cat.read_classified(spec, cap, require_blob),
-			None => Err(GitError::Malformed("cat-file unavailable".into())),
+			None => Err(GitError::Diagnostic("cat-file unavailable")),
 		}
 	}
 

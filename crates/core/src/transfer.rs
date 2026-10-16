@@ -3600,7 +3600,7 @@ impl CommitReplayPreview {
 		cancelled_err(opts, "replay-file-preview")?;
 		let invalid = || {
 			TransferError::Commit(CommitError::InvalidPayload(
-				"invalid replay preview row".into(),
+				commits::PayloadFault::preview_row(),
 			))
 		};
 		let file = self

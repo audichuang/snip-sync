@@ -803,10 +803,10 @@ pub(crate) fn map_git_error_with_leaked(
 	leaked: usize,
 ) -> Response {
 	let mut patch = false;
-	// What the worker may tell the master beyond the code: `for_wire` empties
+	// What the worker may tell the master beyond the code: `beside_code` empties
 	// every path and stderr, and is `None` where the code says it all. A
 	// permit leak is the worker's own state, so it overrides the busy group.
-	let mut reason = err.reason().for_wire();
+	let mut reason = err.reason().beside_code();
 	let (code, message) = match err {
 		GitError::NotARepository(_) | GitError::ToplevelAbove(_) => {
 			(ErrorCode::NotARepository, "not a git repository".into())
@@ -1118,6 +1118,11 @@ mod tests {
 			gone(&malformed).0,
 			"unexpected git output (details withheld)"
 		);
+		// A diagnostic of ours holds nothing git said: sent verbatim, as the
+		// CLI prints it.
+		let fixed = Failure::git("", &GitError::Diagnostic("raw diff record"));
+		assert_eq!(gone(&fixed).0, "unexpected git output: raw diff record");
+		assert_eq!(fixed.message, "unexpected git output: raw diff record");
 		// A row built without the producer's text never sends its message.
 		let bare = Failure::new(
 			secret,

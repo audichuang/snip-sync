@@ -30,7 +30,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Response {
 }
 
 /// A refusal that carries an engine error's reason, scrubbed by
-/// [`Reason::for_wire`] so it names no path of this machine. The code and
+/// [`Reason::beside_code`] so it names no path of this machine. The code and
 /// the message stay what they were (the CLI's bytes); a cancelled job says
 /// so by its code alone.
 fn refused_err(
@@ -45,7 +45,7 @@ fn refused_err(
 		reason: if code == ErrorCode::Cancelled {
 			None
 		} else {
-			reason.for_wire()
+			reason.beside_code()
 		},
 	}
 }

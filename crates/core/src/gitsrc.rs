@@ -113,8 +113,17 @@ pub enum GitError {
 		"Repository history is shallow, so the parent of {0} is not available locally. Run 'git fetch --unshallow' and try again."
 	)]
 	Shallow(String),
+	/// Git's output was not what we parse, and `String` is part of that
+	/// output (an object id, a format name): raw text from git, withheld
+	/// where a worker withholds details. The producer decides: a message
+	/// that is ours alone is a [`GitError::Diagnostic`].
 	#[error("unexpected git output: {0}")]
 	Malformed(String),
+	/// The same failure with a fixed diagnostic of ours ("raw diff record"),
+	/// the same `Display` bytes as [`GitError::Malformed`]. Safe to send
+	/// verbatim: it holds nothing git or the OS said.
+	#[error("unexpected git output: {0}")]
+	Diagnostic(&'static str),
 	#[error("outside the shared folder: {what}")]
 	OutsideBoundary { what: &'static str },
 	#[error("repository too large to verify: {what}")]
@@ -162,6 +171,7 @@ impl GitError {
 			Self::Io(_) => "I/O error (details withheld)".to_string(),
 			// Nothing in these carries stderr or OS text: Display as is.
 			Self::NotFound
+			| Self::Diagnostic(_)
 			| Self::Timeout { .. }
 			| Self::Cancelled { .. }
 			| Self::QueueTimeout { .. }
@@ -209,6 +219,9 @@ impl GitError {
 			},
 			Self::Malformed(output) => Reason::Internal {
 				detail: output.clone(),
+			},
+			Self::Diagnostic(text) => Reason::Internal {
+				detail: (*text).to_string(),
 			},
 			Self::NotARepository(p) => Reason::NotARepository {
 				path: p.display().to_string(),
@@ -264,7 +277,7 @@ pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, GitError> {
 	{
 		std::str::from_utf8(bytes)
 			.map(PathBuf::from)
-			.map_err(|_| GitError::Malformed("path is not UTF-8".into()))
+			.map_err(|_| GitError::Diagnostic("path is not UTF-8"))
 	}
 }
 
@@ -505,9 +518,10 @@ impl Git {
 			});
 		}
 		// Exactly one terminating newline: a path may end in another.
-		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
-			GitError::Malformed("rev-parse --show-toplevel output".into())
-		})?;
+		let top = out
+			.stdout
+			.strip_suffix(b"\n")
+			.ok_or(GitError::Diagnostic("rev-parse --show-toplevel output"))?;
 		let top_path = path_from_git_bytes(top)?;
 		if let Some(ref b) = canonical_boundary {
 			let canonical_top = dunce::canonicalize(&top_path)?;
@@ -736,7 +750,7 @@ impl Git {
 				}
 				let text = std::str::from_utf8(&out.stdout)
 					.map_err(|_| {
-						GitError::Malformed("rev-parse output not utf-8".into())
+						GitError::Diagnostic("rev-parse output not utf-8")
 					})?
 					.trim();
 				// Full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
@@ -791,9 +805,7 @@ impl Git {
 			});
 		}
 		let format = std::str::from_utf8(&out.stdout)
-			.map_err(|_| {
-				GitError::Malformed("rev-parse output not utf-8".into())
-			})?
+			.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?
 			.trim();
 		match format {
 			"sha256" => Ok(SHA256_EMPTY_TREE.into()),
@@ -928,7 +940,7 @@ impl<'a> RawZ<'a> {
 	}
 
 	pub(crate) fn next_entry(&mut self) -> Result<Option<RawEntry>, GitError> {
-		let bad = || GitError::Malformed("raw diff record".into());
+		let bad = || GitError::Diagnostic("raw diff record");
 		let header = loop {
 			match self.fields.next() {
 				None => return Ok(None),
@@ -1086,7 +1098,7 @@ fn unmerged(
 	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
 	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-		let bad = || GitError::Malformed("ls-files -u record".into());
+		let bad = || GitError::Diagnostic("ls-files -u record");
 		let tab = rec.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
 		let stage = match rec[..tab].last() {
 			Some(b @ b'1'..=b'3') => usize::from(b - b'1'),
@@ -1463,7 +1475,7 @@ pub fn read_changed_file_for(
 	let max = max.min(opts.max_stdout as u64);
 	read_changes(git, source, vec![change], Some(max), opts)?
 		.pop()
-		.ok_or_else(|| GitError::Malformed("no file read".into()))
+		.ok_or(GitError::Diagnostic("no file read"))
 }
 
 /// A working-tree file, at most `max` bytes when given. Unreadable is

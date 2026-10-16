@@ -545,13 +545,12 @@ pub(crate) fn check_repo_boundary(
 			limit: opts.max_stdout,
 		});
 	}
-	let stdout = std::str::from_utf8(&out.stdout).map_err(|_| {
-		GitError::Malformed("rev-parse output not utf-8".into())
-	})?;
+	let stdout = std::str::from_utf8(&out.stdout)
+		.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?;
 	let lines: Vec<&str> = stdout.lines().collect();
 	if lines.len() != 10 {
-		return Err(GitError::Malformed(
-			"rev-parse --git-path output must be exactly 10 lines".into(),
+		return Err(GitError::Diagnostic(
+			"rev-parse --git-path output must be exactly 10 lines",
 		));
 	}
 
@@ -2429,7 +2428,7 @@ mod tests {
 		let head = git.resolve_commit_with("HEAD", &opts).unwrap();
 
 		// For Working and Staged, passing listed = Some(...) for unmodified file
-		// must return GitError::Malformed("Path is not in this Git source")
+		// must return GitError::Diagnostic("Path is not in this Git source")
 		let err_work = repo
 			.preview(
 				&GitSource::Working,
@@ -2439,7 +2438,10 @@ mod tests {
 			)
 			.unwrap_err();
 		assert!(
-			matches!(&err_work, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			matches!(
+				&err_work,
+				GitError::Diagnostic("Path is not in this Git source")
+			),
 			"expected Malformed, got {err_work:?}"
 		);
 
@@ -2452,7 +2454,10 @@ mod tests {
 			)
 			.unwrap_err();
 		assert!(
-			matches!(&err_stage, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			matches!(
+				&err_stage,
+				GitError::Diagnostic("Path is not in this Git source")
+			),
 			"expected Malformed, got {err_stage:?}"
 		);
 

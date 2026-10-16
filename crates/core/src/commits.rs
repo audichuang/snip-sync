@@ -16,7 +16,7 @@ use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, Overflow, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
-use crate::reason::{io_reason, Reason};
+use crate::reason::{io_reason, PayloadErrorKind, Reason};
 
 /// Replay replaces a symlink at the target instead of writing through it,
 /// so only the folder it lands in decides whether it is inside Git.
@@ -32,6 +32,48 @@ use crate::workspace::{lock_heavy, RepoIdentity};
 
 /// First line of a commit-mode payload; the rest is JSON.
 pub use crate::clip::COMMIT_MARKER;
+
+/// A payload that does not parse (or serialize). `text` is the English
+/// library message the CLI prints; a front end words `kind`, `line` and
+/// `column` and never shows `text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadFault {
+	pub text: String,
+	pub kind: PayloadErrorKind,
+	pub line: Option<u64>,
+	pub column: Option<u64>,
+}
+
+impl PayloadFault {
+	/// A replay preview row the payload does not have.
+	pub fn preview_row() -> Self {
+		Self {
+			text: "invalid replay preview row".into(),
+			kind: PayloadErrorKind::PreviewRow,
+			line: None,
+			column: None,
+		}
+	}
+}
+
+impl From<&serde_json::Error> for PayloadFault {
+	fn from(e: &serde_json::Error) -> Self {
+		// serde_json reports line 0 where it has no position.
+		let at = |n: usize| (n > 0).then_some(n as u64);
+		Self {
+			text: e.to_string(),
+			kind: PayloadErrorKind::of(e),
+			line: at(e.line()),
+			column: at(e.column()),
+		}
+	}
+}
+
+impl std::fmt::Display for PayloadFault {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.text)
+	}
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
@@ -52,7 +94,7 @@ pub enum CommitError {
 	#[error("not a snip-sync commits payload")]
 	NotCommitPayload,
 	#[error("invalid commits payload: {0}")]
-	InvalidPayload(String),
+	InvalidPayload(PayloadFault),
 	/// The replay's write scope is the folder the user pasted into; a
 	/// target outside it is refused, and replaying the whole repository
 	/// means opening the repository root.
@@ -93,8 +135,10 @@ impl CommitError {
 				first_parent: first_parent.clone(),
 			},
 			Self::NotCommitPayload => Reason::NotCommitPayload,
-			Self::InvalidPayload(detail) => Reason::InvalidPayload {
-				detail: detail.clone(),
+			Self::InvalidPayload(fault) => Reason::InvalidPayload {
+				kind: fault.kind,
+				line: fault.line,
+				column: fault.column,
 			},
 			Self::OutsideScope { path, scope } => Reason::OutsideScope {
 				path: path.clone(),
@@ -617,7 +661,7 @@ fn parse_commit_meta_borrowed<'a>(
 	let (Some(name), Some(email), Some(date)) =
 		(fields.next(), fields.next(), fields.next())
 	else {
-		return Err(GitError::Malformed("commit metadata".into()).into());
+		return Err(GitError::Diagnostic("commit metadata").into());
 	};
 	let mut msg = fields.next().unwrap_or_default();
 	if msg.ends_with(b"\0") {
@@ -954,7 +998,7 @@ fn measure_meta(
 				args: "meta serialize".to_string(),
 			})
 		} else {
-			CommitError::InvalidPayload(e.to_string())
+			CommitError::InvalidPayload(PayloadFault::from(&e))
 		}
 	})?;
 	Ok(counter.count)
@@ -971,7 +1015,7 @@ fn measure_file(
 				args: "file serialize".to_string(),
 			})
 		} else {
-			CommitError::InvalidPayload(e.to_string())
+			CommitError::InvalidPayload(PayloadFault::from(&e))
 		}
 	})?;
 	Ok(counter.count)
@@ -1099,7 +1143,7 @@ pub fn parse_commit_payload(text: &str) -> Result<CommitsPayload, CommitError> {
 	}
 	let json = text.split_once('\n').map_or("", |(_, rest)| rest);
 	serde_json::from_str(json)
-		.map_err(|e| CommitError::InvalidPayload(e.to_string()))
+		.map_err(|e| CommitError::InvalidPayload(PayloadFault::from(&e)))
 }
 
 /// Copy notification numbers (spec 4.2).

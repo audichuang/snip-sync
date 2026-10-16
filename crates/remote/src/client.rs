@@ -2930,7 +2930,7 @@ pub(crate) fn refusal(
 }
 
 // The code-keyed arms below decide from the code alone, which is sound only
-// while the worker sends no reason for those codes (`Reason::for_wire`
+// while the worker sends no reason for those codes (`Reason::beside_code`
 // answers `None` for InvalidRevision, Cancelled and Timeout). TooLarge is
 // the one code a reason refines (VerifyLimit), so its arm checks the reason.
 impl From<RemoteError> for GitError {

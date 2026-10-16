@@ -4104,10 +4104,10 @@ mod tests {
 		for (label, reason) in crate::paste::zh_leaks_tests::reason_samples()
 			.into_iter()
 			.flat_map(|(label, reason)| {
-				let wire = reason.clone().for_wire();
+				let wire = reason.clone().beside_code();
 				[(label.clone(), reason)]
 					.into_iter()
-					.chain(wire.map(|w| (format!("{label}/for_wire"), w)))
+					.chain(wire.map(|w| (format!("{label}/beside_code"), w)))
 			}) {
 			let mut msg = crate::reason::reason_msg(&reason);
 			assert!(

@@ -133,9 +133,10 @@ fn git_variant(e: &GitError) -> usize {
 		GitError::VerifyLimit { .. } => 18,
 		GitError::Remote { .. } => 19,
 		GitError::Io(_) => 20,
+		GitError::Diagnostic(_) => 21,
 	}
 }
-const GIT_VARIANTS: usize = 21;
+const GIT_VARIANTS: usize = 22;
 
 fn preview_variant(e: &PreviewErr) -> usize {
 	match e {
@@ -274,6 +275,9 @@ fn git_samples() -> Vec<(String, GitError)> {
 		("InvalidRevision".into(), GitError::InvalidRevision(a())),
 		("Shallow".into(), GitError::Shallow(a())),
 		("Malformed".into(), GitError::Malformed(a())),
+		// Its text is a technical label for a bug report (classified as
+		// data next to `reason_msg`), shown verbatim like `Malformed`'s.
+		("Diagnostic".into(), GitError::Diagnostic(D)),
 		(
 			"OutsideBoundary".into(),
 			GitError::OutsideBoundary { what: "datatoken" },
@@ -565,7 +569,7 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 				base: d(),
 				tip: d(),
 				at: d(),
-				first_parent: None,
+				first_parent: Some(d()),
 			},
 		),
 		(
@@ -578,7 +582,11 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		("NotCommitPayload".into(), Reason::NotCommitPayload),
 		(
 			"InvalidPayload".into(),
-			Reason::InvalidPayload { detail: d() },
+			Reason::InvalidPayload {
+				kind: snip_core::reason::PayloadErrorKind::Syntax,
+				line: Some(1),
+				column: Some(2),
+			},
 		),
 		(
 			"OutsideScope".into(),
@@ -818,7 +826,9 @@ fn commit_samples() -> Vec<(String, CommitError)> {
 		("NotCommitPayload".into(), CommitError::NotCommitPayload),
 		(
 			"InvalidPayload".into(),
-			CommitError::InvalidPayload(D.into()),
+			CommitError::InvalidPayload(
+				snip_core::commits::PayloadFault::preview_row(),
+			),
 		),
 		(
 			"OutsideScope".into(),
@@ -1077,7 +1087,7 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 }
 
 /// `reason_msg` is the single translation point: every `Reason`, as the
-/// producer builds it and as a worker sends it (`for_wire`), words in both
+/// producer builds it and as a worker sends it (`beside_code`), words in both
 /// languages with every key in both dictionaries, no English run in zh-TW,
 /// Chinese in every zh-TW rendering, no CJK in English, and no empty slot.
 #[test]
@@ -1090,9 +1100,9 @@ fn every_reason_is_worded_in_both_languages() {
 
 	let mut found = Found::default();
 	for (label, reason) in &samples {
-		let wire = reason.clone().for_wire();
+		let wire = reason.clone().beside_code();
 		for (label, reason) in std::iter::once((label.clone(), reason.clone()))
-			.chain(wire.map(|w| (format!("{label}/for_wire"), w)))
+			.chain(wire.map(|w| (format!("{label}/beside_code"), w)))
 		{
 			let msg = reason_msg(&reason);
 			check(label.clone(), &zh(&msg), &mut found);
@@ -1174,4 +1184,122 @@ fn the_empty_slot_detector_sees_a_missing_datum() {
 	assert!(has_empty_slot("上限（）"));
 	assert!(has_empty_slot("操作逾時："));
 	assert!(!has_empty_slot("操作逾時：/x"));
+}
+
+/// Every String a [`Reason`] carries, as `variant.field` (nested tags
+/// skipped), from the JSON of all samples.
+fn string_fields() -> BTreeSet<String> {
+	fn walk(prefix: &str, v: &serde_json::Value, out: &mut BTreeSet<String>) {
+		match v {
+			serde_json::Value::String(_) => {
+				out.insert(prefix.to_string());
+			}
+			serde_json::Value::Array(items) => {
+				for i in items {
+					walk(prefix, i, out);
+				}
+			}
+			serde_json::Value::Object(map) => {
+				for (k, v) in map {
+					// The serde tag names a variant, and `kind`, `code` and
+					// `start` are closed enums: neither is free text.
+					if !matches!(k.as_str(), "r" | "kind" | "code" | "start") {
+						walk(&format!("{prefix}.{k}"), v, out);
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	let mut out = BTreeSet::new();
+	for (_, r) in reason_samples() {
+		let json = serde_json::to_value(&r).unwrap();
+		let tag = json["r"].as_str().unwrap().to_string();
+		walk(&tag, &json, &mut out);
+	}
+	out
+}
+
+/// Every String field of every `Reason` is either data the screen shows
+/// verbatim or not there: the classification lives next to `reason_msg`
+/// (`crate::reason`). A new String field fails here until it is classified
+/// as data (listed below) or made typed. A library's English message is
+/// never data: `InvalidPayload` once held `serde_json`'s text and a zh-TW
+/// screen showed it.
+#[test]
+fn string_fields_are_classified() {
+	const DATA: &[&str] = &[
+		"ambiguous_roots.basename",
+		"ambiguous_roots.roots",
+		"collision.path",
+		"destination_changed.change.rel",
+		"discontinuous.at",
+		"discontinuous.base",
+		"discontinuous.first_parent",
+		"discontinuous.tip",
+		"disconnected.detail",
+		"git_failed.stderr",
+		"inside_parent_repo.path",
+		"internal.detail",
+		"invalid_revision.rev",
+		"io.detail",
+		"not_a_repository.path",
+		"not_found.path",
+		"not_regular_file.path",
+		"outside_root.path",
+		"outside_scope.path",
+		"outside_scope.scope",
+		"payload_too_large.path",
+		"permission_denied.path",
+		"shallow.sha",
+		"source_changed.change.rel",
+		"staged_and_working.path",
+		"start.detail",
+		"submodule_unreadable.detail",
+		"unsafe_path.path",
+		"unverifiable.path",
+		"worker_too_old.worker",
+	];
+	let actual = string_fields();
+	let expected: BTreeSet<String> =
+		DATA.iter().map(|s| s.to_string()).collect();
+	assert_eq!(
+		actual, expected,
+		"a Reason String field is unclassified: data (list it) or typed"
+	);
+}
+
+/// A payload that does not parse is worded in the interface language
+/// whatever `serde_json` said: no English from the library reaches zh-TW.
+#[test]
+fn an_invalid_payload_is_worded_without_the_librarys_text() {
+	use snip_core::commits::{parse_commit_payload, CommitError};
+	let parse_error = |body: &str| match parse_commit_payload(&format!(
+		"// snip-sync commits v1\n{body}"
+	)) {
+		Err(CommitError::InvalidPayload(f)) => f,
+		other => panic!("expected InvalidPayload, got {other:?}"),
+	};
+	let mut kinds = BTreeSet::new();
+	for body in ["{bad", "{\"a\":", "[]", "{\"commits\":7}", ""] {
+		let fault = parse_error(body);
+		kinds.insert(format!("{:?}", fault.kind));
+		let reason = CommitError::InvalidPayload(fault.clone()).reason();
+		let msg = reason_msg(&reason);
+		let mut found = Found::default();
+		check(format!("payload {body:?}"), &zh(&msg), &mut found);
+		assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+		let en = msg.render(Locale::En);
+		assert!(!en.contains(&fault.text), "{en}");
+		assert!(!zh(&msg).contains(&fault.text), "{}", zh(&msg));
+		// The CLI keeps the library's text.
+		assert_eq!(
+			CommitError::InvalidPayload(fault.clone()).to_string(),
+			format!("invalid commits payload: {}", fault.text)
+		);
+	}
+	assert!(
+		kinds.len() >= 2,
+		"the probes cover several kinds: {kinds:?}"
+	);
 }

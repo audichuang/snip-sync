@@ -45,7 +45,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Refusal {
 }
 
 /// A refusal that also says why. `reason` must already have gone through
-/// [`Reason::for_wire`]: it never carries a path or git's stderr.
+/// [`Reason::beside_code`]: it never carries a path or git's stderr.
 fn refused_with(
 	code: ErrorCode,
 	message: impl Into<String>,
@@ -94,16 +94,18 @@ fn transfer_refusal(err: TransferError, cancel: &CancelToken) -> Refusal {
 	let reason = if code == ErrorCode::Cancelled {
 		None
 	} else {
-		err.reason().for_wire()
+		err.reason().beside_code()
 	};
 	refused_with(code, err.paste_message(), reason)
 }
 
 /// A replay result on its way to the master: the failure's reason goes
-/// through [`Reason::for_wire`], so it names no path of this machine.
+/// through [`Reason::scrubbed`], so it names no path of this machine. A
+/// replay failure carries no [`ErrorCode`], so `beside_code` (which drops
+/// the reasons a code says) would leave the master a generic refusal.
 fn scrub_replay(mut result: ReplayResult) -> ReplayResult {
 	if let Some(failure) = &mut result.failure {
-		failure.reason = failure.reason.take().and_then(Reason::for_wire);
+		failure.reason = failure.reason.take().map(Reason::scrubbed);
 	}
 	result
 }
@@ -464,7 +466,7 @@ fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
 		refused_with(
 			ErrorCode::BadRequest,
 			e.to_string(),
-			e.reason().for_wire(),
+			e.reason().beside_code(),
 		)
 	})
 }
@@ -838,12 +840,27 @@ mod reason_tests {
 				path: String::new()
 			})
 		);
+		// No code travels with a replay failure, so the reasons a code
+		// would say stay, scrubbed (the master cannot tell a refused
+		// directory from a generic I/O error otherwise).
 		assert_eq!(
 			sent(Reason::Io {
 				detail: "/opt/secret".into()
 			}),
-			None
+			Some(Reason::Io {
+				detail: String::new()
+			})
 		);
+		for r in [
+			Reason::PermissionDenied { path: "/p".into() },
+			Reason::NotFound { path: "/p".into() },
+			Reason::TimedOut,
+			Reason::Cancelled,
+			Reason::OutsideShare,
+		] {
+			let want = r.clone().scrubbed();
+			assert_eq!(sent(r.clone()), Some(want), "{r:?}");
+		}
 		let wire = serde_json::to_string(&Response::Replayed(scrub_replay(
 			failed(Reason::OutsideScope {
 				path: "a".into(),

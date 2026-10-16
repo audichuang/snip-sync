@@ -483,7 +483,10 @@ fn nested_preview_options_and_source_fidelity() {
 	let mut cat = git_repo.cat_file_with(RunOptions::default()).unwrap();
 	let err = cat.read_object("HEAD:a.txt", 100).unwrap_err();
 	assert!(
-		matches!(err, GitError::Io(_) | GitError::Malformed(_)),
+		matches!(
+			err,
+			GitError::Io(_) | GitError::Malformed(_) | GitError::Diagnostic(_)
+		),
 		"zero exit protocol truncation: {err}"
 	);
 	drop(cat);

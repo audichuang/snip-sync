@@ -137,9 +137,7 @@ fn read_refs(
 		});
 	}
 	let Ok(text) = std::str::from_utf8(&raw.stdout) else {
-		return Err(GitError::Malformed(
-			"for-each-ref output not utf-8".into(),
-		));
+		return Err(GitError::Diagnostic("for-each-ref output not utf-8"));
 	};
 	let mut refs = Vec::new();
 	// Indexes into `refs` whose one-level peel is itself a tag object.
@@ -595,24 +593,20 @@ pub fn commit_directory_with(
 			// Discard trailing bytes from a truncated tail; never construct identity from partial bytes.
 			truncated = true;
 		} else {
-			return Err(GitError::Malformed(
-				"ls-tree output missing terminating NUL".into(),
+			return Err(GitError::Diagnostic(
+				"ls-tree output missing terminating NUL",
 			));
 		}
 	}
 
 	for rec in records_slice.split(|&b| b == 0).filter(|r| !r.is_empty()) {
 		let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
-			return Err(GitError::Malformed(
-				"ls-tree record missing tab".into(),
-			));
+			return Err(GitError::Diagnostic("ls-tree record missing tab"));
 		};
 		let meta = match std::str::from_utf8(&rec[..tab]) {
 			Ok(m) => m,
 			Err(_) => {
-				return Err(GitError::Malformed(
-					"ls-tree metadata not utf-8".into(),
-				))
+				return Err(GitError::Diagnostic("ls-tree metadata not utf-8"))
 			}
 		};
 		let kind = match meta.split(' ').nth(1) {
@@ -622,13 +616,11 @@ pub fn commit_directory_with(
 		};
 		let path_bytes = &rec[tab + 1..];
 		if path_bytes.is_empty() {
-			return Err(GitError::Malformed(
-				"ls-tree record has empty path".into(),
-			));
+			return Err(GitError::Diagnostic("ls-tree record has empty path"));
 		}
 		let Ok(path_str) = std::str::from_utf8(path_bytes) else {
-			return Err(GitError::Malformed(
-				"unsupported non-UTF-8 path in commit directory".into(),
+			return Err(GitError::Diagnostic(
+				"unsupported non-UTF-8 path in commit directory",
 			));
 		};
 		let path = path_str.to_string();
@@ -702,10 +694,8 @@ pub fn commit_blob_with(
 		Ok(s) => s
 			.trim()
 			.parse()
-			.map_err(|_| GitError::Malformed("cat-file size".into()))?,
-		Err(_) => {
-			return Err(GitError::Malformed("cat-file size not utf-8".into()))
-		}
+			.map_err(|_| GitError::Diagnostic("cat-file size"))?,
+		Err(_) => return Err(GitError::Diagnostic("cat-file size not utf-8")),
 	};
 	let effective_max = max_bytes.min(MAX_BLOB_BYTES);
 	if size > effective_max {
@@ -798,9 +788,7 @@ pub fn git_preview_with(
 		opts.max_stdout as u64,
 		opts,
 	)?
-	.ok_or_else(|| {
-		GitError::Malformed("Path is not in this Git source".into())
-	})?;
+	.ok_or(GitError::Diagnostic("Path is not in this Git source"))?;
 	let revs = diff_revs(git, source, None, opts)?;
 	finish_preview(git, revs, path, file.content, file.change_type, opts)
 }
@@ -1711,8 +1699,9 @@ mod tests {
 		assert!(
 			matches!(
 				err,
-				GitError::Malformed(ref msg)
-					if msg.contains("unsupported non-UTF-8 path in commit directory")
+				GitError::Diagnostic(
+					"unsupported non-UTF-8 path in commit directory"
+				)
 			),
 			"{err:?}"
 		);

@@ -582,7 +582,7 @@ pub fn declared_submodules(
 		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
 		Err(e) => return Err(e.into()),
 		Ok(m) if !m.is_file() => {
-			return Err(GitError::Malformed(".gitmodules is not a file".into()))
+			return Err(GitError::Diagnostic(".gitmodules is not a file"))
 		}
 		Ok(_) => {}
 	}
@@ -604,7 +604,7 @@ pub fn declared_submodules(
 		}) if stderr.is_empty() => return Ok(Vec::new()),
 		Err(e) => return Err(e),
 	};
-	let bad = || GitError::Malformed("config -z record".into());
+	let bad = || GitError::Diagnostic("config -z record");
 	let mut list = Vec::new();
 	// `-z`: `<key>\n<value>\0`; a value may contain newlines.
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -665,6 +665,7 @@ pub struct RepoIdentity {
 fn rev_parse_path(
 	git: &Git,
 	flag: &str,
+	bad_output: &'static str,
 	opts: &RunOptions,
 ) -> Result<Option<PathBuf>, GitError> {
 	let out = git
@@ -674,7 +675,7 @@ fn rev_parse_path(
 		return if out.is_empty() {
 			Ok(None)
 		} else {
-			Err(GitError::Malformed(format!("rev-parse {flag} output")))
+			Err(GitError::Diagnostic(bad_output))
 		};
 	};
 	if bytes.is_empty() {
@@ -688,13 +689,26 @@ fn rev_parse_path(
 
 impl RepoIdentity {
 	pub fn resolve(git: &Git, opts: &RunOptions) -> Result<Self, GitError> {
-		let missing = |what: &str| GitError::Malformed(format!("no {what}"));
-		let git_dir = rev_parse_path(git, "--git-dir", opts)?
-			.ok_or_else(|| missing("git dir"))?;
-		let common_dir = rev_parse_path(git, "--git-common-dir", opts)?
-			.ok_or_else(|| missing("common dir"))?;
-		let superproject =
-			rev_parse_path(git, "--show-superproject-working-tree", opts)?;
+		let git_dir = rev_parse_path(
+			git,
+			"--git-dir",
+			"rev-parse --git-dir output",
+			opts,
+		)?
+		.ok_or(GitError::Diagnostic("no git dir"))?;
+		let common_dir = rev_parse_path(
+			git,
+			"--git-common-dir",
+			"rev-parse --git-common-dir output",
+			opts,
+		)?
+		.ok_or(GitError::Diagnostic("no common dir"))?;
+		let superproject = rev_parse_path(
+			git,
+			"--show-superproject-working-tree",
+			"rev-parse --show-superproject-working-tree output",
+			opts,
+		)?;
 		let kind = if superproject.is_some() {
 			RepoKind::Submodule
 		} else if git_dir != common_dir {
@@ -800,7 +814,7 @@ impl RepoSummary {
 fn parse_status(
 	out: &[u8],
 ) -> Result<(Option<String>, Option<String>, ChangeCounts), GitError> {
-	let bad = || GitError::Malformed("status --porcelain=v2 record".into());
+	let bad = || GitError::Diagnostic("status --porcelain=v2 record");
 	let mut head = None;
 	let mut branch = None;
 	let mut c = ChangeCounts::default();
@@ -927,7 +941,7 @@ pub fn status_details(
 }
 
 fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
-	let bad = || GitError::Malformed("status --porcelain=v2 record".into());
+	let bad = || GitError::Diagnostic("status --porcelain=v2 record");
 	let mut details = StatusDetails::default();
 	let mut records = out.split(|&b| b == 0).filter(|r| !r.is_empty());
 	while let Some(rec) = records.next() {

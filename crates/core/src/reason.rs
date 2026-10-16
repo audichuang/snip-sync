@@ -45,6 +45,36 @@ pub enum ErrorCode {
 	Collision,
 }
 
+/// What was wrong with a commits payload, as a kind a front end words.
+/// `serde_json`'s own message is English library text: it stays in the
+/// CLI's `Display` and never becomes data a front end shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadErrorKind {
+	/// Not JSON.
+	Syntax,
+	/// JSON of the wrong shape (a missing or mistyped field).
+	Data,
+	/// The text ends early.
+	Eof,
+	/// The payload could not be written out.
+	Io,
+	/// A replay preview row that does not exist in the payload.
+	PreviewRow,
+}
+
+impl PayloadErrorKind {
+	pub fn of(e: &serde_json::Error) -> Self {
+		use serde_json::error::Category;
+		match e.classify() {
+			Category::Syntax => Self::Syntax,
+			Category::Data => Self::Data,
+			Category::Eof => Self::Eof,
+			Category::Io => Self::Io,
+		}
+	}
+}
+
 /// What changed under a paste or a copy after its preview. `rel` is relative
 /// to the destination (the source root for a source change).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,8 +213,13 @@ pub enum Reason {
 		available: u64,
 	},
 	NotCommitPayload,
+	/// `line` and `column` are 1-based, where `serde_json` knows them.
 	InvalidPayload {
-		detail: String,
+		kind: PayloadErrorKind,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		line: Option<u64>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		column: Option<u64>,
 	},
 	/// `path` is relative to the repository; `scope` is the opened folder,
 	/// emptied on the wire.
@@ -312,12 +347,18 @@ fn wire_relative(p: &str) -> bool {
 }
 
 impl Reason {
-	/// What a worker may send. An exhaustive match, so each new variant
-	/// decides its own wire policy. `None` where the [`ErrorCode`] already
-	/// says it. Otherwise `Some`, with every free-text or possibly-absolute
+	/// What a worker may send in a frame that ALSO carries an [`ErrorCode`]
+	/// (`Response::Error`). An exhaustive match, so each new variant decides
+	/// its own wire policy. `None` where that code already says it.
+	///
+	/// Only valid beside a code: a frame without one (a replay failure, a scan
+	/// row, a restore failure) must send [`scrubbed`](Self::scrubbed), or the
+	/// master loses the variant the code was supposed to stand for.
+	///
+	/// Otherwise `Some`, with every free-text or possibly-absolute
 	/// field emptied (path, scope, roots, detail, stderr); only repo-relative
 	/// names, basenames, shas, revs, worker names and numbers survive.
-	pub fn for_wire(self) -> Option<Reason> {
+	pub fn beside_code(self) -> Option<Reason> {
 		match self {
 			Self::Refused { .. }
 			| Self::Start { .. }
@@ -369,7 +410,7 @@ impl Reason {
 
 	/// This reason with every free-text or possibly-absolute field emptied
 	/// (path, scope, roots, detail, stderr), for a peer that must not learn
-	/// the machine's layout. Unlike [`for_wire`](Self::for_wire) it keeps
+	/// the machine's layout. Unlike [`beside_code`](Self::beside_code) it keeps
 	/// the variant whatever the code says: a scan row has no code. Only
 	/// repo-relative names, basenames, shas, revs, worker names and numbers
 	/// survive. An exhaustive match.
@@ -392,9 +433,6 @@ impl Reason {
 				stderr: String::new(),
 			},
 			Self::Internal { .. } => Self::Internal {
-				detail: String::new(),
-			},
-			Self::InvalidPayload { .. } => Self::InvalidPayload {
 				detail: String::new(),
 			},
 			Self::Io { .. } => Self::Io {
@@ -472,6 +510,7 @@ impl Reason {
 			| Self::Discontinuous { .. }
 			| Self::NotEnoughCommits { .. }
 			| Self::NotCommitPayload
+			| Self::InvalidPayload { .. }
 			| Self::SubmoduleNotCheckedOut
 			| Self::ScanErrorsOmitted { .. }
 			| Self::DepthLimitedOmitted { .. } => self,
@@ -608,7 +647,11 @@ mod tests {
 				available: 2,
 			},
 			Reason::NotCommitPayload,
-			Reason::InvalidPayload { detail: s() },
+			Reason::InvalidPayload {
+				kind: PayloadErrorKind::Syntax,
+				line: Some(1),
+				column: Some(2),
+			},
 			Reason::OutsideScope {
 				path: ok(),
 				scope: s(),
@@ -727,10 +770,10 @@ mod tests {
 	}
 
 	#[test]
-	fn for_wire_leaks_no_free_text() {
+	fn beside_code_leaks_no_free_text() {
 		for r in samples() {
 			let idx = reason_index(&r);
-			let wire = r.clone().for_wire();
+			let wire = r.clone().beside_code();
 			let json = serde_json::to_string(&wire).unwrap();
 			assert!(
 				!json.contains("secret"),
@@ -738,18 +781,18 @@ mod tests {
 			);
 			if let Some(w) = wire {
 				// Idempotent: a scrubbed reason scrubs to itself.
-				assert_eq!(w.clone().for_wire(), Some(w), "variant {idx}");
+				assert_eq!(w.clone().beside_code(), Some(w), "variant {idx}");
 			}
 		}
 	}
 
 	#[test]
-	fn for_wire_keeps_the_relative_names_the_ui_echoes() {
+	fn beside_code_keeps_the_relative_names_the_ui_echoes() {
 		let w = Reason::OutsideScope {
 			path: "src/a.rs".into(),
 			scope: "/abs/secret".into(),
 		}
-		.for_wire();
+		.beside_code();
 		assert_eq!(
 			w,
 			Some(Reason::OutsideScope {
@@ -760,7 +803,7 @@ mod tests {
 		let w = Reason::DestinationChanged {
 			change: StaleChange::Modified { rel: "a/b".into() },
 		}
-		.for_wire();
+		.beside_code();
 		assert_eq!(
 			w,
 			Some(Reason::DestinationChanged {
@@ -775,24 +818,24 @@ mod tests {
 			path: path.map(String::from),
 		};
 		assert_eq!(
-			big(Some("repo/a b.txt")).for_wire(),
+			big(Some("repo/a b.txt")).beside_code(),
 			Some(big(Some("repo/a b.txt")))
 		);
-		assert_eq!(big(Some("/abs/a.txt")).for_wire(), Some(big(None)));
-		assert_eq!(big(Some("../a.txt")).for_wire(), Some(big(None)));
-		assert_eq!(big(None).for_wire(), Some(big(None)));
+		assert_eq!(big(Some("/abs/a.txt")).beside_code(), Some(big(None)));
+		assert_eq!(big(Some("../a.txt")).beside_code(), Some(big(None)));
+		assert_eq!(big(None).beside_code(), Some(big(None)));
 		let chain = Reason::Discontinuous {
 			base: "b".into(),
 			tip: "t".into(),
 			at: "a".into(),
 			first_parent: Some("p".into()),
 		};
-		assert_eq!(chain.clone().for_wire(), Some(chain));
+		assert_eq!(chain.clone().beside_code(), Some(chain));
 		assert_eq!(
 			Reason::StagedAndWorking {
 				path: "f.txt".into()
 			}
-			.for_wire(),
+			.beside_code(),
 			Some(Reason::StagedAndWorking {
 				path: "f.txt".into()
 			})
@@ -807,12 +850,12 @@ mod tests {
 			},
 			Reason::NotFound { path: "x".into() },
 		] {
-			assert_eq!(r.for_wire(), None);
+			assert_eq!(r.beside_code(), None);
 		}
 	}
 
 	#[test]
-	fn scrubbed_leaks_no_free_text_and_for_wire_is_scrubbed_or_nothing() {
+	fn scrubbed_leaks_no_free_text_and_beside_code_is_scrubbed_or_nothing() {
 		for r in samples() {
 			let idx = reason_index(&r);
 			let scrubbed = r.clone().scrubbed();
@@ -823,7 +866,7 @@ mod tests {
 			);
 			assert_eq!(reason_index(&scrubbed), idx, "the variant is kept");
 			assert_eq!(scrubbed.clone().scrubbed(), scrubbed, "idempotent");
-			match r.for_wire() {
+			match r.beside_code() {
 				None => {}
 				Some(w) => assert_eq!(w, scrubbed, "variant {idx}"),
 			}

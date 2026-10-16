@@ -7,7 +7,9 @@
 ## Consequences
 
 - `Response::Error`、`ReplayFailure` 與掃描錯誤列帶可選的 `reason`，以 `lenient` 讀取：未知變體只讓該欄位變成 `None`，不使整個 frame 失敗。沒有原因時不輸出該鍵，不升協定版本。
-- 上線前一律經 `Reason::for_wire`（或掃描列的 `scrubbed`）清掉分享根的絕對路徑、scope 與 git stderr；這兩個函式是窮盡的 match，不用 `_`。
+- 上線前一律清掉分享根的絕對路徑、scope 與 git stderr；這兩個函式是窮盡的 match，不用 `_`。帶 `ErrorCode` 的框（`Response::Error`）走 `Reason::beside_code`，它在 code 已說明時回 `None`；沒有 code 的框（replay 失敗、掃描列、restore 失敗）一律走 `scrubbed`，保留變體，否則 master 會退回通用措辭。
+- `Reason` 的 String 欄位只能是使用者該原樣看到的資料；函式庫或產品的英文診斷（如 serde_json 的訊息）必須是型別化資料（`InvalidPayload { kind, line, column }`），CLI 的 Display 位元組不變。分類寫在 `reason_msg` 旁，`string_fields_are_classified` 釘住。
+- worker 是否隱藏一段文字由產生者決定：`GitError::Malformed(String)` 是 git 的原始輸出（隱藏），`GitError::Diagnostic(&'static str)` 是我們自己的固定診斷（原樣送出，Display 位元組與 Malformed 相同）。
 - 舊 worker 不送 `reason`，新 master 退回通用措辭，CLI 的 repo-busy 拒絕少一段後綴；見 `docs/spec.md` 版本相容。
 - 桌面 App 中仍是英文的只剩資料：git stderr、OS 的 I/O 文字、ssh 文字，且只作為有鍵標題的尾端引數（`Msg::detail`）。
 - `scripts/check_msg_raw.sh` 擋下繞過這條規則的後門（`reason_detail` 字面值、`Msg` 別名）。

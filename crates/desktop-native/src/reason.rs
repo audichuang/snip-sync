@@ -10,7 +10,9 @@
 //! not compile until it has a wording.
 
 use snip_core::gitsrc::StartReason;
-use snip_core::reason::{ErrorCode, Failure, Reason, StaleChange};
+use snip_core::reason::{
+	ErrorCode, Failure, PayloadErrorKind, Reason, StaleChange,
+};
 
 use crate::i18n::Msg;
 
@@ -93,6 +95,61 @@ fn destination_changed(change: &StaleChange) -> Msg {
 fn headed(key: &'static str, datum: &str) -> Msg {
 	Msg::detail(Msg::new(key, []), datum)
 }
+
+/// A payload fault in words: the kind picks the sentence, and the position
+/// (where `serde_json` knew it) is filled into it. The library's own English
+/// message is never data here.
+fn invalid_payload(
+	kind: PayloadErrorKind,
+	line: Option<u64>,
+	column: Option<u64>,
+) -> Msg {
+	match (kind, line, column) {
+		(PayloadErrorKind::Syntax, Some(l), Some(c)) => Msg::new(
+			"err_invalid_payload_syntax_at",
+			[l.to_string(), c.to_string()],
+		),
+		(PayloadErrorKind::Data, Some(l), Some(c)) => Msg::new(
+			"err_invalid_payload_data_at",
+			[l.to_string(), c.to_string()],
+		),
+		(PayloadErrorKind::Eof, Some(l), Some(c)) => Msg::new(
+			"err_invalid_payload_eof_at",
+			[l.to_string(), c.to_string()],
+		),
+		(PayloadErrorKind::Syntax, ..) => {
+			Msg::new("err_invalid_payload_syntax", [])
+		}
+		(PayloadErrorKind::Data, ..) => {
+			Msg::new("err_invalid_payload_data", [])
+		}
+		(PayloadErrorKind::Eof, ..) => Msg::new("err_invalid_payload_eof", []),
+		(PayloadErrorKind::Io, ..) => Msg::new("err_invalid_payload_io", []),
+		(PayloadErrorKind::PreviewRow, ..) => {
+			Msg::new("err_invalid_payload_preview_row", [])
+		}
+	}
+}
+
+// Every String field a Reason carries, and what the screen does with it. A
+// field is either (i) DATA the user should see verbatim, trailing a worded
+// headline (a path, a name, a sha, a rev, git's stderr, the OS's or the
+// transport's own text, which develop showed too), or (ii) a library or
+// product English diagnostic, which must be typed data and worded here.
+// Classified (i): Start.detail, Disconnected.detail (transport text),
+// WorkerTooOld.worker, GitFailed.stderr, NotARepository.path,
+// InsideParentRepo.path, InvalidRevision.rev, Shallow.sha, Io.detail,
+// NotFound/PermissionDenied/UnsafePath/NotRegularFile/OutsideRoot/Collision/
+// StagedAndWorking/Unverifiable.path, AmbiguousRoots.basename/roots,
+// PayloadTooLarge.path, Discontinuous.base/tip/at/first_parent,
+// OutsideScope.path/scope, SourceChanged/DestinationChanged rel,
+// SubmoduleUnreadable.detail, and Internal.detail (a command label or record
+// name for a bug report under the localized "internal error" headline, or
+// git's own output; never a sentence of ours).
+// Classified (ii), now typed: InvalidPayload (`serde_json`'s message became
+// kind + line + column). The zh leak test pins this list
+// (`string_fields_are_classified`): a new String field fails it until it
+// is classified here.
 
 /// The message for a reason. Exhaustive: no `_` arm.
 pub fn reason_msg(r: &Reason) -> Msg {
@@ -187,8 +244,8 @@ pub fn reason_msg(r: &Reason) -> Msg {
 			[requested.to_string(), available.to_string()],
 		),
 		Reason::NotCommitPayload => Msg::new("err_not_commit_payload", []),
-		Reason::InvalidPayload { detail } => {
-			headed("err_invalid_payload", detail)
+		Reason::InvalidPayload { kind, line, column } => {
+			invalid_payload(*kind, *line, *column)
 		}
 		Reason::OutsideScope { path, scope } => {
 			Msg::detail(Msg::new("err_outside_scope", [path.clone()]), scope)

@@ -1006,7 +1006,7 @@ fn error(code: ErrorCode, message: String) -> Response {
 }
 
 /// An error reply that also says why. `reason` must already have gone
-/// through [`Reason::for_wire`]: it never carries a path or git's stderr.
+/// through [`Reason::beside_code`]: it never carries a path or git's stderr.
 pub(crate) fn error_with(
 	code: ErrorCode,
 	message: String,
@@ -1076,8 +1076,8 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 		_ => ErrorCode::Io,
 	};
 	// The code says it all for most kinds, so the reason is usually `None`;
-	// going through `for_wire` keeps a new kind from skipping the scrub.
-	error_with(code, err.to_string(), io_reason(&err, "").for_wire())
+	// going through `beside_code` keeps a new kind from skipping the scrub.
+	error_with(code, err.to_string(), io_reason(&err, "").beside_code())
 }
 
 impl State {

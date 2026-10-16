@@ -25,7 +25,7 @@ _Avoid_: 貼上目的地（單獨使用，易與目的資料夾混淆）、paste
 ## 錯誤
 
 **原因**（Reason）:
-一個失敗的型別化意義，是資料而不是文字：變體加上必要的資料（路徑、細節）。桌面 App 只經 `reason_msg` 把它譯成目前介面語言；CLI 與線上協定的文字來自 thiserror 的 Display。上線前由 `for_wire` 清掉絕對路徑與 git stderr。
+一個失敗的型別化意義，是資料而不是文字：變體加上必要的資料（路徑、細節）。桌面 App 只經 `reason_msg` 把它譯成目前介面語言；CLI 與線上協定的文字來自 thiserror 的 Display。上線前由 `beside_code` 清掉絕對路徑與 git stderr。
 _Avoid_: 錯誤字串、error message（當成資料讀取時）
 
 **錯誤碼**（ErrorCode）:
