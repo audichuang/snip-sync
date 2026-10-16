@@ -716,6 +716,16 @@ pub enum Response {
 		/// field ignores it and reads a plain `TooLarge`.
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		patch: bool,
+		/// Why, beyond the code. A peer that does not know the field
+		/// ignores it; one that does not understand its value reads
+		/// `None` and words the code. Absent when `None`, so a frame
+		/// without a reason is byte-identical to an old worker's.
+		#[serde(
+			default,
+			deserialize_with = "snip_core::reason::lenient",
+			skip_serializing_if = "Option::is_none"
+		)]
+		reason: Option<Reason>,
 	},
 }
 
@@ -1032,6 +1042,169 @@ mod tests {
 	};
 	use snip_core::workspace::ChangeCounts;
 
+	/// What a worker or master built before `reason` decodes: the same enum
+	/// shape without the field. serde ignores unknown keys, so this stays
+	/// the old peer.
+	#[derive(Debug, PartialEq, Deserialize)]
+	#[serde(tag = "reply", rename_all = "snake_case")]
+	enum OldResponse {
+		Error {
+			code: ErrorCode,
+			message: String,
+			#[serde(default)]
+			patch: bool,
+		},
+		Replayed {
+			created: Vec<String>,
+			failure: Option<OldFailure>,
+		},
+	}
+	#[derive(Debug, PartialEq, Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct OldFailure {
+		index: usize,
+		message: String,
+		error: String,
+	}
+
+	fn error_with(reason: Option<Reason>) -> Response {
+		Response::Error {
+			code: ErrorCode::Busy,
+			message: "busy".into(),
+			patch: false,
+			reason,
+		}
+	}
+
+	/// `reason` is additive on `Response::Error`, through the real tagged
+	/// enum (serde buffers the frame to read the tag, then hands
+	/// `deserialize_with` a buffered deserializer).
+	#[test]
+	fn error_reason_is_compatible_in_both_directions() {
+		// Old decoder, new frame: the key is ignored.
+		let new =
+			serde_json::to_string(&error_with(Some(Reason::RepoBusy))).unwrap();
+		assert!(new.contains("\"reason\""), "{new}");
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Error {
+				code: ErrorCode::Busy,
+				message: "busy".into(),
+				patch: false
+			}
+		);
+		// New decoder, old frame: no reason.
+		let old = r#"{"reply":"error","code":"busy","message":"busy"}"#;
+		assert_eq!(
+			serde_json::from_str::<Response>(old).unwrap(),
+			error_with(None)
+		);
+		// No reason is byte-identical to the frame an old worker wrote.
+		assert_eq!(serde_json::to_string(&error_with(None)).unwrap(), old);
+		// Round trips, including a reason that carries data.
+		for reason in [
+			Reason::RepoBusy,
+			Reason::DestinationChanged {
+				change: StaleChange::Created { rel: "a/b".into() },
+			},
+			Reason::PayloadTooLarge {
+				limit: 1,
+				actual: 2,
+				path: Some("a".into()),
+			},
+		] {
+			let r = error_with(Some(reason));
+			let wire = serde_json::to_string(&r).unwrap();
+			assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), r);
+		}
+	}
+
+	/// A newer peer's reason is not an error: the frame still decodes, the
+	/// reason reads as `None`, and the code words it.
+	#[test]
+	fn error_reason_from_a_newer_peer_reads_as_none() {
+		for reason in [
+			r#"{"r":"from_the_future"}"#,
+			// A known variant whose nested tag is unknown.
+			r#"{"r":"start","start":{"k":"from_the_future"},"detail":""}"#,
+			r#"{"r":"destination_changed","change":{"r":"from_the_future"}}"#,
+			r#""not even an object""#,
+			"null",
+		] {
+			let frame = format!(
+				r#"{{"reply":"error","code":"busy","message":"busy","reason":{reason}}}"#
+			);
+			assert_eq!(
+				serde_json::from_str::<Response>(&frame)
+					.unwrap_or_else(|e| panic!("{reason}: {e}")),
+				error_with(None),
+				"{reason}"
+			);
+		}
+	}
+
+	fn replayed(reason: Option<Reason>) -> Response {
+		Response::Replayed(snip_core::commits::ReplayResult {
+			created: vec!["abc".into()],
+			failure: Some(snip_core::commits::ReplayFailure {
+				index: 1,
+				message: "m".into(),
+				error: "e".into(),
+				layout_conflict: None,
+				conflict_path: None,
+				reason,
+			}),
+		})
+	}
+
+	/// The same four cases through `ReplayResult`, which travels in
+	/// `Response::Replayed`.
+	#[test]
+	fn replay_failure_reason_is_compatible_in_both_directions() {
+		let new =
+			serde_json::to_string(&replayed(Some(Reason::EmptySelection)))
+				.unwrap();
+		assert!(new.contains("\"reason\""), "{new}");
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Replayed {
+				created: vec!["abc".into()],
+				failure: Some(OldFailure {
+					index: 1,
+					message: "m".into(),
+					error: "e".into()
+				}),
+			}
+		);
+		let old = serde_json::to_string(&replayed(None)).unwrap();
+		assert!(!old.contains("reason"), "{old}");
+		assert_eq!(
+			serde_json::from_str::<Response>(&old).unwrap(),
+			replayed(None)
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&new).unwrap(),
+			replayed(Some(Reason::EmptySelection))
+		);
+		for reason in [
+			r#"{"r":"from_the_future"}"#,
+			r#"{"r":"unsafe_path","path":7}"#,
+			r#"{"r":"source_changed","change":{"r":"from_the_future"}}"#,
+		] {
+			let frame = old.replace(
+				r#""layoutConflict":null"#,
+				&format!(r#""layoutConflict":null,"reason":{reason}"#),
+			);
+			assert!(frame.contains(reason), "{frame}");
+			assert_eq!(
+				serde_json::from_str::<Response>(&frame)
+					.unwrap_or_else(|e| panic!("{reason}: {e}")),
+				replayed(None),
+				"{reason}"
+			);
+		}
+	}
+
 	/// `folders_only` is an additive field: a request without it (every
 	/// request an older master sends) reads as the whole listing.
 	#[test]
@@ -1267,11 +1440,13 @@ mod tests {
 				code: ErrorCode::Stale,
 				message: "stale destination in '/w': gone".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Collision,
 				message: "target collision".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Repos(RepoScan {
 				repos: vec![ScannedRepo {
@@ -1296,31 +1471,37 @@ mod tests {
 				code: ErrorCode::NotARepository,
 				message: "not a git repo".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::InvalidRevision,
 				message: "invalid rev".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Timeout,
 				message: "timed out".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Busy,
 				message: "busy".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Cancelled,
 				message: "cancelled".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::OutsideShare,
 				message: "outside share".into(),
 				patch: false,
+				reason: None,
 			},
 		];
 		for res in &responses {

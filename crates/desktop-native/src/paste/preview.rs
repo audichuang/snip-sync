@@ -893,6 +893,7 @@ mod tests {
 			RemoteError::Refused {
 				code: ErrorCode::Busy,
 				message: "the worker is busy".into(),
+				reason: None,
 			},
 			|| nav = Some(s.select(1, Some(&o))),
 		);

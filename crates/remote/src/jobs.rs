@@ -296,6 +296,7 @@ pub(crate) fn write_response<W: Write>(
 				code: ErrorCode::TooLarge,
 				message: err.to_string(),
 				patch: false,
+				reason: None,
 			},
 		),
 		other => other,
@@ -404,6 +405,7 @@ fn past_deadline_reply<W: Write>(
 				code: ErrorCode::Timeout,
 				message: "the job timed out".into(),
 				patch: false,
+				reason: None,
 			},
 		);
 	}

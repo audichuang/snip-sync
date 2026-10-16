@@ -676,7 +676,7 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 			detail,
 			..
 		} => start_msg(reason, &detail),
-		RemoteError::Refused { code, message } => match refusal_key(code) {
+		RemoteError::Refused { code, message, .. } => match refusal_key(code) {
 			Some(key) => Msg::new(key, []),
 			// ALLOWED-RAW: worker message for a code with no wording (Stale, Collision: the paste's own text)
 			None => Msg::raw(message),
@@ -690,13 +690,21 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 /// keeps the path as the detail, so the status line says which path failed.
 pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
 	match err {
-		RemoteError::Refused { code, message } => match refusal_key(code) {
+		RemoteError::Refused {
+			code,
+			message,
+			reason,
+		} => match refusal_key(code) {
 			Some(key) => Msg::with_key_arg(
 				"remote_start_detail",
 				[key.to_string(), path.to_string()],
 				0,
 			),
-			None => describe_msg(RemoteError::Refused { code, message }),
+			None => describe_msg(RemoteError::Refused {
+				code,
+				message,
+				reason,
+			}),
 		},
 		other => describe_msg(other),
 	}
@@ -1798,6 +1806,7 @@ mod tests {
 			let err = snip_core::gitsrc::GitError::from(RemoteError::Refused {
 				code,
 				message: "worker English".into(),
+				reason: None,
 			});
 			assert!(
 				matches!(
@@ -1867,6 +1876,7 @@ mod tests {
 		let gone = || RemoteError::Refused {
 			code: snip_remote::ErrorCode::NotFound,
 			message: "No such file or directory (os error 2)".into(),
+			reason: None,
 		};
 		assert_eq!(zh(gone()), "找不到遠端的資料夾或檔案，請確認路徑是否存在");
 		assert_eq!(
@@ -1927,6 +1937,7 @@ mod tests {
 		let refused = |code| RemoteError::Refused {
 			code,
 			message: os.into(),
+			reason: None,
 		};
 		for code in all {
 			let (_, worded) = decide(code);

@@ -215,6 +215,7 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 			RemoteError::Refused {
 				code,
 				message: refusal_text(code).into(),
+				reason: None,
 			},
 		));
 	}

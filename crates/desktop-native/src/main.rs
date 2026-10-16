@@ -6632,6 +6632,7 @@ mod tests {
 					message:
 						"the result is too large to send; narrow the request"
 							.into(),
+					reason: None,
 				}
 			),),
 			PreviewErr::TooLarge

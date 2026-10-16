@@ -72,7 +72,14 @@ pub enum RemoteError {
 	},
 	/// The worker answered with an error.
 	#[error("{message}")]
-	Refused { code: ErrorCode, message: String },
+	Refused {
+		code: ErrorCode,
+		message: String,
+		/// Why, beyond the code; `None` from a worker that sends none (an
+		/// old one) or whose code says it all. Boxed: `Reason` is large and
+		/// this error travels in every `Result`.
+		reason: Option<Box<Reason>>,
+	},
 	/// A `TooLarge` refusal whose file is fine: the diff built from it is
 	/// over the limit (#214). The same wire code as [`Self::Refused`].
 	#[error("{message}")]
@@ -119,7 +126,11 @@ impl RemoteError {
 				start: *reason,
 				detail: detail.clone(),
 			},
-			Self::Refused { code, .. } => Reason::Refused { code: *code },
+			// A worker's own reason wins; without one the code words it.
+			Self::Refused { code, reason, .. } => match reason {
+				Some(r) => (**r).clone(),
+				None => Reason::Refused { code: *code },
+			},
 			Self::PatchTooLarge { .. } => Reason::PatchTooLarge,
 			Self::Protocol(_) => Reason::Protocol,
 			Self::Cancelled => Reason::Cancelled,

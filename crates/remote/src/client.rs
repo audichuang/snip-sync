@@ -20,7 +20,7 @@ use snip_core::gitsrc::{GitError, GitSource};
 use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
-use snip_core::reason::Reason;
+use snip_core::reason::{Reason, StaleChange};
 
 use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
@@ -464,7 +464,8 @@ impl Connection {
 				code,
 				message,
 				patch,
-			})) => Err(refusal(code, message, patch)),
+				reason,
+			})) => Err(refusal(code, message, patch, reason)),
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				let cause = match &reply {
@@ -769,6 +770,11 @@ pub(crate) enum StartCause {
 }
 
 /// The known reason the worker did not start, when there is one.
+///
+/// A deliberate exception to "no meaning read back from an error's English
+/// text" (#225): this and [`start_failure_kind`] classify a foreign tool's
+/// stderr (ssh, the remote shell) at the place the error is produced, where
+/// the exit status still exists. Every consumer receives the typed result.
 pub(crate) fn start_reason(
 	cause: &StartCause,
 	code: Option<i32>,
@@ -1079,7 +1085,8 @@ pub(crate) fn exchange(
 								code,
 								message,
 								patch,
-							}) => Err(refusal(code, message, patch)),
+								reason,
+							}) => Err(refusal(code, message, patch, reason)),
 							Ok(
 								Response::Chunk { .. }
 								| Response::Joined
@@ -1115,8 +1122,9 @@ pub(crate) fn exchange(
 						code,
 						message,
 						patch,
+						reason,
 					} => {
-						return Err(refusal(code, message, patch));
+						return Err(refusal(code, message, patch, reason));
 					}
 					response => return Ok(response),
 				}
@@ -1446,7 +1454,7 @@ impl PreparedImportLease {
 			self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		match &*state {
 			PreparedImportState::Ready(_) => {}
-			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
+			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into(), reason: None }),
 			PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
 			PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
 		}
@@ -1528,6 +1536,9 @@ fn prepared_stale(message: &str) -> RemoteError {
 	RemoteError::Refused {
 		code: ErrorCode::Stale,
 		message: message.into(),
+		reason: Some(Box::new(Reason::DestinationChanged {
+			change: StaleChange::Preview,
+		})),
 	}
 }
 
@@ -2058,6 +2069,7 @@ impl Client {
 				Err(RemoteError::Refused {
 					code: ErrorCode::Stale,
 					message,
+					..
 				}) if message == crate::prepared::TOKEN_GONE => call(
 					&mut connection,
 					&Request::ImportApply {
@@ -2297,6 +2309,7 @@ impl Client {
 				Err(RemoteError::Refused {
 					code: ErrorCode::Stale,
 					message,
+					..
 				}) if message == crate::prepared::TOKEN_GONE => call(
 					&mut connection,
 					&Request::ReplayApply {
@@ -2903,11 +2916,16 @@ pub(crate) fn refusal(
 	code: ErrorCode,
 	message: String,
 	patch: bool,
+	reason: Option<Reason>,
 ) -> RemoteError {
 	if patch && code == ErrorCode::TooLarge {
 		RemoteError::PatchTooLarge { message }
 	} else {
-		RemoteError::Refused { code, message }
+		RemoteError::Refused {
+			code,
+			message,
+			reason: reason.map(Box::new),
+		}
 	}
 }
 
@@ -2917,6 +2935,7 @@ impl From<RemoteError> for GitError {
 			RemoteError::Refused {
 				code: ErrorCode::InvalidRevision,
 				message,
+				..
 			} => GitError::InvalidRevision(message),
 			// The worker names neither path nor limit; its limit is the
 			// preview limit, and the caller knows the path.
@@ -3202,6 +3221,7 @@ mod tests {
 				code: ErrorCode::Stale,
 				message: "expired; preview again".into(),
 				patch: false,
+				reason: None,
 			}),
 		] {
 			let unknown = response.is_none();
@@ -3240,6 +3260,7 @@ mod tests {
 			code: ErrorCode::Busy,
 			message: "busy".into(),
 			patch: false,
+			reason: None,
 		}));
 		assert!(matches!(
 			join_prepared(first),
@@ -3278,6 +3299,7 @@ mod tests {
 		let refusal: Result<(), RemoteError> = Err(RemoteError::Refused {
 			code: ErrorCode::Stale,
 			message: "expired; preview again".into(),
+			reason: None,
 		});
 		fixture
 			.lease
@@ -3672,7 +3694,8 @@ mod tests {
 		for code in [ErrorCode::Busy, ErrorCode::Timeout] {
 			assert!(RemoteError::Refused {
 				code,
-				message: "irrelevant".into()
+				message: "irrelevant".into(),
+				reason: None,
 			}
 			.is_transient_read_failure());
 		}
@@ -3688,10 +3711,12 @@ mod tests {
 			RemoteError::Refused {
 				code: ErrorCode::Forbidden,
 				message: "Connection reset".into(),
+				reason: None,
 			},
 			RemoteError::Refused {
 				code: ErrorCode::BadRequest,
 				message: "bad".into(),
+				reason: None,
 			},
 		] {
 			assert!(!error.is_transient_read_failure(), "{error:?}");
@@ -3748,6 +3773,7 @@ mod tests {
 			let error = RemoteError::Refused {
 				code,
 				message: String::new(),
+				reason: None,
 			};
 			assert!(error.is_restore_retryable(), "{error:?}");
 		}
@@ -3755,6 +3781,7 @@ mod tests {
 			let error = RemoteError::Refused {
 				code,
 				message: String::new(),
+				reason: None,
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
 		}
@@ -3934,6 +3961,7 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 			patch: false,
+			reason: None,
 		}]);
 		let mut frames = 0;
 		let err = exchange(
@@ -3946,7 +3974,7 @@ mod tests {
 		.unwrap_err();
 
 		match err {
-			RemoteError::Refused { code, message } => {
+			RemoteError::Refused { code, message, .. } => {
 				assert_eq!(code, ErrorCode::NotFound);
 				assert_eq!(message, "missing");
 			}
@@ -3960,6 +3988,7 @@ mod tests {
 			code: ErrorCode::TooLarge,
 			message: "big".into(),
 			patch,
+			reason: None,
 		}
 	}
 
@@ -4039,6 +4068,7 @@ mod tests {
 		let err1 = RemoteError::Refused {
 			code: ErrorCode::InvalidRevision,
 			message: "bad rev".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err1),
@@ -4048,6 +4078,7 @@ mod tests {
 		let err2 = RemoteError::Refused {
 			code: ErrorCode::Cancelled,
 			message: "stop".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err2),
@@ -4063,6 +4094,7 @@ mod tests {
 		let err4 = RemoteError::Refused {
 			code: ErrorCode::Timeout,
 			message: "slow".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err4),
@@ -4108,6 +4140,7 @@ mod tests {
 		let err8 = RemoteError::Refused {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err8),
@@ -4156,9 +4189,42 @@ mod tests {
 				if matches!(*reason, Reason::Start { start: None, .. })
 		));
 
+		// A worker's own reason rides through to the Git view's error, and
+		// without one the code words it.
+		let typed = refusal(
+			ErrorCode::Busy,
+			"busy".into(),
+			false,
+			Some(Reason::GitBusy),
+		);
+		assert_eq!(typed.reason(), Reason::GitBusy);
+		assert!(matches!(
+			GitError::from(typed),
+			GitError::Remote { reason, message }
+				if *reason == Reason::GitBusy && message == "busy"
+		));
+		let bare = refusal(ErrorCode::Busy, "busy".into(), false, None);
+		assert_eq!(
+			bare.reason(),
+			Reason::Refused {
+				code: ErrorCode::Busy
+			}
+		);
+		// A diff over its limit keeps its own variant whatever the reason.
+		assert!(matches!(
+			refusal(
+				ErrorCode::TooLarge,
+				"m".into(),
+				true,
+				Some(Reason::PatchTooLarge)
+			),
+			RemoteError::PatchTooLarge { .. }
+		));
+
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,
 			message: "refs payload exceeded frame limit".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err_too_large),
@@ -4178,6 +4244,7 @@ mod tests {
 		let refused = RemoteError::Refused {
 			code: ErrorCode::Unsupported,
 			message: "no".into(),
+			reason: None,
 		};
 
 		// reused + 0 frames + ConnectionReset -> true

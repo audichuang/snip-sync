@@ -1930,7 +1930,7 @@ fn git_view_on_a_non_repo_share_is_not_the_parent() {
 		None,
 	);
 	match res {
-		Err(RemoteError::Refused { code, message }) => {
+		Err(RemoteError::Refused { code, message, .. }) => {
 			assert_eq!(code, ErrorCode::NotARepository);
 			assert!(
 				!message.contains("dirty_outside_secret.txt"),

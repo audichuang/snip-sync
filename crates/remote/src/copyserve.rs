@@ -24,6 +24,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Response {
 		code,
 		message: message.into(),
 		patch: false,
+		reason: None,
 	}
 }
 

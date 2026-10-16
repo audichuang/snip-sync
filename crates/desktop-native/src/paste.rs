@@ -861,21 +861,24 @@ fn destination_msg(
 			// A worker refusal is worded by its code, like a start
 			// reason; the worker's own OS or protocol English is never
 			// shown (#213).
-			RemoteError::Refused { code, message } => {
-				match crate::remote::refusal_key(code) {
-					Some(key) => {
-						return Msg::with_key_arg(
-							"paste_err_destination",
-							[shown, key.to_string()],
-							1,
-						);
-					}
-					None => crate::remote::describe(RemoteError::Refused {
-						code,
-						message,
-					}),
+			RemoteError::Refused {
+				code,
+				message,
+				reason,
+			} => match crate::remote::refusal_key(code) {
+				Some(key) => {
+					return Msg::with_key_arg(
+						"paste_err_destination",
+						[shown, key.to_string()],
+						1,
+					);
 				}
-			}
+				None => crate::remote::describe(RemoteError::Refused {
+					code,
+					message,
+					reason,
+				}),
+			},
 			other => crate::remote::describe(other),
 		},
 		PasteError::Local(e) => e.to_string(),
@@ -911,15 +914,44 @@ fn start_destination_msg(
 	}
 }
 
-/// A stale destination's reason as the message the app shows.
-fn stale_reason_msg(reason: String) -> Msg {
-	if reason.contains("created") {
-		Msg::new("stale_created", [reason])
-	} else if reason.contains("deleted") {
-		Msg::new("stale_deleted", [reason])
-	} else {
-		Msg::new("stale_modified", [reason])
+/// A stale destination as the message the app shows. The kind comes from
+/// the typed [`snip_remote::Reason`], never from the sentence; the argument
+/// is the engine's own sentence locally and the changed path from a worker.
+/// Pending the one translation point of #225 (a later slice).
+fn stale_msg(err: &PasteError) -> Option<Msg> {
+	use snip_remote::{Reason, StaleChange};
+	if !err.is_stale() {
+		return None;
 	}
+	let change = match err.reason() {
+		Reason::DestinationChanged { change } => Some(change),
+		_ => None,
+	};
+	let text = match (err, &change) {
+		(
+			PasteError::Local(TransferError::StaleDestination {
+				reason, ..
+			}),
+			_,
+		) => reason.clone(),
+		(
+			_,
+			Some(
+				StaleChange::Created { rel }
+				| StaleChange::Deleted { rel }
+				| StaleChange::Modified { rel },
+			),
+		) => rel.clone(),
+		(PasteError::Remote(RemoteError::Refused { message, .. }), _) => {
+			message.clone()
+		}
+		_ => String::new(),
+	};
+	Some(match change {
+		Some(StaleChange::Created { .. }) => Msg::new("stale_created", [text]),
+		Some(StaleChange::Deleted { .. }) => Msg::new("stale_deleted", [text]),
+		_ => Msg::new("stale_modified", [text]),
+	})
 }
 
 /// A file Apply's failure, worded as before for each target.
@@ -931,8 +963,8 @@ fn file_apply_msg(
 	if err.is_repo_busy() {
 		return repo_busy();
 	}
-	if let Some(reason) = err.stale_reason() {
-		return stale_reason_msg(reason);
+	if let Some(msg) = stale_msg(&err) {
+		return msg;
 	}
 	match err {
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
@@ -948,8 +980,8 @@ fn commit_msg(
 	err: PasteError,
 	applying: bool,
 ) -> Msg {
-	if let Some(reason) = err.stale_reason() {
-		return stale_reason_msg(reason);
+	if let Some(msg) = stale_msg(&err) {
+		return msg;
 	}
 	match err {
 		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
@@ -962,7 +994,7 @@ fn commit_msg(
 		// Kept as before: any other worker refusal of a replay, Busy
 		// included, reads as a repository error (see Risks). A code with a
 		// wording of its own shows that wording, never the worker's text.
-		PasteError::Remote(RemoteError::Refused { code, message }) => {
+		PasteError::Remote(RemoteError::Refused { code, message, .. }) => {
 			match crate::remote::refusal_key(code) {
 				Some(key) => {
 					Msg::with_key_arg("error_open_repo", [key.to_string()], 0)
@@ -2751,10 +2783,26 @@ pub(crate) mod tests {
 			message: "stale destination in '/w': target file 'a' was created \
 			          externally after preview"
 				.into(),
+			reason: Some(Box::new(snip_remote::Reason::DestinationChanged {
+				change: snip_remote::StaleChange::Created { rel: "a".into() },
+			})),
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
 			"stale_created"
+		);
+		// A worker that sends no reason (an old one) still refuses as stale;
+		// the kind of change is not guessed from its sentence.
+		let old = RemoteError::Refused {
+			code: ErrorCode::Stale,
+			message: "stale destination in '/w': target file 'a' was created \
+			          externally after preview"
+				.into(),
+			reason: None,
+		};
+		assert_eq!(
+			file_apply_msg(Some(&remote), &dest, PasteError::Remote(old)).key,
+			"stale_modified"
 		);
 		// Never reached the worker: nothing can have been written.
 		assert_eq!(
@@ -2829,17 +2877,32 @@ pub(crate) mod tests {
 				Some(&remote),
 				PasteError::Remote(RemoteError::Refused {
 					code: ErrorCode::Busy,
-					message: busy_git().paste_message()
+					message: busy_git().paste_message(),
+					reason: Some(Box::new(snip_remote::Reason::RepoBusy)),
 				})
 			),
 			"paste_repo_busy"
+		);
+		// The same words from a worker that sends no reason are a plain
+		// busy refusal: nothing reads the sentence.
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: busy_git().paste_message(),
+					reason: None,
+				})
+			),
+			"paste_err_destination"
 		);
 		assert_eq!(
 			key(
 				Some(&remote),
 				PasteError::Remote(RemoteError::Refused {
 					code: ErrorCode::Busy,
-					message: "too many callers".into()
+					message: "too many callers".into(),
+					reason: None,
 				})
 			),
 			"paste_err_destination"
@@ -2893,7 +2956,11 @@ pub(crate) mod tests {
 			commit_msg(r, &dest, e, applying).key
 		};
 		let refused = |code, message: String| {
-			PasteError::Remote(RemoteError::Refused { code, message })
+			PasteError::Remote(RemoteError::Refused {
+				code,
+				message,
+				reason: None,
+			})
 		};
 		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
 		// reads as a repository error, not as paste_repo_busy. Changing this
@@ -2909,11 +2976,18 @@ pub(crate) mod tests {
 		assert_eq!(
 			key(
 				Some(&remote),
-				refused(
-					ErrorCode::Stale,
-					"stale destination in '/w': target file 'a' was created externally after preview"
-						.into()
-				),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					message: "stale destination in '/w': target file 'a' was created externally after preview"
+						.into(),
+					reason: Some(Box::new(
+						snip_remote::Reason::DestinationChanged {
+							change: snip_remote::StaleChange::Created {
+								rel: "a".into()
+							}
+						}
+					)),
+				}),
 				false
 			),
 			"stale_created"
@@ -3012,6 +3086,7 @@ pub(crate) mod tests {
 		let refused = |code| RemoteError::Refused {
 			code,
 			message: raw.into(),
+			reason: None,
 		};
 		for code in all {
 			if !worded(code) {

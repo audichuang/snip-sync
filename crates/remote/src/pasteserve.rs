@@ -9,11 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use snip_core::commits;
+use snip_core::commits::{self, ReplayResult};
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
-use snip_core::reason::StaleChange;
+use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
 	plan_import_parsed_with, CanonicalRootId, CommitReplayPreview,
@@ -30,10 +30,21 @@ use crate::worker::{io_error, SharedRoot};
 type Refusal = Box<Response>;
 
 fn refused(code: ErrorCode, message: impl Into<String>) -> Refusal {
+	refused_with(code, message, None)
+}
+
+/// A refusal that also says why. `reason` must already have gone through
+/// [`Reason::for_wire`]: it never carries a path or git's stderr.
+fn refused_with(
+	code: ErrorCode,
+	message: impl Into<String>,
+	reason: Option<Reason>,
+) -> Refusal {
 	Box::new(Response::Error {
 		code,
 		message: message.into(),
 		patch: false,
+		reason,
 	})
 }
 
@@ -67,7 +78,23 @@ fn transfer_refusal(err: TransferError, cancel: &CancelToken) -> Refusal {
 		}
 		_ => ErrorCode::Io,
 	};
-	refused(code, err.paste_message())
+	// A cancelled job says so by its code; every other refusal sends what
+	// the engine knows, scrubbed, so the master need not guess from text.
+	let reason = if code == ErrorCode::Cancelled {
+		None
+	} else {
+		err.reason().for_wire()
+	};
+	refused_with(code, err.paste_message(), reason)
+}
+
+/// A replay result on its way to the master: the failure's reason goes
+/// through [`Reason::for_wire`], so it names no path of this machine.
+fn scrub_replay(mut result: ReplayResult) -> ReplayResult {
+	if let Some(failure) = &mut result.failure {
+		failure.reason = failure.reason.take().and_then(Reason::for_wire);
+	}
+	result
 }
 
 fn stale(root: &Path, reason: &str) -> Refusal {
@@ -268,18 +295,24 @@ pub(crate) fn prepare_import(
 
 /// The refusal for a token the cache would not hand out.
 fn cache_refusal(why: CacheError) -> Response {
-	let (code, message) = match why {
-		CacheError::Missing => (ErrorCode::Stale, prepared::TOKEN_GONE),
+	let stale = Some(Reason::DestinationChanged {
+		change: StaleChange::Preview,
+	});
+	let (code, message, reason) = match why {
+		CacheError::Missing => (ErrorCode::Stale, prepared::TOKEN_GONE, stale),
+		// Forbidden words it.
 		CacheError::Scope => (
 			ErrorCode::Forbidden,
 			"prepared paste belongs to another workspace or destination; preview again",
+			None,
 		),
 		CacheError::Digest => (
 			ErrorCode::Stale,
 			"prepared paste does not match the preview; preview again",
+			stale,
 		),
 	};
-	*refused(code, message)
+	*refused_with(code, message, reason)
 }
 
 pub(crate) fn apply_prepared(
@@ -603,7 +636,7 @@ fn run_prepared_replay(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(result))
+		Ok(Response::Replayed(scrub_replay(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -652,9 +685,158 @@ pub(crate) fn replay_apply(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(result))
+		Ok(Response::Replayed(scrub_replay(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
+}
+
+#[cfg(test)]
+mod reason_tests {
+	use super::*;
+	use snip_core::commits::{CommitError, ReplayFailure};
+
+	fn reason_of(refusal: Refusal) -> (ErrorCode, Option<Reason>, String) {
+		let Response::Error {
+			code,
+			reason,
+			message,
+			..
+		} = *refusal
+		else {
+			panic!("expected Error");
+		};
+		(code, reason, message)
+	}
+
+	/// A refusal names what the engine knows, scrubbed, so the master never
+	/// reads English back; the whole reply names no path of this machine.
+	#[test]
+	fn a_refusal_sends_a_scrubbed_reason() {
+		let secret = "/opt/secret/repo";
+		let cancel = CancelToken::new();
+		let stale = TransferError::StaleDestination {
+			root: secret.into(),
+			reason: "target file 'a' was created externally after preview"
+				.into(),
+			change: StaleChange::Created { rel: "a".into() },
+		};
+		let (code, reason, _) = reason_of(transfer_refusal(stale, &cancel));
+		assert_eq!(code, ErrorCode::Stale);
+		assert_eq!(
+			reason,
+			Some(Reason::DestinationChanged {
+				change: StaleChange::Created { rel: "a".into() }
+			})
+		);
+		let busy =
+			TransferError::Git(snip_core::gitsrc::GitError::WorktreeBusy {
+				args: "paste".into(),
+			});
+		let (code, reason, _) = reason_of(transfer_refusal(busy, &cancel));
+		assert_eq!((code, reason), (ErrorCode::Busy, Some(Reason::RepoBusy)));
+		let git = TransferError::Git(snip_core::gitsrc::GitError::Failed {
+			args: secret.into(),
+			stderr: format!("fatal: {secret}"),
+			code: Some(1),
+		});
+		// The message is the local paste's words; the reason is the part
+		// that must hold no path or stderr.
+		let (_, reason, _) = reason_of(transfer_refusal(git, &cancel));
+		let wire = serde_json::to_string(&reason).unwrap();
+		assert!(!wire.contains("secret"), "{wire}");
+		assert!(wire.contains("git_failed"), "{wire}");
+		let scope = TransferError::Commit(CommitError::OutsideScope {
+			path: "a/b".into(),
+			scope: secret.into(),
+		});
+		let (_, reason, _) = reason_of(transfer_refusal(scope, &cancel));
+		let wire = serde_json::to_string(&reason).unwrap();
+		assert!(!wire.contains("secret"), "{wire}");
+		assert!(wire.contains("\"a/b\""), "{wire}");
+		// A cancelled job says so by its code alone.
+		cancel.cancel();
+		let git = TransferError::Git(snip_core::gitsrc::GitError::Failed {
+			args: "x".into(),
+			stderr: "killed".into(),
+			code: None,
+		});
+		assert_eq!(
+			reason_of(transfer_refusal(git, &cancel)).0,
+			ErrorCode::Cancelled
+		);
+		assert_eq!(
+			reason_of(transfer_refusal(
+				TransferError::Git(snip_core::gitsrc::GitError::Cancelled {
+					args: "x".into()
+				}),
+				&cancel
+			))
+			.1,
+			None
+		);
+	}
+
+	/// A token the cache would not hand out is a stale preview; the wrong
+	/// workspace is a plain Forbidden.
+	#[test]
+	fn cache_refusals_say_the_preview_is_stale() {
+		let reason = |why| {
+			let Response::Error { code, reason, .. } = cache_refusal(why)
+			else {
+				panic!("expected Error");
+			};
+			(code, reason)
+		};
+		let preview = Some(Reason::DestinationChanged {
+			change: StaleChange::Preview,
+		});
+		assert_eq!(
+			reason(CacheError::Missing),
+			(ErrorCode::Stale, preview.clone())
+		);
+		assert_eq!(reason(CacheError::Digest), (ErrorCode::Stale, preview));
+		assert_eq!(reason(CacheError::Scope), (ErrorCode::Forbidden, None));
+	}
+
+	/// A replay result leaves the worker with its failure's reason scrubbed.
+	#[test]
+	fn a_replay_failure_reason_is_scrubbed_before_it_is_sent() {
+		let failed = |reason| ReplayResult {
+			created: vec![],
+			failure: Some(ReplayFailure {
+				index: 0,
+				message: "m".into(),
+				error: "e".into(),
+				layout_conflict: None,
+				conflict_path: None,
+				reason: Some(reason),
+			}),
+		};
+		let sent =
+			|reason| scrub_replay(failed(reason)).failure.unwrap().reason;
+		assert_eq!(
+			sent(Reason::UnsafePath {
+				path: "/etc/x".into()
+			}),
+			Some(Reason::UnsafePath {
+				path: String::new()
+			})
+		);
+		assert_eq!(
+			sent(Reason::Io {
+				detail: "/opt/secret".into()
+			}),
+			None
+		);
+		let wire = serde_json::to_string(&Response::Replayed(scrub_replay(
+			failed(Reason::OutsideScope {
+				path: "a".into(),
+				scope: "/opt/secret".into(),
+			}),
+		)))
+		.unwrap();
+		assert!(!wire.contains("secret"), "{wire}");
+	}
 }
 
 #[cfg(test)]
