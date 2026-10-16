@@ -162,6 +162,7 @@ fn export_commits_local(
 ) -> Result<(String, usize, Msg), CopyCommitsFailure> {
 	let opts = interactive_read_opts(cancel);
 	let git = Git::open_with(repo_root, &opts)
+		// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
 		.map_err(|e| (e.to_string(), crate::remote::git_error_msg(e)))?;
 	let exported = plan_commit_export_exact_with(
 		&git,
@@ -170,6 +171,7 @@ fn export_commits_local(
 		&opts,
 		snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 	)
+	// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
 	.map_err(|e| (e.to_string(), crate::reason::reason_msg(&e.reason())))?;
 	let out = exported.outcome();
 	let status = commit_copied_status(&out);
@@ -4938,6 +4940,7 @@ impl WorkbenchModel {
 								Some(&run_token),
 							)
 							.map_err(|e| {
+								// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
 								(e.to_string(), crate::remote::describe_msg(e))
 							})?;
 						let status = commit_copied_status(&out);

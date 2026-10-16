@@ -26,7 +26,7 @@ def run_check(
 class CheckMsgRaw(unittest.TestCase):
     def test_typed_messages_are_accepted(self):
         r = run_check(
-            "fn f() { Msg::new(\"error_open_repo\", [x]); Msg::detail(h, p) }\n"
+            "fn f() { Msg::new(\"error_open_repo\", [x]); Msg::with_msg_arg(k, a, 0, m) }\n"
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 

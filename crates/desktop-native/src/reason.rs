@@ -18,6 +18,8 @@ use snip_core::reason::{
 	ErrorCode, Failure, PayloadErrorKind, Reason, StaleChange,
 };
 
+use snip_remote::RemoteError;
+
 use crate::i18n::Msg;
 
 /// The command that completes a shallow clone. Shown as data, not wording.
@@ -302,6 +304,17 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::DepthLimitedOmitted { count } => {
 			Msg::new("err_depth_limited_omitted", [count.to_string()])
 		}
+	}
+}
+
+/// A remote failure as a message for a failure of the user's `path`: a worded
+/// refusal keeps the path as the detail, so the status line says which path
+/// failed. Any other failure is worded by its reason alone.
+pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
+	let msg = reason_msg(&err.reason());
+	match err {
+		RemoteError::Refused { .. } => Msg::detail(msg, path),
+		_ => msg,
 	}
 }
 

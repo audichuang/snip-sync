@@ -691,14 +691,7 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 	reason_msg(&err.reason())
 }
 
-/// [`describe_msg`] for a failure of the user's `path`: a worded refusal
-/// keeps the path as the detail, so the status line says which path failed.
-pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
-	match err {
-		RemoteError::Refused { .. } => Msg::detail(describe_msg(err), path),
-		other => describe_msg(other),
-	}
-}
+pub use crate::reason::describe_msg_at;
 
 /// A Git view's error as a message.
 pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {

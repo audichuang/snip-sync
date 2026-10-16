@@ -114,7 +114,7 @@ preflight-workflows:
 	@command -v shellcheck >/dev/null || { echo "shellcheck not on PATH: actionlint would skip the run: scripts CI lints (pip install shellcheck-py)" >&2; exit 1; }
 	actionlint
 	@# The scripts CI's Remote E2E and container jobs lint on their own.
-	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/preflight_ssh.sh scripts/check_test_refresh.sh scripts/check_msg_raw.sh
+	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/preflight_ssh.sh scripts/check_test_refresh.sh scripts/check_msg_raw.sh scripts/lib/test_code.sh
 
 preflight-rust:
 	cargo fmt --all --check
