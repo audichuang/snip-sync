@@ -20755,6 +20755,29 @@ mod tests {
 					== 1));
 			}
 
+			/// A worker that closes the stream mid-scan is worded by the
+			/// interface language, not by the layer's English sentence (#233).
+			#[gpui::test]
+			fn a_worker_that_closes_the_scan_says_so_in_the_interface_language(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				for model in &models {
+					model.read_with(cx, |m, _| {
+						let msg =
+							m.remote.scan_error.as_ref().expect("scan error");
+						let zh = msg.render(crate::i18n::Locale::ZhTw);
+						let en = msg.render(crate::i18n::Locale::En);
+						assert!(zh.contains("結束了連線"), "{zh}");
+						assert!(!zh.contains("closed the connection"), "{zh}");
+						assert!(!en.contains("closed the connection"), "{en}");
+					});
+				}
+			}
+
 			#[gpui::test]
 			fn restored_remote_scan_retry_is_bounded_and_uses_backoff(
 				cx: &mut TestAppContext,

@@ -4185,6 +4185,29 @@ mod tests {
 		assert!(matches!(rejected, Err(GraphAdmissionError::Budget)));
 	}
 
+	/// A ref name the layout refuses is worded in the interface language, not
+	/// followed by the layout's own English diagnostic (#233).
+	#[test]
+	fn a_ref_name_over_the_limit_is_worded_not_echoed() {
+		use crate::i18n::Locale;
+		let mut page = history(vec![c("c1", &[])]);
+		page.head = Some("c1".into());
+		page.refs = vec![browser::GitReference {
+			name: format!("refs/heads/{}", vec!["a".repeat(200); 6].join("/")),
+			sha: "c1".into(),
+		}];
+		let Err(GraphAdmissionError::Layout(msg)) =
+			PreparedHistory::prepare(page, 0, &[], Vec::new(), None, None)
+		else {
+			panic!("an over-long ref name must be refused by the layout");
+		};
+		let zh = msg.render(Locale::ZhTw);
+		let en = msg.render(Locale::En);
+		assert!(zh.contains("1024") && zh.contains("ref 名稱"), "{zh}");
+		assert!(!zh.contains("invalid input"), "{zh}");
+		assert!(!en.contains("invalid input"), "{en}");
+	}
+
 	#[test]
 	fn graph_admission_leaves_room_for_the_separate_search_input() {
 		let input = crate::text_input::TextInput::new_for_test(

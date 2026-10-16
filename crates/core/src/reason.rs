@@ -99,6 +99,10 @@ pub enum StaleChange {
 /// Why something failed, as data. One variant per distinct user sentence.
 /// Never `Display`ed: the CLI keeps each error's thiserror text, and the
 /// desktop words a `Reason` in one place.
+///
+/// ```compile_fail
+/// let _ = snip_core::reason::Reason::Io { detail: "ours".into() };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "r", rename_all = "snake_case")]
 pub enum Reason {
@@ -975,16 +979,48 @@ mod tests {
 			io_reason(&Error::from(ErrorKind::TimedOut), "a"),
 			Reason::TimedOut
 		);
-		// Text that merely sounds like another kind stays Io.
-		assert_eq!(
-			io_reason(&Error::other("exceeds 1 MiB"), ""),
-			Reason::Io {
-				detail: "exceeds 1 MiB".into()
-			}
-		);
 		assert_eq!(
 			io_reason(&Error::new(ErrorKind::FileTooLarge, "x"), ""),
 			Reason::TooLarge
 		);
+	}
+
+	/// Only what the OS said reaches `detail`: a sentence std, a library or
+	/// we wrote (`Error::other("exceeds 1 MiB")`) is not data a front end may
+	/// print after its own headline.
+	#[test]
+	fn io_reason_keeps_only_the_os_text() {
+		use std::io::{Error, ErrorKind};
+		let detail = |e: &Error| -> String {
+			let v = serde_json::to_value(io_reason(e, "")).unwrap();
+			assert_eq!(v["r"], "io", "{v}");
+			v.get("detail")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or("")
+				.to_string()
+		};
+		let ours = [
+			Error::other("exceeds 1 MiB"),
+			Error::new(
+				ErrorKind::InvalidData,
+				"the worker closed the connection",
+			),
+			std::io::Read::read_exact(&mut &b""[..], &mut [0u8; 1])
+				.unwrap_err(),
+			Error::from(ErrorKind::BrokenPipe),
+			Error::new(
+				ErrorKind::InvalidData,
+				serde_json::from_str::<u8>("x").unwrap_err(),
+			),
+		];
+		for e in &ours {
+			assert_eq!(detail(e), "", "text that is not the OS's: {e}");
+		}
+		#[cfg(unix)]
+		let os = Error::from_raw_os_error(28);
+		#[cfg(windows)]
+		let os = Error::from_raw_os_error(112);
+		assert!(!detail(&os).is_empty());
+		assert_eq!(detail(&os), os.to_string());
 	}
 }

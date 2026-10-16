@@ -244,7 +244,47 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 			},
 		));
 	}
+	// The English the remote layer raises itself (#233): none of it is the
+	// OS's text, so none of it may reach a zh-TW screen.
+	for (label, e) in english_io_errors() {
+		v.push((format!("Io(english: {label})"), RemoteError::Io(e)));
+	}
 	v
+}
+
+/// `io::Error`s whose text is a sentence of ours, std's or a library's, as
+/// the remote layer and the stream readers raise them.
+fn english_io_errors() -> Vec<(&'static str, std::io::Error)> {
+	use std::io::{Error, ErrorKind};
+	let frame = |len: u32, body: &[u8]| {
+		let mut bytes = len.to_be_bytes().to_vec();
+		bytes.extend_from_slice(body);
+		snip_remote::proto::read_frame::<snip_remote::Response>(&mut &bytes[..])
+			.unwrap_err()
+	};
+	vec![
+		(
+			"worker closed",
+			Error::new(
+				ErrorKind::UnexpectedEof,
+				"the worker closed the connection",
+			),
+		),
+		(
+			"writer abandoned",
+			Error::new(
+				ErrorKind::BrokenPipe,
+				"the transport's writer was abandoned",
+			),
+		),
+		("frame too large", frame(0x7fff_ffff, b"x")),
+		("frame not json", frame(3, b"abc")),
+		("frame cut short", frame(10, b"abc")),
+		(
+			"request too large",
+			Error::new(ErrorKind::InvalidData, "request of 9 bytes exceeds 8"),
+		),
+	]
 }
 
 fn git_samples() -> Vec<(String, GitError)> {
@@ -324,6 +364,34 @@ fn git_samples() -> Vec<(String, GitError)> {
 		),
 		("Host".into(), GitError::remote(Reason::Protocol, a())),
 		("Io".into(), GitError::Io(std::io::Error::other(D))),
+		// English that is not data (#233): std's, a library's and ours.
+		(
+			"Io(english: pipe reader)".into(),
+			GitError::Io(std::io::Error::other("Git pipe reader panicked")),
+		),
+		(
+			"Io(english: read_exact)".into(),
+			GitError::Io(
+				std::io::Read::read_exact(&mut &b""[..], &mut [0u8; 1])
+					.unwrap_err(),
+			),
+		),
+		(
+			"Io(english: not a regular file)".into(),
+			GitError::Io(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"Not a regular file",
+			)),
+		),
+		(
+			"Cleanup(english)".into(),
+			GitError::Cleanup {
+				args: D.into(),
+				message: "cannot signal process group after root process was \
+				          reaped"
+					.into(),
+			},
+		),
 	];
 	for condition in ALL_CONDITIONS {
 		v.push((

@@ -4143,6 +4143,29 @@ mod tests {
 		assert_eq!(frames, 0);
 	}
 
+	/// A stream that ends between frames is the worker having closed: the
+	/// reason says so in its own words, while the CLI keeps its sentence and
+	/// a reused connection is still tried again.
+	#[test]
+	fn a_clean_close_mid_call_is_worker_closed() {
+		let mut stream = FakeDuplex::new(&[]);
+		let mut frames = 0;
+		let err = exchange(
+			&mut stream,
+			None,
+			IO_TIMEOUT,
+			Instant::now() + Duration::from_secs(10),
+			&mut frames,
+		)
+		.unwrap_err();
+		assert_eq!(err.to_string(), "the worker closed the connection");
+		assert_eq!(
+			serde_json::to_value(err.reason()).unwrap(),
+			serde_json::json!({"r": "worker_closed"})
+		);
+		assert!(should_resend(true, 0, &err));
+	}
+
 	#[test]
 	fn git_error_conversion_table() {
 		let err1 = RemoteError::Refused {

@@ -660,6 +660,13 @@ pub enum GitQuery {
 	},
 }
 
+/// A worker's answer.
+///
+/// ```compile_fail
+/// let _ = snip_remote::Response::Imported(
+///     snip_core::restore::RestoreExecutionResult::default(),
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Response {

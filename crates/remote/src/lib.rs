@@ -345,3 +345,77 @@ pub fn save_json<T: Serialize + ?Sized>(
 	}
 	res
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::io::ErrorKind;
+
+	/// An error read off a byte stream, the way `read_frame` meets it.
+	fn frame_error(bytes: &[u8]) -> io::Error {
+		proto::read_frame::<proto::Response>(&mut &bytes[..]).unwrap_err()
+	}
+
+	/// What the remote layer raises itself is our sentence (or std's, or
+	/// serde's): none of it becomes data a front end words. Only the OS's
+	/// own text does. Rows: the error, whether a read may be tried again,
+	/// the reason's variant.
+	#[test]
+	fn remote_io_reasons_carry_no_text_of_ours() {
+		let mut over = 0x7fff_ffffu32.to_be_bytes().to_vec();
+		over.extend_from_slice(b"x");
+		let mut bad = 3u32.to_be_bytes().to_vec();
+		bad.extend_from_slice(b"abc");
+		let mut short = 10u32.to_be_bytes().to_vec();
+		short.extend_from_slice(b"abc");
+		let rows: Vec<(io::Error, bool, &str)> = vec![
+			(
+				io::Error::new(
+					ErrorKind::UnexpectedEof,
+					"the worker closed the connection",
+				),
+				true,
+				"worker_closed",
+			),
+			(
+				io::Error::new(
+					ErrorKind::BrokenPipe,
+					"the transport's writer was abandoned",
+				),
+				true,
+				"disconnected",
+			),
+			(frame_error(&over), false, "protocol"),
+			(frame_error(&bad), false, "protocol"),
+			(frame_error(&short), true, "disconnected"),
+		];
+		for (e, transient, variant) in rows {
+			let shown = e.to_string();
+			let err = RemoteError::Io(e);
+			let v = serde_json::to_value(err.reason()).unwrap();
+			for ours in [
+				"worker",
+				"writer",
+				"frame of",
+				"expected",
+				"fill",
+				"abandoned",
+			] {
+				assert!(
+					!v.to_string().contains(ours),
+					"`{shown}` leaks {ours:?}: {v}"
+				);
+			}
+			assert_eq!(v["r"], variant, "`{shown}`: {v}");
+			assert_eq!(err.is_transient_read_failure(), transient, "{shown}");
+			assert!(err.outcome_unknown(), "{shown}");
+		}
+		#[cfg(unix)]
+		let os = io::Error::from_raw_os_error(32);
+		#[cfg(windows)]
+		let os = io::Error::from_raw_os_error(232);
+		let v = serde_json::to_value(RemoteError::Io(os).reason()).unwrap();
+		assert_eq!(v["r"], "disconnected");
+		assert!(!v["detail"].as_str().unwrap_or("").is_empty(), "{v}");
+	}
+}

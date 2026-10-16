@@ -1932,6 +1932,26 @@ mod tests {
 		);
 	}
 
+	/// A failed cleanup's message is our sentence (or the OS's, mixed into it):
+	/// only the command it belongs to is data.
+	#[test]
+	fn a_cleanup_failure_keeps_only_its_command() {
+		let e = GitError::Cleanup {
+			args: "status".into(),
+			message: "cannot signal process group after root process was \
+			          reaped; tree cleanup unconfirmed"
+				.into(),
+		};
+		let wire = serde_json::to_string(&e.reason()).unwrap();
+		assert!(!wire.contains("cannot signal"), "{wire}");
+		assert!(wire.contains("status"), "{wire}");
+		assert_eq!(
+			e.to_string(),
+			"cleaning up git status failed: cannot signal process group \
+			 after root process was reaped; tree cleanup unconfirmed"
+		);
+	}
+
 	#[test]
 	fn remote_displays_its_message_and_reasons_as_given() {
 		let e = GitError::remote(
