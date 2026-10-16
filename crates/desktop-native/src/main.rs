@@ -924,6 +924,11 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
+	/// The selection the shown preview belongs to, held while a file read
+	/// that may replace it is in flight. It follows the shown content, not
+	/// one request: a read that supersedes another keeps it, and it ends only
+	/// when the preview is replaced, cleared or its reads are dropped.
+	held_selection: Option<ShownSelection>,
 	/// The latest preview read came from the Log (commit, compare,
 	/// multi-selection, commit file or commit tree). Only a Project/Changes
 	/// read or `clear_commit_selection` resets it, so it outlives
@@ -1099,6 +1104,23 @@ impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
 /// Identity of a shown preview's text, as `reader.rs` compares it.
 pub(crate) fn preview_identity(p: &Preview) -> usize {
 	Arc::as_ptr(&p.text) as *const u8 as usize
+}
+
+/// Everything a file read takes from the model while it is in flight, so a
+/// refusal by the retained budget can name the still shown preview again.
+/// The commit view goes back whole: the file list and its origins index
+/// `log_selected`, and a compare's list belongs to its endpoints.
+struct ShownSelection {
+	file: Option<String>,
+	source: Option<SourceKind>,
+	root: Option<PathBuf>,
+	commit: Option<String>,
+	view: crate::history::CommitView,
+	log_selected: Vec<String>,
+	range_head: Option<String>,
+	compare: Option<(String, String)>,
+	log_selection_expanded: bool,
+	log_branches_all: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1451,6 +1473,7 @@ impl WorkbenchModel {
 			selected_list_row: 0,
 			preview: None,
 			preview_loading: false,
+			held_selection: None,
 			preview_pending_from_log: false,
 			preview_error: None,
 			reader: Reader::default(),
@@ -2132,6 +2155,7 @@ impl WorkbenchModel {
 			);
 		}
 		// The caller that read it names its repo again after installing.
+		self.held_selection = None;
 		self.preview_root = None;
 		self.preview_error_root = None;
 		self.preview = Some(p);
@@ -2144,6 +2168,7 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn clear_preview(&mut self) {
+		self.held_selection = None;
 		self.preview = None;
 		self.preview_root = None;
 		self.preview_error_root = None;
@@ -2454,6 +2479,7 @@ impl WorkbenchModel {
 				self.generation = self.generation.wrapping_add(1);
 				self.preview_generation =
 					self.preview_generation.wrapping_add(1);
+				self.held_selection = None;
 				self.history_generation =
 					self.history_generation.wrapping_add(1);
 				self.tree_generation = self.tree_generation.wrapping_add(1);
@@ -2657,6 +2683,7 @@ impl WorkbenchModel {
 	fn release_repo_state(&mut self) {
 		self.generation = self.generation.wrapping_add(1);
 		self.preview_generation = self.preview_generation.wrapping_add(1);
+		self.held_selection = None;
 		self.history_generation = self.history_generation.wrapping_add(1);
 		self.tree_generation = self.tree_generation.wrapping_add(1);
 		self.tree_worker = self.tree_worker.wrapping_add(1);
@@ -4008,6 +4035,8 @@ impl WorkbenchModel {
 		}
 		self.generation += 1;
 		self.preview_generation += 1;
+		// The reads that could have restored it are dropped.
+		self.held_selection = None;
 		let task_generation = self.generation;
 		if reload_log {
 			self.history_generation += 1;
@@ -4406,25 +4435,10 @@ impl WorkbenchModel {
 		}
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		// Restored if the budget refuses the new text and the old one stays.
-		let shown_selection = (
-			self.selected_file.replace(path.to_string()),
-			self.selected_file_source.replace(source.clone()),
-			self.selected_file_root.clone(),
-			self.selected_commit.take(),
-			// Taking the view resets it; it goes back with the selection,
-			// whole: the file list and its origins index `log_selected`,
-			// and a compare's list belongs to its endpoints.
-			std::mem::take(&mut self.commit_view),
-			std::mem::take(&mut self.log_selected),
-			self.range_head.take(),
-			self.compare.take(),
-			std::mem::take(&mut self.log_selection_expanded),
-			std::mem::take(&mut self.log_branches_all),
-		);
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
+		self.hold_shown_selection(path, &source);
 		let fs_only = matches!(source, SourceKind::File);
 		if fs_only {
 			self.selected_file_root = Some(repo_root.clone());
@@ -4498,6 +4512,7 @@ impl WorkbenchModel {
 					return;
 				}
 				if model.apply_source_preview(file_path.clone(), result) {
+					model.held_selection = None;
 					model.preview_root = model
 						.preview
 						.as_ref()
@@ -4511,24 +4526,60 @@ impl WorkbenchModel {
 				{
 					// Refused by the retained budget: the previous text is
 					// still shown, so the selection must name it again.
-					(
-						model.selected_file,
-						model.selected_file_source,
-						model.selected_file_root,
-						model.selected_commit,
-						model.commit_view,
-						model.log_selected,
-						model.range_head,
-						model.compare,
-						model.log_selection_expanded,
-						model.log_branches_all,
-					) = shown_selection;
+					model.restore_shown_selection();
 				} else {
 					model.preview_error_root = Some(shown_root);
 				}
 				cx.notify();
 			});
 		});
+	}
+
+	/// Names `path` as the selection and sets aside what the shown preview's
+	/// selection was, unless an earlier read already did: its snapshot still
+	/// describes the shown preview, while what is on the model now is only
+	/// what that read left behind.
+	fn hold_shown_selection(&mut self, path: &str, source: &SourceKind) {
+		let file = self.selected_file.replace(path.to_string());
+		let file_source = self.selected_file_source.replace(source.clone());
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		if self.held_selection.is_some() {
+			// The earlier read took the rest already.
+			return;
+		}
+		let held = ShownSelection {
+			file,
+			source: file_source,
+			root: self.selected_file_root.clone(),
+			commit: self.selected_commit.take(),
+			// Taking the view resets it.
+			view: std::mem::take(&mut self.commit_view),
+			log_selected: std::mem::take(&mut self.log_selected),
+			range_head: self.range_head.take(),
+			compare: self.compare.take(),
+			log_selection_expanded: std::mem::take(
+				&mut self.log_selection_expanded,
+			),
+			log_branches_all: std::mem::take(&mut self.log_branches_all),
+		};
+		self.held_selection = shown.then_some(held);
+	}
+
+	/// Puts the held selection back; the shown preview is still its own.
+	fn restore_shown_selection(&mut self) {
+		let Some(held) = self.held_selection.take() else {
+			return;
+		};
+		self.selected_file = held.file;
+		self.selected_file_source = held.source;
+		self.selected_file_root = held.root;
+		self.selected_commit = held.commit;
+		self.commit_view = held.view;
+		self.log_selected = held.log_selected;
+		self.range_head = held.range_head;
+		self.compare = held.compare;
+		self.log_selection_expanded = held.log_selection_expanded;
+		self.log_branches_all = held.log_branches_all;
 	}
 
 	/// Turns a core `SourcePreview` into the single retained preview.
