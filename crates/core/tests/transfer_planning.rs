@@ -9381,3 +9381,126 @@ fn test_two_spellings_of_a_new_folder_created_before_planning_are_stale() {
 	);
 	assert!(!ws.join("new/sub").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Target collisions are judged on the paths the plan finally writes
+// ---------------------------------------------------------------------------
+
+/// `/System/Volumes/Data` followed by `ws`: the macOS data volume's
+/// firmlink, another spelling of the same folder.
+#[cfg(target_os = "macos")]
+fn data_volume_spelling(ws: &Path) -> PathBuf {
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(ws.strip_prefix("/").unwrap());
+	fs::metadata(&spelled).expect("the data volume's firmlink is there");
+	spelled
+}
+
+/// Two routes to one new folder, through the two spellings of the folder
+/// above it, each with a file of the same name. Moving both into one
+/// spelling of the folder made them one target; the collision was checked
+/// before that, on the two spellings, and Apply wrote the second file over
+/// the first. One target written twice is refused whole, and nothing is
+/// written.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_two_routes_to_one_new_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	let spelled = data_volume_spelling(&ws);
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&spelled.join("new")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: p/a.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
+
+/// The same with the folder already there: no folder to make, so nothing
+/// moves the two spellings together, and the two targets are still one
+/// file. A collision is told by the folder the filesystem has, not by how
+/// its path reads.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_two_routes_to_one_existing_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir(ws.join("new")).unwrap();
+	let spelled = data_volume_spelling(&ws);
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&spelled.join("new")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: p/a.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), vec![ws.join("new")]);
+}
+
+/// Two routes to one new folder named in two cases, on a filesystem that
+/// folds case: one folder, so one target, and the paste is refused.
+#[test]
+fn test_two_cases_of_one_new_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	if !test_dir_case_insensitive(&ws) {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+				|| cfg!(target_os = "linux"),
+			"needs a case-insensitive filesystem"
+		);
+		return;
+	}
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("q", placed(&ws.join("NEW")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: q/A.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
+
+/// A plan that reaches Apply with two writes to one target (from a peer, or
+/// a planning mistake) is refused before anything is written.
+#[test]
+fn test_apply_refuses_a_plan_that_writes_one_target_twice() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws));
+	let plan = plan_import(
+		"// file: a.txt\nFIRST\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	)
+	.unwrap();
+	let mut restore_plan = plan.restore_plan().clone();
+	let mut second = restore_plan.create_operations[0].clone();
+	second.content = "SECOND\n".into();
+	restore_plan.create_operations.push(second);
+	let plan = snip_core::transfer::TransferImportPlan::from_parts(
+		plan.roots().to_vec(),
+		restore_plan,
+		plan.destination_freshness().clone(),
+	);
+	let res = plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
