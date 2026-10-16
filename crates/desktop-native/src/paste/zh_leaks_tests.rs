@@ -819,9 +819,10 @@ fn transfer_variant(e: &TransferError) -> usize {
 		TransferError::Commit(_) => 19,
 		TransferError::Io(_) => 20,
 		TransferError::NewDirsNotConfirmed { .. } => 21,
+		TransferError::NotTakenBack { .. } => 22,
 	}
 }
-const TRANSFER_VARIANTS: usize = 22;
+const TRANSFER_VARIANTS: usize = 23;
 
 fn transfer_samples() -> Vec<(String, TransferError)> {
 	let d = || D.to_string();
@@ -913,6 +914,16 @@ fn transfer_samples() -> Vec<(String, TransferError)> {
 			}),
 		),
 		("Io".into(), TransferError::Io(std::io::Error::other(D))),
+		(
+			"NotTakenBack".into(),
+			TransferError::NotTakenBack {
+				cause: Box::new(TransferError::TargetCollision {
+					path: p(),
+					msg: W.into(),
+				}),
+				left: vec![d(), d()],
+			},
+		),
 	];
 	for (i, change) in stale_changes().into_iter().enumerate() {
 		v.push((

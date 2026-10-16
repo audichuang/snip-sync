@@ -194,7 +194,7 @@ pub struct RestoreFailure {
 impl RestoreExecutionResult {
 	/// Record a failure in both forms, so the CLI's line and the typed
 	/// reason cannot drift apart.
-	fn fail(&mut self, path: &str, text: &str, reason: Reason) {
+	pub(crate) fn fail(&mut self, path: &str, text: &str, reason: Reason) {
 		self.errors.push(format!("{path}: {text}"));
 		self.failures.push(RestoreFailure {
 			path: path.to_string(),
@@ -369,6 +369,12 @@ pub(crate) enum Reservation {
 pub(crate) struct Reserved {
 	pub(crate) key: DirKey,
 	pub(crate) modified: Option<SystemTime>,
+	/// The handle the file was made with, kept open on Linux within the
+	/// Apply's budget (`Made` in transfer.rs): while it is open the file's
+	/// number is no other object's, and the file is read through it with
+	/// no descriptor of its own.
+	#[cfg(target_os = "linux")]
+	pub(crate) pin: Option<std::sync::Arc<fs::File>>,
 }
 
 /// What the filesystem says a file is, taken without any right to read or
@@ -454,6 +460,16 @@ impl Seen {
 }
 
 impl Reserved {
+	/// The file made as `key`, last modified at `modified`, not pinned.
+	pub(crate) fn new(key: DirKey, modified: Option<SystemTime>) -> Self {
+		Self {
+			key,
+			modified,
+			#[cfg(target_os = "linux")]
+			pin: None,
+		}
+	}
+
 	/// Whether `seen` is still the file made, untouched: the same object,
 	/// empty, not modified since, and under no other name. The one test
 	/// every step takes it by: its row writes into it, and the Apply takes
@@ -491,7 +507,31 @@ impl Reserved {
 	/// Whether what is at `path` is still the file made, untouched
 	/// ([`Self::holds`]), asked without any permission on its content: the
 	/// Apply takes a file back on this.
+	///
+	/// A pinned file opens nothing: the name is `lstat`-ed, and when it
+	/// names the pinned object (whose number nothing else can carry while
+	/// it is held) the object is read through the pin. Taking back what
+	/// an Apply made must not need a descriptor its pins took.
 	pub(crate) fn is_untouched(&self, path: &Path) -> std::io::Result<bool> {
+		#[cfg(target_os = "linux")]
+		if let Some(pin) = &self.pin {
+			use std::os::unix::fs::MetadataExt;
+			let named = match fs::symlink_metadata(path) {
+				Ok(info) => info,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					return Ok(false)
+				}
+				Err(e) => return Err(e),
+			};
+			if !named.is_file()
+				|| DirKey::Object(named.dev(), named.ino()) != self.key
+			{
+				return Ok(false);
+			}
+			return Ok(
+				Seen::of_file(pin, path).is_some_and(|seen| self.holds(&seen))
+			);
+		}
 		Ok(Seen::of_path(path)?.is_some_and(|seen| self.holds(&seen)))
 	}
 
@@ -1056,7 +1096,7 @@ mod tests {
 		let key = DirKey::of_file(&file).unwrap();
 		drop(file);
 		let modified = fs::symlink_metadata(&path).unwrap().modified().ok();
-		(path, Reserved { key, modified })
+		(path, Reserved::new(key, modified))
 	}
 
 	fn untouched(path: &Path, reserved: &Reserved) -> bool {

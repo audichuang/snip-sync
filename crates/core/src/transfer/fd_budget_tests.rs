@@ -41,9 +41,11 @@ fn fail_at(f: impl Fn(&str, &Path) -> io::Result<()> + 'static) -> FailGuard {
 	FailGuard
 }
 
+#[cfg(unix)]
 const FILES: usize = 300;
 
 /// 300 new files in 30 new folders: 330 objects for an Apply to make.
+#[cfg(unix)]
 fn many() -> String {
 	let mut text = String::new();
 	for i in 0..FILES {

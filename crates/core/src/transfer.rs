@@ -627,9 +627,34 @@ pub enum TransferError {
 	Commit(#[from] CommitError),
 	#[error(transparent)]
 	Io(#[from] io::Error),
+	/// The Apply was refused after it made empty files or folders, and
+	/// taking some of them back failed: they are still there.
+	#[error(
+		"{cause}; what this paste made could not all be taken back: {}",
+		.left.join(", ")
+	)]
+	NotTakenBack {
+		cause: Box<TransferError>,
+		/// `path: why`, each.
+		left: Vec<String>,
+	},
 }
 
 impl TransferError {
+	/// `cause`, and `left` when taking back what was made failed for some.
+	fn left_behind(cause: Self, left: Vec<NotTakenBack>) -> Self {
+		if left.is_empty() {
+			return cause;
+		}
+		Self::NotTakenBack {
+			cause: Box::new(cause),
+			left: left
+				.iter()
+				.map(|(path, e)| format!("{}: {e}", path.display()))
+				.collect(),
+		}
+	}
+
 	/// Why this failed, as data for a front end to word. The `Display` text
 	/// stays the CLI's. An exhaustive match: a new variant must decide.
 	pub fn reason(&self) -> Reason {
@@ -701,6 +726,8 @@ impl TransferError {
 			Self::Git(e) => e.reason(),
 			Self::Commit(e) => e.reason(),
 			Self::Io(e) => io_reason(e, ""),
+			// Why it was refused: what is left is in the text.
+			Self::NotTakenBack { cause, .. } => cause.reason(),
 		}
 	}
 
@@ -2057,12 +2084,14 @@ impl TransferImportPlan {
 			});
 		}
 
+		// Made after the lock and the checks: its pin budget counts the
+		// descriptors they hold open.
 		let mut made = Made::default();
 		let reserved = match self.reserve(selection, &routed, &mut made) {
 			Ok(reserved) => reserved,
 			Err(e) => {
-				made.take_back();
-				return Err(e);
+				let left = made.take_back();
+				return Err(TransferError::left_behind(e, left));
 			}
 		};
 		let (mut result, unwritten) = restore::execute_restore_plan_reserved(
@@ -2071,14 +2100,32 @@ impl TransferImportPlan {
 			&reserved,
 			after_write,
 		);
+		// An empty file left behind is reported: a later Apply would take
+		// it for an existing file and skip it.
 		for i in unwritten {
-			made.release_file(&self.create_operations()[i].absolute_path);
+			let op = &self.create_operations()[i];
+			if let Err(e) = made.release_file(&op.absolute_path) {
+				result.fail(
+					&op.relative_path,
+					&format!("left empty, could not be taken back: {e}"),
+					io_reason(&e, &op.relative_path),
+				);
+			}
 		}
 		let wrote = result.created_count
 			+ result.overwritten_count
 			+ result.deleted_count
 			> 0;
-		result.created_dirs = made.finish(wrote);
+		let (kept, left) = made.finish(wrote);
+		result.created_dirs = kept;
+		for (dir, e) in left {
+			let shown = dir.display().to_string();
+			result.fail(
+				&shown,
+				&format!("folder made could not be taken back: {e}"),
+				io_reason(&e, &shown),
+			);
+		}
 		Ok(result)
 	}
 
@@ -2330,16 +2377,11 @@ impl TransferImportPlan {
 				// name a moment later may be someone else's.
 				let key =
 					DirKey::of_file(&file).unwrap_or_else(|| DirKey::of(path));
-				// Closed at once, except on Linux within its budget (see
-				// `Made`): one held per new file would run out of
-				// descriptors on a large paste, and Windows cannot replace
-				// an open file.
-				made.pin(file);
 				// Read by name, as the row will read it.
 				let modified = fs::symlink_metadata(path)
 					.and_then(|info| info.modified())
 					.ok();
-				let reserved = restore::Reserved { key, modified };
+				let reserved = made.reserved(file, key, modified);
 				made.file(path, &reserved, &op.relative_path);
 				Ok(reserved)
 			}
@@ -2403,30 +2445,102 @@ enum Reserve {
 /// timestamps tick too coarsely (about 4 ms) to tell them apart. On Linux
 /// each object made is therefore pinned for the rest of the Apply: a handle
 /// held open keeps its inode, and its number, from being freed, so another
-/// object can never carry it ([`Self::pin`]). The pin is `O_PATH` (or the
-/// handle a file was made with) and blocks nothing: the object can still be
-/// written, renamed or removed. macOS and Windows hand a number out again
-/// only much later (APFS object ids grow; an NTFS file index carries a
-/// sequence number), and Windows cannot replace an open file, so nothing is
-/// held there.
-#[derive(Default)]
+/// object can never carry it. The pin is `O_PATH` (or the handle a file was
+/// made with) and blocks nothing: the object can still be written, renamed
+/// or removed. macOS and Windows hand a number out again only much later
+/// (APFS object ids grow; an NTFS file index carries a sequence number),
+/// and Windows cannot replace an open file, so nothing is held there.
+///
+/// Pins are descriptors, and the Apply's own rows and take-backs need
+/// descriptors too: how many it holds is a budget read from the process's
+/// limit and what is open already ([`pin_budget`]); past it, or with no
+/// room at all, an object is told by its number alone, as elsewhere. A
+/// pinned file is checked through its pin, with no descriptor of its own.
 struct Made {
 	/// Folders in the order made; `true` for a placed folder's level.
 	dirs: Vec<(PathBuf, DirKey, bool)>,
-	/// Empty files made with `create_new`, as made.
+	/// Empty files made with `create_new`, as made (with their pins).
 	files: Vec<(PathBuf, restore::Reserved)>,
 	/// Every object made, with what made it.
 	objects: HashMap<DirKey, String>,
-	/// The handles that keep the objects made from being freed (Linux).
+	/// The handles that keep the folders made from being freed (Linux).
 	#[cfg(target_os = "linux")]
-	pins: Vec<fs::File>,
+	dir_pins: Vec<fs::File>,
+	/// How many objects this Apply may still pin, and how many it did.
+	#[cfg(target_os = "linux")]
+	budget: usize,
+	#[cfg(target_os = "linux")]
+	pinned: usize,
 }
 
-/// How many objects one Apply pins: a quarter of the usual soft limit on
-/// open files (1024), so its rows and git still have descriptors. Past it,
-/// an object is told by its number alone, as on other systems.
+/// At most this many objects are pinned in the whole process at once: a
+/// quarter of the usual soft limit on open files (1024).
 #[cfg(target_os = "linux")]
-const PIN_BUDGET: usize = 256;
+const PIN_CAP: usize = 256;
+
+/// Descriptors kept free for everything else an Apply opens while its pins
+/// are held: one per row at a time (its write handle, or the temporary
+/// file of a replace), one to check an unpinned file, git's pipes, the
+/// `/proc` listing, and whatever else the process does meanwhile. Its
+/// repository locks are open already, and counted as used.
+#[cfg(target_os = "linux")]
+const PIN_RESERVE: usize = 64;
+
+/// The objects pinned by every Apply in this process now: two Applies in
+/// one process (two tabs pasting into two repositories) share its limit.
+#[cfg(target_os = "linux")]
+static PINNED: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+/// How many objects an Apply starting now may pin: half of what the soft
+/// limit leaves past the descriptors open and [`PIN_RESERVE`], within what
+/// [`PIN_CAP`] leaves to the process. When what is open cannot be counted,
+/// half the limit is taken as open.
+#[cfg(target_os = "linux")]
+fn pin_budget() -> usize {
+	use nix::sys::resource::{getrlimit, Resource};
+	use std::sync::atomic::Ordering;
+	let Ok((soft, _)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+		return 0;
+	};
+	let soft = usize::try_from(soft).unwrap_or(usize::MAX);
+	let open = fs::read_dir("/proc/self/fd")
+		.map(Iterator::count)
+		.unwrap_or(soft / 2);
+	let room = soft.saturating_sub(open).saturating_sub(PIN_RESERVE) / 2;
+	room.min(PIN_CAP.saturating_sub(PINNED.load(Ordering::Relaxed)))
+}
+
+// Derivable only where nothing is pinned.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::derivable_impls))]
+impl Default for Made {
+	fn default() -> Self {
+		Self {
+			dirs: Vec::new(),
+			files: Vec::new(),
+			objects: HashMap::new(),
+			#[cfg(target_os = "linux")]
+			dir_pins: Vec::new(),
+			#[cfg(target_os = "linux")]
+			budget: pin_budget(),
+			#[cfg(target_os = "linux")]
+			pinned: 0,
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Made {
+	fn drop(&mut self) {
+		use std::sync::atomic::Ordering;
+		PINNED.fetch_sub(self.pinned, Ordering::Relaxed);
+	}
+}
+
+/// Something an Apply made that it meant to take back and could not: the
+/// path, and why. An empty file left this way is still there, and a
+/// later Apply would take it for one that exists.
+pub(crate) type NotTakenBack = (PathBuf, io::Error);
 
 impl Made {
 	/// Records the folder just made at `path` and returns which object it
@@ -2441,11 +2555,23 @@ impl Made {
 		key
 	}
 
+	/// Takes one pin of the budget, if one is left.
+	#[cfg(target_os = "linux")]
+	fn take_pin(&mut self) -> bool {
+		use std::sync::atomic::Ordering;
+		if self.pinned >= self.budget {
+			return false;
+		}
+		self.pinned += 1;
+		PINNED.fetch_add(1, Ordering::Relaxed);
+		true
+	}
+
 	/// Pins the folder at `path` if it is still `key` (see [`Made`]).
 	#[cfg(target_os = "linux")]
 	fn pin_dir(&mut self, path: &Path, key: &DirKey) {
 		use std::os::unix::fs::OpenOptionsExt;
-		if self.pins.len() >= PIN_BUDGET {
+		if self.pinned >= self.budget {
 			return;
 		}
 		// The access mode is ignored with `O_PATH`: no permission on the
@@ -2455,8 +2581,9 @@ impl Made {
 			.custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
 			.open(path);
 		if let Ok(handle) = handle {
-			if DirKey::of_file(&handle).as_ref() == Some(key) {
-				self.pins.push(handle);
+			if DirKey::of_file(&handle).as_ref() == Some(key) && self.take_pin()
+			{
+				self.dir_pins.push(handle);
 			}
 		}
 	}
@@ -2464,15 +2591,26 @@ impl Made {
 	#[cfg(not(target_os = "linux"))]
 	fn pin_dir(&mut self, _path: &Path, _key: &DirKey) {}
 
-	/// Keeps `handle`, the file just made, open for the rest of the Apply
-	/// on Linux (see [`Made`]); elsewhere it is closed here.
-	fn pin(&mut self, handle: fs::File) {
+	/// The file just made through `handle`, as `key`, last modified at
+	/// `modified`: its handle kept as its pin on Linux within the budget
+	/// (see [`Made`]), closed otherwise. One held per new file past it
+	/// would run out of descriptors on a large paste, and Windows cannot
+	/// replace an open file.
+	fn reserved(
+		&mut self,
+		handle: fs::File,
+		key: DirKey,
+		modified: Option<std::time::SystemTime>,
+	) -> restore::Reserved {
+		#[allow(unused_mut)]
+		let mut reserved = restore::Reserved::new(key, modified);
 		#[cfg(target_os = "linux")]
-		if self.pins.len() < PIN_BUDGET {
-			self.pins.push(handle);
+		if self.take_pin() {
+			reserved.pin = Some(std::sync::Arc::new(handle));
+			return reserved;
 		}
-		#[cfg(not(target_os = "linux"))]
 		drop(handle);
+		reserved
 	}
 
 	fn file(&mut self, path: &Path, reserved: &restore::Reserved, rel: &str) {
@@ -2497,58 +2635,90 @@ impl Made {
 
 	/// Removes the empty file made at `path`, if it is still that file
 	/// untouched (`Reserved::is_untouched`, the test its row wrote by, asked
-	/// without any permission on the file's content). On macOS and other
-	/// Unix without `O_PATH` the check is an `lstat`, so a residual, very
-	/// small window remains between it and the unlink (Linux could narrow
-	/// it by stat-ing the `O_PATH` handle again just before).
-	fn release_file(&self, path: &Path) {
+	/// without any permission on the file's content, and through its pin
+	/// when it has one). On macOS and other Unix without `O_PATH` the check
+	/// is an `lstat`, so a residual, very small window remains between it
+	/// and the unlink.
+	///
+	/// An error is what kept it from telling or from removing: the file
+	/// may be left there empty, and the caller reports it. One that is
+	/// someone else's by now, or gone, is no error.
+	fn release_file(&self, path: &Path) -> io::Result<()> {
 		let Some((_, reserved)) = self.files.iter().find(|(p, _)| p == path)
 		else {
-			return;
+			return Ok(());
 		};
-		// The handle is closed before the name is removed: on Windows the
-		// name of an open file lingers, and its folder is not empty yet.
-		let untouched = restore::fail_point("release", path)
-			.and_then(|()| reserved.is_untouched(path))
-			.unwrap_or(false);
-		if untouched {
-			let _ = fs::remove_file(path);
+		restore::fail_point("release", path)?;
+		if !reserved.is_untouched(path)? {
+			return Ok(());
+		}
+		match fs::remove_file(path) {
+			Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+			_ => Ok(()),
 		}
 	}
 
 	/// Removes, deepest first, the folders made that are still those
-	/// folders and empty.
-	fn take_back_dirs(&self) {
+	/// folders and empty. A folder with something in it, or gone, stays
+	/// as it is; one that could not be told or removed is returned.
+	fn take_back_dirs(&self) -> Vec<NotTakenBack> {
+		let mut left = Vec::new();
 		for (path, key, _) in self.dirs.iter().rev() {
-			if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-				&& DirKey::of(path) == *key
-			{
-				let _ = fs::remove_dir(path);
+			match fs::symlink_metadata(path) {
+				Ok(info) if info.is_dir() && DirKey::of(path) == *key => {}
+				Ok(_) => continue,
+				Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+				Err(e) => {
+					left.push((path.clone(), e));
+					continue;
+				}
+			}
+			match fs::remove_dir(path) {
+				Ok(()) => {}
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound
+							| io::ErrorKind::DirectoryNotEmpty
+					) => {}
+				Err(e) => left.push((path.clone(), e)),
 			}
 		}
+		left
 	}
 
-	/// Takes back everything made: no content was written.
-	fn take_back(&self) {
-		for (path, _) in &self.files {
-			self.release_file(path);
-		}
-		self.take_back_dirs();
+	/// Takes back everything made: no content was written. Returns what
+	/// it could not.
+	fn take_back(&self) -> Vec<NotTakenBack> {
+		let mut left: Vec<NotTakenBack> = self
+			.files
+			.iter()
+			.filter_map(|(path, _)| {
+				self.release_file(path).err().map(|e| (path.clone(), e))
+			})
+			.collect();
+		left.extend(self.take_back_dirs());
+		left
 	}
 
 	/// After the rows ran: a paste that wrote and deleted nothing leaves no
 	/// folder it made behind (one with something in it stays). Returns how
-	/// many placed folders' levels it made are still there.
-	fn finish(&self, wrote: bool) -> usize {
-		if !wrote {
-			self.take_back_dirs();
-		}
-		self.dirs
+	/// many placed folders' levels it made are still there, and the
+	/// folders it meant to take back and could not.
+	fn finish(&self, wrote: bool) -> (usize, Vec<NotTakenBack>) {
+		let left = if wrote {
+			Vec::new()
+		} else {
+			self.take_back_dirs()
+		};
+		let kept = self
+			.dirs
 			.iter()
 			.filter(|(path, _, placed)| {
 				*placed && fs::symlink_metadata(path).is_ok()
 			})
-			.count()
+			.count();
+		(kept, left)
 	}
 }
 
@@ -7296,21 +7466,26 @@ mod new_dir_tests {
 			made
 		};
 		let made = make();
-		assert_eq!(made.finish(true), 2);
+		assert_eq!(made.finish(true).0, 2);
 		assert!(b.is_dir());
-		assert_eq!(made.finish(false), 0);
+		assert_eq!(made.finish(false).0, 0);
 		assert!(!a.exists());
 
 		let made = make();
 		fs::write(b.join("keep.txt"), "x").unwrap();
-		assert_eq!(made.finish(false), 2);
+		let (kept, left) = made.finish(false);
+		assert_eq!(kept, 2);
+		assert!(
+			left.is_empty(),
+			"a folder with something in it is no failure: {left:?}"
+		);
 		assert!(b.join("keep.txt").exists());
 
 		fs::remove_dir_all(&a).unwrap();
 		let made = make();
 		fs::remove_dir(&b).unwrap();
 		fs::create_dir(&b).unwrap();
-		made.finish(false);
+		assert!(made.finish(false).1.is_empty());
 		assert!(b.is_dir(), "another folder in its place is not ours");
 	}
 
@@ -7329,11 +7504,10 @@ mod new_dir_tests {
 			.unwrap();
 		let key = DirKey::of_file(&file).unwrap();
 		let mut made = Made::default();
-		made.pin(file);
 		let modified = fs::symlink_metadata(&path)
 			.and_then(|info| info.modified())
 			.ok();
-		let reserved = restore::Reserved { key, modified };
+		let reserved = made.reserved(file, key, modified);
 		made.file(&path, &reserved, "new.txt");
 		fs::remove_file(&path).unwrap();
 		// Made within the same clock tick: Linux stamps a file with a
@@ -7342,7 +7516,7 @@ mod new_dir_tests {
 		other.set_modified(modified.unwrap()).unwrap();
 		drop(other);
 		assert!(!reserved.is_untouched(&path).unwrap());
-		made.release_file(&path);
+		made.release_file(&path).unwrap();
 		assert!(path.exists(), "another file in its place is not ours");
 	}
 
@@ -7402,10 +7576,10 @@ mod new_dir_tests {
 		let modified = fs::symlink_metadata(&path)
 			.and_then(|info| info.modified())
 			.ok();
-		let reserved = restore::Reserved { key, modified };
+		let reserved = restore::Reserved::new(key, modified);
 		let mut made = Made::default();
 		made.file(&path, &reserved, "new.txt");
-		made.release_file(&path);
+		made.release_file(&path).unwrap();
 		assert!(!path.exists(), "an empty write-only file made is ours");
 	}
 
