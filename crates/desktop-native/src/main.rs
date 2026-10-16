@@ -22805,6 +22805,178 @@ mod tests {
 			});
 		}
 
+		/// Two file reads in flight, the last one refused by the budget: the
+		/// second read must not capture the emptied selection the first one
+		/// left behind. The snapshot belongs to the diff still shown, not to
+		/// one request, so the refusal puts the real selection back.
+		#[gpui::test]
+		fn a_superseded_file_read_keeps_the_snapshot_of_the_shown_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			fs::write(beta.join("b.txt"), "beta content\n").unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta commit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta commit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			let shown_root = model.read_with(cx, |m, _| {
+				m.preview_root().expect("a preview root")
+			});
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			// Two reads, the second superseding the first before it lands.
+			for _ in 0..2 {
+				let root = alpha.clone();
+				model.update(cx, |m, cx| {
+					m.select_file_in(
+						Some(root),
+						"big.txt",
+						snip_core::transfer::SourceKind::File,
+						cx,
+					);
+				});
+			}
+			settle(cx);
+			// Nearly all of the retained budget is held, so the 128 KiB file
+			// cannot replace the commit diff.
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff stays");
+				assert!(m.selected_commit.is_some(), "selection restored");
+				assert!(
+					m.commit_view.commit_details.is_some(),
+					"details lost to the superseded read",
+				);
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files lost to the superseded read",
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(shown_root.as_path()),
+					"the shown diff must keep its own repository",
+				);
+			});
+		}
+
+		/// The snapshot ends with the diff it belongs to: after a superseding
+		/// read lands, a later refusal restores that file's selection, never
+		/// the commit that an earlier snapshot still named.
+		#[gpui::test]
+		fn a_landed_file_read_releases_the_snapshot_of_the_replaced_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			fs::write(alpha.join("small.txt"), "small\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.any(|c| c.subject == "alpha commit")
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "alpha commit")
+					.expect("commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			let read = |model: &Entity<WorkbenchModel>,
+			            cx: &mut VisualTestContext,
+			            name: &str| {
+				let (root, name) = (alpha.clone(), name.to_string());
+				model.update(cx, |m, cx| {
+					m.select_file_in(
+						Some(root),
+						&name,
+						snip_core::transfer::SourceKind::File,
+						cx,
+					);
+				});
+			};
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			read(&model, cx, "big.txt");
+			read(&model, cx, "small.txt");
+			settle(cx);
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("small.txt"));
+				assert!(m.selected_commit.is_none(), "the file replaced it");
+			});
+			model.update(cx, |m, _| {
+				m.e2e_read_delay = None;
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			read(&model, cx, "big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_file.as_deref(),
+					Some("small.txt"),
+					"the refusal restored a selection older than the shown file",
+				);
+				assert!(
+					m.selected_commit.is_none(),
+					"a released snapshot came back",
+				);
+				assert!(m.commit_view.is_reset());
+			});
+		}
+
 		/// The budget's refusal puts the whole selection back, the
 		/// multi-selection with it (#230): a file list that outlived its
 		/// `log_selected` named origins past its end, so a copy took the

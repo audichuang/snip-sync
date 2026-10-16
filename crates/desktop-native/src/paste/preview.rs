@@ -185,6 +185,13 @@ impl PastePreview {
 		self.plan.as_mut()
 	}
 
+	/// A test holds retained bytes the way a running apply does, so a
+	/// refusal needs neither a worker nor a clock to race.
+	#[cfg(test)]
+	pub fn hold_retained_for_test(&self, bytes: usize) {
+		lock_pending(&self.pending).apply_active = bytes;
+	}
+
 	pub fn detail(&self) -> Option<&Preview> {
 		self.detail.as_ref()
 	}
