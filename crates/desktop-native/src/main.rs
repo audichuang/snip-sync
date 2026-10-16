@@ -15179,6 +15179,76 @@ mod tests {
 			);
 		}
 
+		/// Inter's digits are proportional (1 is far narrower than 4), so a
+		/// date is only whole where the box fits its widest digits: dates with
+		/// "10/24" and "04:44" in them (zh and en long forms, and the today and
+		/// yesterday forms) are whole at 900 and 1080 with the hash column on.
+		/// `shown == total` alone has a +0.5 tolerance gpui's truncation does
+		/// not, so the box must also hold the raw text width.
+		#[gpui::test]
+		fn real_text_dates_with_wide_digits_are_whole(cx: &mut TestAppContext) {
+			use chrono::{Duration, Local};
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "solo", &[]);
+			let today = Local::now().date_naive();
+			let days = [
+				"2024-10-24T04:44:00".to_string(),
+				"2020-10-20T20:00:00".to_string(),
+				format!("{}T04:44:00", today - Duration::days(1)),
+				format!("{}T04:44:00", today),
+			];
+			for (i, date) in days.iter().enumerate() {
+				fs::write(r.join(format!("d{i}.txt")), "d").unwrap();
+				git(&r, &["add", "."]);
+				git_dated(
+					&r,
+					&["commit", "-q", "-m", &format!("subject number {i}")],
+					date,
+				);
+			}
+			let mut bad = Vec::new();
+			// (window width, English).
+			for (w, english) in
+				[(900., false), (900., true), (1080., false), (1080., true)]
+			{
+				let Some((model, cx)) =
+					open_real_text(cx, ws.path().to_path_buf(), w, 720.)
+				else {
+					return;
+				};
+				settle_until(cx, "the log rows", |cx| {
+					model.read_with(cx, |m, _| m.display_commits().len() >= 4)
+				});
+				settle(cx);
+				if english {
+					cx.simulate_keystrokes("alt-l");
+					settle(cx);
+				}
+				click_probed(&model, cx, "btn-log-more");
+				click_probed(&model, cx, "log-more:hash");
+				settle(cx);
+				for ix in 0..4 {
+					let Some(d) = seen_cell(&model, cx, ix, RowCell::Date)
+					else {
+						bad.push(format!("{w} en={english} row {ix}: no date"));
+						continue;
+					};
+					if d.shown != d.total || d.visible < d.natural {
+						bad.push(format!(
+							"{w} en={english} row {ix} {:?}: {}/{} in {:.1}px of {:.1}",
+							d.text, d.shown, d.total, d.visible, d.natural
+						));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
 		/// The test platform measures with `NoopTextSystem` (every char 0.6em),
 		/// so CJK is undercounted and truncation never shows (#224).
 		/// `use_real_text_system` swaps in the OS text system (CoreText on
