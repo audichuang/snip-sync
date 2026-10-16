@@ -563,9 +563,10 @@ fn reason_variant(r: &Reason) -> usize {
 		Reason::SubmoduleUnreadable { .. } => 42,
 		Reason::ScanErrorsOmitted { .. } => 43,
 		Reason::DepthLimitedOmitted { .. } => 44,
+		Reason::WorkerClosed => 45,
 	}
 }
-const REASON_VARIANTS: usize = 45;
+const REASON_VARIANTS: usize = 46;
 
 fn stale_changes() -> Vec<StaleChange> {
 	vec![
@@ -596,6 +597,7 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 				detail: Datum::for_test(D),
 			},
 		),
+		("WorkerClosed".into(), Reason::WorkerClosed),
 		("Protocol".into(), Reason::Protocol),
 		(
 			"WorkerTooOld".into(),
@@ -1455,8 +1457,16 @@ const PRODUCT_SENTENCE: &str = "the folder is not a regular file";
 
 /// The String fields classified as data whose producer is, or once was,
 /// able to carry a sentence of our own (not a path, a name or git's or the
-/// OS's words). Each one must have its sentences typed at the producer.
-const PRODUCT_TEXT_FIELDS: &[&str] = &["internal.detail", "start.detail"];
+/// OS's words): the six [`snip_core::reason::Datum`] fields. Each one must
+/// have its sentences typed at the producer.
+pub(crate) const PRODUCT_TEXT_FIELDS: &[&str] = &[
+	"disconnected.detail",
+	"git_failed.stderr",
+	"internal.detail",
+	"io.detail",
+	"start.detail",
+	"submodule_unreadable.detail",
+];
 
 /// `sample` with the String at `field` (`variant.field`) replaced.
 fn with_field(sample: &Reason, field: &str, text: &str) -> Option<Reason> {
@@ -1610,4 +1620,212 @@ fn product_text_never_reaches_a_data_field() {
 		assert!(found.no_wording.is_empty(), "no Chinese: {start:?}");
 		assert!(!zh(&msg).contains("the sentence of the CLI"));
 	}
+}
+
+/// Every commit graph error, with every fault inside it, as the history view
+/// words it. The matches are exhaustive: a new error or fault does not
+/// compile until it is listed here.
+fn graph_errors() -> Vec<(String, snip_core::graph::GraphError)> {
+	use snip_core::graph::{
+		ConfigFault, ContinuityFault, GraphError, InputFault,
+	};
+	fn error_index(e: &GraphError) -> usize {
+		match e {
+			GraphError::InvalidConfig { .. } => 0,
+			GraphError::FrontierLimitExceeded { .. } => 1,
+			GraphError::RowLimitExceeded { .. } => 2,
+			GraphError::RefLimitExceeded { .. } => 3,
+			GraphError::ByteLimitExceeded { .. } => 4,
+			GraphError::InvalidInput { .. } => 5,
+			GraphError::DuplicateCommit { .. } => 6,
+			GraphError::ContinuityError { .. } => 7,
+		}
+	}
+	fn config_index(f: ConfigFault) -> usize {
+		match f {
+			ConfigFault::MaxFrontierSize => 0,
+			ConfigFault::MaxRows => 1,
+			ConfigFault::MaxRefs => 2,
+			ConfigFault::MaxTotalBytes => 3,
+			ConfigFault::UnitX => 4,
+			ConfigFault::UnitY => 5,
+			ConfigFault::OffsetX => 6,
+		}
+	}
+	fn input_index(f: &InputFault) -> usize {
+		match f {
+			InputFault::CommitSha { .. } => 0,
+			InputFault::ParentSha { .. } => 1,
+			InputFault::RefSha { .. } => 2,
+			InputFault::RefNameEmpty { .. } => 3,
+			InputFault::RefNameTooLong { .. } => 4,
+			InputFault::FrontierSha => 5,
+			InputFault::CheckpointSha => 6,
+		}
+	}
+	fn continuity_index(f: &ContinuityFault) -> usize {
+		match f {
+			ContinuityFault::RepeatsLastCommit { .. } => 0,
+		}
+	}
+	let mut v: Vec<(String, GraphError)> = vec![
+		(
+			"FrontierLimit".into(),
+			GraphError::FrontierLimitExceeded {
+				current: 5,
+				limit: 4,
+			},
+		),
+		(
+			"RowLimit".into(),
+			GraphError::RowLimitExceeded {
+				requested: 5,
+				limit: 4,
+			},
+		),
+		(
+			"RefLimit".into(),
+			GraphError::RefLimitExceeded {
+				requested: 5,
+				limit: 4,
+			},
+		),
+		(
+			"ByteLimit".into(),
+			GraphError::ByteLimitExceeded { total: 5, limit: 4 },
+		),
+		(
+			"Duplicate".into(),
+			GraphError::DuplicateCommit {
+				sha: "abc".into(),
+				row: 1,
+			},
+		),
+	];
+	for field in [
+		ConfigFault::MaxFrontierSize,
+		ConfigFault::MaxRows,
+		ConfigFault::MaxRefs,
+		ConfigFault::MaxTotalBytes,
+		ConfigFault::UnitX,
+		ConfigFault::UnitY,
+		ConfigFault::OffsetX,
+	] {
+		v.push((
+			format!("Config#{}", config_index(field)),
+			GraphError::InvalidConfig { field },
+		));
+	}
+	for fault in [
+		InputFault::CommitSha { row: 1 },
+		InputFault::ParentSha {
+			index: 1,
+			commit: "abc".into(),
+		},
+		InputFault::RefSha { index: 1 },
+		InputFault::RefNameEmpty { index: 1 },
+		InputFault::RefNameTooLong { index: 1 },
+		InputFault::FrontierSha,
+		InputFault::CheckpointSha,
+	] {
+		v.push((
+			format!("Input#{}", input_index(&fault)),
+			GraphError::InvalidInput { fault },
+		));
+	}
+	let fault = ContinuityFault::RepeatsLastCommit { sha: "abc".into() };
+	v.push((
+		format!("Continuity#{}", continuity_index(&fault)),
+		GraphError::ContinuityError { fault },
+	));
+	let seen: BTreeSet<_> = v.iter().map(|(_, e)| error_index(e)).collect();
+	assert_eq!(seen.len(), 8, "a GraphError has no sample");
+	v
+}
+
+/// No English of the layout's reaches the zh-TW screen: its `Display` is a
+/// diagnostic for the CLI and the log (#233).
+#[test]
+fn every_graph_error_reads_as_zh_tw() {
+	let mut found = Found::default();
+	for (label, error) in graph_errors() {
+		let msg = crate::reason::graph_error_msg(&error);
+		check(label.clone(), &zh(&msg), &mut found);
+		assert!(
+			!msg.render(Locale::En).contains(&error.to_string()),
+			"{label}: the layout's own text reached the screen"
+		);
+	}
+	assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+	assert!(found.no_wording.is_empty(), "{:#?}", found.no_wording);
+	assert!(found.empties.is_empty(), "{:#?}", found.empties);
+}
+
+/// The clipboard library's English never reaches the screen: each fault is
+/// worded, and the old way of showing its text is seen by the detector.
+#[test]
+fn every_clipboard_fault_reads_as_zh_tw() {
+	use snip_core::clip::ClipFault;
+	fn fault_index(f: ClipFault) -> usize {
+		match f {
+			ClipFault::Empty => 0,
+			ClipFault::Unsupported => 1,
+			ClipFault::Occupied => 2,
+			ClipFault::Conversion => 3,
+			ClipFault::Other => 4,
+		}
+	}
+	let mut found = Found::default();
+	let faults = [
+		ClipFault::Empty,
+		ClipFault::Unsupported,
+		ClipFault::Occupied,
+		ClipFault::Conversion,
+		ClipFault::Other,
+	];
+	let seen: BTreeSet<_> = faults.iter().map(|f| fault_index(*f)).collect();
+	assert_eq!(seen.len(), 5);
+	for fault in faults {
+		let label = format!("{fault:?}");
+		check(
+			format!("clip_fault_msg/{label}"),
+			&zh(&crate::reason::clip_fault_msg(fault)),
+			&mut found,
+		);
+	}
+	for (label, e) in [
+		("empty", arboard::Error::ContentNotAvailable),
+		("unsupported", arboard::Error::ClipboardNotSupported),
+		("occupied", arboard::Error::ClipboardOccupied),
+		("conversion", arboard::Error::ConversionFailure),
+		(
+			"unknown",
+			arboard::Error::Unknown {
+				description: "developer words".into(),
+			},
+		),
+	] {
+		check(
+			format!("clipboard_failed/{label}"),
+			&zh(&crate::reason::clipboard_failed(&e)),
+			&mut found,
+		);
+		check(
+			format!("clipboard_read_failed/{label}"),
+			&zh(&crate::reason::clipboard_read_failed(&e)),
+			&mut found,
+		);
+	}
+	assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+	assert!(found.no_wording.is_empty(), "{:#?}", found.no_wording);
+	assert!(found.empties.is_empty(), "{:#?}", found.empties);
+
+	// The detector sees the old wording: the library's text as the argument.
+	let mut old = Found::default();
+	let legacy = Msg::new(
+		"status_clipboard_failed",
+		[arboard::Error::ContentNotAvailable.to_string()],
+	);
+	check("legacy".into(), &zh(&legacy), &mut old);
+	assert!(!old.leaks.is_empty(), "{}", zh(&legacy));
 }

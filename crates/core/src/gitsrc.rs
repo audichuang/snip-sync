@@ -300,8 +300,10 @@ impl GitError {
 					condition: None,
 				}
 			}
-			Self::Cleanup { args, message } => Reason::Internal {
-				detail: Datum::command(&format!("{args}: {message}")),
+			// The message is our sentence or the OS's, mixed: only the command
+			// it belongs to is data.
+			Self::Cleanup { args, .. } => Reason::Internal {
+				detail: Datum::command(args),
 				condition: None,
 			},
 			Self::Malformed { output, .. } => Reason::Internal {

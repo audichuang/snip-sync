@@ -21,6 +21,7 @@ pub(crate) mod copyserve;
 #[doc(hidden)]
 pub mod fault;
 pub(crate) mod gitserve;
+pub(crate) mod iofault;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
 pub mod pastetarget;
@@ -144,11 +145,14 @@ impl RemoteError {
 	/// stays the CLI's. An exhaustive match: a new variant must decide.
 	pub fn reason(&self) -> Reason {
 		match self {
-			Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => {
-				Reason::TimedOut
-			}
-			Self::Io(e) => Reason::Disconnected {
-				detail: Datum::os_error(e),
+			// A fault this layer raised is worded by its variant; anything
+			// else is the OS's, and only its own text is data.
+			Self::Io(e) => match iofault::IoFault::of(e) {
+				Some(fault) => fault.reason(),
+				None if e.kind() == io::ErrorKind::TimedOut => Reason::TimedOut,
+				None => Reason::Disconnected {
+					detail: Datum::os_error(e),
+				},
 			},
 			Self::Start { reason, detail, .. } => Reason::Start {
 				start: *reason,
@@ -368,7 +372,8 @@ mod tests {
 					"the worker closed the connection",
 				),
 				true,
-				"worker_closed",
+				// Not raised by the remote layer: the funnel rule only.
+				"disconnected",
 			),
 			(
 				io::Error::new(

@@ -200,6 +200,9 @@ pub enum Reason {
 	Disconnected {
 		detail: Datum,
 	},
+	/// The worker ended the stream between frames. Raised by the master
+	/// from its own read, never sent by a worker.
+	WorkerClosed,
 	Protocol,
 	WorkerTooOld {
 		worker: String,
@@ -454,6 +457,7 @@ impl Reason {
 			Self::Refused { .. }
 			| Self::Start { .. }
 			| Self::Disconnected { .. }
+			| Self::WorkerClosed
 			| Self::Protocol
 			| Self::WorkerTooOld { .. }
 			| Self::TimedOut
@@ -583,6 +587,7 @@ impl Reason {
 				self
 			}
 			Self::Refused { .. }
+			| Self::WorkerClosed
 			| Self::Protocol
 			| Self::WorkerTooOld { .. }
 			| Self::TimedOut
@@ -631,6 +636,7 @@ pub mod test_support {
 				detail: ds(),
 			},
 			Reason::Disconnected { detail: ds() },
+			Reason::WorkerClosed,
 			Reason::Protocol,
 			Reason::WorkerTooOld {
 				worker: ok(),
@@ -791,6 +797,7 @@ mod tests {
 			Reason::SubmoduleUnreadable { .. } => 42,
 			Reason::ScanErrorsOmitted { .. } => 43,
 			Reason::DepthLimitedOmitted { .. } => 44,
+			Reason::WorkerClosed => 45,
 		}
 	}
 

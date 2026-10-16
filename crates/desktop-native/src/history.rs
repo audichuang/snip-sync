@@ -1065,12 +1065,9 @@ impl PreparedHistory {
 					filtered,
 					shallow.clone(),
 				)
-				// The graph's own Display is an internal diagnostic: it trails
-				// the worded headline as data.
 				.map_err(|e| {
-					GraphAdmissionError::Layout(Msg::detail(
-						Msg::new("err_graph_layout", []),
-						e.to_string(),
+					GraphAdmissionError::Layout(crate::reason::graph_error_msg(
+						&e,
 					))
 				})
 			};

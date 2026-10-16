@@ -4710,7 +4710,7 @@ impl WorkbenchModel {
 		match result {
 			Ok((text, copied_count, msg)) => {
 				if let Err(e) = clip::write_text(&text) {
-					self.set_status("status_clipboard_failed", [e.to_string()]);
+					self.set_status_msg(crate::reason::clipboard_failed(&e));
 				} else {
 					app_log!("[APP:COPY_DONE: copied={copied_count}]");
 					self.set_status_msg(msg);
@@ -4924,9 +4924,8 @@ impl WorkbenchModel {
 				match result {
 					Ok((text, n_commits, status)) => {
 						if let Err(e) = clip::write_text(&text) {
-							model.set_status(
-								"status_clipboard_failed",
-								[e.to_string()],
+							model.set_status_msg(
+								crate::reason::clipboard_failed(&e),
 							);
 						} else {
 							app_log!(
@@ -5140,10 +5139,7 @@ impl WorkbenchModel {
 			Err(e) => {
 				app_log!("[APP:PASTE_ERR: clipboard]");
 				self.restore_log_after_paste();
-				self.set_status(
-					"status_clipboard_read_failed",
-					[e.to_string()],
-				);
+				self.set_status_msg(crate::reason::clipboard_read_failed(&e));
 				self.pending_focus = Some(self.focus_handle.clone());
 				cx.notify();
 				return;
@@ -5825,7 +5821,7 @@ impl WorkbenchModel {
 					);
 				}
 				Err(e) => {
-					self.set_status("status_clipboard_failed", [e.to_string()])
+					self.set_status_msg(crate::reason::clipboard_failed(&e))
 				}
 			}
 			cx.notify();
@@ -20773,7 +20769,8 @@ mod tests {
 						let en = msg.render(crate::i18n::Locale::En);
 						assert!(zh.contains("結束了連線"), "{zh}");
 						assert!(!zh.contains("closed the connection"), "{zh}");
-						assert!(!en.contains("closed the connection"), "{en}");
+						// The layer's own sentence, not the dictionary's.
+						assert!(!en.contains("the worker closed"), "{en}");
 					});
 				}
 			}

@@ -9,7 +9,11 @@
 //! fallback. All matches are exhaustive: a new variant of any enum below does
 //! not compile until it has a wording.
 
+use snip_core::clip::ClipFault;
 use snip_core::gitsrc::{Condition, StartReason};
+use snip_core::graph::{
+	ContinuityFault, GraphError, InputFault, MAX_REF_NAME_LEN,
+};
 use snip_core::reason::{
 	ErrorCode, Failure, PayloadErrorKind, Reason, StaleChange,
 };
@@ -239,6 +243,7 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::Disconnected { detail } => {
 			headed("err_disconnected", detail.as_str())
 		}
+		Reason::WorkerClosed => Msg::new("err_worker_closed", []),
 		Reason::Protocol => Msg::new("err_protocol", []),
 		Reason::WorkerTooOld { worker, have, need } => Msg::new(
 			"err_worker_outdated",
@@ -354,6 +359,87 @@ pub fn reason_msg(r: &Reason) -> Msg {
 /// log, never for the screen.
 pub fn failure_msg(f: &Failure) -> Msg {
 	reason_msg(&f.reason)
+}
+
+/// A commit graph the layout refused, in words. The layout's own `Display`
+/// is an English diagnostic for the CLI and the log: it is never data here.
+/// A fault only a bug can cause (nothing a repository can make git hand us)
+/// trails the headline as a fixed label for a bug report. Exhaustive: a new
+/// error or fault does not compile until it has a wording.
+pub fn graph_error_msg(e: &GraphError) -> Msg {
+	let bug = |label: &'static str| {
+		Msg::detail(Msg::new("err_graph_layout", []), label)
+	};
+	match e {
+		GraphError::RowLimitExceeded { requested, limit } => Msg::new(
+			"graph_err_rows",
+			[requested.to_string(), limit.to_string()],
+		),
+		GraphError::RefLimitExceeded { requested, limit } => Msg::new(
+			"graph_err_refs",
+			[requested.to_string(), limit.to_string()],
+		),
+		GraphError::ByteLimitExceeded { total, limit } => {
+			Msg::new("graph_err_bytes", [total.to_string(), limit.to_string()])
+		}
+		// The history view steps down to a plain list before it gets here,
+		// but a message is owed all the same.
+		GraphError::FrontierLimitExceeded { current, limit } => Msg::new(
+			"graph_err_frontier",
+			[current.to_string(), limit.to_string()],
+		),
+		GraphError::InvalidInput { fault } => match fault {
+			InputFault::CommitSha { .. }
+			| InputFault::ParentSha { .. }
+			| InputFault::RefSha { .. } => Msg::new("graph_commit_id_too_long", []),
+			InputFault::RefNameTooLong { .. } => Msg::new(
+				"graph_err_ref_name_too_long",
+				[MAX_REF_NAME_LEN.to_string()],
+			),
+			InputFault::RefNameEmpty { .. } => bug("empty_ref_name"),
+			InputFault::FrontierSha => bug("frontier_sha"),
+			InputFault::CheckpointSha => bug("checkpoint_sha"),
+		},
+		GraphError::InvalidConfig { .. } => bug("invalid_config"),
+		GraphError::ContinuityError { fault } => match fault {
+			ContinuityFault::RepeatsLastCommit { .. } => bug("page_continuity"),
+		},
+		GraphError::DuplicateCommit { .. } => bug("duplicate_commit"),
+	}
+}
+
+/// What a clipboard library error means, in words.
+pub fn clip_fault_msg(f: ClipFault) -> Msg {
+	Msg::new(
+		match f {
+			ClipFault::Empty => "clip_err_empty",
+			ClipFault::Unsupported => "clip_err_unsupported",
+			ClipFault::Occupied => "clip_err_occupied",
+			ClipFault::Conversion => "clip_err_conversion",
+			ClipFault::Other => "clip_err_other",
+		},
+		[],
+	)
+}
+
+/// A failed clipboard write, with the cause in words.
+pub fn clipboard_failed(e: &arboard::Error) -> Msg {
+	Msg::with_msg_arg(
+		"status_clipboard_failed",
+		[String::new()],
+		0,
+		clip_fault_msg(snip_core::clip::fault(e)),
+	)
+}
+
+/// A failed clipboard read, with the cause in words.
+pub fn clipboard_read_failed(e: &arboard::Error) -> Msg {
+	Msg::with_msg_arg(
+		"status_clipboard_read_failed",
+		[String::new()],
+		0,
+		clip_fault_msg(snip_core::clip::fault(e)),
+	)
 }
 
 #[cfg(test)]

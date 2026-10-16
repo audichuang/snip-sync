@@ -1168,10 +1168,9 @@ pub(crate) fn exchange(
 				}
 			}
 			None => {
-				return Err(RemoteError::Io(io::Error::new(
-					io::ErrorKind::UnexpectedEof,
-					"the worker closed the connection",
-				)));
+				return Err(RemoteError::Io(
+					crate::iofault::IoFault::WorkerClosed.into(),
+				));
 			}
 		}
 	}

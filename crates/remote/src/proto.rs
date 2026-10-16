@@ -18,6 +18,8 @@ use snip_core::gitview::{
 use snip_core::graph::MAX_REF_NAME_LEN;
 use snip_core::workspace::ScanStatus;
 
+use crate::iofault::IoFault;
+
 /// Base protocol, both sides must speak it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -841,10 +843,11 @@ pub fn write_frame<T: Serialize>(
 ) -> io::Result<()> {
 	let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
 	if bytes.len() > MAX_FRAME {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidData,
-			format!("frame of {} bytes exceeds {MAX_FRAME}", bytes.len()),
-		));
+		return Err(IoFault::OutgoingFrameTooLarge {
+			len: bytes.len(),
+			max: MAX_FRAME,
+		}
+		.into());
 	}
 	w.write_all(&(bytes.len() as u32).to_be_bytes())?;
 	w.write_all(&bytes)?;
@@ -918,10 +921,11 @@ fn write_whole_request(
 		return write_frame(w, request);
 	}
 	if json.len() > JOINED_MAX {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidData,
-			format!("request of {} bytes exceeds {JOINED_MAX}", json.len()),
-		));
+		return Err(IoFault::OutgoingRequestTooLarge {
+			len: json.len(),
+			max: JOINED_MAX,
+		}
+		.into());
 	}
 	for piece in chunks(std::str::from_utf8(&json).map_err(io::Error::other)?) {
 		write_frame(
@@ -948,16 +952,20 @@ pub fn read_frame<T: DeserializeOwned>(
 	}
 	let len = u32::from_be_bytes(len) as usize;
 	if len > MAX_FRAME {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidData,
-			format!("frame of {len} bytes exceeds {MAX_FRAME}"),
-		));
+		return Err(IoFault::IncomingFrameTooLarge {
+			len,
+			max: MAX_FRAME,
+		}
+		.into());
 	}
 	let mut buf = vec![0u8; len];
 	r.read_exact(&mut buf)?;
-	serde_json::from_slice(&buf)
-		.map(Some)
-		.map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+	serde_json::from_slice(&buf).map(Some).map_err(|err| {
+		IoFault::BadFrame {
+			text: err.to_string(),
+		}
+		.into()
+	})
 }
 
 pub fn valid_hex_oid(s: &str) -> bool {

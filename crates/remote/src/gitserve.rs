@@ -47,6 +47,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		Reason::Refused { .. }
 		| Reason::Start { .. }
 		| Reason::Disconnected { .. }
+		| Reason::WorkerClosed
 		| Reason::Protocol
 		| Reason::WorkerTooOld { .. }
 		| Reason::TimedOut

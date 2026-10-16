@@ -1697,7 +1697,7 @@ impl WorkbenchModel {
 				);
 			}
 			Err(e) => {
-				self.set_status("status_clipboard_failed", [e.to_string()]);
+				self.set_status_msg(crate::reason::clipboard_failed(&e));
 			}
 		}
 		cx.notify();
