@@ -359,3 +359,44 @@ fn fuzz_regression_a_details_read_does_not_land_on_a_selection_a_file_took(
 		invariants::assert_holds(m, cx, &[L6, L8]);
 	});
 }
+
+/// R6: a repo whose own load was in flight when another repo was opened is
+/// read by the Changes queue instead, so its node never stays Loading. The
+/// "previous repo" it is found by was read after `select_repo` had pinned the
+/// new one, and was always `None` (found by
+/// `fuzz_local_workbench_keeps_derived_state`: open beta, open gamma at once).
+#[gpui::test]
+fn fuzz_regression_the_repo_left_while_loading_is_read_by_the_changes_queue(
+	cx: &mut TestAppContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	for name in ["alpha", "beta", "gamma"] {
+		repo(ws.path(), name, &[]);
+	}
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "every repo's Changes", |cx| {
+		model.read_with(cx, |m, _| {
+			m.repos.len() == 3
+				&& m.change_repos.len() == 3
+				&& m.change_repos
+					.iter()
+					.all(|r| r.state == crate::ChangeRepoState::Loaded)
+		})
+	});
+	// One turn: beta's own read has not run when gamma is opened.
+	model.update_in(cx, |m, _, cx| {
+		m.select_repo(1, cx);
+		m.select_repo(2, cx);
+	});
+	settle_until(cx, "the Changes of the repo that was left", |cx| {
+		model.read_with(cx, |m, _| {
+			m.change_repos
+				.iter()
+				.all(|r| r.state != crate::ChangeRepoState::Loading)
+		})
+	});
+	model.read_with(cx, |m, cx| {
+		invariants::assert_holds(m, cx, &[R6]);
+	});
+}
