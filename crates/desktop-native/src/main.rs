@@ -14117,21 +14117,44 @@ mod tests {
 		/// embedded fonts, as the app does (`use_real_text_system` alone
 		/// leaves "Inter" to fall back to a system font, 7% off). `None`
 		/// where the platform has no real text system.
+		///
+		/// The text system is swapped once per `TestAppContext`. A `FontId`
+		/// is an index into the text system that resolved it: a window
+		/// shapes with the one it was opened under, but gpui paints with
+		/// the app's current one (`paint_line_background` reads
+		/// `cx.text_system()`), so a second swap with an older window still
+		/// open painted ids of one cosmic-text instance against another and
+		/// panicked out of bounds on Linux. For the same reason the windows
+		/// opened under the Noop system before the swap are closed.
 		fn open_real_text(
 			cx: &mut TestAppContext,
 			ws: PathBuf,
 			w: f32,
 			h: f32,
 		) -> Option<(Entity<WorkbenchModel>, &mut VisualTestContext)> {
-			if !cx.use_real_text_system() {
-				assert!(
-					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
-						|| cfg!(windows),
-					"no real text system on this OS"
-				);
-				return None;
+			let swapped = cx
+				.text_system()
+				.all_font_names()
+				.iter()
+				.any(|n| n == crate::theme::UI_FONT);
+			if !swapped {
+				cx.update(|cx| {
+					for window in cx.windows() {
+						let _ = window
+							.update(cx, |_, window, _| window.remove_window());
+					}
+				});
+				cx.run_until_parked();
+				if !cx.use_real_text_system() {
+					assert!(
+						std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+							|| cfg!(windows),
+						"no real text system on this OS"
+					);
+					return None;
+				}
+				cx.update(|cx| crate::theme::register_fonts(cx));
 			}
-			cx.update(|cx| crate::theme::register_fonts(cx));
 			let names = cx.text_system().all_font_names();
 			for family in [crate::theme::UI_FONT, crate::theme::CODE_FONT] {
 				assert!(
