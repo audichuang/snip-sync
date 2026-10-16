@@ -3514,11 +3514,14 @@ fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_is_malformed() {
 
 	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
 	match err {
-		TransferError::Git(gitsrc::GitError::Malformed(msg)) => {
-			assert!(msg.contains("not a file"), "unexpected message: {msg}");
+		TransferError::Git(e @ gitsrc::GitError::NotAFile { .. }) => {
+			assert!(
+				e.to_string().ends_with("is a commit, not a file"),
+				"unexpected message: {e}"
+			);
 		}
 		other => panic!(
-			"expected TransferError::Git(GitError::Malformed), got {other:?}"
+			"expected TransferError::Git(GitError::NotAFile), got {other:?}"
 		),
 	}
 }

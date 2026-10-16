@@ -158,12 +158,19 @@ pub enum GitError {
 		"Repository history is shallow, so the parent of {0} is not available locally. Run 'git fetch --unshallow' and try again."
 	)]
 	Shallow(String),
-	/// Git's output was not what we parse, and `String` is part of that
-	/// output (an object id, a format name): raw text from git, withheld
-	/// where a worker withholds details. The producer decides: a message
-	/// that is ours alone is a [`GitError::Diagnostic`].
-	#[error("unexpected git output: {0}")]
-	Malformed(String),
+	/// Git's output was not what we parse. `what` is our fixed label of the
+	/// check that failed; `output` is git's own bytes (an object id, a
+	/// format name), the only data: withheld where a worker withholds
+	/// details. A sentence of ours never goes into `output`: a message that
+	/// is ours alone is a [`GitError::Diagnostic`], and one the user can
+	/// cause has a type ([`GitError::Condition`], [`GitError::NotAFile`]).
+	#[error("unexpected git output: {what}: {output}")]
+	Malformed { what: &'static str, output: String },
+	/// A revision path names something that is not a file (`kind` is git's
+	/// object type, such as "tree"). The same `Display` shape as
+	/// [`GitError::Malformed`]; a front end words it from `spec`.
+	#[error("unexpected git output: '{spec}' is a {kind}, not a file")]
+	NotAFile { spec: String, kind: String },
 	/// The same failure with a fixed diagnostic of ours ("raw diff record"),
 	/// the same `Display` bytes as [`GitError::Malformed`]. Safe to send
 	/// verbatim: it holds nothing git or the OS said.
@@ -191,6 +198,34 @@ pub enum GitError {
 	Io(#[from] io::Error),
 }
 
+/// A full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
+#[doc(hidden)]
+pub fn full_oid(text: &str) -> Result<String, GitError> {
+	if (text.len() != 40 && text.len() != 64)
+		|| !text.bytes().all(|b| b.is_ascii_hexdigit())
+	{
+		return Err(GitError::Malformed {
+			what: "rev-parse returned invalid commit OID",
+			output: text.to_string(),
+		});
+	}
+	Ok(text.to_string())
+}
+
+/// The empty tree of the object format `rev-parse --show-object-format`
+/// printed.
+#[doc(hidden)]
+pub fn empty_tree_of(format: &str) -> Result<String, GitError> {
+	match format {
+		"sha256" => Ok(SHA256_EMPTY_TREE.into()),
+		"sha1" => Ok(EMPTY_TREE.into()),
+		other => Err(GitError::Malformed {
+			what: "unknown object format",
+			output: other.to_string(),
+		}),
+	}
+}
+
 impl GitError {
 	/// A [`GitError::Remote`] (the reason is boxed, so build it here).
 	pub fn remote(reason: Reason, message: impl Into<String>) -> Self {
@@ -211,7 +246,7 @@ impl GitError {
 			Self::Cleanup { args, .. } => {
 				format!("cleaning up git {args} failed (details withheld)")
 			}
-			Self::Malformed(_) => {
+			Self::Malformed { .. } | Self::NotAFile { .. } => {
 				"unexpected git output (details withheld)".to_string()
 			}
 			Self::Remote { .. } => {
@@ -269,10 +304,13 @@ impl GitError {
 				detail: format!("{args}: {message}"),
 				condition: None,
 			},
-			Self::Malformed(output) => Reason::Internal {
+			Self::Malformed { output, .. } => Reason::Internal {
 				detail: output.clone(),
 				condition: None,
 			},
+			Self::NotAFile { spec, .. } => {
+				Reason::NotRegularFile { path: spec.clone() }
+			}
 			Self::Diagnostic(text) => Reason::Internal {
 				detail: (*text).to_string(),
 				condition: None,
@@ -811,15 +849,7 @@ impl Git {
 						GitError::Diagnostic("rev-parse output not utf-8")
 					})?
 					.trim();
-				// Full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
-				if (text.len() != 40 && text.len() != 64)
-					|| !text.bytes().all(|b| b.is_ascii_hexdigit())
-				{
-					return Err(GitError::Malformed(format!(
-						"rev-parse returned invalid commit OID: {text}"
-					)));
-				}
-				Ok(text.to_string())
+				full_oid(text)
 			}
 			Err(e) if is_quiet_miss(&e) => {
 				Err(GitError::InvalidRevision(rev.to_string()))
@@ -865,13 +895,7 @@ impl Git {
 		let format = std::str::from_utf8(&out.stdout)
 			.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?
 			.trim();
-		match format {
-			"sha256" => Ok(SHA256_EMPTY_TREE.into()),
-			"sha1" => Ok(EMPTY_TREE.into()),
-			other => Err(GitError::Malformed(format!(
-				"unknown object format: {other}"
-			))),
-		}
+		empty_tree_of(format)
 	}
 
 	/// The symbolic ref HEAD points at, `None` when detached.
@@ -1871,6 +1895,42 @@ pub fn collect_payload_with_selection<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+
+	/// The CLI's bytes of the typed producers are what `Malformed(String)`
+	/// printed, and only git's own bytes become data.
+	#[test]
+	fn malformed_producers_keep_their_display_and_type_only_git_bytes() {
+		let e = full_oid("zzz").unwrap_err();
+		assert_eq!(
+			e.to_string(),
+			"unexpected git output: rev-parse returned invalid commit OID: zzz"
+		);
+		assert_eq!(
+			e.reason(),
+			Reason::Internal {
+				detail: "zzz".into(),
+				condition: None
+			}
+		);
+		assert!(full_oid(&"a".repeat(40)).is_ok());
+		assert!(full_oid(&"A".repeat(64)).is_ok());
+
+		let e = empty_tree_of("sha512").unwrap_err();
+		assert_eq!(
+			e.to_string(),
+			"unexpected git output: unknown object format: sha512"
+		);
+		assert_eq!(
+			e.reason(),
+			Reason::Internal {
+				detail: "sha512".into(),
+				condition: None
+			}
+		);
+		assert!(
+			empty_tree_of("sha1").is_ok() && empty_tree_of("sha256").is_ok()
+		);
+	}
 
 	#[test]
 	fn remote_displays_its_message_and_reasons_as_given() {

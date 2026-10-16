@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use snip_core::commits::{self, ReplayResult};
+use snip_core::commits;
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
@@ -20,6 +20,7 @@ use snip_core::transfer::{
 	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
+use crate::codeless;
 use crate::prepared::{self, CacheError, CachedImport, PreparedCache};
 use crate::proto::{
 	valid_rel_path, ErrorCode, ImportExpect, ImportPlanned, PasteMapping,
@@ -28,17 +29,6 @@ use crate::proto::{
 use crate::worker::{io_error, SharedRoot};
 
 type Refusal = Box<Response>;
-
-/// A write result for the wire: a failure's reason loses the OS text and
-/// the machine's paths, like every other reason a worker sends.
-fn wire_result(
-	mut result: snip_core::restore::RestoreExecutionResult,
-) -> snip_core::restore::RestoreExecutionResult {
-	for f in &mut result.failures {
-		f.reason = f.reason.take().map(snip_core::reason::Reason::scrubbed);
-	}
-	result
-}
 
 fn refused(code: ErrorCode, message: impl Into<String>) -> Refusal {
 	refused_with(code, message, None)
@@ -97,17 +87,6 @@ fn transfer_refusal(err: TransferError, cancel: &CancelToken) -> Refusal {
 		err.reason().beside_code()
 	};
 	refused_with(code, err.paste_message(), reason)
-}
-
-/// A replay result on its way to the master: the failure's reason goes
-/// through [`Reason::scrubbed`], so it names no path of this machine. A
-/// replay failure carries no [`ErrorCode`], so `beside_code` (which drops
-/// the reasons a code says) would leave the master a generic refusal.
-fn scrub_replay(mut result: ReplayResult) -> ReplayResult {
-	if let Some(failure) = &mut result.failure {
-		failure.reason = failure.reason.take().map(Reason::scrubbed);
-	}
-	result
 }
 
 fn stale(root: &Path, reason: &str) -> Refusal {
@@ -437,7 +416,7 @@ pub(crate) fn import_apply(
 				}
 			})
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Imported(wire_result(result)))
+		Ok(Response::Imported(codeless::restore_result(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -654,7 +633,7 @@ fn run_prepared_replay(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(scrub_replay(result)))
+		Ok(Response::Replayed(codeless::replay_result(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -703,7 +682,7 @@ pub(crate) fn replay_apply(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(scrub_replay(result)))
+		Ok(Response::Replayed(codeless::replay_result(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -711,7 +690,7 @@ pub(crate) fn replay_apply(
 #[cfg(test)]
 mod reason_tests {
 	use super::*;
-	use snip_core::commits::{CommitError, ReplayFailure};
+	use snip_core::commits::{CommitError, ReplayFailure, ReplayResult};
 
 	fn reason_of(refusal: Refusal) -> (ErrorCode, Option<Reason>, String) {
 		let Response::Error {
@@ -830,8 +809,12 @@ mod reason_tests {
 				reason: Some(reason),
 			}),
 		};
-		let sent =
-			|reason| scrub_replay(failed(reason)).failure.unwrap().reason;
+		let sent = |reason| {
+			codeless::replay_result(failed(reason))
+				.failure
+				.unwrap()
+				.reason
+		};
 		assert_eq!(
 			sent(Reason::UnsafePath {
 				path: "/etc/x".into()
@@ -861,12 +844,12 @@ mod reason_tests {
 			let want = r.clone().scrubbed();
 			assert_eq!(sent(r.clone()), Some(want), "{r:?}");
 		}
-		let wire = serde_json::to_string(&Response::Replayed(scrub_replay(
-			failed(Reason::OutsideScope {
+		let wire = serde_json::to_string(&Response::Replayed(
+			codeless::replay_result(failed(Reason::OutsideScope {
 				path: "a".into(),
 				scope: "/opt/secret".into(),
-			}),
-		)))
+			})),
+		))
 		.unwrap();
 		assert!(!wire.contains("secret"), "{wire}");
 	}

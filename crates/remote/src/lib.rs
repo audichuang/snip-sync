@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
+pub(crate) mod codeless;
 pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;

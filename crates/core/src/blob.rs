@@ -501,13 +501,18 @@ pub(crate) fn not_text_of(read: BlobRead) -> Option<NotText> {
 	}
 }
 
-pub(crate) fn not_a_file(spec: &str, kind: &str) -> GitError {
-	GitError::Malformed(format!("'{spec}' is a {kind}, not a file"))
+#[doc(hidden)]
+pub fn not_a_file(spec: &str, kind: &str) -> GitError {
+	GitError::NotAFile {
+		spec: spec.to_string(),
+		kind: kind.to_string(),
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::reason::Reason;
 	use std::io::Cursor;
 
 	fn batch(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -810,7 +815,7 @@ mod tests {
 	}
 
 	#[test]
-	fn deleted_policy_not_a_blob_returns_malformed() {
+	fn deleted_policy_not_a_blob_returns_not_a_file() {
 		let specs = ["tree"];
 		let err = first_deleted_text(specs, |_| {
 			Ok(BlobRead::NotABlob {
@@ -819,10 +824,19 @@ mod tests {
 		})
 		.unwrap_err();
 		match err {
-			GitError::Malformed(msg) => {
-				assert_eq!(msg, "'tree' is a tree, not a file");
+			ref e @ GitError::NotAFile { .. } => {
+				assert_eq!(
+					e.to_string(),
+					"unexpected git output: 'tree' is a tree, not a file"
+				);
+				assert_eq!(
+					e.reason(),
+					Reason::NotRegularFile {
+						path: "tree".into()
+					}
+				);
 			}
-			other => panic!("expected GitError::Malformed, got {other:?}"),
+			other => panic!("expected GitError::NotAFile, got {other:?}"),
 		}
 	}
 

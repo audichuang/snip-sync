@@ -139,16 +139,17 @@ fn git_variant(e: &GitError) -> usize {
 		GitError::ToplevelAbove(_) => 13,
 		GitError::InvalidRevision(_) => 14,
 		GitError::Shallow(_) => 15,
-		GitError::Malformed(_) => 16,
+		GitError::Malformed { .. } => 16,
 		GitError::OutsideBoundary { .. } => 17,
 		GitError::VerifyLimit { .. } => 18,
 		GitError::Remote { .. } => 19,
 		GitError::Io(_) => 20,
 		GitError::Diagnostic(_) => 21,
 		GitError::Condition(_) => 22,
+		GitError::NotAFile { .. } => 23,
 	}
 }
-const GIT_VARIANTS: usize = 23;
+const GIT_VARIANTS: usize = 24;
 
 fn preview_variant(e: &PreviewErr) -> usize {
 	match e {
@@ -286,7 +287,20 @@ fn git_samples() -> Vec<(String, GitError)> {
 		("ToplevelAbove".into(), GitError::ToplevelAbove(p())),
 		("InvalidRevision".into(), GitError::InvalidRevision(a())),
 		("Shallow".into(), GitError::Shallow(a())),
-		("Malformed".into(), GitError::Malformed(a())),
+		(
+			"Malformed".into(),
+			GitError::Malformed {
+				what: "label",
+				output: a(),
+			},
+		),
+		(
+			"NotAFile".into(),
+			GitError::NotAFile {
+				spec: a(),
+				kind: a(),
+			},
+		),
 		// Its text is a technical label for a bug report (classified as
 		// data next to `reason_msg`), shown verbatim like `Malformed`'s.
 		("Diagnostic".into(), GitError::Diagnostic(D)),
@@ -1435,6 +1449,54 @@ fn product_text_never_reaches_a_data_field() {
 					!msg.render(loc).contains(condition.text()),
 					"{condition:?} shows the CLI's English in {loc:?}"
 				);
+			}
+		}
+	}
+	// Our own sentences inside a git error: the producers that once wrote
+	// them into `Malformed` hold only git's bytes as data now. Each keeps its
+	// CLI Display, and none of the label or sentence reaches a reason.
+	let sentences = [
+		"rev-parse returned invalid commit OID",
+		"unknown object format",
+		"is a tree, not a file",
+	];
+	let producers = [
+		(
+			snip_core::gitsrc::full_oid(D).unwrap_err(),
+			format!(
+				"unexpected git output: rev-parse returned invalid commit \
+				 OID: {D}"
+			),
+		),
+		(
+			snip_core::gitsrc::empty_tree_of(D).unwrap_err(),
+			format!("unexpected git output: unknown object format: {D}"),
+		),
+		(
+			snip_core::blob::not_a_file(D, "tree"),
+			format!("unexpected git output: '{D}' is a tree, not a file"),
+		),
+	];
+	for (error, display) in producers {
+		assert_eq!(error.to_string(), display);
+		let reason = error.reason();
+		let json = serde_json::to_string(&reason).unwrap();
+		for r in [Some(reason.clone()), reason.clone().beside_code()]
+			.into_iter()
+			.flatten()
+		{
+			let msg = reason_msg(&r);
+			let mut found = Found::default();
+			check(format!("{error}"), &zh(&msg), &mut found);
+			assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+			for sentence in sentences {
+				assert!(!json.contains(sentence), "{sentence} in {json}");
+				for loc in [Locale::ZhTw, Locale::En] {
+					assert!(
+						!msg.render(loc).contains(sentence),
+						"{sentence} shown in {loc:?}"
+					);
+				}
 			}
 		}
 	}

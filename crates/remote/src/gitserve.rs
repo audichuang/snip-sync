@@ -15,6 +15,7 @@ use snip_core::gitview::{
 use snip_core::reason::{Failure, Reason};
 use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
+use crate::codeless;
 use crate::proto::{
 	valid_log_query, valid_rel_path, valid_rev, valid_tips, ErrorCode,
 	GitQuery, GitReply, RepoScan, Response, ScannedRepo, REMOTE_MAX_LOG_LIMIT,
@@ -97,7 +98,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		),
 		Policy::Scrub => scrub(&failure.message, share),
 	};
-	(text, failure.reason.clone().scrubbed())
+	(text, codeless::scan_reason(failure.reason.clone()))
 }
 
 /// Answers a ScanRepos request within the shared root.
@@ -229,7 +230,8 @@ pub(crate) fn scan(
 						&root.path,
 					),
 				));
-				error_reasons.push(Some(Reason::OutsideShare));
+				error_reasons
+					.push(Some(codeless::scan_reason(Reason::OutsideShare)));
 			}
 		}
 	}
@@ -1112,7 +1114,13 @@ mod tests {
 			"git log exited but a detached process kept its output open"
 		);
 		// Unexpected git output keeps no output.
-		let malformed = Failure::git("", &GitError::Malformed(secret.into()));
+		let malformed = Failure::git(
+			"",
+			&GitError::Malformed {
+				what: "label",
+				output: secret.into(),
+			},
+		);
 		assert!(malformed.message.contains(secret));
 		assert_eq!(
 			gone(&malformed).0,
@@ -1542,7 +1550,10 @@ mod tests {
 				}),
 			),
 			(
-				GitError::Malformed(format!("{secret} odd")),
+				GitError::Malformed {
+					what: "label",
+					output: format!("{secret} odd"),
+				},
 				Some(Reason::Internal {
 					detail: String::new(),
 					condition: None,

@@ -485,7 +485,10 @@ fn nested_preview_options_and_source_fidelity() {
 	assert!(
 		matches!(
 			err,
-			GitError::Io(_) | GitError::Malformed(_) | GitError::Diagnostic(_)
+			GitError::Io(_)
+				| GitError::Malformed { .. }
+				| GitError::NotAFile { .. }
+				| GitError::Diagnostic(_)
 		),
 		"zero exit protocol truncation: {err}"
 	);

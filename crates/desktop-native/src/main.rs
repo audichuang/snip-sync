@@ -106,6 +106,39 @@ macro_rules! app_log {
 	}};
 }
 
+/// A commit copy's failure: the engine's own text (what the CLI prints, for
+/// the e2e log) beside the message the UI words in the language then in force.
+type CopyCommitsFailure = (String, Msg);
+
+/// The `COPY_COMMITS_ERR` e2e line. Drivers match its text, so it is the
+/// engine's, never a translation's wording.
+fn copy_commits_err_line(engine_text: &str) -> String {
+	format!("[APP:COPY_COMMITS_ERR: {engine_text}]")
+}
+
+/// Exports the selected commits of a local repository.
+fn export_commits_local(
+	repo_root: &std::path::Path,
+	tip_sha: &str,
+	selected: &[String],
+	cancel: CancelToken,
+) -> Result<(String, usize, Msg), CopyCommitsFailure> {
+	let opts = interactive_read_opts(cancel);
+	let git = Git::open_with(repo_root, &opts)
+		.map_err(|e| (e.to_string(), crate::remote::git_error_msg(e)))?;
+	let exported = plan_commit_export_exact_with(
+		&git,
+		tip_sha,
+		selected,
+		&opts,
+		snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
+	)
+	.map_err(|e| (e.to_string(), crate::reason::reason_msg(&e.reason())))?;
+	let out = exported.outcome();
+	let status = commit_copied_status(&out);
+	Ok((out.text, out.commit_count, status))
+}
+
 /// Most not-copied paths the commit copy toast names; the rest are counted.
 const COMMIT_TOAST_PATHS: usize = 3;
 
@@ -4878,8 +4911,11 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize, Msg), Msg> = bg
-					.spawn(async move {
+				// The error carries the engine's own text for the e2e log
+				// line (a machine contract, never the UI's wording) and the
+				// message the UI words.
+				let result: Result<(String, usize, Msg), CopyCommitsFailure> =
+					bg.spawn(async move {
 						if let Some((session, repo)) = remote {
 							let out = session
 								.client
@@ -4890,24 +4926,18 @@ impl WorkbenchModel {
 									selected,
 									Some(&run_token),
 								)
-								.map_err(crate::remote::describe_msg)?;
+								.map_err(|e| {
+									(
+										e.to_string(),
+										crate::remote::describe_msg(e),
+									)
+								})?;
 							let status = commit_copied_status(&out);
 							return Ok((out.text, out.commit_count, status));
 						}
-						let opts = interactive_read_opts(run_token);
-						let git = Git::open_with(&repo_root, &opts)
-							.map_err(crate::remote::git_error_msg)?;
-						let exported = plan_commit_export_exact_with(
-							&git,
-							&tip_sha,
-							&selected,
-							&opts,
-							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
+						export_commits_local(
+							&repo_root, &tip_sha, &selected, run_token,
 						)
-						.map_err(|e| crate::reason::reason_msg(&e.reason()))?;
-						let out = exported.outcome();
-						let status = commit_copied_status(&out);
-						Ok((out.text, out.commit_count, status))
 					})
 					.await;
 				#[cfg(test)]
@@ -4934,11 +4964,8 @@ impl WorkbenchModel {
 								model.status = status;
 							}
 						}
-						Err(err) => {
-							app_log!(
-								"[APP:COPY_COMMITS_ERR: {}]",
-								err.render(Locale::En)
-							);
+						Err((log, err)) => {
+							app_log!("{}", copy_commits_err_line(&log));
 							model.set_status_msg(Msg::with_msg_arg(
 								"error_payload",
 								[String::new()],
@@ -22533,6 +22560,58 @@ mod tests {
 			.status()
 			.expect("git must run");
 		assert!(st.success(), "git failed: {args:?}");
+	}
+
+	/// The `COPY_COMMITS_ERR` line is a machine contract (the e2e drivers
+	/// match it): for a selection that is not one first-parent chain it
+	/// starts with the engine's text, whatever the UI says in any language.
+	#[test]
+	fn copy_commits_err_line_is_the_engines_text_not_the_uis() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path();
+		run_git(root, &["init", "-q"]);
+		let mut shas = Vec::new();
+		for n in 1..=3 {
+			fs::write(root.join("f.txt"), format!("{n}\n")).unwrap();
+			run_git(root, &["add", "f.txt"]);
+			run_git(
+				root,
+				&[
+					"-c",
+					"user.name=t",
+					"-c",
+					"user.email=t@example.com",
+					"commit",
+					"-q",
+					"-m",
+					&format!("c{n}"),
+				],
+			);
+			let out = Command::new("git")
+				.args(["rev-parse", "HEAD"])
+				.current_dir(root)
+				.output()
+				.unwrap();
+			shas.push(
+				String::from_utf8(out.stdout).unwrap().trim().to_string(),
+			);
+		}
+		// The first and third commit: the second is skipped.
+		let selected = vec![shas[0].clone(), shas[2].clone()];
+		let (log, msg) =
+			export_commits_local(root, &shas[2], &selected, CancelToken::new())
+				.unwrap_err();
+		let line = copy_commits_err_line(&log);
+		assert!(
+			line.starts_with(
+				"[APP:COPY_COMMITS_ERR: commits are not contiguous:"
+			),
+			"{line}"
+		);
+		// The UI words it its own way, in either language.
+		let ui = msg.render(Locale::En);
+		assert!(ui.contains("not contiguous"), "{ui}");
+		assert!(!ui.starts_with("commits are not contiguous"), "{ui}");
 	}
 
 	#[test]

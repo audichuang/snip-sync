@@ -894,10 +894,7 @@ impl WorkbenchModel {
 				}
 			}
 			Err(err) => {
-				app_log!(
-					"[APP:REMOTE_HOST_FAILED: host={name} {}]",
-					err.render(crate::i18n::Locale::En)
-				);
+				app_log!("[APP:REMOTE_HOST_FAILED: host={name} {}]", err.key);
 				browse.client = None;
 			}
 		}
@@ -1081,11 +1078,9 @@ impl WorkbenchModel {
 							let retryable = err.is_restore_retryable();
 							// The reason stays a message: worded when drawn, in
 							// the language then in force (#206 #208).
+							// The log line is the engine's text, not the UI's.
+							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
 							let err = describe_msg_at(err, &shown_path);
-							app_log!(
-								"[APP:REMOTE_OPEN_FAILED: {}]",
-								err.render(crate::i18n::Locale::En)
-							);
 							// Also on the status bar: a reconnect on launch runs
 							// with the menu closed.
 							this.set_status_msg(Msg::with_msg_arg(
@@ -1522,8 +1517,8 @@ impl WorkbenchModel {
 								other => {
 									// The reason stays a message: worded when
 									// drawn, in the language then in force.
+									let text = other.to_string();
 									let why = describe_msg(other);
-									let text = why.render(crate::i18n::Locale::En);
 									(
 										Msg::with_msg_arg(
 											"remote_scan_failed",

@@ -524,66 +524,15 @@ impl Reason {
 	}
 }
 
-#[cfg(test)]
-mod tests {
+/// Every [`Reason`] shape, for tests that walk a rule over all of them (here
+/// and in `snip-remote`, which enables the `test-support` feature).
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
 	use super::*;
-
-	/// Every variant gets a distinct index, by an exhaustive match: a new
-	/// variant does not compile until it has one, and `samples` must then
-	/// cover it (`samples_cover_every_variant`).
-	fn reason_index(r: &Reason) -> usize {
-		match r {
-			Reason::Refused { .. } => 0,
-			Reason::Start { .. } => 1,
-			Reason::Disconnected { .. } => 2,
-			Reason::Protocol => 3,
-			Reason::WorkerTooOld { .. } => 4,
-			Reason::TimedOut => 5,
-			Reason::Cancelled => 6,
-			Reason::GitMissing => 7,
-			Reason::GitFailed { .. } => 8,
-			Reason::GitBusy => 9,
-			Reason::RepoBusy => 10,
-			Reason::WorkerNeedsRestart => 11,
-			Reason::TooLarge => 12,
-			Reason::PatchTooLarge => 13,
-			Reason::VerifyLimit => 14,
-			Reason::NotARepository { .. } => 15,
-			Reason::InsideParentRepo { .. } => 16,
-			Reason::InvalidRevision { .. } => 17,
-			Reason::Shallow { .. } => 18,
-			Reason::OutsideShare => 19,
-			Reason::Internal { .. } => 20,
-			Reason::Io { .. } => 21,
-			Reason::NotFound { .. } => 22,
-			Reason::PermissionDenied { .. } => 23,
-			Reason::EmptySelection => 24,
-			Reason::UnsafePath { .. } => 25,
-			Reason::NotRegularFile { .. } => 26,
-			Reason::OutsideRoot { .. } => 27,
-			Reason::Collision { .. } => 28,
-			Reason::AmbiguousRoots { .. } => 29,
-			Reason::PayloadTooLarge { .. } => 30,
-			Reason::StagedAndWorking { .. } => 40,
-			Reason::SourceChanged { .. } => 31,
-			Reason::DestinationChanged { .. } => 32,
-			Reason::CrossRepoCommits => 33,
-			Reason::Discontinuous { .. } => 34,
-			Reason::NotEnoughCommits { .. } => 35,
-			Reason::NotCommitPayload => 36,
-			Reason::InvalidPayload { .. } => 37,
-			Reason::OutsideScope { .. } => 38,
-			Reason::Unverifiable { .. } => 39,
-			Reason::SubmoduleNotCheckedOut => 41,
-			Reason::SubmoduleUnreadable { .. } => 42,
-			Reason::ScanErrorsOmitted { .. } => 43,
-			Reason::DepthLimitedOmitted { .. } => 44,
-		}
-	}
 
 	/// Fields that must not reach the wire carry "/abs/secret"; the ones
 	/// that may carry "ok".
-	fn samples() -> Vec<Reason> {
+	pub fn samples() -> Vec<Reason> {
 		let s = || "/abs/secret".to_string();
 		let ok = || "ok".to_string();
 		let mut v = vec![
@@ -697,6 +646,65 @@ mod tests {
 			v.push(Reason::DestinationChanged { change });
 		}
 		v
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::test_support::samples;
+	use super::*;
+
+	/// Every variant gets a distinct index, by an exhaustive match: a new
+	/// variant does not compile until it has one, and `samples` must then
+	/// cover it (`samples_cover_every_variant`).
+	fn reason_index(r: &Reason) -> usize {
+		match r {
+			Reason::Refused { .. } => 0,
+			Reason::Start { .. } => 1,
+			Reason::Disconnected { .. } => 2,
+			Reason::Protocol => 3,
+			Reason::WorkerTooOld { .. } => 4,
+			Reason::TimedOut => 5,
+			Reason::Cancelled => 6,
+			Reason::GitMissing => 7,
+			Reason::GitFailed { .. } => 8,
+			Reason::GitBusy => 9,
+			Reason::RepoBusy => 10,
+			Reason::WorkerNeedsRestart => 11,
+			Reason::TooLarge => 12,
+			Reason::PatchTooLarge => 13,
+			Reason::VerifyLimit => 14,
+			Reason::NotARepository { .. } => 15,
+			Reason::InsideParentRepo { .. } => 16,
+			Reason::InvalidRevision { .. } => 17,
+			Reason::Shallow { .. } => 18,
+			Reason::OutsideShare => 19,
+			Reason::Internal { .. } => 20,
+			Reason::Io { .. } => 21,
+			Reason::NotFound { .. } => 22,
+			Reason::PermissionDenied { .. } => 23,
+			Reason::EmptySelection => 24,
+			Reason::UnsafePath { .. } => 25,
+			Reason::NotRegularFile { .. } => 26,
+			Reason::OutsideRoot { .. } => 27,
+			Reason::Collision { .. } => 28,
+			Reason::AmbiguousRoots { .. } => 29,
+			Reason::PayloadTooLarge { .. } => 30,
+			Reason::StagedAndWorking { .. } => 40,
+			Reason::SourceChanged { .. } => 31,
+			Reason::DestinationChanged { .. } => 32,
+			Reason::CrossRepoCommits => 33,
+			Reason::Discontinuous { .. } => 34,
+			Reason::NotEnoughCommits { .. } => 35,
+			Reason::NotCommitPayload => 36,
+			Reason::InvalidPayload { .. } => 37,
+			Reason::OutsideScope { .. } => 38,
+			Reason::Unverifiable { .. } => 39,
+			Reason::SubmoduleNotCheckedOut => 41,
+			Reason::SubmoduleUnreadable { .. } => 42,
+			Reason::ScanErrorsOmitted { .. } => 43,
+			Reason::DepthLimitedOmitted { .. } => 44,
+		}
 	}
 
 	#[test]

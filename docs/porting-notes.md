@@ -94,7 +94,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - transfer 的刪除來源分開:`Working` 讀 `HEAD:<path>`(與 gitsrc / TS 的 SCM 行為一致)、`Unstaged` 讀 index(`:<path>`)、`Staged` 讀 `HEAD:<path>`。
   工作區的刪除會把「不存在」記入 freshness,寫剪貼簿前若路徑又出現就視為過期。
 - 瀏覽 commit 目錄(`browser::commit_directory`)、blob(`browser::commit_blob`)與作者歷史(`browser::history_by_author`):
-  - 嚴格路徑身份:非 UTF-8 檔名在 `commit_directory` 中直接回報 `GitError::Diagnostic("unsupported non-UTF-8 path in commit directory")`，絕不靜默略過、絕不捏造檔名、不使用有損替換字元，確保有效的 `U+FFFD` 檔名（例如 `a\u{FFFD}`）與字面包含 `[unsupported non-UTF-8]` 的合法檔名皆能完全正常讀取與操作；`BlobText::NotUtf8` 僅保留給檔案內容位元組非 UTF-8 的情況。
+  - 嚴格路徑身份:非 UTF-8 檔名在 `commit_directory` 中直接回報 `GitError::Condition(Condition::CommitPathNotUtf8)`（Display 仍是 `unexpected git output: unsupported non-UTF-8 path in commit directory`），絕不靜默略過、絕不捏造檔名、不使用有損替換字元，確保有效的 `U+FFFD` 檔名（例如 `a\u{FFFD}`）與字面包含 `[unsupported non-UTF-8]` 的合法檔名皆能完全正常讀取與操作；`BlobText::NotUtf8` 僅保留給檔案內容位元組非 UTF-8 的情況。
   - 嚴格 NUL 終止紀錄:`ls-tree -z` 僅以結尾包含 NUL 的完整 record 建立項目；截斷時拋棄不完整的尾端並忠實標記 `truncated = true`，絕不憑中斷片段捏造檔名。若截斷導致連一筆完整紀錄都無法解析且 limit > 0，回傳 `GitError::OutputLimit`。
   - 嚴格預算傳遞:所有 `_with` 變體將取消權杖(`CancelToken`)、逾時與輸出上限傳遞至包含 `resolve_commit_with`、`head_with`、`cat-file -s` 在內的每個子程序。
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
