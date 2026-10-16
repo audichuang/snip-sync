@@ -2616,3 +2616,117 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 	assert!(!evil.exists());
 	assert!(ws.join("not/a.txt").exists());
 }
+
+// ---------------------------------------------------------------------------
+// #241 review: a path below the folder, planning that writes nothing, one
+// identity for a new folder
+// ---------------------------------------------------------------------------
+
+/// R7: a payload path that names no file below the folder to make is
+/// skipped, on a worker and locally, and the folder is never made as a file.
+#[test]
+fn a_path_with_no_file_name_is_not_the_missing_destination_on_either_side() {
+	let _serial = serial();
+	let route = new_dirs_route(&[("p", "not/yet")]);
+	for raw in [".", "/", "p/", "p/."] {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let local = tmp.path().join("local");
+		fs::create_dir_all(&ws).unwrap();
+		fs::create_dir_all(&local).unwrap();
+		let text = entry(raw, "BODY");
+		let w = worker(None);
+		let (client, id) = open(&w, &ws);
+		let remote = remote_target(client, id, "not/yet");
+		let here = PasteTarget::Local {
+			dest: local.join("not/yet"),
+			bound: Some(local.clone()),
+		};
+		for (name, target, dir) in
+			[("worker", &remote, &ws), ("local", &here, &local)]
+		{
+			let opts = RunOptions::default();
+			let plan = target.plan_files(&text, &route, &opts, None).unwrap();
+			assert!(
+				plan.restore_plan().create_operations.is_empty(),
+				"{name} {raw:?}: planned {:?}",
+				plan.restore_plan().create_operations
+			);
+			let result = target
+				.apply_files(&text, &route, &plan, &confirm(&plan))
+				.unwrap();
+			assert_eq!(result.created_count, 0, "{name} {raw:?}");
+			assert!(
+				tree(dir).is_empty(),
+				"{name} {raw:?}: wrote {:?}",
+				tree(dir)
+			);
+		}
+	}
+}
+
+/// R8: a worker's planning does not write into the empty folder it only
+/// reads, the mtime the proof: a probe file made and removed there moves it.
+#[cfg(unix)]
+#[test]
+fn a_worker_plans_a_missing_destination_without_touching_its_anchor() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "new");
+	let old = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	let handle = fs::File::open(&ws).unwrap();
+	handle.set_modified(old).unwrap();
+	drop(handle);
+	let before = fs::metadata(&ws).unwrap().modified().unwrap();
+	let text = entry("a.txt", "A");
+	let route = new_dirs_route(&[]);
+	target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	assert_eq!(
+		fs::metadata(&ws).unwrap().modified().unwrap(),
+		before,
+		"the worker's planning wrote into the anchor"
+	);
+	assert!(tree(&ws).is_empty());
+}
+
+/// R9: two spellings of one new folder are one folder on a worker too: it
+/// asks for it once, makes it once, and both files land.
+#[test]
+fn a_worker_makes_one_folder_of_two_spellings_of_it() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("base")).unwrap();
+	let ci = {
+		let probe = ws.join("probe_x");
+		fs::write(&probe, "x").unwrap();
+		let ci = ws.join("PROBE_X").exists();
+		fs::remove_file(&probe).unwrap();
+		ci
+	};
+	let text = [entry("p/a.txt", "A"), entry("q/b.txt", "B")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "base");
+	let route = new_dirs_route(&[("p", "new"), ("q", "NEW")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let asked = plan.new_dirs().requested;
+	assert_eq!(asked.len(), if ci { 1 } else { 2 }, "{asked:?}");
+	let result = target
+		.apply_files(&text, &route, &plan, &confirm(&plan))
+		.unwrap();
+	assert_eq!(result.created_count, 2);
+	assert_eq!(result.created_dirs, asked.len());
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
+	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
+	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");
+}

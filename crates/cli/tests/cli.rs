@@ -3375,3 +3375,107 @@ fn paste_dry_run_reports_a_failing_stdout_target() {
 		text(&out.stderr)
 	);
 }
+
+/// #241 review: a payload path that names no file below the folder to make
+/// is skipped. It once became the folder itself, and `--apply` without
+/// `--create-dirs` wrote a regular file where the folder was to be.
+#[test]
+fn paste_never_writes_a_file_where_the_missing_repo_was_to_be() {
+	let cases: [(&str, &[&str]); 4] = [
+		("// file: .\nBODY\n", &[]),
+		("// file: /\nBODY\n", &[]),
+		("// file: p/\nBODY\n", &["--map", "p=."]),
+		("// file: p/.\nBODY\n", &["--map", "p=."]),
+	];
+	for (payload, extra) in cases {
+		for create_dirs in [false, true] {
+			let tmp = tempfile::tempdir().unwrap();
+			let nope = tmp.path().join("new");
+			let mut args = vec!["--repo", nope.to_str().unwrap(), "paste"];
+			args.extend(["--apply", "--stdin"]);
+			args.extend(extra);
+			if create_dirs {
+				args.push("--create-dirs");
+			}
+			let out = snip(&args, Some(payload.as_bytes()));
+			assert!(
+				!nope.exists(),
+				"{payload:?} {extra:?} create_dirs={create_dirs}: made {} \
+				 (exit {}, stderr: {})",
+				if nope.is_file() { "a file" } else { "a folder" },
+				code(&out),
+				text(&out.stderr)
+			);
+		}
+	}
+}
+
+/// #241 review: `--dry-run` writes nothing, not even to the empty folder
+/// the missing one hangs from (a watcher on it would see the write).
+#[cfg(unix)]
+#[test]
+fn paste_dry_run_into_a_missing_repo_leaves_the_anchor_untouched() {
+	let tmp = tempfile::tempdir().unwrap();
+	let anchor = tmp.path().join("empty");
+	fs::create_dir_all(&anchor).unwrap();
+	let old = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	let handle = fs::File::open(&anchor).unwrap();
+	handle.set_modified(old).unwrap();
+	drop(handle);
+	let before = fs::metadata(&anchor).unwrap().modified().unwrap();
+	let repo = anchor.join("new");
+	let out = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(b"// file: a/b.txt\nhi\n"),
+	);
+	assert_eq!(code(&out), 0, "stderr was: {}", text(&out.stderr));
+	assert_eq!(
+		fs::metadata(&anchor).unwrap().modified().unwrap(),
+		before,
+		"a dry run wrote into the anchor"
+	);
+	assert!(fs::read_dir(&anchor).unwrap().next().is_none());
+}
+
+/// #241 review: two `--map`s that spell one new folder two ways (on a
+/// filesystem that folds case) make it once, and both files land in it.
+#[test]
+fn paste_map_two_spellings_of_one_new_folder_both_land() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let probe = repo.join("probe_x");
+	fs::write(&probe, "x").unwrap();
+	let case_insensitive = repo.join("PROBE_X").exists();
+	fs::remove_file(&probe).unwrap();
+	let out = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--create-dirs",
+			"--map",
+			"p=new",
+			"--map",
+			"q=NEW",
+			"--stdin",
+		],
+		Some(b"// file: p/a.txt\nA\n// file: q/b.txt\nB\n"),
+	);
+	assert_eq!(code(&out), 0, "stderr was: {}", text(&out.stderr));
+	assert_eq!(fs::read_to_string(repo.join("new/a.txt")).unwrap(), "A");
+	let second = if case_insensitive {
+		"new/b.txt"
+	} else {
+		"NEW/b.txt"
+	};
+	assert_eq!(fs::read_to_string(repo.join(second)).unwrap(), "B");
+}
