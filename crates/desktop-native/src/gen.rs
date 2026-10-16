@@ -123,6 +123,13 @@ impl<L> fmt::Debug for Gen<L> {
 	}
 }
 
+/// A stamp prints as its number: the E2E lines carry it (`generation=2`).
+impl<L> fmt::Display for Stamp<L> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", self.n)
+	}
+}
+
 impl<L> fmt::Debug for Stamp<L> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "Stamp({})", self.n)

@@ -1583,7 +1583,9 @@ impl WorkbenchModel {
 			workspace_path_input,
 			paste_dest_input,
 			recent_workspaces: recent::load(),
-			lifecycle: lifecycle::Lifecycle::new(1),
+			lifecycle: lifecycle::Lifecycle::new(crate::gen::Gen::starting_at(
+				1,
+			)),
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
@@ -3074,10 +3076,14 @@ impl WorkbenchModel {
 
 	/// True when this copy may write the clipboard. A cancelled token or a
 	/// generation change drops the text.
-	fn accept_copy_result(&mut self, ws_gen: u64, token: &CancelToken) -> bool {
+	fn accept_copy_result(
+		&mut self,
+		ws_gen: crate::gen::Stamp<crate::gen::WorkspaceLane>,
+		token: &CancelToken,
+	) -> bool {
 		self.is_copying = false;
 		let cancelled = token.is_cancelled();
-		let stale = self.lifecycle.generation() != ws_gen;
+		let stale = !self.lifecycle.is_current(ws_gen);
 		if !cancelled && !stale {
 			return true;
 		}
@@ -3738,7 +3744,7 @@ impl WorkbenchModel {
 					.update(&mut async_app, |model, cx| {
 						// A close or reopen bumps the lifecycle generation;
 						// a repo switch bumps the worker id.
-						if model.lifecycle.generation() != ws_gen
+						if !model.lifecycle.is_current(ws_gen)
 							|| !model.tree_worker.is_current(worker)
 						{
 							if e2e_on() {
@@ -4928,7 +4934,7 @@ impl WorkbenchModel {
 	/// reports it.
 	fn finish_copy(
 		&mut self,
-		ws_gen: u64,
+		ws_gen: crate::gen::Stamp<crate::gen::WorkspaceLane>,
 		cancel: &CancelToken,
 		result: Result<(String, usize, Msg), Msg>,
 		cx: &mut Context<Self>,
@@ -11550,7 +11556,9 @@ mod tests {
 			);
 			assert_eq!(load_after, crate::lifecycle::GitLoad::idle());
 
-			let mut lc = crate::lifecycle::Lifecycle::new(1);
+			let mut lc = crate::lifecycle::Lifecycle::new(
+				crate::gen::Gen::starting_at(1),
+			);
 			let now = std::time::Instant::now();
 			let req = lc.request(crate::lifecycle::Intent::CloseWorkspace, now);
 			assert_eq!(req, crate::lifecycle::Request::Accepted);
@@ -24520,8 +24528,9 @@ mod tests {
 				let (_tmp, shared, root, cx) = three_tabs_with_remote(cx);
 				let remote =
 					complete_remote_paste_in_background(&root, cx, &shared);
-				let before =
-					remote.read_with(cx, |m, _| m.discovery_generation.raw_for_tests());
+				let before = remote.read_with(cx, |m, _| {
+					m.discovery_generation.raw_for_tests()
+				});
 				// Consecutive real key events, with GPUI's normal event-loop
 				// turn between them; no click or test-only redraw.
 				cx.simulate_keystrokes("cmd-3");
@@ -24534,7 +24543,8 @@ mod tests {
 				);
 				wait_scaled(cx, "Cmd+R refresh on the remote tab", |cx| {
 					remote.read_with(cx, |m, _| {
-						m.discovery_generation.raw_for_tests() > before && !m.is_loading
+						m.discovery_generation.raw_for_tests() > before
+							&& !m.is_loading
 					})
 				});
 				assert_eq!(active(&root, cx), Some(2));
@@ -26295,9 +26305,11 @@ mod tests {
 				);
 				let (root, cx) = fixture.launch(cx);
 				let models = initial_scan_failures(&root, cx);
-				let generations = models
-					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation.raw_for_tests()));
+				let generations = models.each_ref().map(|m| {
+					m.read_with(cx, |m, _| {
+						m.discovery_generation.raw_for_tests()
+					})
+				});
 				cx.executor().advance_clock(Duration::from_secs(60));
 				cx.run_until_parked();
 				for (ix, model) in models.iter().enumerate() {
@@ -26308,7 +26320,10 @@ mod tests {
 						1
 					);
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation.raw_for_tests(), generations[ix]);
+						assert_eq!(
+							m.discovery_generation.raw_for_tests(),
+							generations[ix]
+						);
 						assert!(
 							m.remote.scan_error.is_some()
 								&& m.remote.scan_recovery.is_none()
@@ -26332,9 +26347,11 @@ mod tests {
 				);
 				let (root, cx) = fixture.launch(cx);
 				let models = initial_scan_failures(&root, cx);
-				let generations = models
-					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation.raw_for_tests()));
+				let generations = models.each_ref().map(|m| {
+					m.read_with(cx, |m, _| {
+						m.discovery_generation.raw_for_tests()
+					})
+				});
 				let connections =
 					fixture.worker.started_connections_for_tests();
 				cx.executor().advance_clock(Duration::from_secs(60));
@@ -26345,7 +26362,10 @@ mod tests {
 				);
 				for (ix, model) in models.iter().enumerate() {
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation.raw_for_tests(), generations[ix]);
+						assert_eq!(
+							m.discovery_generation.raw_for_tests(),
+							generations[ix]
+						);
 						assert_eq!(
 							m.remote.scan_error.as_ref().unwrap().key,
 							"remote_worker_too_old"

@@ -1460,7 +1460,7 @@ impl WorkbenchModel {
 					.and_then(|_| scan_retry_delay(retries));
 				let landed = this.update(&mut async_app, |model, cx| {
 					if !model.discovery_generation.is_current(generation)
-						|| model.lifecycle.generation() != lifecycle_generation
+						|| !model.lifecycle.is_current(lifecycle_generation)
 					{
 						return false;
 					}
@@ -1583,7 +1583,7 @@ impl WorkbenchModel {
 				if cancel.is_cancelled() { return; }
 				let _ = this.update(&mut async_app, |model, cx| {
 					if model.discovery_generation.is_current(generation)
-						&& model.lifecycle.generation() == lifecycle_generation
+						&& model.lifecycle.is_current(lifecycle_generation)
 						&& model.accepting_work()
 					{
 						model.launch_remote_scan_attempt(under, wipe, retries + 1, cx);

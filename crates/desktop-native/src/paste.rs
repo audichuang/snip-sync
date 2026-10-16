@@ -5404,7 +5404,8 @@ pub(crate) mod tests {
 		let first = PastePending::start(&pool, None, token.clone())
 			.unwrap()
 			.unwrap();
-		let mut life = crate::lifecycle::Lifecycle::new(1);
+		let mut life =
+			crate::lifecycle::Lifecycle::new(crate::gen::Gen::starting_at(1));
 		let (id, held) = life.register_read(Some(token.clone()));
 		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
 		token.cancel();
