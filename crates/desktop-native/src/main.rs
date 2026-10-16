@@ -996,8 +996,8 @@ pub struct WorkbenchModel {
 	pub is_copying: bool,
 	pub locale: Locale,
 	pub generation: u64,
-	pub preview_generation: u64,
-	pub history_generation: u64,
+	pub preview_generation: crate::gen::Gen<crate::gen::PreviewLane>,
+	pub history_generation: crate::gen::Gen<crate::gen::HistoryLane>,
 	/// Replace loads of the log that got past the discovery wait: a test
 	/// counts how many one repo-set change costs.
 	#[cfg(test)]
@@ -1540,8 +1540,8 @@ impl WorkbenchModel {
 			is_copying: false,
 			locale: loc,
 			generation: 0,
-			preview_generation: 0,
-			history_generation: 0,
+			preview_generation: Default::default(),
+			history_generation: Default::default(),
 			#[cfg(test)]
 			history_replace_loads: 0,
 			tree_generation: Default::default(),
@@ -2475,11 +2475,9 @@ impl WorkbenchModel {
 				// open that lands later must not touch it (remote.rs).
 				self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
 				self.generation = self.generation.wrapping_add(1);
-				self.preview_generation =
-					self.preview_generation.wrapping_add(1);
+				self.preview_generation.invalidate();
 				self.held_selection = None;
-				self.history_generation =
-					self.history_generation.wrapping_add(1);
+				self.history_generation.invalidate();
 				self.tree_generation.invalidate();
 				for slot in [
 					&mut self.history_cancel,
@@ -2679,9 +2677,9 @@ impl WorkbenchModel {
 	/// a late result cannot repopulate it.
 	fn release_repo_state(&mut self) {
 		self.generation = self.generation.wrapping_add(1);
-		self.preview_generation = self.preview_generation.wrapping_add(1);
+		self.preview_generation.invalidate();
 		self.held_selection = None;
-		self.history_generation = self.history_generation.wrapping_add(1);
+		self.history_generation.invalidate();
 		self.tree_generation.invalidate();
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		for slot in [
@@ -4039,12 +4037,12 @@ impl WorkbenchModel {
 			self.preview_error = None;
 		}
 		self.generation += 1;
-		self.preview_generation += 1;
+		self.preview_generation.invalidate();
 		// The reads that could have restored it are dropped.
 		self.held_selection = None;
 		let task_generation = self.generation;
 		if reload_log {
-			self.history_generation += 1;
+			self.history_generation.invalidate();
 			let _ = arm_cancel(&mut self.history_cancel);
 			self.log_reload_for = Some(task_generation);
 		}
@@ -4452,8 +4450,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
@@ -4522,7 +4519,7 @@ impl WorkbenchModel {
 			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					if e2e_on() {
 						app_log!(
 							"[APP:PREVIEW_DISCARDED: stale path={file_path}]"
@@ -6246,7 +6243,7 @@ impl WorkbenchModel {
 			return;
 		}
 		// Drop in-flight reads for the closed tab.
-		self.preview_generation += 1;
+		self.preview_generation.invalidate();
 		let _ = arm_cancel(&mut self.preview_cancel);
 		self.clear_preview();
 		self.reader.release_retained();
@@ -25252,7 +25249,7 @@ mod tests {
 				let before = ta.read_with(cx, |m, _| {
 					(
 						m.lifecycle.generation(),
-						m.history_generation,
+						m.history_generation.raw_for_tests(),
 						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,
@@ -25263,7 +25260,7 @@ mod tests {
 				let after = ta.read_with(cx, |m, _| {
 					(
 						m.lifecycle.generation(),
-						m.history_generation,
+						m.history_generation.raw_for_tests(),
 						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,

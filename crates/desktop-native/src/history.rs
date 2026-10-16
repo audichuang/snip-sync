@@ -1336,8 +1336,7 @@ impl WorkbenchModel {
 			return;
 		};
 
-		self.history_generation += 1;
-		let task_generation = self.history_generation;
+		let task_generation = self.history_generation.bump();
 		let cancel = arm_cancel(&mut self.history_cancel);
 		self.history_extending = !matches!(load, PageLoad::Replace(_));
 		if !self.history_extending {
@@ -1431,7 +1430,7 @@ impl WorkbenchModel {
 				.await;
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.history_generation != task_generation {
+				if !model.history_generation.is_current(task_generation) {
 					return;
 				}
 				model.history_extending = false;
@@ -1630,7 +1629,7 @@ impl WorkbenchModel {
 		// read able to install (#202). A Project or Changes read still
 		// loading has set it false and keeps its generation.
 		if self.preview_pending_from_log {
-			self.preview_generation += 1;
+			self.preview_generation.invalidate();
 			self.preview_pending_from_log = false;
 			self.preview_loading = false;
 		}
@@ -2122,8 +2121,7 @@ impl WorkbenchModel {
 			return;
 		};
 		self.user_action();
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		self.selected_commit =
 			Some(Box::<str>::from(id.as_str()).into_string());
 		self.range_head = None;
@@ -2472,8 +2470,7 @@ impl WorkbenchModel {
 			self.clear_commit_selection();
 			return;
 		};
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		self.details_generation.invalidate();
 		self.reset_commit_view();
 		self.reset_selection_details();
@@ -2529,7 +2526,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					return;
 				}
 				match res {
@@ -2640,8 +2637,7 @@ impl WorkbenchModel {
 			Box::<str>::from(newer).into_string(),
 			Box::<str>::from(older).into_string(),
 		);
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		self.compare = Some((older.clone(), newer.clone()));
 		self.details_generation.invalidate();
 		// Compare shows only its own header, so the whole view and the
@@ -2675,7 +2671,7 @@ impl WorkbenchModel {
 		source: GitSource,
 		preview_source: PreviewSource,
 		parents: Option<Vec<String>>,
-		task_generation: u64,
+		task_generation: crate::gen::Stamp<crate::gen::PreviewLane>,
 		cx: &mut Context<Self>,
 	) {
 		if !self.accepting_work() {
@@ -2767,7 +2763,7 @@ impl WorkbenchModel {
 				hold.timer(delay).await;
 			}
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					return;
 				}
 				match res {
@@ -2899,8 +2895,7 @@ impl WorkbenchModel {
 		let Some(root) = root else {
 			return;
 		};
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		self.hold_shown_commit_file(path, false);
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
@@ -2934,7 +2929,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					return;
 				}
 				if model.apply_source_preview(
@@ -3204,8 +3199,7 @@ impl WorkbenchModel {
 		let Some(root) = self.repo_root() else {
 			return;
 		};
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
@@ -3239,7 +3233,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					return;
 				}
 				model.preview_loading = false;
@@ -3857,7 +3851,7 @@ impl WorkbenchModel {
 				Some(multi_log::Feed::new(root, name, mine))
 			})
 			.collect();
-		self.history_generation += 1;
+		self.history_generation.invalidate();
 		let _ = arm_cancel(&mut self.history_cancel);
 		self.history_error = None;
 		self.history_loaded = false;
@@ -3904,8 +3898,7 @@ impl WorkbenchModel {
 			.filter(|q| !q.is_empty());
 		let ref_filter = self.active_ref_filter.clone();
 		let want_email = first && i == 0;
-		self.history_generation += 1;
-		let generation = self.history_generation;
+		let generation = self.history_generation.bump();
 		let cancel = arm_cancel(&mut self.history_cancel);
 		self.history_extending = true;
 		let mut async_app = cx.to_async();
@@ -3936,7 +3929,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.history_generation != generation {
+				if !model.history_generation.is_current(generation) {
 					return;
 				}
 				model.history_extending = false;
