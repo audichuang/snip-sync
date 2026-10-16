@@ -1574,6 +1574,17 @@ fn a_paste_target_refuses_a_changed_repo_under_a_non_repo_destination_on_both_si
 		fs::create_dir_all(dir).unwrap();
 		init_repo(&dir.join("repoA"));
 	}
+	// The two destinations must not lie in a repository themselves, or the
+	// repository set this test is about changes with the temp directory.
+	for dir in [&ws, &local_real] {
+		assert!(
+			matches!(
+				snip_core::gitsrc::Git::open(dir),
+				Err(snip_core::gitsrc::GitError::NotARepository(_))
+			),
+			"{dir:?} lies inside a git repository; this test needs a non-repo destination",
+		);
+	}
 	let local_dest = spelled(tmp.path(), &local_real, "local");
 	let text = entry("repoA/x.txt", "x");
 	let route = PasteRoute::default();

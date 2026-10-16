@@ -7875,7 +7875,10 @@ fn test_a_snapshot_without_the_new_fields_still_revalidates_and_matches() {
 	object.remove("symlinked_dirs");
 	let old: DestinationFreshnessSnapshot =
 		serde_json::from_value(json).unwrap();
-	assert_eq!((&old.repos, &old.missing_dirs), (&None, &None));
+	assert_eq!(
+		(&old.repos, &old.missing_dirs, &old.symlinked_dirs),
+		(&None, &None, &None)
+	);
 	old.revalidate().unwrap();
 	assert!(new.matches_preview(&old));
 

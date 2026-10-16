@@ -68,7 +68,7 @@
 
 - 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
   (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;錯誤訊息格式呈現為單一目標路徑並列出衝突的操作名稱（如 `target collision: multiple operations target '<p>': previous was 'create a', current is 'create b'`，不重複輸出路徑亦不暴露內部大小寫摺疊字串）;
-  (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。freshness 涵蓋寫入鎖會鎖住的每個 repo(每個寫入或刪除的資料夾往上最近的 `.git`;預覽後多出或少了這樣的 repo 也算過期),也涵蓋目標路徑上的資料夾:預覽時不存在的資料夾後來變成檔案或 symlink、或已存在的資料夾被換成檔案,都整批以過期拒絕;變成一般資料夾或被刪掉則照常寫入。
+  (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。freshness 涵蓋寫入鎖會鎖住的每個 repo(每個寫入或刪除的資料夾往上最近的 `.git`;預覽後多出或少了這樣的 repo 也算過期),也涵蓋目標路徑上的資料夾:預覽時不存在的資料夾後來變成檔案或 symlink、或已存在的資料夾被換成檔案或 symlink(預覽時就是 symlink 的資料夾不算),都整批以過期拒絕;變成一般資料夾或被刪掉則照常寫入。
   (c) 寫入鎖:檔案貼上與 commit 重放套用前,先取得目的地每個 repo 的寫入鎖(git dir 裡的 `snip-paste.lock`,OS 檔案鎖,跨行程有效,行程結束即釋放),拿到鎖之後才重新檢查 freshness 並寫入。另一個貼上(另一個工作區分頁、遠端 worker 或 CLI)正持有鎖時立刻拒絕、什麼都不寫,不排隊等待(`GitError::WorktreeBusy`;桌面顯示「這個儲存庫正在被另一個貼上作業使用，請稍後再試」,CLI exit 1)。不在任何 repo 裡的資料夾不加鎖:鎖只放在 git dir,不在一般資料夾留下檔案。無法建立或鎖住鎖檔(而非被占用)時整批以 `Io` 拒絕,不會略過鎖照寫。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫,含 Win32 結尾點或空白拼寫如 `.git.`)視為 unsafe/unresolved 拒絕(檔案模式的寫入與刪除、commit 模式的 `path`/`old_path` 皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、寫入或刪除的目標把 symlink 解析到底後落在 Git 目錄(repo 的 `.git`、bare repo、獨立 git dir)裡的,規劃時列為略過(檔案模式 UNRESOLVED_PATH、commit 模式 UnsafePath)、寫入前再檢查一次(只拒絕那一筆,其餘照寫)、
@@ -258,7 +258,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - **貼上**(協定 4):
   - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地是目前的 repo,沒有 repo 時是工作區資料夾。
   - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
-  - Apply 不信任保留的舊計畫:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。master 送回的快照裡的 repo 清單必須和 worker 從同一份目標路徑算出的完全相同,比對在執行任何 git 之前;快照列出的新資料夾必須在工作區內。舊 master 送回的快照沒有這兩個欄位時,只比對原有欄位。
+  - Apply 不信任保留的舊計畫:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。master 送回的快照裡的 repo 清單必須和 worker 從同一份目標路徑算出的完全相同,比對在執行任何 git 之前;快照列出的新資料夾與 symlink 資料夾必須在工作區內。舊 master 送回的快照沒有這些欄位時,只比對原有欄位。
   - 協定 7 的檔案預覽以 `PrepareImport` 上傳 payload，回覆路徑、動作、略過原因、新鮮度、摘要與來源 entry 序號，不回傳檔案全文。master 從同一份 payload 還原內容，核對完整計畫 digest；目的端 diff 仍按需求讀取。
   - 協定 8 的 commit 重放同樣只上傳一次 payload：`PrepareReplay` 上傳 payload，worker 把自己產生的 `CommitReplayPreview` 以單次使用的 token 保留在同一條連線租約中（與檔案貼上共用每個 Client 最多 2 份的上限）；回覆仍帶計畫與新鮮度供顯示。`ApplyPreparedReplay` 只送 token、digest 與 check_only；覆寫閘門與 CLI 的檢查同樣經由 token，檢查通過後 token 保留給之後的套用。寫入前的 `Busy`／`Timeout` 保留 token。`TOKEN_GONE` 時在同一條連線上只送一次 `ReplayApply`（全文），由 worker 重新規劃並比對。協定 4–7 的 worker 沿用 `ReplayPlan`／`ReplayApply`。
   - worker 可保留原始 payload、mapping、canonical workspace／目的地與 digest，發出單次使用的 token；不快取可直接執行的計畫。每個 worker 的保留上限為 128 MiB、8 筆、5 分鐘；記憶體計入字串／路由配置容量與正在套用的 payload。容量不足或 master 未要求保留時，仍回傳精簡預覽但不給 token，套用沿用 `ImportApply` 上傳全文。

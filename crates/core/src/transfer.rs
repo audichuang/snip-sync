@@ -764,6 +764,12 @@ pub struct DestinationFreshnessSnapshot {
 	/// symlink there is stale.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub missing_dirs: Option<HashSet<PathBuf>>,
+	/// Folders on a planned create's path that were symlinks to a folder at
+	/// preview (below the target's root). A folder that is a symlink now but
+	/// was not one then would carry the write somewhere the preview did not
+	/// show, so it is stale. `None`: not recorded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub symlinked_dirs: Option<HashSet<PathBuf>>,
 }
 
 impl DestinationFreshnessSnapshot {
@@ -811,7 +817,10 @@ impl DestinationFreshnessSnapshot {
 					);
 			}
 		}
-		if let Some(dirs) = &self.missing_dirs {
+		for dirs in [&self.missing_dirs, &self.symlinked_dirs]
+			.into_iter()
+			.flatten()
+		{
 			bytes = bytes
 				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
 					dirs.capacity(),
@@ -889,7 +898,7 @@ impl DestinationFreshnessSnapshot {
 			);
 		}
 
-		let missing_dirs = capture_missing_dirs(plan, opts)?;
+		let (missing_dirs, symlinked_dirs) = capture_folder_chain(plan, opts)?;
 		let repos = capture_destination_repos(&roots, &target_files, opts)?;
 
 		cancelled_err(opts, "import-freshness")?;
@@ -898,6 +907,7 @@ impl DestinationFreshnessSnapshot {
 			target_files,
 			repos: Some(repos),
 			missing_dirs: Some(missing_dirs),
+			symlinked_dirs: Some(symlinked_dirs),
 		})
 	}
 
@@ -947,15 +957,17 @@ impl DestinationFreshnessSnapshot {
 			target_files,
 			repos: None,
 			missing_dirs: None,
+			symlinked_dirs: None,
 		})
 	}
 
 	/// Whether this snapshot, captured again on the worker, still describes the
 	/// `preview` a master showed. A field the preview lacks is not compared: an
 	/// older master drops fields it does not know, and the worker's own Apply
-	/// still re-checks its fresh capture under the lock. `missing_dirs` is never
-	/// compared: a planned folder that now exists as a folder is fine, and
-	/// `revalidate` has already checked the preview's list against the disk.
+	/// still re-checks its fresh capture under the lock. `missing_dirs` and
+	/// `symlinked_dirs` are never compared: a planned folder that now exists as
+	/// a folder is fine, and `revalidate` has already checked the preview's
+	/// lists against the disk.
 	pub fn matches_preview(&self, preview: &Self) -> bool {
 		self.roots == preview.roots
 			&& self.target_files == preview.target_files
@@ -1027,9 +1039,12 @@ impl DestinationFreshnessSnapshot {
 			}
 		}
 
-		// A created path needs a folder at its nearest existing ancestor.
-		// This also guards a snapshot that carries no `missing_dirs`.
+		// A created path needs a folder at its nearest existing ancestor,
+		// and no folder on the way down to it may have become a symlink since
+		// the preview. This also guards a snapshot that carries no
+		// `missing_dirs`.
 		let mut checked = HashSet::new();
+		let mut chain_ok: HashSet<PathBuf> = HashSet::new();
 		for (path, target) in &self.target_files {
 			if target.existed {
 				continue;
@@ -1055,6 +1070,27 @@ impl DestinationFreshnessSnapshot {
 							return Err(created_where_a_folder_was_needed_at(
 								root, ancestor,
 							));
+						}
+						if let Some(linked) = &self.symlinked_dirs {
+							for dir in ancestor.ancestors().take_while(|a| {
+								*a != root && a.starts_with(root)
+							}) {
+								if chain_ok.contains(dir) {
+									break;
+								}
+								let now_a_link = fs::symlink_metadata(dir)
+									.map_err(TransferError::Io)?
+									.file_type()
+									.is_symlink();
+								if now_a_link && !linked.contains(dir) {
+									return Err(
+										created_where_a_folder_was_needed_at(
+											root, dir,
+										),
+									);
+								}
+								chain_ok.insert(dir.to_path_buf());
+							}
 						}
 						found = true;
 						break;
@@ -1175,15 +1211,17 @@ fn not_a_directory() -> io::Error {
 	}
 }
 
-/// Folders on a planned create's path that do not exist yet. A file or a
-/// symlink that is not a folder where a folder is needed is refused here,
-/// the same on every platform.
-fn capture_missing_dirs(
+/// The folders on every planned create's path, below its root: those that do
+/// not exist yet, and those that are symlinks to a folder. A file or a
+/// symlink that is not a folder where a folder is needed is refused here, the
+/// same on every platform.
+fn capture_folder_chain(
 	plan: &RestorePlan,
 	opts: &RunOptions,
-) -> Result<HashSet<PathBuf>, TransferError> {
+) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>), TransferError> {
 	let mut missing = HashSet::new();
-	let mut folders = HashSet::new();
+	let mut linked = HashSet::new();
+	let mut seen = HashSet::new();
 	for op in &plan.create_operations {
 		cancelled_err(opts, "import-freshness")?;
 		if op.existed {
@@ -1191,26 +1229,21 @@ fn capture_missing_dirs(
 		}
 		let mut dir = op.absolute_path.parent();
 		while let Some(d) = dir {
-			// The root is the nearest existing folder at the latest; whether
-			// it is fit is checked elsewhere.
+			// The root itself is not looked at: whether it is fit is checked
+			// elsewhere.
 			if d == op.root_path
 				|| !d.starts_with(&op.root_path)
-				|| folders.contains(d)
-				|| missing.contains(d)
+				|| !seen.insert(d.to_path_buf())
 			{
 				break;
 			}
 			match fs::symlink_metadata(d) {
-				Ok(meta) if meta.file_type().is_dir() => {
-					folders.insert(d.to_path_buf());
-					break;
-				}
+				Ok(meta) if meta.file_type().is_dir() => {}
 				Ok(meta)
 					if meta.file_type().is_symlink()
 						&& fs::metadata(d).is_ok_and(|m| m.is_dir()) =>
 				{
-					folders.insert(d.to_path_buf());
-					break;
+					linked.insert(d.to_path_buf());
 				}
 				Ok(_) => return Err(TransferError::Io(not_a_directory())),
 				Err(e)
@@ -1226,7 +1259,7 @@ fn capture_missing_dirs(
 			dir = d.parent();
 		}
 	}
-	Ok(missing)
+	Ok((missing, linked))
 }
 
 /// The repositories an Apply of the snapshot's targets locks, with the state
@@ -4306,6 +4339,7 @@ fn capture_replay_freshness(
 		target_files,
 		repos: None,
 		missing_dirs: None,
+		symlinked_dirs: None,
 	})
 }
 

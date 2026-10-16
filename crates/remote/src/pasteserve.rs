@@ -138,7 +138,8 @@ fn check_snapshot(
 			.target_files
 			.iter()
 			.all(|(p, t)| inside(p) && inside(t.root.path()))
-		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p));
+		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p))
+		&& freshness.symlinked_dirs.iter().flatten().all(|p| inside(p));
 	if ok {
 		Ok(())
 	} else {
