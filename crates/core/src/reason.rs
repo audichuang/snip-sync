@@ -292,6 +292,12 @@ pub enum Reason {
 	DestinationChanged {
 		change: StaleChange,
 	},
+	/// An Apply would make `count` folders the user named as a destination
+	/// or an import path without having agreed to them. A number only: the
+	/// folders themselves come from the plan, never from the error.
+	NewDirsNotConfirmed {
+		count: u64,
+	},
 	CrossRepoCommits,
 	/// `at` is the commit that breaks the chain and `first_parent` its first
 	/// parent, if any. Both are shas.
@@ -483,6 +489,7 @@ impl Reason {
 			| Self::OutsideScope { .. }
 			| Self::SourceChanged { .. }
 			| Self::DestinationChanged { .. }
+			| Self::NewDirsNotConfirmed { .. }
 			| Self::GitBusy
 			| Self::RepoBusy
 			| Self::WorkerNeedsRestart
@@ -603,6 +610,7 @@ impl Reason {
 			| Self::Shallow { .. }
 			| Self::OutsideShare
 			| Self::EmptySelection
+			| Self::NewDirsNotConfirmed { .. }
 			| Self::CrossRepoCommits
 			| Self::Discontinuous { .. }
 			| Self::NotEnoughCommits { .. }
@@ -686,6 +694,7 @@ pub mod test_support {
 			Reason::DestinationChanged {
 				change: StaleChange::Created { rel: ok() },
 			},
+			Reason::NewDirsNotConfirmed { count: 2 },
 			Reason::CrossRepoCommits,
 			Reason::Discontinuous {
 				base: ok(),
@@ -798,6 +807,7 @@ mod tests {
 			Reason::ScanErrorsOmitted { .. } => 43,
 			Reason::DepthLimitedOmitted { .. } => 44,
 			Reason::WorkerClosed => 45,
+			Reason::NewDirsNotConfirmed { .. } => 46,
 		}
 	}
 

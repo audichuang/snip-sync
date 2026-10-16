@@ -140,6 +140,11 @@ pub struct RestoreSelection {
 	pub skip_existing: bool,
 	pub unchecked_creates: BTreeSet<usize>,
 	pub unchecked_deletes: BTreeSet<usize>,
+	/// The new folders the user agreed to make (absolute; a worker's own
+	/// paths for a remote plan). Apply refuses when the rows kept need one
+	/// that is not here.
+	#[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+	pub confirmed_new_dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +164,15 @@ pub struct RestoreExecutionResult {
 	/// end to word. Empty from a peer that predates it.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub failures: Vec<RestoreFailure>,
+	/// The folders the user named (a destination or an import path) that
+	/// this Apply made and that are still there. Additive on the wire: an
+	/// older worker sends none.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub created_dirs: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+	*n == 0
 }
 
 /// One failed entry: the plan's relative path and why, as a [`Reason`].

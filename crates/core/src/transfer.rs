@@ -614,6 +614,12 @@ pub enum TransferError {
 		at: String,
 		first_parent: Option<String>,
 	},
+	#[error(
+		"{} folder(s) would be created without consent: {}",
+		.dirs.len(),
+		.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+	)]
+	NewDirsNotConfirmed { dirs: Vec<PathBuf> },
 	#[error(transparent)]
 	Git(#[from] GitError),
 	#[error(transparent)]
@@ -676,6 +682,9 @@ impl TransferError {
 					change: change.clone(),
 				}
 			}
+			Self::NewDirsNotConfirmed { dirs } => Reason::NewDirsNotConfirmed {
+				count: dirs.len() as u64,
+			},
 			Self::CrossRepoCommitsNotSupported => Reason::CrossRepoCommits,
 			Self::DiscontinuousCommits {
 				base,
@@ -999,6 +1008,13 @@ pub struct DestinationFreshnessSnapshot {
 	/// did not show, so it is stale. `None`: not recorded.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub symlinked_dirs: Option<HashMap<PathBuf, PathBuf>>,
+	/// The folders of `missing_dirs` the user named as a destination or an
+	/// import path (a `PlacedRoot`'s tail), as opposed to those a file path
+	/// implies. Apply makes them only with consent, and one that exists by
+	/// then, as anything, is stale. `None`: not recorded (no tail, an older
+	/// peer).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub requested_dirs: Option<HashSet<PathBuf>>,
 }
 
 impl DestinationFreshnessSnapshot {
@@ -1047,6 +1063,15 @@ impl DestinationFreshnessSnapshot {
 			}
 		}
 		if let Some(dirs) = &self.missing_dirs {
+			bytes = bytes
+				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
+					dirs.capacity(),
+				));
+			for dir in dirs {
+				bytes = bytes.saturating_add(dir.capacity());
+			}
+		}
+		if let Some(dirs) = &self.requested_dirs {
 			bytes = bytes
 				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
 					dirs.capacity(),
@@ -1146,6 +1171,7 @@ impl DestinationFreshnessSnapshot {
 			repos: Some(repos),
 			missing_dirs: Some(missing_dirs),
 			symlinked_dirs: Some(symlinked_dirs),
+			requested_dirs: None,
 		})
 	}
 
@@ -1196,6 +1222,7 @@ impl DestinationFreshnessSnapshot {
 			repos: None,
 			missing_dirs: None,
 			symlinked_dirs: None,
+			requested_dirs: None,
 		})
 	}
 
@@ -1222,6 +1249,10 @@ impl DestinationFreshnessSnapshot {
 				.symlinked_dirs
 				.as_ref()
 				.is_none_or(|then| self.symlinked_dirs.as_ref() == Some(then))
+			&& preview
+				.requested_dirs
+				.as_ref()
+				.is_none_or(|then| self.requested_dirs.as_ref() == Some(then))
 	}
 
 	/// Every folder a write is rooted in still resolves to the canonical
@@ -1303,12 +1334,26 @@ impl DestinationFreshnessSnapshot {
 			}
 		}
 
-		if let Some(missing) = &self.missing_dirs {
-			let mut missing: Vec<&PathBuf> = missing.iter().collect();
+		if self.missing_dirs.is_some() || self.requested_dirs.is_some() {
+			// A folder the user named (a destination, an import path) is
+			// strict: whatever is there now, it was not there when the
+			// preview put this destination under an anchor, so the paths the
+			// rows show are not the ones a write would reach.
+			let mut missing: Vec<&PathBuf> = self
+				.missing_dirs
+				.iter()
+				.chain(self.requested_dirs.iter())
+				.flatten()
+				.collect();
 			missing.sort();
+			missing.dedup();
 			for dir in missing {
+				let requested = self
+					.requested_dirs
+					.as_ref()
+					.is_some_and(|dirs| dirs.contains(dir));
 				match fs::symlink_metadata(dir) {
-					Ok(meta) if meta.file_type().is_dir() => {}
+					Ok(meta) if meta.file_type().is_dir() && !requested => {}
 					Ok(_) => {
 						return Err(self.created_where_a_folder_was_needed(dir))
 					}
@@ -1721,9 +1766,50 @@ impl TransferImportPlan {
 		&self.restore_plan.skipped_operations
 	}
 
+	/// Every create's folders (what `--dry-run` lists).
+	pub fn new_dirs(&self) -> NewDirs {
+		self.new_dirs_for(&RestoreSelection::default())
+	}
+
+	/// Only the folders the creates `selection` keeps need: an unchecked row,
+	/// and an existing file, need none.
+	pub fn new_dirs_for(&self, selection: &RestoreSelection) -> NewDirs {
+		let empty = HashSet::new();
+		let freshness = &self.destination_freshness;
+		let missing = freshness.missing_dirs.as_ref().unwrap_or(&empty);
+		let requested = freshness.requested_dirs.as_ref().unwrap_or(&empty);
+		let mut found: BTreeSet<(usize, PathBuf)> = BTreeSet::new();
+		for (i, op) in self.create_operations().iter().enumerate() {
+			if op.existed || selection.unchecked_creates.contains(&i) {
+				continue;
+			}
+			// A folder that exists has every ancestor existing: what is
+			// missing is one run from the file upward.
+			let mut dir = op.absolute_path.parent();
+			while let Some(d) = dir {
+				if !missing.contains(d) {
+					break;
+				}
+				found.insert((d.components().count(), d.to_path_buf()));
+				dir = d.parent();
+			}
+		}
+		let mut out = NewDirs::default();
+		for (_, dir) in found {
+			if requested.contains(&dir) {
+				out.requested.push(dir);
+			} else {
+				out.incidental.push(dir);
+			}
+		}
+		out
+	}
+
 	/// Applies the planned restore after verifying destination freshness.
 	/// If any destination repo or file changed after preview, returns a stale error
-	/// and writes nothing.
+	/// and writes nothing. Folders the user named that do not exist are made
+	/// only when `selection.confirmed_new_dirs` names every one the rows kept
+	/// need; a file's own intermediate folders are made as it is written.
 	pub fn apply(
 		&self,
 		selection: &RestoreSelection,
@@ -1764,13 +1850,144 @@ impl TransferImportPlan {
 		let _locks =
 			lock_destination_repos(directories, &RunOptions::default())?;
 		self.destination_freshness.revalidate()?;
-		let result = restore::execute_restore_plan_observed(
+
+		// Stale outranks a missing consent: a plan that changed is previewed
+		// again, and the agreement to the old one is not carried over.
+		let new = self.new_dirs_for(selection);
+		let unconfirmed: Vec<PathBuf> = new
+			.requested
+			.iter()
+			.filter(|d| !selection.confirmed_new_dirs.contains(*d))
+			.cloned()
+			.collect();
+		if !unconfirmed.is_empty() {
+			return Err(TransferError::NewDirsNotConfirmed {
+				dirs: unconfirmed,
+			});
+		}
+		let made = self.make_requested_dirs(&new.requested)?;
+
+		let mut result = restore::execute_restore_plan_observed(
 			&self.restore_plan,
 			selection,
 			after_write,
 		);
+		let wrote = result.created_count
+			+ result.overwritten_count
+			+ result.deleted_count
+			> 0;
+		result.created_dirs = finish_new_dirs(&made, wrote);
 		Ok(result)
 	}
+
+	/// Makes `dirs` (shallow to deep), one level at a time, under the lock
+	/// and after `revalidate`. A failure at any level takes back the levels
+	/// already made, and nothing is written.
+	fn make_requested_dirs(
+		&self,
+		dirs: &[PathBuf],
+	) -> Result<Vec<PathBuf>, TransferError> {
+		let mut made: Vec<PathBuf> = Vec::new();
+		for dir in dirs {
+			let step = (|| -> Result<(), TransferError> {
+				if paths::lands_in_git_dir(dir) {
+					return Err(TransferError::UnsafePath(
+						dir.display().to_string(),
+					));
+				}
+				new_dir_hook(NewDirStage::BeforeCreate, dir)?;
+				match fs::create_dir(dir) {
+					Ok(()) => made.push(dir.clone()),
+					Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+						return Err(self
+							.destination_freshness
+							.created_where_a_folder_was_needed(dir))
+					}
+					Err(e) => return Err(TransferError::Io(e)),
+				}
+				new_dir_hook(NewDirStage::AfterCreate, dir)?;
+				// Someone put a symlink where the folder was just made: the
+				// rows would land somewhere the preview did not show.
+				if dunce::canonicalize(dir)? != *dir {
+					return Err(TransferError::StaleDestination {
+						root: dir.parent().unwrap_or(dir).to_path_buf(),
+						reason: format!(
+							"folder '{}' was replaced right after it was made",
+							dir.display()
+						),
+						change: StaleChange::Preview,
+					});
+				}
+				Ok(())
+			})();
+			if let Err(e) = step {
+				remove_new_dirs(&made);
+				return Err(e);
+			}
+		}
+		Ok(made)
+	}
+}
+
+/// The folders an Apply would make, shallow to deep, each once. `requested`
+/// need the user's consent (`RestoreSelection::confirmed_new_dirs`);
+/// `incidental` are made as files are written, as always.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewDirs {
+	pub requested: Vec<PathBuf>,
+	pub incidental: Vec<PathBuf>,
+}
+
+/// Where `make_requested_dirs` is in a folder: a test injects a failure or
+/// an interloper here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewDirStage {
+	BeforeCreate,
+	AfterCreate,
+}
+
+#[cfg(test)]
+type NewDirHook = Box<dyn Fn(NewDirStage, &Path) -> io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+	static NEW_DIR_HOOK: std::cell::RefCell<Option<NewDirHook>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn new_dir_hook(stage: NewDirStage, dir: &Path) -> Result<(), TransferError> {
+	NEW_DIR_HOOK
+		.with(|slot| match slot.borrow().as_ref() {
+			Some(hook) => hook(stage, dir),
+			None => Ok(()),
+		})
+		.map_err(TransferError::Io)
+}
+
+#[cfg(not(test))]
+fn new_dir_hook(_stage: NewDirStage, _dir: &Path) -> Result<(), TransferError> {
+	Ok(())
+}
+
+/// Takes back, deepest first, the folders `made`: a folder that is not empty
+/// stays.
+fn remove_new_dirs(made: &[PathBuf]) {
+	for dir in made.iter().rev() {
+		let _ = fs::remove_dir(dir);
+	}
+}
+
+/// After the rows ran: a paste that wrote and deleted nothing leaves no
+/// folder it made behind (one with something in it stays). Returns how many
+/// of `made` are still there.
+fn finish_new_dirs(made: &[PathBuf], wrote: bool) -> usize {
+	if !wrote {
+		remove_new_dirs(made);
+	}
+	made.iter()
+		.filter(|d| fs::symlink_metadata(d).is_ok())
+		.count()
 }
 
 // ---------------------------------------------------------------------------
@@ -4130,11 +4347,30 @@ pub fn plan_import_parsed_with(
 	};
 
 	cancelled_err(opts, "plan-import")?;
-	let destination_freshness = DestinationFreshnessSnapshot::capture_with(
+	let mut destination_freshness = DestinationFreshnessSnapshot::capture_with(
 		destination_roots,
 		&restore_plan,
 		opts,
 	)?;
+	// The folders the user named: a tail's names that a create's path needs.
+	// Only when there are some, so a plan without a tail is what it was.
+	if let Some(missing) = &destination_freshness.missing_dirs {
+		let mut requested = HashSet::new();
+		for placed in mapping
+			.primary_destination
+			.iter()
+			.chain(mapping.prefix_destinations.values())
+		{
+			for dir in placed.new_chain() {
+				if missing.contains(&dir) {
+					requested.insert(dir);
+				}
+			}
+		}
+		if !requested.is_empty() {
+			destination_freshness.requested_dirs = Some(requested);
+		}
+	}
 
 	Ok((
 		TransferImportPlan {
@@ -4802,6 +5038,7 @@ fn capture_replay_freshness(
 		repos: None,
 		missing_dirs: None,
 		symlinked_dirs: None,
+		requested_dirs: None,
 	})
 }
 
