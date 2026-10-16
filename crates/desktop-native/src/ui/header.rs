@@ -60,7 +60,7 @@ impl WorkbenchModel {
 				.h(px(RECENT_ROW_H))
 				.flex_shrink_0()
 				// The row clips a long path; hover shows all of it.
-				.tooltip(tip(path.display().to_string()))
+				.tip(path.display().to_string())
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.close_overlay(
@@ -111,7 +111,7 @@ impl WorkbenchModel {
 				.debug_selector(move || selector)
 				.h(px(RECENT_ROW_H))
 				.flex_shrink_0()
-				.tooltip(tip(format!("{}:{}", r.host, r.path)))
+				.tip(format!("{}:{}", r.host, r.path))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.open_remote_recent(n, cx);
@@ -301,14 +301,10 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().hover_bg)))
 					.when(workspace_menu_open, |d| d.bg(rgb(pal().hover_bg)))
-					// Open, the menu is what the pointer is after: a
-					// tooltip here covers its first item (#203).
-					.when(!workspace_menu_open, |d| {
-						d.tooltip(tip(format!(
-							"{tip_text} · {}",
-							mac_keys(t("tip_workspace_menu", loc))
-						)))
-					})
+					.tip(format!(
+						"{tip_text} · {}",
+						mac_keys(t("tip_workspace_menu", loc))
+					))
 					.on_click(cx.listener(|this, _, window, cx| {
 						this.toggle_workspace_menu_at(Some(window), cx);
 					}))
@@ -461,8 +457,7 @@ impl WorkbenchModel {
 				.hover(|s| s.bg(rgb(pal().hover_bg)))
 				.when(open, |d| d.bg(rgb(pal().hover_bg)))
 				.map(focus_ring)
-				// No tooltip over an open popup (IntelliJ hides it).
-				.when(!open, |d| d.tooltip(tip(tooltip)))
+				.tip(tooltip)
 				.child(icon(ic, 14.))
 				.child(clip_text(label).font_weight(FontWeight::SEMIBOLD))
 				.child(icon(Icon::ChevronDown, 10.))
@@ -878,11 +873,11 @@ impl WorkbenchModel {
 				fill_text(status.clone())
 					.id("status-text")
 					.debug_selector(|| "status-text".into())
-					.tooltip({
+					.live_tip({
 						// The status is a Msg: read it and the language at
 						// draw time, or an open tooltip keeps old text (#208).
 						let model = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							model
 								.upgrade()
 								.map(|m| {
@@ -891,7 +886,7 @@ impl WorkbenchModel {
 								})
 								.unwrap_or_default()
 								.into()
-						})
+						}
 					})
 					.mr(px(8.))
 			})
@@ -922,7 +917,7 @@ impl WorkbenchModel {
 						.max_w(px(200.))
 						.cursor_pointer()
 						.hover(|s| s.bg(rgb(pal().hover_bg)))
-						.tooltip(tip(t("tip_vcs_branch", loc)))
+						.tip(t("tip_vcs_branch", loc))
 						.on_click(cx.listener(|this, _, window, cx| {
 							this.open_popover_from(
 								Popover::Ref,
@@ -951,7 +946,7 @@ impl WorkbenchModel {
 				.px(px(6.))
 				.text_size(px(SMALL_TEXT))
 				.text_color(rgb(pal().text_muted))
-				.tooltip(tip(t("tip_language", loc)))
+				.tip(t("tip_language", loc))
 				.on_click(cx.listener(|this, _, _, cx| this.toggle_locale(cx)))
 				.children(probe(&self.probes, "btn-locale")),
 			)

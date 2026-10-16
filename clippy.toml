@@ -1,0 +1,8 @@
+disallowed-methods = [
+	{ path = "gpui::StatefulInteractiveElement::tooltip", reason = "use TipExt::tip / live_tip: they go through the tooltip gate" },
+	{ path = "gpui::StatefulInteractiveElement::hoverable_tooltip", reason = "use TipExt::tip / live_tip: they go through the tooltip gate" },
+	{ path = "gpui::Interactivity::tooltip", reason = "use TipExt::tip / live_tip: they go through the tooltip gate" },
+	{ path = "gpui::Interactivity::hoverable_tooltip", reason = "use TipExt::tip / live_tip: they go through the tooltip gate" },
+	{ path = "gpui::InteractiveElement::on_mouse_down_out", reason = "a floating panel is built through overlay::overlay_panel" },
+	{ path = "gpui::Interactivity::on_mouse_down_out", reason = "a floating panel is built through overlay::overlay_panel" },
+]

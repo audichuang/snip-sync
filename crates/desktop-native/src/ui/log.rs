@@ -795,19 +795,6 @@ pub(super) fn log_icon_button(
 	enabled: bool,
 	active: bool,
 ) -> Stateful<Div> {
-	log_icon_button_tip(id, ic, Some(tooltip.into()), enabled, active)
-}
-
-/// `log_icon_button` whose tooltip can be left off: a button that opens a
-/// menu below itself passes `None` while the menu is open, or the tooltip
-/// covers the menu's first item (#203).
-pub(super) fn log_icon_button_tip(
-	id: &'static str,
-	ic: Icon,
-	tooltip: Option<SharedString>,
-	enabled: bool,
-	active: bool,
-) -> Stateful<Div> {
 	div()
 		.id(id)
 		.debug_selector(move || id.to_string())
@@ -820,7 +807,7 @@ pub(super) fn log_icon_button_tip(
 		.rounded(px(4.))
 		.border_1()
 		.border_color(transparent_black())
-		.when_some(tooltip, |d, t| d.tooltip(tip(t)))
+		.tip(tooltip)
 		.when(active, |d| d.bg(rgb(pal().hover_bg)))
 		.when(enabled, |d| {
 			d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
@@ -872,7 +859,6 @@ pub(super) fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
 	row: &str,
-	show_tips: bool,
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
@@ -906,7 +892,7 @@ pub(super) fn ref_label_elements(
 			// label keeps its icon and a few characters (never a bare icon).
 			.min_w(px((17. + measure(&l.text)).min(LABEL_FLOOR_W)))
 			.overflow_hidden()
-			.when(show_tips, |d| d.tooltip(tip(tooltip)))
+			.tip(tooltip)
 			.child(label_icon(&l))
 			.child(
 				clip_text(l.text.clone())
@@ -933,7 +919,7 @@ pub(super) fn ref_label_elements(
 				.flex_shrink_0()
 				.text_size(px(SMALL_TEXT))
 				.text_color(rgb(pal().log_ref_text))
-				.when(show_tips, |d| d.tooltip(tip(all)))
+				.tip(all)
 				.child(format!("+{hidden}"))
 				.into_any_element(),
 		);
@@ -1012,7 +998,7 @@ impl WorkbenchModel {
 					.flex()
 					.rounded(px(3.))
 					.hover(|s| s.bg(rgb(pal().divider)))
-					.tooltip(tip(t("log_clear_filter", self.locale)))
+					.tip(t("log_clear_filter", self.locale))
 					.on_click(cx.listener(move |this, _, _, cx| {
 						cx.stop_propagation();
 						this.clear_log_chip(menu, cx);
@@ -2122,10 +2108,10 @@ impl WorkbenchModel {
 				.cursor_pointer()
 				.when(active, |d| d.bg(rgb(pal().selection_inactive_bg)))
 				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(match &repo {
+				.tip(match &repo {
 					Some(r) => format!("{label} ({r})"),
 					None => label.clone(),
-				}))
+				})
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.filter_by_ref(target.clone(), cx)
 				}))

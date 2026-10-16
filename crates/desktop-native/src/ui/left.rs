@@ -34,7 +34,7 @@ impl WorkbenchModel {
 				.when(on, |d| d.bg(rgb(pal().rail_active_bg)))
 				.when(!on, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 				.map(focus_ring)
-				.tooltip(tip(label))
+				.tip(label)
 				.child(if on {
 					icon_tinted(ic, 16., pal().accent_text).into_any_element()
 				} else {
@@ -652,31 +652,26 @@ impl WorkbenchModel {
 					.rounded(px(4.))
 					.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
 					.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(
-						!self
-							.overlays
-							.is_open(crate::overlay::OverlayKind::ContextMenu),
-						|d| {
-							// Carries the locale-dependent counts legend (#208).
-							// Found by root, not row position: a rescan can
-							// reorder or shrink `repos` under an open tooltip.
-							let model = cx.weak_entity();
-							let root = repo.root.clone();
-							d.tooltip(live_tip(move |cx| {
-								model
-									.upgrade()
-									.and_then(|m| {
-										let m = m.read(cx);
-										m.repos
-											.iter()
-											.find(|r| r.root == root)
-											.map(|r| m.project_repo_tooltip(r))
-									})
-									.unwrap_or_default()
-									.into()
-							}))
-						},
-					)
+					// Carries the locale-dependent counts legend (#208). Found
+					// by root, not row position: a rescan can reorder or
+					// shrink `repos` under an open tooltip.
+					.live_tip({
+						let model = cx.weak_entity();
+						let root = repo.root.clone();
+						move |cx| {
+							model
+								.upgrade()
+								.and_then(|m| {
+									let m = m.read(cx);
+									m.repos
+										.iter()
+										.find(|r| r.root == root)
+										.map(|r| m.project_repo_tooltip(r))
+								})
+								.unwrap_or_default()
+								.into()
+						}
+					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.tree_cursor = ix;
 						this.toggle_repo_row(idx, cx);

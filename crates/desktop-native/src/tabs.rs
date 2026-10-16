@@ -27,7 +27,7 @@ use crate::i18n::{t, Locale, Msg};
 use crate::icons::{icon_tinted, Icon};
 use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
-use crate::ui::{clip_text, live_tip, probe, probe_frame_end, Probes};
+use crate::ui::{clip_text, probe, probe_frame_end, Probes, TipExt};
 use crate::{
 	lifecycle, CloseWorkspace, NextWorkspaceTab, OpenWorkspace,
 	PrevWorkspaceTab, Quit, WorkbenchModel, WorkspaceTab1, WorkspaceTab2,
@@ -1017,15 +1017,15 @@ impl TabsRoot {
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().tab_hover_bg)))
 					.child(icon_tinted(Icon::Plus, 16., pal().text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							t("tip_ws_tab_new", loc).into()
-						})
+						}
 					})
 					.debug_selector(|| "ws-tab-new".into())
 					.on_click(cx.listener(|this, _, window, cx| {
@@ -1119,16 +1119,16 @@ impl TabsRoot {
 					.rounded(px(3.))
 					.hover(|s| s.bg(rgb(p.hover_bg)))
 					.child(icon_tinted(Icon::Close, 12., p.text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							crate::ui::mac_keys(t("tip_ws_tab_close", loc))
 								.into()
-						})
+						}
 					})
 					.debug_selector(move || close_selector)
 					.on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -1140,13 +1140,13 @@ impl TabsRoot {
 					}))
 					.children(probe(&self.probes, close_id)),
 			)
-			.tooltip({
+			.live_tip({
 				let root = cx.weak_entity();
-				live_tip(move |cx| {
+				move |cx| {
 					root.upgrade()
 						.map(|r| r.read(cx).tab_tip(ix, cx))
 						.unwrap_or_default()
-				})
+				}
 			})
 			.debug_selector(move || selector)
 			.on_mouse_down(

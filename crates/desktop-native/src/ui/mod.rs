@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use gpui::{
 	anchored, canvas, deferred, div, prelude::*, px, rgb, transparent_black,
-	uniform_list, AnyElement, AnyView, App, Context, Div, ElementId,
-	FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+	uniform_list, AnyElement, App, Context, Div, ElementId, FontWeight,
+	MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
 	ScrollWheelEvent, SharedString, Stateful, Window,
 };
 use snip_core::format::ChangeType;
@@ -482,9 +482,16 @@ struct Tip(Rc<dyn Fn(&App) -> SharedString>);
 impl Render for Tip {
 	fn render(
 		&mut self,
-		_: &mut Window,
+		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		// A floating layer is open in this window: a tooltip would land on
+		// it or on the controls under it. Asked here, on every frame the
+		// tooltip is shown, so one that is already up goes when a layer
+		// opens, and no control has to remember to ask.
+		if crate::overlay::tooltips_suppressed(window, cx) {
+			return div();
+		}
 		let text = (self.0)(cx);
 		if text.is_empty() {
 			// The thing it described is gone: no empty box.
@@ -509,22 +516,29 @@ impl Render for Tip {
 	}
 }
 
-pub(crate) fn tip(
-	text: impl Into<SharedString>,
-) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-	let text = text.into();
-	live_tip(move |_| text.clone())
+/// The one way to give an element a tooltip (`clippy.toml` refuses
+/// `.tooltip(`): every tooltip then asks the window's tooltip gate as it is
+/// drawn.
+pub(crate) trait TipExt: StatefulInteractiveElement + Sized {
+	/// A tooltip of fixed text.
+	fn tip(self, text: impl Into<SharedString>) -> Self {
+		let text = text.into();
+		self.live_tip(move |_| text.clone())
+	}
+
+	/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
+	/// shown tooltip's view while the mouse stays, so text fixed when it
+	/// opened goes stale when, say, a tab switch changes the language under
+	/// it.
+	fn live_tip(self, text: impl Fn(&App) -> SharedString + 'static) -> Self {
+		let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
+		#[allow(clippy::disallowed_methods)] // the one place
+		let this = self.tooltip(move |_, cx| cx.new(|_| Tip(text.clone())).into());
+		this
+	}
 }
 
-/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
-/// shown tooltip's view while the mouse stays, so text fixed when it opened
-/// goes stale when, say, a tab switch changes the language under it.
-pub(crate) fn live_tip(
-	text: impl Fn(&App) -> SharedString + 'static,
-) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-	let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
-	move |_, cx| cx.new(|_| Tip(text.clone())).into()
-}
+impl<T: StatefulInteractiveElement> TipExt for T {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Btn {
@@ -679,7 +693,7 @@ fn icon_button(
 		.rounded(px(4.))
 		.border_1()
 		.border_color(transparent_black())
-		.tooltip(tip(tooltip))
+		.tip(tooltip)
 		.when(enabled, |d| {
 			d.cursor_pointer()
 				.tab_index(tab)
@@ -1559,6 +1573,9 @@ impl Render for WorkbenchModel {
 		// A closed layer's keyboard target first; a focus asked for in the
 		// same turn wins over it.
 		self.apply_pending_return(window, cx);
+		// The window's tooltip rule for this frame: tooltips ask it as they
+		// are drawn, after this tab (and the tab bar above it) rendered.
+		self.publish_gate(window, cx);
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}

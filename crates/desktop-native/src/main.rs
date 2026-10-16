@@ -24219,6 +24219,48 @@ mod tests {
 				assert!(failures.is_empty(), "{}", failures.join("\n"));
 			}
 
+			/// The add-repo field is an inline layer of the Project pane: its
+			/// button toggles it, a floating layer opens over it without
+			/// closing it, and Escape in its field closes it and gives the
+			/// keyboard back to where the button left it.
+			#[gpui::test]
+			fn the_add_repo_field_is_an_inline_layer(cx: &mut TestAppContext) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				let button = Opener::Click("btn-add-repo", "add-repo");
+				button.fire(&model, cx);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				assert!(cx.debug_bounds("input-add-repo").is_some());
+				let at_open = focus_name(&model, cx);
+				// A second press on the button closes it.
+				button.fire(&model, cx);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				button.fire(&model, cx);
+				// A floating layer opens over it and closes first.
+				Opener::Click("btn-ref-selector", "selector:Ref")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["selector:Ref"]);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				// Escape in its field closes it.
+				let field = model
+					.read_with(cx, |m, cx| m.add_repo_input.read(cx).handle());
+				cx.update(|window, _| window.focus(&field));
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "other");
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				assert_eq!(
+					focus_name(&model, cx),
+					at_open,
+					"the keyboard is back where the button left it"
+				);
+			}
+
 			/// One rule for the keyboard after a layer closes (the user's
 			/// decision): back to where it was opened from, or the root.
 			#[gpui::test]

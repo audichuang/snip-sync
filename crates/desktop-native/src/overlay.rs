@@ -14,12 +14,12 @@
 //! written.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::{
 	canvas, div, prelude::*, App, Bounds, Context, Div, Entity, FocusHandle,
-	MouseDownEvent, Pixels, Stateful, Window,
+	Global, MouseDownEvent, Pixels, Stateful, Window, WindowId,
 };
 
 use crate::menu::{ContextMenu, MenuOrigin};
@@ -61,6 +61,19 @@ impl OverlayKind {
 
 	/// Anchored over the panes, one at a time.
 	pub(crate) const fn is_floating(self) -> bool {
+		match self {
+			OverlayKind::WorkspaceMenu
+			| OverlayKind::LogMenu(_)
+			| OverlayKind::Selector(_)
+			| OverlayKind::ContextMenu => true,
+			OverlayKind::FindBar | OverlayKind::AddRepoField => false,
+		}
+	}
+
+	/// A tooltip would land on this layer's panel or on the controls under
+	/// it, so none shows while it is open. An inline layer is part of its
+	/// pane and takes none of that away.
+	pub(crate) const fn suppresses_tooltips(self) -> bool {
 		match self {
 			OverlayKind::WorkspaceMenu
 			| OverlayKind::LogMenu(_)
@@ -238,6 +251,9 @@ pub(crate) struct OverlayStack {
 	/// A layer closed and its keyboard target is waiting for the next
 	/// frame: (target, the closed layer's handles).
 	pending_return: Option<(ReturnFocus, Vec<FocusHandle>)>,
+	/// What the last frame told the tooltip gate (its window and whether
+	/// tooltips were off): invariant O6 compares it with the layers.
+	published_gate: Cell<Option<(WindowId, bool)>>,
 }
 
 impl OverlayStack {
@@ -248,6 +264,7 @@ impl OverlayStack {
 			add_repo: None,
 			triggers: RefCell::new(HashMap::new()),
 			pending_return: None,
+			published_gate: Cell::new(None),
 		}
 	}
 
@@ -454,6 +471,9 @@ pub(crate) enum OverlayInvariant {
 	O4,
 	/// No return of the keyboard is left waiting after a frame.
 	O5,
+	/// The window's tooltip gate is closed exactly while a floating layer
+	/// is open.
+	O6,
 }
 
 #[allow(dead_code)]
@@ -464,6 +484,7 @@ impl OverlayInvariant {
 		OverlayInvariant::O3,
 		OverlayInvariant::O4,
 		OverlayInvariant::O5,
+		OverlayInvariant::O6,
 	];
 
 	/// Holds only once nothing is loading: a ref selector's candidates are
@@ -474,7 +495,8 @@ impl OverlayInvariant {
 			OverlayInvariant::O1
 			| OverlayInvariant::O2
 			| OverlayInvariant::O3
-			| OverlayInvariant::O5 => false,
+			| OverlayInvariant::O5
+			| OverlayInvariant::O6 => false,
 		}
 	}
 
@@ -491,6 +513,9 @@ impl OverlayInvariant {
 			OverlayInvariant::O4 => "the selector cursor is on a candidate",
 			OverlayInvariant::O5 => {
 				"no return of the keyboard is waiting after a frame"
+			}
+			OverlayInvariant::O6 => {
+				"the tooltip gate is closed exactly while a floating layer is open"
 			}
 		}
 	}
@@ -527,6 +552,21 @@ impl OverlayStack {
 			OverlayInvariant::O5 => o.has_pending_return().then(|| {
 				"a return of the keyboard is still waiting".to_string()
 			}),
+			OverlayInvariant::O6 => {
+				// Nothing published yet: the tab has not drawn a frame.
+				let (window, on) = o.published_gate.get()?;
+				let want =
+					o.floating().is_some_and(OverlayKind::suppresses_tooltips);
+				let gate = cx
+					.try_global::<TooltipGate>()
+					.is_some_and(|g| g.0.contains(&window));
+				(on != want || gate != on).then(|| {
+					format!(
+						"published {on}, gate {gate}, layers say {want} ({:?})",
+						o.floating()
+					)
+				})
+			}
 		}
 	}
 
@@ -539,6 +579,49 @@ impl OverlayStack {
 			.iter()
 			.filter_map(|&id| Self::eval(id, m, cx).map(|d| (id, d)))
 			.collect()
+	}
+}
+
+// ───────────────────────── tooltip gate ─────────────────────────
+
+/// The windows where no tooltip shows: a floating layer is open there. Read
+/// by every tooltip as it is drawn, so a control cannot forget to ask.
+#[derive(Default)]
+pub(crate) struct TooltipGate(HashSet<WindowId>);
+
+impl Global for TooltipGate {}
+
+/// Tells the gate whether `window` has a floating layer open. Called by the
+/// shown tab on every frame: a tooltip already on screen reads it again and
+/// goes the frame after a layer opens.
+pub(crate) fn publish_tooltip_gate(window: &Window, cx: &mut App, on: bool) {
+	let id = window.window_handle().window_id();
+	let gate = cx.default_global::<TooltipGate>();
+	if on {
+		gate.0.insert(id);
+	} else {
+		gate.0.remove(&id);
+	}
+}
+
+/// No tooltip shows in `window` now.
+pub(crate) fn tooltips_suppressed(window: &Window, cx: &App) -> bool {
+	let id = window.window_handle().window_id();
+	cx.try_global::<TooltipGate>()
+		.is_some_and(|gate| gate.0.contains(&id))
+}
+
+impl WorkbenchModel {
+	/// Publishes this frame's tooltip rule for the window.
+	pub(crate) fn publish_gate(&self, window: &Window, cx: &mut App) {
+		let on = self
+			.overlays
+			.floating()
+			.is_some_and(OverlayKind::suppresses_tooltips);
+		publish_tooltip_gate(window, cx, on);
+		self.overlays
+			.published_gate
+			.set(Some((window.window_handle().window_id(), on)));
 	}
 }
 
@@ -1087,7 +1170,8 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) -> Stateful<Div> {
 		let selector = kind.panel_selector();
-		div()
+		#[allow(clippy::disallowed_methods)] // the one panel builder
+		let panel = div()
 			.id(selector)
 			.debug_selector(move || selector.into())
 			.occlude()
@@ -1097,7 +1181,8 @@ impl WorkbenchModel {
 						this.close_overlay(kind, CloseWhy::OutsidePress, cx);
 					}
 				},
-			))
+			));
+		panel
 	}
 
 	/// The open repo selector's cursor follows its repo when the list

@@ -47,11 +47,10 @@ impl WorkbenchModel {
 			)
 			.child(div().flex_1())
 			.child(
-				log_icon_button_tip(
+				log_icon_button(
 					"btn-log-more",
 					Icon::More,
-					(self.overlays.log_menu() != Some(LogMenu::More))
-						.then(|| t("tip_log_more", loc).into()),
+					t("tip_log_more", loc),
 					true,
 					self.overlays.log_menu() == Some(LogMenu::More),
 				)
@@ -98,7 +97,7 @@ impl WorkbenchModel {
 				.justify_center()
 				.rounded(px(3.))
 				.cursor_pointer()
-				.tooltip(tip(t(tooltip, loc)))
+				.tip(t(tooltip, loc))
 				.when(on, |d| {
 					d.bg(rgb(pal().selection_bg))
 						.border_1()
@@ -461,11 +460,9 @@ impl WorkbenchModel {
 										.bg(rgb(pal().error_bg))
 										.text_size(px(SMALL_TEXT))
 										.text_color(rgb(pal().error))
-										.when(!self.overlays.is_open(crate::overlay::OverlayKind::ContextMenu), |d| {
-											d.tooltip(tip(self
-												.failed_feed_names()
-												.join("\n")))
-										})
+										.tip(
+											self.failed_feed_names().join("\n"),
+										)
 										.child(msg.render(loc))
 										.children(probe(
 											log,
@@ -638,11 +635,6 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		let loc = self.locale;
-		// Row tooltips are off while a context menu is open (they would
-		// draw over it).
-		let show_tips = !self
-			.overlays
-			.is_open(crate::overlay::OverlayKind::ContextMenu);
 		// Every selected row (a range selects its anchor's repository only).
 		let selected = self.log_is_selected(&c.sha);
 		let sha = c.sha.clone();
@@ -687,7 +679,6 @@ impl WorkbenchModel {
 					&r.refs,
 					current_branch.as_deref(),
 					&key,
-					show_tips,
 					&|s: &str| text_width(window, s, SMALL_TEXT),
 				)
 			})
@@ -799,16 +790,14 @@ impl WorkbenchModel {
 								.size(px(14.))
 								.rounded(px(7.))
 								.hover(|s| s.bg(rgb(pal().hover_bg)))
-								.when(show_tips, |d| {
-									d.tooltip(tip(t(
-										if collapsed {
-											"tip_expand_merge"
-										} else {
-											"tip_collapse_merge"
-										},
-										loc,
-									)))
-								})
+								.tip(t(
+									if collapsed {
+										"tip_expand_merge"
+									} else {
+										"tip_collapse_merge"
+									},
+									loc,
+								))
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
 									this.toggle_collapse(merge_sha.clone(), cx);
@@ -837,9 +826,7 @@ impl WorkbenchModel {
 							.overflow_hidden()
 							.line_clamp(1)
 							.text_ellipsis()
-							.when(show_tips && truncated, |d| {
-								d.tooltip(tip(c.subject.clone()))
-							})
+							.when(truncated, |d| d.tip(c.subject.clone()))
 							.child(c.subject.clone()),
 					)
 					// Out of scope: `row_widths` does not count this chip (and
@@ -877,12 +864,7 @@ impl WorkbenchModel {
 					.id(SharedString::from(format!("author:{key}")))
 					.flex_shrink_0()
 					.w(px(cols.author))
-					.when(show_tips, |d| {
-						d.tooltip(tip(format!(
-							"{} <{}>",
-							c.author_name, c.author_email
-						)))
-					})
+					.tip(format!("{} <{}>", c.author_name, c.author_email))
 					.child(
 						clip_text(c.author_name.clone()).when(mine, |d| {
 							d.font_weight(FontWeight::SEMIBOLD)
@@ -894,9 +876,7 @@ impl WorkbenchModel {
 					.id(SharedString::from(format!("date:{key}")))
 					.flex_shrink_0()
 					.w(px(cols.date))
-					.when(show_tips, |d| {
-						d.tooltip(tip(short_date(&c.author_date)))
-					})
+					.tip(short_date(&c.author_date))
 					.child(clip_text(date)),
 			)
 			.when(self.log_show_hash, |d| {
@@ -908,11 +888,7 @@ impl WorkbenchModel {
 						.font_family(CODE_FONT)
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
-						.when(show_tips, |d| {
-							d.tooltip(tip(crate::multi_log::split_id(&c.sha)
-								.0
-								.to_string()))
-						})
+						.tip(crate::multi_log::split_id(&c.sha).0.to_string())
 						.child(short(&c.sha).to_string()),
 				)
 			})
@@ -928,7 +904,7 @@ impl WorkbenchModel {
 						.w(px(4.))
 						.h_full()
 						.bg(color)
-						.when(show_tips, |d| d.tooltip(tip(name)))
+						.tip(name)
 						.children(probe(&self.probes, id)),
 				)
 			})
@@ -1169,12 +1145,7 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(
-						!self
-							.overlays
-							.is_open(crate::overlay::OverlayKind::ContextMenu),
-						|d| d.tooltip(tip(path.clone())),
-					)
+					.tip(path.clone())
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
 						let key = key.clone();
@@ -1288,19 +1259,14 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(
-						!self
-							.overlays
-							.is_open(crate::overlay::OverlayKind::ContextMenu),
-						|d| {
-							let mut tip_text = format!("{path}  ({letter})");
-							if let Some(note) = &same_note {
-								tip_text.push('\n');
-								tip_text.push_str(note);
-							}
-							d.tooltip(tip(tip_text))
-						},
-					)
+					.tip({
+						let mut tip_text = format!("{path}  ({letter})");
+						if let Some(note) = &same_note {
+							tip_text.push('\n');
+							tip_text.push_str(note);
+						}
+						tip_text
+					})
 					.on_click(cx.listener(
 						move |this, ev: &gpui::ClickEvent, _, cx| {
 							// Cmd on macOS, Ctrl elsewhere toggles the file;

@@ -93,7 +93,7 @@ impl WorkbenchModel {
 					.gap(px(6.))
 					.flex_1()
 					.min_w_0()
-					.tooltip(tip(dest.clone()))
+					.tip(dest.clone())
 					.child(
 						div()
 							.flex_shrink_0()
@@ -119,11 +119,9 @@ impl WorkbenchModel {
 					} else {
 						t("apply", loc)
 					})
-					.when(loading, |b| {
-						b.tooltip(tip(t("paste_loading_refused", loc)))
-					})
+					.when(loading, |b| b.tip(t("paste_loading_refused", loc)))
 					.when(!loading && !mapping_ready, |b| {
-						b.tooltip(tip(t("mapping_required", loc)))
+						b.tip(t("mapping_required", loc))
 					})
 					.when(can_apply, |b| {
 						b.on_click(cx.listener(|this, _, _, cx| {
@@ -144,9 +142,7 @@ impl WorkbenchModel {
 							this.cancel_paste_preview(cx)
 						}))
 					})
-					.when(applying, |b| {
-						b.tooltip(tip(t("paste_busy_refused", loc)))
-					})
+					.when(applying, |b| b.tip(t("paste_busy_refused", loc)))
 					.children(probe(log, "btn-cancel")),
 			)
 	}
@@ -245,11 +241,11 @@ impl WorkbenchModel {
 				this.toggle_paste_commit(c, cx)
 			}))
 			.when(c > 0, |d| d.border_t_1().border_color(rgb(pal().divider)))
-			.tooltip(tip(format!(
+			.tip(format!(
 				"{}\n{author}\n{}",
 				commit.message.trim_end(),
 				commit.author_date
-			)))
+			))
 			.child(icon(
 				if folded {
 					Icon::ChevronRight
@@ -444,11 +440,11 @@ impl WorkbenchModel {
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
 				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(if planned_skip {
+				.tip(if planned_skip {
 					format!("{path}\n{}", t(paste_op(item).2, loc))
 				} else {
 					format!("{path}\n→ {}", item.dest_path.display())
-				}))
+				})
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.select_paste_item(ix, cx)
 				}))
@@ -463,8 +459,7 @@ impl WorkbenchModel {
 						.items_center()
 						.justify_center()
 						.when(applying, |d| {
-							d.opacity(0.4)
-								.tooltip(tip(t("paste_busy_refused", loc)))
+							d.opacity(0.4).tip(t("paste_busy_refused", loc))
 						})
 						// Still routed to the model while applying so the refusal
 						// is explicit (it logs and explains).
@@ -551,10 +546,8 @@ impl WorkbenchModel {
 										.hover(|s| s.bg(rgb(pal().hover_bg)))
 								})
 								.when(applying, |d| {
-									d.opacity(0.4).tooltip(tip(t(
-										"paste_busy_refused",
-										loc,
-									)))
+									d.opacity(0.4)
+										.tip(t("paste_busy_refused", loc))
 								})
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
@@ -632,11 +625,11 @@ impl WorkbenchModel {
 							!applying,
 							69,
 						)
-						.tooltip(tip(format!(
+						.tip(format!(
 							"{}/{}",
 							plan.shown(&plan.destination),
 							prefix
-						)))
+						))
 						.when(!applying, |b| {
 							b.on_click(cx.listener(move |this, _, _, cx| {
 								this.choose_paste_keep(&prefix_keep, cx);
@@ -667,7 +660,7 @@ impl WorkbenchModel {
 									70 + idx as isize,
 								)
 								.debug_selector(|| id.clone())
-								.tooltip(tip(full))
+								.tip(full)
 								.when(!applying, |b| {
 									b.on_click(cx.listener(
 										move |this, _, _, cx| {
@@ -725,7 +718,7 @@ impl WorkbenchModel {
 									} else {
 										pal().warning
 									}))
-									.tooltip(tip(target.clone()))
+									.tip(target.clone())
 									.child(format!("→ {target}"))
 									.children(probe(log, target_id)),
 							)
@@ -867,7 +860,7 @@ impl WorkbenchModel {
 							.py(px(4.))
 							.text_size(px(SMALL_TEXT))
 							.text_color(rgb(pal().text_muted))
-							.tooltip(tip(metadata.clone()))
+							.tip(metadata.clone())
 							.child(clip_text(metadata))
 							.children(probe(log, "paste-commit-metadata")),
 					)

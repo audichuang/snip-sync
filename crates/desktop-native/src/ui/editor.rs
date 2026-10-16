@@ -51,7 +51,7 @@ impl WorkbenchModel {
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
 						.when(preview, |d| {
-							d.tooltip(tip(t("tip_preview_tab", loc)))
+							d.tip(t("tip_preview_tab", loc))
 								// Double-click keeps the tab, as in IntelliJ.
 								.on_click(cx.listener(
 									|this, ev: &gpui::ClickEvent, _, cx| {
@@ -370,7 +370,7 @@ impl WorkbenchModel {
 					.border_1()
 					.border_color(rgb(pal().button_border))
 					.bg(rgb(pal().button_bg))
-					.tooltip(tip(t("tip_goto", loc)))
+					.tip(t("tip_goto", loc))
 					.child(icon(Icon::GoToLine, 14.))
 					.child(
 						div()
@@ -682,7 +682,7 @@ impl WorkbenchModel {
 							.line_clamp(1)
 							.text_ellipsis()
 							.text_color(rgb(pal().text_muted))
-							.tooltip(tip(crumbs.clone()))
+							.tip(crumbs.clone())
 							.child(crumbs)
 							.children(probe(log, "breadcrumb")),
 					)
@@ -700,7 +700,7 @@ impl WorkbenchModel {
 								.overflow_hidden()
 								.line_clamp(1)
 								.text_ellipsis()
-								.tooltip(tip(badge.clone()))
+								.tip(badge.clone())
 								.child(badge)
 								.children(probe(log, "source-badge")),
 						)
