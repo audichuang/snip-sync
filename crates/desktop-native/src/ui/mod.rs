@@ -75,6 +75,7 @@ use crate::{NextDiff, PrevDiff};
 
 mod changes;
 mod editor;
+mod fit;
 mod header;
 mod left;
 mod log;

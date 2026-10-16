@@ -1,0 +1,974 @@
+//! One rule for how a text gives way to its neighbours in the Log window
+//! (#228, ADR 0005): the rule table ([`FitRole::rule`]), the solver that
+//! shares a row's width ([`fit_row`]) and the `TEXT_FIT` probe that checks
+//! what was drawn against it.
+//!
+//! This half is pure: it needs no GPUI, only a `measure` function from text
+//! to width.
+// Until the Log rows use it (S2).
+#![cfg_attr(not(test), allow(dead_code))]
+
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::theme::{CODE_FONT, SMALL_TEXT, UI_FONT, UI_TEXT};
+
+/// A text of the Log window that shares its width with others. Every role
+/// has a rule, a presence, a font and a chrome: a new role does not compile
+/// until it has them (the matches below have no `_ =>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FitRole {
+	Subject,
+	BranchLabel,
+	TagLabel,
+	RefMore,
+	Collapsed,
+	Author,
+	Date,
+	Hash,
+	ChipRepo,
+	ChipBranch,
+	ChipUser,
+	ChipDate,
+	ChipMore,
+	RefHint,
+	PaneGroup,
+	PaneRefName,
+	PaneRepo,
+	MenuRefName,
+	MenuRepo,
+}
+
+/// How much of a text must stay in sight (graphemes, not pixels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FitRule {
+	/// All of it, or none.
+	Whole,
+	/// At least this many graphemes before the ellipsis.
+	Readable(usize),
+	/// The key whole, and this many graphemes of the value.
+	KeyValue(usize),
+}
+
+/// What a role does when there is not even room for its floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Presence {
+	/// Never absent.
+	Always,
+	/// With its group: all of them or none.
+	Group,
+	/// With its column: the column is absent in every row.
+	Column,
+	/// Folded into the overflow chip.
+	Overflow,
+	/// Whole or absent.
+	Optional,
+}
+
+/// The icon and the gap before a label's text.
+pub(crate) const LABEL_ICON_W: f32 = 14.;
+pub(crate) const LABEL_ICON_GAP: f32 = 3.;
+/// A chip's padding (6 + 6), the gap (3) and the 12px icon around its text.
+pub(crate) const CHIP_CHROME_W: f32 = 27.;
+/// What gpui's ellipsis needs beyond the shaped width: it adds up the
+/// characters one by one, which can come out a hair wider than the shaped
+/// line, and cuts the line when that sum, rounded down, exceeds the box
+/// (`LineWrapper::truncate_line`). Every width the rule table gives
+/// includes it.
+pub(crate) const FIT_MARGIN: f32 = 1.;
+
+pub(crate) const ELLIPSIS: &str = "\u{2026}";
+
+impl FitRole {
+	pub(crate) const ALL: [FitRole; 19] = [
+		FitRole::Subject,
+		FitRole::BranchLabel,
+		FitRole::TagLabel,
+		FitRole::RefMore,
+		FitRole::Collapsed,
+		FitRole::Author,
+		FitRole::Date,
+		FitRole::Hash,
+		FitRole::ChipRepo,
+		FitRole::ChipBranch,
+		FitRole::ChipUser,
+		FitRole::ChipDate,
+		FitRole::ChipMore,
+		FitRole::RefHint,
+		FitRole::PaneGroup,
+		FitRole::PaneRefName,
+		FitRole::PaneRepo,
+		FitRole::MenuRefName,
+		FitRole::MenuRepo,
+	];
+
+	/// The name in a `TEXT_FIT` id.
+	pub(crate) fn key(self) -> &'static str {
+		match self {
+			FitRole::Subject => "subject",
+			FitRole::BranchLabel => "branch",
+			FitRole::TagLabel => "tag",
+			FitRole::RefMore => "more",
+			FitRole::Collapsed => "collapsed",
+			FitRole::Author => "author",
+			FitRole::Date => "date",
+			FitRole::Hash => "hash",
+			FitRole::ChipRepo => "chip-repo",
+			FitRole::ChipBranch => "chip-branch",
+			FitRole::ChipUser => "chip-user",
+			FitRole::ChipDate => "chip-date",
+			FitRole::ChipMore => "chip-more",
+			FitRole::RefHint => "ref-hint",
+			FitRole::PaneGroup => "pane-group",
+			FitRole::PaneRefName => "pane-name",
+			FitRole::PaneRepo => "pane-repo",
+			FitRole::MenuRefName => "menu-name",
+			FitRole::MenuRepo => "menu-repo",
+		}
+	}
+
+	/// The role named by `key`.
+	pub(crate) fn from_key(key: &str) -> Option<FitRole> {
+		FitRole::ALL.into_iter().find(|r| r.key() == key)
+	}
+
+	/// How much of the text must stay in sight (ADR 0005's table).
+	pub(crate) fn rule(self) -> FitRule {
+		match self {
+			FitRole::Subject => FitRule::Readable(6),
+			FitRole::BranchLabel | FitRole::TagLabel => FitRule::Readable(6),
+			FitRole::RefMore => FitRule::Whole,
+			FitRole::Collapsed => FitRule::Whole,
+			FitRole::Author => FitRule::Readable(3),
+			FitRole::Date => FitRule::Whole,
+			FitRole::Hash => FitRule::Whole,
+			FitRole::ChipRepo
+			| FitRole::ChipBranch
+			| FitRole::ChipUser
+			| FitRole::ChipDate => FitRule::KeyValue(4),
+			FitRole::ChipMore => FitRule::Whole,
+			FitRole::RefHint => FitRule::KeyValue(6),
+			FitRole::PaneGroup
+			| FitRole::PaneRefName
+			| FitRole::MenuRefName => FitRule::Readable(6),
+			FitRole::PaneRepo | FitRole::MenuRepo => FitRule::Whole,
+		}
+	}
+
+	/// What happens when even the floor does not fit.
+	pub(crate) fn presence(self) -> Presence {
+		match self {
+			FitRole::Subject => Presence::Always,
+			FitRole::BranchLabel | FitRole::TagLabel => Presence::Group,
+			FitRole::RefMore => Presence::Group,
+			FitRole::Collapsed => Presence::Always,
+			FitRole::Author => Presence::Column,
+			FitRole::Date => Presence::Always,
+			FitRole::Hash => Presence::Always,
+			FitRole::ChipRepo
+			| FitRole::ChipBranch
+			| FitRole::ChipUser
+			| FitRole::ChipDate => Presence::Overflow,
+			FitRole::ChipMore => Presence::Always,
+			FitRole::RefHint => Presence::Always,
+			FitRole::PaneGroup
+			| FitRole::PaneRefName
+			| FitRole::MenuRefName => Presence::Always,
+			FitRole::PaneRepo | FitRole::MenuRepo => Presence::Optional,
+		}
+	}
+
+	/// The font family and size the text is drawn in.
+	pub(crate) fn font(self) -> (&'static str, f32) {
+		match self {
+			FitRole::Hash => (CODE_FONT, SMALL_TEXT),
+			FitRole::BranchLabel
+			| FitRole::TagLabel
+			| FitRole::RefMore
+			| FitRole::Collapsed
+			| FitRole::PaneRepo
+			| FitRole::MenuRepo => (UI_FONT, SMALL_TEXT),
+			FitRole::Subject
+			| FitRole::Author
+			| FitRole::Date
+			| FitRole::ChipRepo
+			| FitRole::ChipBranch
+			| FitRole::ChipUser
+			| FitRole::ChipDate
+			| FitRole::ChipMore
+			| FitRole::RefHint
+			| FitRole::PaneGroup
+			| FitRole::PaneRefName
+			| FitRole::MenuRefName => (UI_FONT, UI_TEXT),
+		}
+	}
+
+	/// The width around the text inside the role's box: a label's icon and
+	/// gap, a chip's padding, gap and icon.
+	pub(crate) fn chrome(self) -> f32 {
+		match self {
+			FitRole::BranchLabel | FitRole::TagLabel => {
+				LABEL_ICON_W + LABEL_ICON_GAP
+			}
+			FitRole::ChipRepo
+			| FitRole::ChipBranch
+			| FitRole::ChipUser
+			| FitRole::ChipDate => CHIP_CHROME_W,
+			FitRole::Subject
+			| FitRole::RefMore
+			| FitRole::Collapsed
+			| FitRole::Author
+			| FitRole::Date
+			| FitRole::Hash
+			| FitRole::ChipMore
+			| FitRole::RefHint
+			| FitRole::PaneGroup
+			| FitRole::PaneRefName
+			| FitRole::PaneRepo
+			| FitRole::MenuRefName
+			| FitRole::MenuRepo => 0.,
+		}
+	}
+}
+
+impl FitRule {
+	/// `whole`, `readable<n>` or `kv<n>`, as a `TEXT_FIT` line writes it.
+	pub(crate) fn name(self) -> String {
+		match self {
+			FitRule::Whole => "whole".into(),
+			FitRule::Readable(n) => format!("readable{n}"),
+			FitRule::KeyValue(n) => format!("kv{n}"),
+		}
+	}
+
+	/// The rule `name` writes.
+	pub(crate) fn parse(name: &str) -> Option<FitRule> {
+		if name == "whole" {
+			return Some(FitRule::Whole);
+		}
+		if let Some(n) = name.strip_prefix("readable") {
+			return n.parse().ok().map(FitRule::Readable);
+		}
+		name.strip_prefix("kv")
+			.and_then(|n| n.parse().ok())
+			.map(FitRule::KeyValue)
+	}
+}
+
+pub(crate) fn grapheme_count(s: &str) -> usize {
+	s.graphemes(true).count()
+}
+
+/// The first `n` graphemes of `s`.
+fn prefix_graphemes(s: &str, n: usize) -> &str {
+	match s.grapheme_indices(true).nth(n) {
+		Some((i, _)) => &s[..i],
+		None => s,
+	}
+}
+
+/// The width of the whole text in its role's box: its chrome, the text, and
+/// [`FIT_MARGIN`].
+pub(crate) fn natural_px(
+	role: FitRole,
+	text: &str,
+	measure: &dyn Fn(&str) -> f32,
+) -> f32 {
+	role.chrome() + measure(text) + FIT_MARGIN
+}
+
+/// The narrowest the role's rule allows `text`'s box (see [`FitRule`]); never
+/// more than [`natural_px`]. `key_end` is where a `KeyValue` text's key ends
+/// (a byte index; the key is what comes before, `": "` included).
+pub(crate) fn floor_px(
+	role: FitRole,
+	text: &str,
+	key_end: usize,
+	measure: &dyn Fn(&str) -> f32,
+) -> f32 {
+	let natural = natural_px(role, text, measure);
+	let kept = match role.rule() {
+		FitRule::Whole => return natural,
+		FitRule::Readable(n) => {
+			if grapheme_count(text) <= n {
+				return natural;
+			}
+			format!("{}{ELLIPSIS}", prefix_graphemes(text, n))
+		}
+		FitRule::KeyValue(n) => {
+			let key_end = key_end.min(text.len());
+			let (key, value) = text.split_at(key_end);
+			if grapheme_count(value) <= n {
+				return natural;
+			}
+			format!("{key}{}{ELLIPSIS}", prefix_graphemes(value, n))
+		}
+	};
+	(role.chrome() + measure(&kept) + FIT_MARGIN).min(natural)
+}
+
+/// How many graphemes of `text` a box `visible` wide shows, of how many it
+/// has: all of them when the whole text fits, else the most whose prefix and
+/// the ellipsis fit (the way gpui cuts, with [`FIT_MARGIN`]).
+pub(crate) fn shown_graphemes(
+	role: FitRole,
+	text: &str,
+	visible: f32,
+	measure: &dyn Fn(&str) -> f32,
+) -> (usize, usize) {
+	let total = grapheme_count(text);
+	if role.chrome() + measure(text) <= visible + 0.5 {
+		return (total, total);
+	}
+	let fits = |k: usize| {
+		let kept = format!("{}{ELLIPSIS}", prefix_graphemes(text, k));
+		role.chrome() + measure(&kept) + FIT_MARGIN <= visible
+	};
+	// The most graphemes that fit; a longer prefix is never narrower.
+	let (mut lo, mut hi) = (0, total);
+	while lo < hi {
+		let mid = (lo + hi).div_ceil(2);
+		if fits(mid) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	(lo, total)
+}
+
+/// Whether `shown` of `total` graphemes satisfies `rule`; `key_graphemes` is a
+/// `KeyValue` text's key length.
+pub(crate) fn rule_holds(
+	rule: FitRule,
+	shown: usize,
+	total: usize,
+	key_graphemes: usize,
+) -> bool {
+	match rule {
+		FitRule::Whole => shown == total,
+		FitRule::Readable(n) => shown >= n.min(total),
+		FitRule::KeyValue(n) => shown >= (key_graphemes + n).min(total),
+	}
+}
+
+// ───────────────────────────── the solver ─────────────────────────────
+
+/// One text of a row: the widest it wants, the least its rule allows, and the
+/// gap before it (paid only while it is shown). `floor` never exceeds
+/// `natural`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Part<P> {
+	pub id: P,
+	pub natural: f32,
+	pub floor: f32,
+	pub gap: f32,
+}
+
+impl<P> Part<P> {
+	pub(crate) fn new(id: P, natural: f32, floor: f32, gap: f32) -> Self {
+		let natural = natural.max(0.);
+		Self {
+			id,
+			natural,
+			floor: floor.clamp(0., natural),
+			gap,
+		}
+	}
+}
+
+/// What a row gives next, in priority order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Claim<P> {
+	/// Every part at its floor, or none of them: when the rest cannot pay all
+	/// their floors and gaps, they are `dropped` and no later claim gives
+	/// them anything.
+	Atomic(Vec<P>),
+	/// This part up to the width (at most its natural); a part not shown yet
+	/// first pays its gap. It may get only a part.
+	Grow(P, f32),
+	/// The shown parts, shortest natural first, each up to its natural: the
+	/// short ones are whole before a long one gets more.
+	ShortestFirst(Vec<P>),
+	/// Everything left, up to the part's natural.
+	Rest(P),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Placed<P> {
+	part: Part<P>,
+	width: f32,
+	shown: bool,
+	dropped: bool,
+}
+
+/// The widths [`fit_row`] settled on.
+#[derive(Clone, Debug)]
+pub(crate) struct RowFit<P> {
+	placed: Vec<Placed<P>>,
+	slack: f32,
+}
+
+impl<P: Copy + Eq + std::fmt::Debug> RowFit<P> {
+	fn get(&self, p: P) -> &Placed<P> {
+		self.placed
+			.iter()
+			.find(|s| s.part.id == p)
+			.unwrap_or_else(|| panic!("{p:?} is not a part of this row"))
+	}
+
+	/// The width given to `p`: 0 when it was dropped or got nothing.
+	pub(crate) fn width(&self, p: P) -> f32 {
+		self.get(p).width
+	}
+
+	pub(crate) fn natural(&self, p: P) -> f32 {
+		self.get(p).part.natural
+	}
+
+	pub(crate) fn floor(&self, p: P) -> f32 {
+		self.get(p).part.floor
+	}
+
+	/// Whether `p` was given a place in the row (its gap was paid).
+	pub(crate) fn shown(&self, p: P) -> bool {
+		self.get(p).shown
+	}
+
+	/// Whether an [`Claim::Atomic`] group holding `p` was refused.
+	pub(crate) fn dropped(&self, p: P) -> bool {
+		self.get(p).dropped
+	}
+
+	/// What was left after every claim.
+	pub(crate) fn slack(&self) -> f32 {
+		self.slack
+	}
+}
+
+/// Shares `avail` px between `parts` as `claims` say, in their order.
+/// Invariants: no part is wider than its natural; only shown parts pay their
+/// gap; the shown widths and gaps add up to at most `avail`.
+pub(crate) fn fit_row<P: Copy + Eq + std::fmt::Debug>(
+	avail: f32,
+	parts: &[Part<P>],
+	claims: &[Claim<P>],
+) -> RowFit<P> {
+	let mut fit = RowFit {
+		placed: parts
+			.iter()
+			.map(|&part| Placed {
+				part,
+				width: 0.,
+				shown: false,
+				dropped: false,
+			})
+			.collect(),
+		slack: avail,
+	};
+	let ix = |fit: &RowFit<P>, p: P| {
+		fit.placed
+			.iter()
+			.position(|s| s.part.id == p)
+			.unwrap_or_else(|| panic!("{p:?} is not a part of this row"))
+	};
+	// Costs are sums of f32: a part that fits to the last pixel still fits.
+	const EPS: f32 = 1e-3;
+	for claim in claims {
+		match claim {
+			Claim::Atomic(ps) => {
+				let ixs: Vec<usize> = ps
+					.iter()
+					.map(|&p| ix(&fit, p))
+					.filter(|&i| !fit.placed[i].shown && !fit.placed[i].dropped)
+					.collect();
+				let cost: f32 = ixs
+					.iter()
+					.map(|&i| fit.placed[i].part.floor + fit.placed[i].part.gap)
+					.sum();
+				if cost <= fit.slack + EPS {
+					for &i in &ixs {
+						let s = &mut fit.placed[i];
+						s.shown = true;
+						s.width = s.part.floor;
+					}
+					fit.slack -= cost;
+				} else {
+					for &i in &ixs {
+						fit.placed[i].dropped = true;
+					}
+				}
+			}
+			Claim::Grow(p, target) => {
+				let i = ix(&fit, *p);
+				if fit.placed[i].dropped {
+					continue;
+				}
+				if !pay_gap(&mut fit, i) {
+					continue;
+				}
+				let s = &mut fit.placed[i];
+				let to = target.min(s.part.natural);
+				let add = (to - s.width).min(fit.slack).max(0.);
+				s.width += add;
+				fit.slack -= add;
+			}
+			Claim::ShortestFirst(ps) => {
+				let mut ixs: Vec<usize> = ps
+					.iter()
+					.map(|&p| ix(&fit, p))
+					.filter(|&i| fit.placed[i].shown)
+					.collect();
+				ixs.sort_by(|&a, &b| {
+					fit.placed[a]
+						.part
+						.natural
+						.total_cmp(&fit.placed[b].part.natural)
+				});
+				for i in ixs {
+					let s = &mut fit.placed[i];
+					let add = (s.part.natural - s.width).min(fit.slack).max(0.);
+					s.width += add;
+					fit.slack -= add;
+				}
+			}
+			Claim::Rest(p) => {
+				let i = ix(&fit, *p);
+				if fit.placed[i].dropped || !pay_gap(&mut fit, i) {
+					continue;
+				}
+				let s = &mut fit.placed[i];
+				let add = (s.part.natural - s.width).min(fit.slack).max(0.);
+				s.width += add;
+				fit.slack -= add;
+			}
+		}
+	}
+	fit
+}
+
+/// Shows the part at `i` if it is not yet: pays its gap, if some room is
+/// left after it. Whether it is shown.
+fn pay_gap<P>(fit: &mut RowFit<P>, i: usize) -> bool {
+	if fit.placed[i].shown {
+		return true;
+	}
+	let gap = fit.placed[i].part.gap;
+	if fit.slack <= gap {
+		return false;
+	}
+	fit.slack -= gap;
+	fit.placed[i].shown = true;
+	true
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// 0.6em per char, as the test text system measures (12px: 7.2).
+	fn noop(size: f32) -> impl Fn(&str) -> f32 {
+		move |s: &str| s.chars().count() as f32 * 0.6 * size
+	}
+
+	// ── R1, R2: the rule table ──
+
+	/// What ADR 0005's table says, written once more.
+	const TABLE: [(FitRole, &str, FitRule, Presence); 19] = [
+		(
+			FitRole::Subject,
+			"subject",
+			FitRule::Readable(6),
+			Presence::Always,
+		),
+		(
+			FitRole::BranchLabel,
+			"branch",
+			FitRule::Readable(6),
+			Presence::Group,
+		),
+		(
+			FitRole::TagLabel,
+			"tag",
+			FitRule::Readable(6),
+			Presence::Group,
+		),
+		(FitRole::RefMore, "more", FitRule::Whole, Presence::Group),
+		(
+			FitRole::Collapsed,
+			"collapsed",
+			FitRule::Whole,
+			Presence::Always,
+		),
+		(
+			FitRole::Author,
+			"author",
+			FitRule::Readable(3),
+			Presence::Column,
+		),
+		(FitRole::Date, "date", FitRule::Whole, Presence::Always),
+		(FitRole::Hash, "hash", FitRule::Whole, Presence::Always),
+		(
+			FitRole::ChipRepo,
+			"chip-repo",
+			FitRule::KeyValue(4),
+			Presence::Overflow,
+		),
+		(
+			FitRole::ChipBranch,
+			"chip-branch",
+			FitRule::KeyValue(4),
+			Presence::Overflow,
+		),
+		(
+			FitRole::ChipUser,
+			"chip-user",
+			FitRule::KeyValue(4),
+			Presence::Overflow,
+		),
+		(
+			FitRole::ChipDate,
+			"chip-date",
+			FitRule::KeyValue(4),
+			Presence::Overflow,
+		),
+		(
+			FitRole::ChipMore,
+			"chip-more",
+			FitRule::Whole,
+			Presence::Always,
+		),
+		(
+			FitRole::RefHint,
+			"ref-hint",
+			FitRule::KeyValue(6),
+			Presence::Always,
+		),
+		(
+			FitRole::PaneGroup,
+			"pane-group",
+			FitRule::Readable(6),
+			Presence::Always,
+		),
+		(
+			FitRole::PaneRefName,
+			"pane-name",
+			FitRule::Readable(6),
+			Presence::Always,
+		),
+		(
+			FitRole::PaneRepo,
+			"pane-repo",
+			FitRule::Whole,
+			Presence::Optional,
+		),
+		(
+			FitRole::MenuRefName,
+			"menu-name",
+			FitRule::Readable(6),
+			Presence::Always,
+		),
+		(
+			FitRole::MenuRepo,
+			"menu-repo",
+			FitRule::Whole,
+			Presence::Optional,
+		),
+	];
+
+	#[test]
+	fn every_fit_role_has_a_key_rule_and_font() {
+		assert_eq!(FitRole::ALL.len(), TABLE.len());
+		let mut keys = std::collections::HashSet::new();
+		for (role, key, rule, presence) in TABLE {
+			assert!(FitRole::ALL.contains(&role), "{role:?} is not in ALL");
+			assert_eq!(role.key(), key);
+			assert_eq!(FitRole::from_key(key), Some(role));
+			assert_eq!(role.rule(), rule, "{role:?}");
+			assert_eq!(role.presence(), presence, "{role:?}");
+			assert!(keys.insert(key), "{key} is two roles' key");
+			let (font, size) = role.font();
+			assert!(!font.is_empty() && size > 0.);
+			// A rule names itself as the probe prints it, and reads back.
+			assert_eq!(FitRule::parse(&rule.name()), Some(rule));
+		}
+		assert_eq!(FitRole::Hash.font(), (CODE_FONT, SMALL_TEXT));
+		assert_eq!(FitRole::BranchLabel.chrome(), 17.);
+		assert_eq!(FitRole::ChipUser.chrome(), 27.);
+	}
+
+	#[test]
+	fn readable_floor_counts_graphemes() {
+		let m = noop(10.);
+		let role = FitRole::Subject; // Readable(6)
+							   // A CJK character, a combining pair and a ZWJ family are one each.
+		let cjk = "\u{6f22}".repeat(10);
+		let combining = "e\u{301}".repeat(10);
+		let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(10);
+		for text in [cjk, combining, family] {
+			assert_eq!(grapheme_count(&text), 10);
+			// Six graphemes, the ellipsis and the margin.
+			let kept = format!("{}{ELLIPSIS}", prefix_graphemes(&text, 6));
+			assert_eq!(
+				floor_px(role, &text, 0, &m),
+				m(&kept) + FIT_MARGIN,
+				"{text}"
+			);
+		}
+		// Not longer than six: the floor is the whole text.
+		for text in ["abc", "abcdef", "e\u{301}e\u{301}e\u{301}"] {
+			assert_eq!(floor_px(role, text, 0, &m), natural_px(role, text, &m));
+		}
+		// The floor never exceeds the natural width: seven graphemes of
+		// width 1 cost less whole than six and the ellipsis.
+		let seven = "iiiiiii";
+		let narrow = |s: &str| s.chars().count() as f32;
+		assert_eq!(
+			floor_px(role, seven, 0, &narrow),
+			natural_px(role, seven, &narrow)
+		);
+		// A label's chrome is in both.
+		let label = FitRole::BranchLabel;
+		assert_eq!(
+			floor_px(label, "abcdefgh", 0, &m),
+			17. + m("abcdef\u{2026}") + 1.
+		);
+	}
+
+	#[test]
+	fn a_key_value_floor_keeps_the_key_whole() {
+		let m = noop(10.);
+		let role = FitRole::ChipUser; // KeyValue(4)
+		let text = "User: someone@example.com";
+		let key_end = "User: ".len();
+		let want = 27. + m("User: some\u{2026}") + 1.;
+		assert_eq!(floor_px(role, text, key_end, &m), want);
+		// A short value is whole.
+		assert_eq!(
+			floor_px(role, "User: me", key_end, &m),
+			natural_px(role, "User: me", &m)
+		);
+		// No value, no key_end: the whole key.
+		assert_eq!(floor_px(role, "User", 4, &m), natural_px(role, "User", &m));
+	}
+
+	#[test]
+	fn shown_graphemes_and_rule_holds_agree_with_the_floor() {
+		let m = noop(10.);
+		let role = FitRole::Subject;
+		let text = "abcdefghijklmnopqrstuvwxyz";
+		let natural = natural_px(role, text, &m);
+		// Whole text in sight.
+		assert_eq!(shown_graphemes(role, text, natural, &m), (26, 26));
+		assert_eq!(shown_graphemes(role, text, natural + 50., &m), (26, 26));
+		// At the floor: six graphemes.
+		let floor = floor_px(role, text, 0, &m);
+		assert_eq!(shown_graphemes(role, text, floor, &m), (6, 26));
+		assert!(rule_holds(role.rule(), 6, 26, 0));
+		assert!(!rule_holds(role.rule(), 5, 26, 0));
+		// A pixel less than the floor: five.
+		assert_eq!(shown_graphemes(role, text, floor - 1., &m), (5, 26));
+		// Nothing fits.
+		assert_eq!(shown_graphemes(role, text, 1., &m), (0, 26));
+		// A text shorter than the rule needs only shows itself.
+		assert!(rule_holds(FitRule::Readable(6), 3, 3, 0));
+		assert!(rule_holds(FitRule::Whole, 9, 9, 0));
+		assert!(!rule_holds(FitRule::Whole, 8, 9, 0));
+		assert!(rule_holds(FitRule::KeyValue(4), 10, 30, 6));
+		assert!(!rule_holds(FitRule::KeyValue(4), 9, 30, 6));
+		assert!(rule_holds(FitRule::KeyValue(4), 8, 8, 6));
+	}
+
+	#[test]
+	fn gpui_may_cut_inside_a_grapheme_and_shown_stays_on_the_safe_side() {
+		// gpui truncates char by char: a ZWJ family is three chars (and two
+		// joiners) to it. `shown` counts graphemes, so it counts fewer than
+		// gpui keeps, never more.
+		let m = noop(10.);
+		let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+		let text = family.repeat(4);
+		let role = FitRole::Subject;
+		let (shown, total) = shown_graphemes(role, &text, 30., &m);
+		assert_eq!(total, 4);
+		// In 30px chars (6px each) 5 chars fit with the ellipsis; a family is
+		// 5 chars: 0 whole graphemes.
+		assert_eq!(shown, 0);
+	}
+
+	// ── U1–U7: the solver ──
+
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum P {
+		A,
+		B,
+		C,
+		D,
+	}
+
+	fn part(id: P, natural: f32, floor: f32, gap: f32) -> Part<P> {
+		Part::new(id, natural, floor, gap)
+	}
+
+	fn shown_total(fit: &RowFit<P>, parts: &[Part<P>]) -> f32 {
+		parts
+			.iter()
+			.filter(|p| fit.shown(p.id))
+			.map(|p| fit.width(p.id) + p.gap)
+			.sum()
+	}
+
+	#[test]
+	fn fit_row_stays_within_avail_and_natural() {
+		let mut checked = 0;
+		for avail in (0..=700).step_by(7) {
+			for (na, nb, nc, nd) in [
+				(80., 140., 60., 400.),
+				(20., 20., 20., 20.),
+				(300., 10., 120., 50.),
+			] {
+				for gap in [0., 6., 8.] {
+					let parts = [
+						part(P::A, na, na * 0.4, gap),
+						part(P::B, nb, nb * 0.5, gap),
+						part(P::C, nc, nc, gap),
+						part(P::D, nd, nd * 0.2, gap),
+					];
+					let claims = [
+						Claim::Atomic(vec![P::C]),
+						Claim::Grow(P::D, nd * 0.2),
+						Claim::Atomic(vec![P::A, P::B]),
+						Claim::ShortestFirst(vec![P::A, P::B]),
+						Claim::Grow(P::D, 160.),
+						Claim::Rest(P::D),
+					];
+					let fit = fit_row(avail as f32, &parts, &claims);
+					for p in &parts {
+						assert!(
+							fit.width(p.id) <= p.natural + 1e-3,
+							"{avail} {p:?}: {}",
+							fit.width(p.id)
+						);
+					}
+					let used = shown_total(&fit, &parts);
+					assert!(
+						used <= avail as f32 + 1e-3,
+						"{avail}: {used} > avail"
+					);
+					assert!((avail as f32 - used - fit.slack()).abs() < 1e-3);
+					checked += 1;
+				}
+			}
+		}
+		assert!(checked > 200);
+	}
+
+	#[test]
+	fn an_atomic_claim_is_whole_or_absent() {
+		let parts = [
+			part(P::A, 100., 40., 8.),
+			part(P::B, 100., 40., 8.),
+			part(P::C, 50., 50., 0.),
+		];
+		let claims =
+			[Claim::Atomic(vec![P::A, P::B]), Claim::Atomic(vec![P::C])];
+		// Room for both floors and gaps (96) and C: both at their floors.
+		let fit = fit_row(146., &parts, &claims);
+		assert_eq!((fit.width(P::A), fit.width(P::B)), (40., 40.));
+		assert!(fit.shown(P::A) && fit.shown(P::B) && fit.shown(P::C));
+		assert_eq!(fit.slack(), 0.);
+		// A pixel short for the pair: neither, and C still gets its place.
+		let fit = fit_row(95., &parts, &claims);
+		assert!(fit.dropped(P::A) && fit.dropped(P::B));
+		assert!(!fit.shown(P::A) && !fit.shown(P::B));
+		assert_eq!((fit.width(P::A), fit.width(P::B)), (0., 0.));
+		assert!(fit.shown(P::C) && !fit.dropped(P::C));
+		assert_eq!(fit.slack(), 45.);
+	}
+
+	#[test]
+	fn a_later_claim_gets_nothing_while_an_earlier_grow_is_short() {
+		let parts = [part(P::A, 200., 50., 0.), part(P::B, 100., 100., 8.)];
+		let claims = [Claim::Grow(P::A, 200.), Claim::Atomic(vec![P::B])];
+		// A takes everything it can: B finds no room.
+		let fit = fit_row(150., &parts, &claims);
+		assert_eq!(fit.width(P::A), 150.);
+		assert!(fit.dropped(P::B));
+		// A is whole: B gets its place.
+		let fit = fit_row(320., &parts, &claims);
+		assert_eq!(fit.width(P::A), 200.);
+		assert!(fit.shown(P::B) && fit.width(P::B) == 100.);
+	}
+
+	#[test]
+	fn shortest_first_keeps_the_shorter_whole() {
+		let parts = [part(P::A, 140., 40., 0.), part(P::B, 60., 40., 8.)];
+		let claims = [
+			Claim::Atomic(vec![P::A, P::B]),
+			Claim::ShortestFirst(vec![P::A, P::B]),
+		];
+		// 88 pays the floors and the gap; 60 more: B (shorter) first.
+		let fit = fit_row(88. + 20., &parts, &claims);
+		assert_eq!(fit.width(P::B), 60.);
+		assert_eq!(fit.width(P::A), 40.);
+		let fit = fit_row(88. + 10., &parts, &claims);
+		assert_eq!(fit.width(P::B), 50.);
+		assert_eq!(fit.width(P::A), 40.);
+		// Declared order does not matter: the shorter natural is served first.
+		let swapped = [
+			Claim::Atomic(vec![P::B, P::A]),
+			Claim::ShortestFirst(vec![P::B, P::A]),
+		];
+		let fit = fit_row(88. + 10., &parts, &swapped);
+		assert_eq!(fit.width(P::B), 50.);
+	}
+
+	#[test]
+	fn no_slack_while_a_grow_or_rest_part_is_cut() {
+		for avail in 0..=300 {
+			let parts = [part(P::A, 120., 30., 8.), part(P::B, 200., 20., 8.)];
+			let claims = [
+				Claim::Atomic(vec![P::A]),
+				Claim::Grow(P::B, 20.),
+				Claim::ShortestFirst(vec![P::A]),
+				Claim::Rest(P::B),
+			];
+			let fit = fit_row(avail as f32, &parts, &claims);
+			if fit.shown(P::B) && fit.width(P::B) < fit.natural(P::B) - 1e-3 {
+				assert!(fit.slack() < 1e-3, "{avail}: {}", fit.slack());
+			}
+		}
+	}
+
+	#[test]
+	fn only_shown_parts_pay_their_gap() {
+		let parts = [part(P::A, 50., 50., 20.), part(P::B, 50., 50., 20.)];
+		// A dropped part pays nothing: B gets all of its room.
+		let claims = [Claim::Atomic(vec![P::A]), Claim::Atomic(vec![P::B])];
+		let fit = fit_row(70., &parts, &claims);
+		assert!(fit.shown(P::A) && fit.dropped(P::B));
+		assert_eq!(fit.slack(), 0.);
+		// A Grow with no room for its gap is skipped, not dropped.
+		let claims = [Claim::Grow(P::A, 50.)];
+		let fit = fit_row(20., &parts, &claims);
+		assert!(!fit.shown(P::A) && !fit.dropped(P::A));
+		assert_eq!(fit.slack(), 20.);
+	}
+
+	#[test]
+	fn a_failed_atomic_part_stays_dropped() {
+		let parts = [part(P::A, 100., 80., 8.), part(P::B, 100., 20., 8.)];
+		let claims = [
+			Claim::Atomic(vec![P::A]),
+			Claim::Grow(P::A, 100.),
+			Claim::ShortestFirst(vec![P::A, P::B]),
+			Claim::Rest(P::A),
+			Claim::Atomic(vec![P::B]),
+		];
+		// 60 cannot pay A's 88: A is dropped and later claims leave it alone,
+		// while B still fits in its 28.
+		let fit = fit_row(60., &parts, &claims);
+		assert!(fit.dropped(P::A));
+		assert_eq!(fit.width(P::A), 0.);
+		assert!(!fit.shown(P::A));
+		assert!(fit.shown(P::B) && fit.width(P::B) == 20.);
+	}
+}
