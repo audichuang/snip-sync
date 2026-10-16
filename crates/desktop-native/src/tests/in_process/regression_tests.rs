@@ -67,3 +67,44 @@ fn fuzz_regression_no_zh_entry_carries_an_english_run() {
 		leaks.join("\n")
 	);
 }
+
+/// O7: an inline layer is drawn exactly when its pane is. The add-repo field
+/// belongs to the Project pane, which the user can hide by pressing its rail
+/// button again: the field is then open and not drawn, and that is right,
+/// not a stray layer: the pane brings it back as it was. The check assumed
+/// the pane is drawn whenever the Project tab is active (found by
+/// `fuzz_local_workbench_keeps_derived_state`).
+#[gpui::test]
+fn fuzz_regression_a_hidden_project_pane_keeps_its_add_repo_field_open(
+	cx: &mut TestAppContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	repo(ws.path(), "alpha", &[]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle(cx);
+	cx.simulate_keystrokes("alt-1");
+	settle(cx);
+	click_probed(&model, cx, "btn-add-repo");
+	let open = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| {
+			m.overlays
+				.is_open(crate::overlay::OverlayKind::AddRepoField)
+		})
+	};
+	assert!(open(cx), "the field opens");
+	overlays::assert_overlay_panels_match(cx, &model);
+	click_probed(&model, cx, "rail-project");
+	assert!(open(cx), "hiding the pane leaves the field open");
+	assert!(
+		cx.debug_bounds("input-add-repo").is_none(),
+		"a hidden pane draws nothing"
+	);
+	model.read_with(cx, |m, _| assert!(!m.left_visible));
+	overlays::assert_overlay_panels_match(cx, &model);
+	// Shown again, the field is where it was left.
+	click_probed(&model, cx, "rail-project");
+	assert!(open(cx));
+	assert!(cx.debug_bounds("input-add-repo").is_some());
+	overlays::assert_overlay_panels_match(cx, &model);
+}
