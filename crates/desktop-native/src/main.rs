@@ -22799,6 +22799,595 @@ mod tests {
 				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 		}
+
+		/// The paste panel's destination folder (#238): picked with the
+		/// pointer or typed, then applied from the keyboard.
+		mod paste_destination {
+			use super::*;
+
+			/// `ws/` is a plain folder holding two repos, `docs/` with a
+			/// file, and a folder whose name has a space. Also returns the
+			/// temp dir's owner so a test can add siblings.
+			fn multi_repo_ws() -> (tempfile::TempDir, PathBuf) {
+				let tmp = tempfile::tempdir().unwrap();
+				let ws = tmp.path().join("ws");
+				fs::create_dir(&ws).unwrap();
+				repo(&ws, "repoA", &[]);
+				repo(&ws, "repoB", &[]);
+				fs::create_dir(ws.join("docs")).unwrap();
+				fs::write(ws.join("docs/readme.txt"), "readme").unwrap();
+				fs::create_dir(ws.join("my dir")).unwrap();
+				(tmp, ws)
+			}
+
+			/// Opens `ws` and waits (bounded) for the scan and its trees.
+			fn open_ready<'a>(
+				cx: &'a mut TestAppContext,
+				ws: &Path,
+			) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
+				let (model, cx) = open(cx, ws.to_path_buf(), None);
+				settle_until(cx, "the workspace scan", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.is_loading
+							&& m.repos.len() == 2 && m
+							.ws_tree
+							.as_ref()
+							.is_some_and(|t| t.is_loaded)
+					})
+				});
+				// The Project tool window, where the folders are.
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				(model, cx)
+			}
+
+			/// Puts `text` on the clipboard and opens its paste preview
+			/// with Cmd+V, waiting (bounded) for the plan.
+			fn preview(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				text: &str,
+			) {
+				clip::write_text(text).unwrap();
+				cx.simulate_keystrokes("cmd-v");
+				landed(model, cx);
+			}
+
+			fn landed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				settle_until(cx, "the paste plan", |cx| {
+					model.read_with(cx, |m, _| {
+						m.paste.plan().is_some() && !m.paste.is_loading()
+					})
+				});
+			}
+
+			/// The Enter that applies, then the wait for the write.
+			fn apply_with_enter(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				cx.simulate_keystrokes("enter");
+				settle_until(cx, "the write to finish", |cx| {
+					model.read_with(cx, |m, _| {
+						m.paste.plan().is_none() && !m.paste_busy()
+					})
+				});
+			}
+
+			/// Where the probe `id` is drawn, centred, in window points.
+			fn probed_point(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> gpui::Point<gpui::Pixels> {
+				if model.read_with(cx, |m, _| m.probes.is_none()) {
+					model.update(cx, |m, cx| {
+						m.probes = Some(crate::ui::Probes::for_test());
+						cx.notify();
+					});
+					settle(cx);
+				}
+				let b = model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+					.unwrap_or_else(|| panic!("no probed control {id}"));
+				let scale = cx.update(|window, _| window.scale_factor());
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				)
+			}
+
+			fn right_click_probed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) {
+				let pos = probed_point(model, cx, id);
+				cx.simulate_mouse_down(
+					pos,
+					gpui::MouseButton::Right,
+					gpui::Modifiers::none(),
+				);
+				cx.simulate_mouse_up(
+					pos,
+					gpui::MouseButton::Right,
+					gpui::Modifiers::none(),
+				);
+				settle(cx);
+			}
+
+			fn plan_destination(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> PathBuf {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().expect("a plan").destination.clone()
+				})
+			}
+
+			fn executable(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some_and(|p| p.executable())
+				})
+			}
+
+			fn paste_focused(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				cx.update(|w, cx| model.read(cx).paste_focus.is_focused(w))
+			}
+
+			fn probed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> bool {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| p.bounds(id).is_some())
+				})
+			}
+
+			fn file(path: &Path) -> Option<String> {
+				fs::read_to_string(path).ok()
+			}
+
+			/// The report of #236: in a workspace of several repos there was
+			/// no way to paste into the workspace folder itself.
+			#[gpui::test]
+			fn multi_repo_paste_targets_the_workspace_root_from_the_breadcrumb(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				// The default stays the pinned repo, whichever scans first.
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				assert_ne!(first, ws);
+				assert_eq!(plan_destination(&model, cx), first);
+
+				click_probed(&model, cx, "paste-dest-crumb:0");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws);
+				assert!(executable(&model, cx));
+				assert!(
+					paste_focused(&model, cx),
+					"focus returns to the panel"
+				);
+
+				apply_with_enter(&model, cx);
+				assert!(
+					file(&ws.join("x.txt")).is_some_and(|s| s.contains('X'))
+				);
+				assert!(!ws.join("repoA/x.txt").exists());
+				assert!(!ws.join("repoB/x.txt").exists());
+			}
+
+			/// Keeping a prefix follows the destination only until the
+			/// destination moves: the choice is asked for again (#238).
+			#[gpui::test]
+			fn moving_the_destination_asks_for_the_prefix_again(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: notes/x.txt\nN\n");
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				assert!(model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().mapping_ready()
+				}));
+				click_probed(&model, cx, "paste-dest-root");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws);
+				assert!(!model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().mapping_ready()
+				}));
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join("notes/x.txt")).as_deref(),
+					Some("N\n")
+				);
+			}
+
+			/// Right-click a folder, pick "paste into this folder": the next
+			/// Enter applies (the menu's own Enter has been spent).
+			#[gpui::test]
+			fn paste_into_from_the_project_menu_applies_on_the_first_enter(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+
+				// (a) The pointer picks it, with no preview open.
+				{
+					let (model, cx) = open_ready(cx, &ws);
+					clip::write_text("// FILE: x.txt\nX\n").unwrap();
+					right_click_probed(&model, cx, "ws-tree-row:docs");
+					assert!(model.read_with(cx, |m, _| menu_has_enabled(
+						m,
+						"paste-into"
+					)));
+					click_probed(&model, cx, "menu-item:paste-into");
+					landed(&model, cx);
+					assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+					assert!(paste_focused(&model, cx));
+					assert!(model.read_with(cx, |m, _| m.chrome.menu.is_none()));
+					apply_with_enter(&model, cx);
+					assert_eq!(
+						file(&ws.join("docs/x.txt")).as_deref(),
+						Some("X\n")
+					);
+					fs::remove_file(ws.join("docs/x.txt")).unwrap();
+				}
+			}
+
+			/// Whether the open menu has an enabled item `id`.
+			fn menu_has_enabled(m: &WorkbenchModel, id: &str) -> bool {
+				m.chrome.menu.as_ref().is_some_and(|menu| {
+					menu.entries.iter().any(|e| {
+						matches!(
+							e,
+							crate::menu::MenuEntry::Item {
+								id: i,
+								act: Some(_),
+								..
+							} if *i == id
+						)
+					})
+				})
+			}
+
+			/// The same, with the menu driven from the keyboard.
+			#[gpui::test]
+			fn paste_into_from_the_menu_by_keyboard_applies_on_the_next_enter(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs");
+				for _ in 0..8 {
+					let on_it = model.read_with(cx, |m, _| {
+						m.chrome.menu.as_ref().is_some_and(|menu| {
+							matches!(
+								menu.cursor.and_then(|c| menu.entries.get(c)),
+								Some(crate::menu::MenuEntry::Item {
+									id: "paste-into",
+									..
+								})
+							)
+						})
+					});
+					if on_it {
+						break;
+					}
+					cx.simulate_keystrokes("down");
+				}
+				// The menu's Enter picks the item and applies nothing.
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(!ws.join("docs/x.txt").exists());
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join("docs/x.txt")).as_deref(),
+					Some("X\n")
+				);
+			}
+
+			/// With a preview already open the menu moves it, and the
+			/// payload is the one previewed, not the clipboard now.
+			#[gpui::test]
+			fn paste_into_with_a_preview_open_keeps_the_previewed_payload(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				clip::write_text("other").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.unwrap()
+						.items
+						.iter()
+						.any(|i| i.path == "x.txt")
+				}));
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join("docs/x.txt")).as_deref(),
+					Some("X\n")
+				);
+			}
+
+			/// Opens the destination editor over a fresh preview.
+			fn open_editor(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				preview(model, cx, "// FILE: x.txt\nX\n");
+				click_probed(model, cx, "paste-dest-edit");
+				assert!(probed(model, cx, "paste-dest-input"));
+			}
+
+			#[gpui::test]
+			fn typed_destination_applies_on_enter_and_escape_restores(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				assert!(editor_focused(&model, cx));
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs");
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(!editor_open(&model, cx));
+				assert!(paste_focused(&model, cx));
+				// The first Enter chose the folder; the second applies.
+				assert!(!ws.join("docs/x.txt").exists());
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join("docs/x.txt")).as_deref(),
+					Some("X\n")
+				);
+
+				// Escape drops what was typed and keeps the folder.
+				open_editor(&model, cx);
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("repoA");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!editor_open(&model, cx));
+				assert_eq!(plan_destination(&model, cx), first);
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(paste_focused(&model, cx));
+				// The second Escape closes the panel.
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+			}
+
+			/// Refused folders stay in the editor, and the open plan stays
+			/// ready for the folder it already had.
+			#[gpui::test]
+			fn typed_destination_errors_stay_in_the_editor_and_keep_the_plan(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (tmp, ws) = multi_repo_ws();
+				#[cfg(unix)]
+				{
+					let outside = tmp.path().join("outside");
+					fs::create_dir(&outside).unwrap();
+					std::os::unix::fs::symlink(&outside, ws.join("link"))
+						.unwrap();
+				}
+				#[cfg(not(unix))]
+				let _ = &tmp;
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				let mut cases = vec![
+					("missing/dir", "paste_err_destination", None),
+					(
+						"../outside",
+						"paste_err_destination",
+						Some("not under the workspace"),
+					),
+					("docs/readme.txt", "paste_err_destination_not_dir", None),
+				];
+				#[cfg(unix)]
+				cases.push((
+					"link",
+					"paste_err_destination",
+					Some("not under the workspace"),
+				));
+				for (typed, key, words) in cases {
+					cx.simulate_keystrokes("cmd-a");
+					cx.simulate_input(typed);
+					cx.simulate_keystrokes("enter");
+					settle(cx);
+					let err = editor_error(&model, cx)
+						.unwrap_or_else(|| panic!("{typed}: no error"));
+					assert_eq!(err.key, key, "{typed}");
+					if let Some(words) = words {
+						let en = err.render(crate::i18n::Locale::En);
+						assert!(en.contains(words), "{typed}: {en}");
+					}
+					assert!(editor_open(&model, cx), "{typed}: editor closed");
+					assert!(probed(&model, cx, "paste-dest-status"), "{typed}");
+					assert_eq!(plan_destination(&model, cx), first, "{typed}");
+					assert!(executable(&model, cx), "{typed}: plan disarmed");
+				}
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!editor_open(&model, cx));
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X\n"));
+			}
+
+			/// A space typed in the field is text, not the preview's row
+			/// toggle.
+			#[gpui::test]
+			fn a_space_typed_in_the_destination_reaches_the_input(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("my dir");
+				assert_eq!(editor_text(&model, cx), "my dir");
+				assert!(model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().items.iter().all(|i| i.selected)
+				}));
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("my dir"));
+			}
+
+			/// The workspace root of a remote workspace is a destination of
+			/// its own, not the repo the paste would default to.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn remote_root_chip_plans_and_writes_the_workspace_itself(
+				cx: &mut TestAppContext,
+			) {
+				let _serial = remote_lock();
+				let Some(_clip) = clipboard() else { return };
+				let tmp = tempfile::tempdir().unwrap();
+				let shared = tmp.path().join("shared");
+				fs::create_dir(&shared).unwrap();
+				for name in ["repoA", "repoB"] {
+					let r = shared.join(name);
+					fs::create_dir(&r).unwrap();
+					crate::paste::tests::git_init(&r);
+					fs::write(r.join("init.txt"), "hello\n").unwrap();
+					crate::paste::tests::git_run(&r, &["add", "init.txt"]);
+					crate::paste::tests::git_run(&r, &["commit", "-m", "init"]);
+				}
+				let (model, cx, _worker) = open_remote(
+					cx,
+					&shared,
+					snip_remote::WorkerOptions {
+						name: "test-worker".into(),
+						..Default::default()
+					},
+				);
+				model.update(cx, |m, cx| m.select_repo(0, cx));
+				settle(cx);
+				remote_paste_preview(&model, cx, "// FILE: x.txt\nX\n");
+				let (root, first) = model.read_with(cx, |m, _| {
+					(
+						m.remote.session.as_ref().unwrap().root.clone(),
+						m.repo_root().unwrap(),
+					)
+				});
+				assert_ne!(first, root);
+				assert_eq!(plan_destination(&model, cx), first);
+
+				click_probed(&model, cx, "paste-dest-root");
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				assert_eq!(plan_destination(&model, cx), root);
+				assert_eq!(
+					crate::remote::remote_rel(&root, &root).as_deref(),
+					Some("")
+				);
+				assert!(executable(&model, cx));
+				remote_paste_apply(&model, cx);
+				assert_eq!(file(&shared.join("x.txt")).as_deref(), Some("X\n"));
+				assert!(!shared.join("repoA/x.txt").exists());
+				assert!(!shared.join("repoB/x.txt").exists());
+
+				// A folder the worker has none of: its refusal, in the
+				// interface language, and nothing to apply.
+				remote_paste_preview(&model, cx, "// FILE: y.txt\nY\n");
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("nope");
+				cx.simulate_keystrokes("enter");
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				assert_eq!(plan_destination(&model, cx), root.join("nope"));
+				assert!(!executable(&model, cx));
+				let said = model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.and_then(|p| p.error.as_ref())
+						.map(|e| e.render(crate::i18n::Locale::ZhTw))
+				});
+				let said = said.expect("the worker's refusal is shown");
+				assert!(said.contains("無法使用貼上目的地"), "{said}");
+				assert!(!said.contains("No such file"), "{said}");
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()));
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert!(!shared.join("nope").exists());
+				assert!(!shared.join("y.txt").exists());
+			}
+
+			// Red-light stand-ins: the destination editor does not exist yet.
+			fn editor_open(
+				_model: &Entity<WorkbenchModel>,
+				_cx: &mut VisualTestContext,
+			) -> bool {
+				unimplemented!("destination editor (#238)")
+			}
+
+			fn editor_focused(
+				_model: &Entity<WorkbenchModel>,
+				_cx: &mut VisualTestContext,
+			) -> bool {
+				unimplemented!("destination editor (#238)")
+			}
+
+			fn editor_text(
+				_model: &Entity<WorkbenchModel>,
+				_cx: &mut VisualTestContext,
+			) -> String {
+				unimplemented!("destination editor (#238)")
+			}
+
+			fn editor_error(
+				_model: &Entity<WorkbenchModel>,
+				_cx: &mut VisualTestContext,
+			) -> Option<crate::i18n::Msg> {
+				unimplemented!("destination editor (#238)")
+			}
+		}
 	}
 
 	mod folder_copy {
