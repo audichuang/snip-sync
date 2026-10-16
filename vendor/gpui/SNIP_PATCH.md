@@ -102,3 +102,9 @@ test is affected unless it calls it. CJK glyphs come from a system font
 relations (wider than the Noop estimate, cut vs whole), not pixels. The
 test is `real_text_system_measures_cjk_and_the_log_labels_stay_readable`
 (#224); it runs in about 0.6 s, like its Noop siblings.
+
+A test that measures text must also call the app's `theme::register_fonts`
+after it: without the embedded fonts "Inter" falls back to a system font and
+the same string measures 249.6 instead of 232.0 (7% off). `open_real_text` in
+`crates/desktop-native/src/main.rs` does both and asserts the families
+resolve (#228).

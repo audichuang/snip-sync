@@ -42,9 +42,7 @@ impl WorkbenchModel {
 			out.push(
 				menu_row(SharedString::from(id.clone()), 82)
 					.debug_selector(move || selector)
-					// The open row's folder list sits right below it; its
-					// tooltip would cover the open-here button (#203).
-					.when(!open, |d| d.tooltip(tip(host.name.clone())))
+					.tip(host.name.clone())
 					.when(open, |d| d.bg(rgb(pal().hover_bg)))
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.browse_remote_host(ix, cx);
@@ -82,7 +80,7 @@ impl WorkbenchModel {
 							.min_w_0()
 							.text_size(px(SMALL_TEXT))
 							.text_color(rgb(pal().text_muted))
-							.tooltip(tip(browse.path.clone()))
+							.tip(browse.path.clone())
 							.child(clip_text(browse.path.clone()))
 							.children(probe(log, "remote-path")),
 					)
@@ -196,7 +194,7 @@ impl WorkbenchModel {
 							menu_row(SharedString::from(id.clone()), 84)
 								.debug_selector(move || selector)
 								.pl(px(32.))
-								.tooltip(tip(tip_path))
+								.tip(tip_path)
 								.on_click(cx.listener(move |this, _, _, cx| {
 									this.enter_remote_folder(&enter, cx);
 								}))

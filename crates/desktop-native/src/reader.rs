@@ -20,6 +20,7 @@ use snip_core::gitview::{Read, ReadProfile};
 
 use crate::githost::GitHost;
 use crate::i18n::{t, tf, Msg};
+use crate::overlay::{OverlayKind, ReturnFocus};
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
 use crate::theme::*;
 use crate::WorkbenchModel;
@@ -898,8 +899,6 @@ pub struct Reader {
 	pub row_geom: RowGeometry,
 	/// Last find query, re-applied when a new preview replaces the text.
 	pub find_query: String,
-	/// The find / go-to row is shown (Ctrl+F / Ctrl+G open it, Esc closes).
-	pub find_open: bool,
 	pub find_opts: FindOptions,
 	/// The regex query does not compile.
 	pub find_invalid: bool,
@@ -931,7 +930,6 @@ impl Default for Reader {
 			scroll: UniformListScrollHandle::new(),
 			row_geom: Rc::default(),
 			find_query: String::new(),
-			find_open: false,
 			find_opts: FindOptions::default(),
 			find_invalid: false,
 			pinned: false,
@@ -1224,39 +1222,29 @@ impl WorkbenchModel {
 	}
 
 	/// Ctrl+F / Ctrl+G: reveal the find row and focus its find or go-to
-	/// field; the query typed before is searched again.
+	/// field; the query typed before is searched again. The row is a layer
+	/// of the reader: Escape or its close button closes it, and the
+	/// keyboard goes back to the reader.
 	pub fn open_find(
 		&mut self,
 		goto: bool,
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		if !self.reader.find_open {
-			self.reader.find_open = true;
-			let q = self.find_input.read(cx).text().to_string();
-			self.run_find(&q, cx);
-			app_log!("[APP:FIND_BAR: open]");
-		}
+		let ret = ReturnFocus::To(self.reader_focus.clone());
+		self.open_overlay(
+			OverlayKind::FindBar,
+			ret,
+			None,
+			Some(&mut *window),
+			cx,
+		);
 		let input = if goto {
 			&self.goto_input
 		} else {
 			&self.find_input
 		};
 		window.focus(&input.read(cx).handle());
-		cx.notify();
-	}
-
-	/// Esc: hide the find row and its highlights, back to the text.
-	pub fn close_find(&mut self, cx: &mut Context<Self>) {
-		self.pending_focus = Some(self.reader_focus.clone());
-		if self.reader.find_open {
-			self.reader.find_open = false;
-			self.reader.find_query.clear();
-			self.reader.matches.clear();
-			self.reader.current = None;
-			self.reader.find_invalid = false;
-			app_log!("[APP:FIND_BAR: closed]");
-		}
 		cx.notify();
 	}
 

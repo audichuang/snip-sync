@@ -16,6 +16,22 @@ _Avoid_: 分頁（單獨使用，易與工具視窗混淆）、視窗
 工作區分頁內的 Project、Changes、Log 等面板。
 _Avoid_: tab、分頁
 
+**浮層**（floating layer）:
+錨定在窗格之上的面板：工作區選單、Log 下拉選單、repo／ref 選擇器、右鍵選單。同時最多開一個，開新的會取代舊的，分頁切走時它關掉。開著時，所有 tooltip 不顯示。
+_Avoid_: popover、popup、dropdown（泛指時）、menu（單獨使用，易與右鍵選單混淆）
+
+**內嵌層**（inline layer）:
+屬於某個窗格的一塊介面：閱讀器的搜尋／跳行列、Project 窗格的加入 repo 輸入框。開浮層不會關它，分頁切走時它留著，它開著時 tooltip 照常顯示。
+_Avoid_: 工具列、bar（泛指時）
+
+**可辨識下限**（readable floor）:
+一段文字至少要看得到的 grapheme 數，由 `FitRole::rule()` 決定（subject 與 ref 標籤 6、作者 3、chip 的鍵加值 4 個字；日期整段）。空間不夠時，文字被截到這個下限為止，再不夠就整個 chip、整欄或整組標籤退出，不再截。
+_Avoid_: 最小寬度、幾 px
+
+**探索軸**（exploration axis）:
+dogfood 與 gpui 矩陣測試共用的固定維度：視窗寬度（含縮放路徑）、語系、Log 欄位（hash 與窗格）、資料形狀、狀態。每輪 dogfood 依軸走並交一張覆蓋表，定義見 `docs/ui-exploration-axes.md`。
+_Avoid_: 隨便看看、也看大視窗
+
 ## 貼上
 
 **貼上目標**（paste target）:

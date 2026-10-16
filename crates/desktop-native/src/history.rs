@@ -11,10 +11,11 @@ use crate::githost::GitHost;
 use crate::graph_view;
 use crate::i18n::Msg;
 use crate::multi_log;
+use crate::overlay::{CloseWhy, OverlayKind, ReturnFocus, TriggerId};
 use crate::reader::{fnv1a, Preview, PreviewSource};
 use crate::syntax::Language;
 use crate::{e2e_on, WorkbenchModel, WorkbenchTab};
-use gpui::{Context, ScrollStrategy};
+use gpui::{Context, ScrollStrategy, Window};
 use snip_core::browser::{self, BlobText, CommitSummary, TreeEntry, TreeKind};
 use snip_core::gitsrc::GitSource;
 use snip_core::gitview::{ChangedPathList, Read, ReadProfile, RepoView};
@@ -88,6 +89,64 @@ pub const MAX_WINDOW_PAGES: usize = 10;
 pub const MAX_USER_EMAIL: usize = snip_core::gitview::MAX_USER_EMAIL;
 
 pub use snip_core::gitview::{clip_utf8, CommitDetails};
+
+/// Everything shown for the Log selection. It is replaced whole
+/// (`WorkbenchModel::reset_commit_view`) whenever the selection changes, so
+/// no member can outlive the commit it describes: a new member added here is
+/// reset with the others, and `is_reset` will not compile without it.
+#[derive(Default)]
+pub struct CommitView {
+	/// Files of the selected commit or compare.
+	pub commit_files: Vec<(String, Option<snip_core::format::ChangeType>)>,
+	/// Per file of a multi-selection: index in `log_selected` of the newest
+	/// selected commit that touched it.
+	pub commit_file_origin: Vec<u32>,
+	/// Listed files that are submodule commits (no content to copy).
+	pub commit_file_gitlinks: Vec<String>,
+	/// The listing was cut to `MAX_COMMIT_FILES`.
+	pub commit_files_truncated: bool,
+	/// For the selected merge commit: its files unchanged against the first
+	/// parent (listed only through another parent), keyed by the raw SHA.
+	pub commit_files_first_parent_same: Option<(String, HashSet<String>)>,
+	pub selected_commit_file: Option<String>,
+	/// Cmd/Shift multi-selection in the changed files; empty means just
+	/// `selected_commit_file`. Cleared with every change of that one.
+	pub commit_file_sel: Vec<String>,
+	pub commit_details: Option<CommitDetails>,
+	/// Details of an open multi-selection's commits, newest first.
+	pub selection_details: Vec<CommitDetails>,
+	/// Repository of the commit or compare the reader shows from the log.
+	pub log_commit_root: Option<PathBuf>,
+}
+
+impl CommitView {
+	/// True when nothing of a selection is left. Destructures every field
+	/// without `..`: a member added to the struct must be named here.
+	pub fn is_reset(&self) -> bool {
+		let Self {
+			commit_files,
+			commit_file_origin,
+			commit_file_gitlinks,
+			commit_files_truncated,
+			commit_files_first_parent_same,
+			selected_commit_file,
+			commit_file_sel,
+			commit_details,
+			selection_details,
+			log_commit_root,
+		} = self;
+		commit_files.is_empty()
+			&& commit_file_origin.is_empty()
+			&& commit_file_gitlinks.is_empty()
+			&& !commit_files_truncated
+			&& commit_files_first_parent_same.is_none()
+			&& selected_commit_file.is_none()
+			&& commit_file_sel.is_empty()
+			&& commit_details.is_none()
+			&& selection_details.is_empty()
+			&& log_commit_root.is_none()
+	}
+}
 
 /// How a history read changes the loaded window of pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1387,6 +1446,9 @@ impl WorkbenchModel {
 						model.history_autoload = false;
 						model
 							.report_graph_error(GraphAdmissionError::Layout(e));
+						if matches!(load, PageLoad::Replace(_)) {
+							model.drop_selection_the_log_lost();
+						}
 					}
 				}
 				cx.notify();
@@ -1451,6 +1513,9 @@ impl WorkbenchModel {
 			Err(error) => {
 				self.history_autoload = false;
 				self.report_graph_error(error);
+				if matches!(load, PageLoad::Replace(_)) {
+					self.drop_selection_the_log_lost();
+				}
 				return;
 			}
 		};
@@ -1461,6 +1526,9 @@ impl WorkbenchModel {
 		if let Err(error) = candidate.check_budget() {
 			self.history_autoload = false;
 			self.report_graph_error(error);
+			if matches!(load, PageLoad::Replace(_)) {
+				self.drop_selection_the_log_lost();
+			}
 			return;
 		}
 		app_log!(
@@ -1570,14 +1638,32 @@ impl WorkbenchModel {
 		self.selected_commit = None;
 		self.range_head = None;
 		self.log_selected.clear();
-		self.commit_details = None;
+		self.reset_commit_view();
 		self.reset_selection_details();
-		self.commit_files.clear();
-		self.commit_files_first_parent_same = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
 		self.compare = None;
 		self.clear_commit_preview();
+	}
+
+	/// The one place the Log selection's view is dropped: every member of
+	/// `CommitView` goes together, so none can outlive the selection.
+	pub(crate) fn reset_commit_view(&mut self) {
+		self.commit_view = CommitView::default();
+	}
+
+	/// After a read of the Log failed: a selection whose commit is no longer
+	/// in the list is dropped whole, as a read that succeeds does when it
+	/// cannot select the commit again. A fresh window the failure left empty
+	/// must not keep showing the files of a commit it no longer lists.
+	fn drop_selection_the_log_lost(&mut self) {
+		let listed = |id: &str| self.commits.iter().any(|c| c.sha == id);
+		let lost = self
+			.selected_commit
+			.as_deref()
+			.is_some_and(|id| !listed(id))
+			|| self.log_selected.iter().any(|id| !listed(id));
+		if lost {
+			self.clear_commit_selection();
+		}
 	}
 
 	/// Releases the preview only when it came from the Log selection: a
@@ -1798,7 +1884,7 @@ impl WorkbenchModel {
 		author: Option<String>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_filter.author = author
 			.filter(|a| !a.is_empty())
 			.map(|a| clip_utf8(a, MAX_USER_EMAIL));
@@ -1811,7 +1897,7 @@ impl WorkbenchModel {
 		since: Option<&'static str>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_date_error = false;
 		self.log_filter.since = since.map(str::to_string);
 		self.log_filter.until = None;
@@ -1826,7 +1912,7 @@ impl WorkbenchModel {
 		match date_range(&since, &until) {
 			Some((since, until)) => {
 				// The fields go with the menu; the log keeps the keyboard.
-				self.dismiss_log_menu(cx);
+				self.close_log_menus(CloseWhy::Picked, cx);
 				self.log_date_error = false;
 				self.log_filter.since = since;
 				self.log_filter.until = until;
@@ -1905,7 +1991,7 @@ impl WorkbenchModel {
 
 	/// Repo chip ✕ outside a repository scope: every path.
 	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_filter.paths.clear();
 		self.apply_log_filter(cx);
 	}
@@ -1931,68 +2017,23 @@ impl WorkbenchModel {
 		}
 	}
 
-	pub fn toggle_log_menu(
+	/// A press on a Log chip, or on More: opens its dropdown, or closes the
+	/// one that control opened. The keyboard goes back to the Log.
+	pub(crate) fn toggle_log_menu(
 		&mut self,
 		menu: crate::ui::LogMenu,
+		trigger: TriggerId,
+		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		// The click that dismissed this menu (mouse down outside it) lands on
-		// its own chip: that click closes, it does not reopen.
-		// ponytail: time window, not hit testing; a >400ms press reopens.
-		if let Some((m, at)) = self.log_menu_dismissed.take() {
-			if m == menu && at.elapsed() < std::time::Duration::from_millis(400)
-			{
-				cx.notify();
-				return;
-			}
-		}
-		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
-		if self.log_menu == Some(crate::ui::LogMenu::Repo) {
-			self.pending_focus =
-				Some(self.log_path_input.read(cx).handle().clone());
-			self.load_picker_dir("", cx);
-		}
-		// IntelliJ's Branch popup opens with an empty field, sections shut.
-		if self.log_menu == Some(crate::ui::LogMenu::Branch) {
-			self.log_branch_menu_input
-				.update(cx, |i, _| i.clear_retained());
-			self.log_branch_menu_open.clear();
-			self.pending_focus =
-				Some(self.log_branch_menu_input.read(cx).handle().clone());
-		}
-		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
-		cx.notify();
-	}
-
-	/// Esc in a dropdown's field: the log keeps the keyboard, not the
-	/// field that is no longer drawn.
-	pub fn dismiss_log_menu(&mut self, cx: &mut Context<Self>) {
-		self.close_log_menu(cx);
-		self.pending_focus = Some(self.log_focus.clone());
-	}
-
-	/// Closes every workbench popover that is open: the workspace menu, the
-	/// log dropdown and the Repo/Ref selector. True when something was open.
-	/// Only a closed log dropdown hands the focus to the log list.
-	pub fn close_open_popovers(&mut self, cx: &mut Context<Self>) -> bool {
-		let open = self.workspace_menu
-			|| self.log_menu.is_some()
-			|| self.popover.is_some();
-		self.close_popover(cx);
-		if self.workspace_menu {
-			self.close_workspace_menu(cx);
-		}
-		if self.log_menu.is_some() {
-			self.dismiss_log_menu(cx);
-		}
-		open
-	}
-
-	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
-		if let Some(menu) = self.log_menu.take() {
-			self.log_menu_dismissed = Some((menu, std::time::Instant::now()));
-			cx.notify();
-		}
+		let ret = ReturnFocus::To(self.log_focus.clone());
+		self.toggle_overlay(
+			OverlayKind::LogMenu(menu),
+			Some(trigger),
+			ret,
+			Some(window),
+			cx,
+		);
 	}
 
 	/// Authors offered by the User chip: the loaded commits' authors, in
@@ -2071,28 +2112,39 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
+		// A click while the tab drains starts no read, so it must not change
+		// the selection or leave a loading flag (#230).
+		if !self.accepting_work() {
+			return;
+		}
+		let id = sha.to_string();
+		let Some((root, sha)) = self.log_root_for(&id) else {
+			return;
+		};
 		self.user_action();
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.selected_commit = Some(Box::<str>::from(sha).into_string());
+		self.selected_commit =
+			Some(Box::<str>::from(id.as_str()).into_string());
 		self.range_head = None;
 		self.log_selected.clear();
 		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_file_root = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
-		self.commit_files.clear();
+		// The details of the same commit stay while it is selected again.
+		let details = self
+			.commit_view
+			.commit_details
+			.take()
+			.filter(|d| d.sha == id);
+		self.reset_commit_view();
+		self.commit_view.commit_details = details;
 		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
-		let id = sha.to_string();
-		let Some((root, sha)) = self.log_root_for(&id) else {
-			return;
-		};
-		self.log_commit_root = Some(root.clone());
+		self.commit_view.log_commit_root = Some(root.clone());
 		app_log!(
 			"[APP:LOG_SELECTION: n=1 repo={}]",
 			self.log_repo_name(&root)
@@ -2121,8 +2173,13 @@ impl WorkbenchModel {
 	) {
 		self.details_generation = self.details_generation.wrapping_add(1);
 		let generation = self.details_generation;
-		if self.commit_details.as_ref().is_some_and(|d| d.sha != id) {
-			self.commit_details = None;
+		if self
+			.commit_view
+			.commit_details
+			.as_ref()
+			.is_some_and(|d| d.sha != id)
+		{
+			self.commit_view.commit_details = None;
 		}
 		if !self.accepting_work() {
 			return;
@@ -2151,7 +2208,7 @@ impl WorkbenchModel {
 				}
 				// A failed read leaves the row's own fields on screen.
 				// Details are keyed by the row id (merged log: with repo).
-				model.commit_details = res.ok().map(|mut d| {
+				model.commit_view.commit_details = res.ok().map(|mut d| {
 					app_log!(
 						"[APP:COMMIT_DETAILS: {} branches={}]",
 						&d.sha[..7.min(d.sha.len())],
@@ -2168,7 +2225,7 @@ impl WorkbenchModel {
 	/// A new selection starts with its commit list collapsed.
 	fn reset_selection_details(&mut self) {
 		self.log_selection_expanded = false;
-		self.selection_details.clear();
+		self.commit_view.selection_details.clear();
 		self.log_branches_all.clear();
 	}
 
@@ -2181,7 +2238,9 @@ impl WorkbenchModel {
 			self.log_selection_expanded
 		);
 		cx.notify();
-		if !self.log_selection_expanded || !self.selection_details.is_empty() {
+		if !self.log_selection_expanded
+			|| !self.commit_view.selection_details.is_empty()
+		{
 			return;
 		}
 		let reads: Vec<(PathBuf, Option<RepoIdentity>, String, String)> = self
@@ -2230,7 +2289,7 @@ impl WorkbenchModel {
 					return;
 				}
 				app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
-				model.selection_details = res;
+				model.commit_view.selection_details = res;
 				cx.notify();
 			});
 		});
@@ -2241,6 +2300,11 @@ impl WorkbenchModel {
 		if sha.len() > MAX_SHA_LEN {
 			self.report_graph_error(GraphAdmissionError::Budget);
 			cx.notify();
+			return;
+		}
+		// A click while the tab drains starts no read, so it must not change
+		// the selection or leave a loading flag (#230).
+		if !self.accepting_work() {
 			return;
 		}
 		let Some(anchor) = self.selected_commit.as_deref() else {
@@ -2280,6 +2344,11 @@ impl WorkbenchModel {
 		if sha.len() > MAX_SHA_LEN {
 			self.report_graph_error(GraphAdmissionError::Budget);
 			cx.notify();
+			return;
+		}
+		// A click while the tab drains starts no read, so it must not change
+		// the selection or leave a loading flag (#230).
+		if !self.accepting_work() {
 			return;
 		}
 		let Some(anchor) = self.selected_commit.clone() else {
@@ -2357,30 +2426,34 @@ impl WorkbenchModel {
 	/// files (the newest change per path), read in one cancellable job of
 	/// at most `MAX_SELECTION_READS` listings, then the first file's diff.
 	pub fn load_selection(&mut self, cx: &mut Context<Self>) {
+		// The callers changed the selection before asking for its files. A
+		// selection no read can be started for (the tab drains, or its repo
+		// is gone) is dropped whole, not left half set with a loading flag.
+		let Some((root, _)) = self
+			.accepting_work()
+			.then(|| {
+				self.log_selected
+					.first()
+					.and_then(|id| self.log_root_for(id))
+			})
+			.flatten()
+		else {
+			self.clear_commit_selection();
+			return;
+		};
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.details_generation = self.details_generation.wrapping_add(1);
-		self.commit_details = None;
+		self.reset_commit_view();
 		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_file_root = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
-		self.commit_files.clear();
-		self.commit_file_origin.clear();
 		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
-		let Some((root, _)) = self
-			.log_selected
-			.first()
-			.and_then(|id| self.log_root_for(id))
-		else {
-			return;
-		};
-		self.log_commit_root = Some(root.clone());
+		self.commit_view.log_commit_root = Some(root.clone());
 		let n = self.log_selected.len();
 		app_log!(
 			"[APP:LOG_SELECTION: n={n} repo={}]",
@@ -2398,9 +2471,6 @@ impl WorkbenchModel {
 			.take(MAX_SELECTION_READS)
 			.map(|id| multi_log::split_id(id).0.to_string())
 			.collect();
-		if !self.accepting_work() {
-			return;
-		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
@@ -2455,10 +2525,11 @@ impl WorkbenchModel {
 							);
 						}
 						let first = files.first().map(|(p, _)| p.clone());
-						model.commit_files = files;
-						model.commit_file_origin = origin;
-						model.commit_file_gitlinks = gitlinks;
-						model.commit_files_truncated = total > MAX_COMMIT_FILES;
+						model.commit_view.commit_files = files;
+						model.commit_view.commit_file_origin = origin;
+						model.commit_view.commit_file_gitlinks = gitlinks;
+						model.commit_view.commit_files_truncated =
+							total > MAX_COMMIT_FILES;
 						match first {
 							Some(path) => model.select_commit_file(&path, cx),
 							None => model.show_preview_error(Msg::new(
@@ -2520,6 +2591,9 @@ impl WorkbenchModel {
 
 	/// Endpoint diff between the two ends of the range (older → newer).
 	pub fn compare_range(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		let Some((top, bottom)) = self.range_rows() else {
 			return;
 		};
@@ -2539,15 +2613,16 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.compare = Some((older.clone(), newer.clone()));
 		self.details_generation = self.details_generation.wrapping_add(1);
-		self.commit_details = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
-		self.commit_files.clear();
+		// Compare shows only its own header, so the whole view and the
+		// multi-selection's list state restart together: an expanded flag
+		// must not stay true over an emptied `selection_details`.
+		self.reset_commit_view();
+		self.reset_selection_details();
 		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
-		self.log_commit_root = Some(root.clone());
+		self.commit_view.log_commit_root = Some(root.clone());
 		app_log!("[APP:COMPARE: from={} to={}]", &older[..7], &newer[..7]);
 		self.load_change_list(
 			root,
@@ -2676,15 +2751,17 @@ impl WorkbenchModel {
 								],
 							);
 						}
-						model.commit_files = files;
-						model.commit_files_first_parent_same = same;
-						model.commit_file_origin.clear();
-						model.commit_file_gitlinks = gitlinks;
-						model.commit_files_truncated = total > MAX_COMMIT_FILES;
+						model.commit_view.commit_files = files;
+						model.commit_view.commit_files_first_parent_same = same;
+						model.commit_view.commit_file_origin.clear();
+						model.commit_view.commit_file_gitlinks = gitlinks;
+						model.commit_view.commit_files_truncated =
+							total > MAX_COMMIT_FILES;
 						match first {
 							Some((path, p)) => {
-								model.selected_commit_file = Some(path.clone());
-								model.commit_file_sel.clear();
+								model.commit_view.selected_commit_file =
+									Some(path.clone());
+								model.commit_view.commit_file_sel.clear();
 								model.apply_source_preview(
 									path,
 									p.map(|p| (p, preview_source)),
@@ -2715,9 +2792,9 @@ impl WorkbenchModel {
 	/// Cmd/Ctrl-click in the changed files: adds or drops `path` from the
 	/// selection; the open diff stays.
 	pub fn toggle_commit_file(&mut self, path: &str, cx: &mut Context<Self>) {
-		let sel = &mut self.commit_file_sel;
+		let sel = &mut self.commit_view.commit_file_sel;
 		if sel.is_empty() {
-			sel.extend(self.selected_commit_file.clone());
+			sel.extend(self.commit_view.selected_commit_file.clone());
 		}
 		match sel.iter().position(|p| p == path) {
 			Some(i) => {
@@ -2736,8 +2813,12 @@ impl WorkbenchModel {
 		path: &str,
 		cx: &mut Context<Self>,
 	) {
-		let anchor = self.selected_commit_file.as_deref().unwrap_or(path);
-		self.commit_file_sel = file_range(shown, anchor, path);
+		let anchor = self
+			.commit_view
+			.selected_commit_file
+			.as_deref()
+			.unwrap_or(path);
+		self.commit_view.commit_file_sel = file_range(shown, anchor, path);
 		cx.notify();
 	}
 
@@ -2754,7 +2835,7 @@ impl WorkbenchModel {
 						from: a.clone(),
 						to: b.clone(),
 					},
-					self.log_commit_root.clone(),
+					self.commit_view.log_commit_root.clone(),
 					None,
 				),
 				(None, _) if self.log_selected.len() > 1 => {
@@ -2777,6 +2858,7 @@ impl WorkbenchModel {
 				_ => return,
 			};
 		let change = self
+			.commit_view
 			.commit_files
 			.iter()
 			.find(|(p, _)| p == path)
@@ -2786,8 +2868,8 @@ impl WorkbenchModel {
 		};
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.selected_commit_file = Some(path.to_string());
-		self.commit_file_sel.clear();
+		self.commit_view.selected_commit_file = Some(path.to_string());
+		self.commit_view.commit_file_sel.clear();
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -2864,10 +2946,14 @@ impl WorkbenchModel {
 				None,
 			));
 		}
-		let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+		let idx = self
+			.commit_view
+			.commit_files
+			.iter()
+			.position(|(p, _)| p == path)?;
 		let id = self
 			.log_selected
-			.get(*self.commit_file_origin.get(idx)? as usize)?;
+			.get(*self.commit_view.commit_file_origin.get(idx)? as usize)?;
 		let (_, sha) = self.log_root_for(id)?;
 		Some((
 			GitSource::Commit(sha.clone()),
@@ -2885,13 +2971,20 @@ impl WorkbenchModel {
 		path: &str,
 	) -> Option<(std::path::PathBuf, String)> {
 		if let Some((_, to)) = &self.compare {
-			return Some((self.log_commit_root.clone()?, to.clone()));
+			return Some((
+				self.commit_view.log_commit_root.clone()?,
+				to.clone(),
+			));
 		}
 		if self.log_selected.len() > 1 {
-			let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+			let idx = self
+				.commit_view
+				.commit_files
+				.iter()
+				.position(|(p, _)| p == path)?;
 			let id = self
 				.log_selected
-				.get(*self.commit_file_origin.get(idx)? as usize)?;
+				.get(*self.commit_view.commit_file_origin.get(idx)? as usize)?;
 			return self.log_root_for(id);
 		}
 		self.log_root_for(self.selected_commit.as_deref()?)
@@ -3081,8 +3174,8 @@ impl WorkbenchModel {
 
 		self.selected_file = None;
 		self.selected_file_root = None;
-		self.selected_commit_file = Some(path.clone());
-		self.commit_file_sel.clear();
+		self.commit_view.selected_commit_file = Some(path.clone());
+		self.commit_view.commit_file_sel.clear();
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -3629,7 +3722,7 @@ impl WorkbenchModel {
 		roots: Vec<PathBuf>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_repo_filter = roots;
 		self.apply_log_repo_filter(cx);
 	}
@@ -3806,6 +3899,7 @@ impl WorkbenchModel {
 						model.history_autoload = false;
 						model
 							.report_graph_error(GraphAdmissionError::Layout(e));
+						model.drop_selection_the_log_lost();
 						cx.notify();
 					}
 					_ => model.merged_step(target, cx),
@@ -3924,6 +4018,7 @@ impl WorkbenchModel {
 			Err(error) => {
 				self.history_autoload = false;
 				self.report_graph_error(error);
+				self.drop_selection_the_log_lost();
 				return;
 			}
 		};

@@ -27,7 +27,7 @@ use crate::i18n::{t, Locale, Msg};
 use crate::icons::{icon_tinted, Icon};
 use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
-use crate::ui::{clip_text, live_tip, probe, probe_frame_end, Probes};
+use crate::ui::{clip_text, probe, probe_frame_end, Probes, TipExt};
 use crate::{
 	lifecycle, CloseWorkspace, NextWorkspaceTab, OpenWorkspace,
 	PrevWorkspaceTab, Quit, WorkbenchModel, WorkspaceTab1, WorkspaceTab2,
@@ -404,7 +404,7 @@ impl TabsRoot {
 						if let Some(ix) = root.find(&identity, cx) {
 							ix
 						} else {
-							root.add_tab(Some(path), false, window, cx)
+							root.add_tab(Some(path), window, cx)
 						}
 					}
 					SavedTab::Remote { host, path } => {
@@ -415,7 +415,7 @@ impl TabsRoot {
 						if let Some(ix) = root.find(&identity, cx) {
 							ix
 						} else {
-							let ix = root.add_tab(None, false, window, cx);
+							let ix = root.add_tab(None, window, cx);
 							let tab = &root.tabs[ix];
 							with_log_tab(Some(tab.id), || {
 								tab.model.update(cx, |m, cx| {
@@ -444,14 +444,14 @@ impl TabsRoot {
 				let identity = WsIdentity::Local(path.clone());
 				Some(match root.find(&identity, cx) {
 					Some(ix) => ix,
-					None => root.add_tab(Some(path), false, window, cx),
+					None => root.add_tab(Some(path), window, cx),
 				})
 			}
 			FirstTab::Empty => None,
 		};
 		let ix = match launch_tab.or(shown) {
 			Some(ix) => ix,
-			None => root.add_tab(None, false, window, cx),
+			None => root.add_tab(None, window, cx),
 		};
 		if restoring && crate::e2e_on() {
 			root_log!(
@@ -563,7 +563,6 @@ impl TabsRoot {
 	fn add_tab(
 		&mut self,
 		workspace: Option<PathBuf>,
-		menu_open: bool,
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> usize {
@@ -581,7 +580,6 @@ impl TabsRoot {
 				let mut m = WorkbenchModel::new_tab(
 					workspace, None, mode, id, probes, cx,
 				);
-				m.workspace_menu = menu_open;
 				if let Some((b, l, d)) = layout {
 					m.bottom_h = b;
 					m.left_w = l;
@@ -611,8 +609,20 @@ impl TabsRoot {
 	/// The "+" button and Cmd/Ctrl+Shift+O with no tab: an empty tab with
 	/// the workspace menu open.
 	pub fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-		let ix = self.add_tab(None, true, window, cx);
+		let ix = self.add_tab(None, window, cx);
 		self.activate(ix, window, cx);
+		// A floating layer belongs to the tab that is shown: opened once
+		// the new tab is.
+		let model = self.tabs[ix].model.clone();
+		model.update(cx, |m, cx| {
+			m.open_overlay(
+				crate::overlay::OverlayKind::WorkspaceMenu,
+				crate::overlay::ReturnFocus::Root,
+				Some(crate::overlay::TriggerId::Workspace),
+				None,
+				cx,
+			)
+		});
 	}
 
 	pub fn activate(
@@ -634,8 +644,10 @@ impl TabsRoot {
 			return;
 		}
 		if let Some(old) = self.active.and_then(|i| self.tabs.get(i)) {
-			// The tab gets back the pane it had the keyboard in; a field
-			// or a menu it had open does not outlive the switch.
+			// The tab gets back the pane it had the keyboard in; a floating
+			// layer it had open does not outlive the switch, so a keyboard
+			// inside one resumes where the layer would have given it back
+			// (an inline layer, the find bar, stays with the pane).
 			let old_id = old.id;
 			let keep = window.focused(cx).and_then(|f| {
 				let m = old.model.read(cx);
@@ -643,6 +655,7 @@ impl TabsRoot {
 					.into_iter()
 					.find(|pane| pane.contains(&f, window))
 					.cloned()
+					.or_else(|| m.overlays.return_target_for(&f, window))
 			});
 			with_log_tab(Some(old_id), || {
 				old.model.update(cx, |m, cx| m.leave_tab(keep, cx))
@@ -787,7 +800,7 @@ impl TabsRoot {
 		}
 		let ix = match from_ix {
 			Some(f) if self.tabs[f].model.read(cx).is_empty_tab() => f,
-			_ => self.add_tab(None, false, window, cx),
+			_ => self.add_tab(None, window, cx),
 		};
 		self.activate(ix, window, cx);
 		let tab = &self.tabs[ix];
@@ -1004,15 +1017,15 @@ impl TabsRoot {
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().tab_hover_bg)))
 					.child(icon_tinted(Icon::Plus, 16., pal().text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							t("tip_ws_tab_new", loc).into()
-						})
+						}
 					})
 					.debug_selector(|| "ws-tab-new".into())
 					.on_click(cx.listener(|this, _, window, cx| {
@@ -1106,16 +1119,16 @@ impl TabsRoot {
 					.rounded(px(3.))
 					.hover(|s| s.bg(rgb(p.hover_bg)))
 					.child(icon_tinted(Icon::Close, 12., p.text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							crate::ui::mac_keys(t("tip_ws_tab_close", loc))
 								.into()
-						})
+						}
 					})
 					.debug_selector(move || close_selector)
 					.on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -1127,13 +1140,13 @@ impl TabsRoot {
 					}))
 					.children(probe(&self.probes, close_id)),
 			)
-			.tooltip({
+			.live_tip({
 				let root = cx.weak_entity();
-				live_tip(move |cx| {
+				move |cx| {
 					root.upgrade()
 						.map(|r| r.read(cx).tab_tip(ix, cx))
 						.unwrap_or_default()
-				})
+				}
 			})
 			.debug_selector(move || selector)
 			.on_mouse_down(

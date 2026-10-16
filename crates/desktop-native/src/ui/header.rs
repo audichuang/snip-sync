@@ -38,6 +38,8 @@ impl WorkbenchModel {
 			t("workspace_none", loc).to_string()
 		};
 		let open = self.workspace_open;
+		let workspace_menu_open =
+			self.overlays.is_open(OverlayKind::WorkspaceMenu);
 		let current = self.workspace_root.clone();
 		let mut recent: Vec<AnyElement> = self
 			.recent_workspaces
@@ -58,10 +60,14 @@ impl WorkbenchModel {
 				.h(px(RECENT_ROW_H))
 				.flex_shrink_0()
 				// The row clips a long path; hover shows all of it.
-				.tooltip(tip(path.display().to_string()))
+				.tip(path.display().to_string())
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
-					this.hide_workspace_menu();
+					this.close_overlay(
+						OverlayKind::WorkspaceMenu,
+						CloseWhy::Picked,
+						cx,
+					);
 					this.open_workspace_path(target.clone(), cx);
 				}))
 				.child(div().flex_shrink_0().child(icon(Icon::Folder, 16.)))
@@ -105,7 +111,7 @@ impl WorkbenchModel {
 				.debug_selector(move || selector)
 				.h(px(RECENT_ROW_H))
 				.flex_shrink_0()
-				.tooltip(tip(format!("{}:{}", r.host, r.path)))
+				.tip(format!("{}:{}", r.host, r.path))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.open_remote_recent(n, cx);
@@ -143,10 +149,8 @@ impl WorkbenchModel {
 		// The menu sits under the header; past the window's height it
 		// scrolls instead of running off screen.
 		let max_h = (self.viewport_h - WORKSPACE_MENU_TOP).max(200.);
-		let panel = div()
-			.id("workspace-menu")
-			.debug_selector(|| "workspace-menu".into())
-			.occlude()
+		let panel = self
+			.overlay_panel(OverlayKind::WorkspaceMenu, cx)
 			.w(px(340.))
 			.when(self.viewport_h > 0., |d| d.max_h(px(max_h)))
 			.overflow_y_scroll()
@@ -160,18 +164,6 @@ impl WorkbenchModel {
 			.border_color(rgb(pal().popup_border))
 			.rounded(px(8.))
 			.shadow_lg()
-			.on_mouse_down_out(cx.listener(
-				|this, ev: &MouseDownEvent, _, cx| {
-					// The button's own click toggles the menu closed.
-					let on_button = this
-						.workspace_menu_button
-						.get()
-						.is_some_and(|b| b.contains(&ev.position));
-					if !on_button {
-						this.close_workspace_menu(cx);
-					}
-				},
-			))
 			.child(
 				menu_row("btn-open-folder", 60)
 					.on_click(cx.listener(|this, _, _, cx| {
@@ -197,7 +189,7 @@ impl WorkbenchModel {
 					.child(fill_text(t("workspace_open", loc)))
 					.children(probe(log, "btn-open-workspace")),
 			)
-			.when(self.workspace_picker, |d| {
+			.when(self.overlays.workspace_picker(), |d| {
 				d.child(
 					div()
 						.flex()
@@ -275,7 +267,11 @@ impl WorkbenchModel {
 					.when(!open, |d| d.text_color(rgb(pal().text_disabled)))
 					.when(open, |d| {
 						d.on_click(cx.listener(|this, _, _, cx| {
-							this.hide_workspace_menu();
+							this.close_overlay(
+								OverlayKind::WorkspaceMenu,
+								CloseWhy::Picked,
+								cx,
+							);
 							this.request_user_close(
 								crate::lifecycle::Intent::CloseWorkspace,
 								cx,
@@ -304,33 +300,19 @@ impl WorkbenchModel {
 					.rounded(px(4.))
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().hover_bg)))
-					.when(self.workspace_menu, |d| d.bg(rgb(pal().hover_bg)))
-					// Open, the menu is what the pointer is after: a
-					// tooltip here covers its first item (#203).
-					.when(!self.workspace_menu, |d| {
-						d.tooltip(tip(format!(
-							"{tip_text} · {}",
-							mac_keys(t("tip_workspace_menu", loc))
-						)))
-					})
-					.on_click(cx.listener(|this, _, _, cx| {
-						this.toggle_workspace_menu(cx);
+					.when(workspace_menu_open, |d| d.bg(rgb(pal().hover_bg)))
+					.tip(format!(
+						"{tip_text} · {}",
+						mac_keys(t("tip_workspace_menu", loc))
+					))
+					.on_click(cx.listener(|this, _, window, cx| {
+						this.toggle_workspace_menu_at(Some(window), cx);
 					}))
 					.child(clip_text(label))
-					.child({
-						let slot = self.workspace_menu_button.clone();
-						canvas(
-							move |b, _, _| slot.set(Some(b)),
-							|_, _, _, _| {},
-						)
-						.absolute()
-						.top_0()
-						.left_0()
-						.size_full()
-					})
+					.child(self.overlay_trigger_slot(TriggerId::Workspace))
 					.children(probe(log, "btn-workspace-menu")),
 			)
-			.when(self.workspace_menu, |d| {
+			.when(workspace_menu_open, |d| {
 				d.child(
 					div().absolute().top(px(28.)).left_0().child(
 						deferred(anchored().snap_to_window().child(panel))
@@ -475,8 +457,7 @@ impl WorkbenchModel {
 				.hover(|s| s.bg(rgb(pal().hover_bg)))
 				.when(open, |d| d.bg(rgb(pal().hover_bg)))
 				.map(focus_ring)
-				// No tooltip over an open popup (IntelliJ hides it).
-				.when(!open, |d| d.tooltip(tip(tooltip)))
+				.tip(tooltip)
 				.child(icon(ic, 14.))
 				.child(clip_text(label).font_weight(FontWeight::SEMIBOLD))
 				.child(icon(Icon::ChevronDown, 10.))
@@ -523,17 +504,21 @@ impl WorkbenchModel {
 							},
 							repo.map(|r| r.name.clone())
 								.unwrap_or_else(|| t("no_repo", loc).into()),
-							self.popover == Some(Popover::Repo),
+							self.overlays.selector() == Some(Popover::Repo),
 							1,
 							t("tip_repo_selector", loc).into(),
 						)
 						.on_click(cx.listener(|this, _, window, cx| {
 							this.open_popover(Popover::Repo, window, cx)
-						})),
+						}))
+						.child(
+							self.overlay_trigger_slot(TriggerId::RepoSelector),
+						),
 					)
-					.when(self.popover == Some(Popover::Repo), |d| {
-						d.child(self.render_popover(cx))
-					}),
+					.when(
+						self.overlays.selector() == Some(Popover::Repo),
+						|d| d.child(self.render_popover(cx)),
+					),
 			)
 			.child(
 				div()
@@ -545,17 +530,21 @@ impl WorkbenchModel {
 							"btn-ref-selector",
 							Icon::Branch,
 							ref_label,
-							self.popover == Some(Popover::Ref),
+							self.overlays.selector() == Some(Popover::Ref),
 							2,
 							tf("tip_ref_selector", loc, &[&branch]),
 						)
 						.on_click(cx.listener(|this, _, window, cx| {
 							this.open_popover(Popover::Ref, window, cx)
-						})),
+						}))
+						.child(
+							self.overlay_trigger_slot(TriggerId::RefSelector),
+						),
 					)
-					.when(self.popover == Some(Popover::Ref), |d| {
-						d.child(self.render_popover(cx))
-					}),
+					.when(
+						self.overlays.selector() == Some(Popover::Ref),
+						|d| d.child(self.render_popover(cx)),
+					),
 			)
 			.child(div().flex_1())
 			.child(
@@ -613,7 +602,7 @@ impl WorkbenchModel {
 
 	/// IntelliJ branches / repositories popup: search field on top, then the
 	/// list with Local / Remote / Tags section headers. Headers are display
-	/// rows only; `popover_cursor` and the filter count stay over items.
+	/// rows only; the cursor and the filter count stay over items.
 	pub(super) fn render_popover(&self, cx: &mut Context<Self>) -> AnyElement {
 		const ITEM_H: f32 = 24.0;
 		let log = &self.probes;
@@ -632,10 +621,14 @@ impl WorkbenchModel {
 		}
 		let rows = n + sections.len();
 		let list_h = (rows.max(1) as f32 * ITEM_H).min(360.0);
-		let cursor = self.popover_cursor;
-		let panel = div()
-			.id("selector-popover")
-			.occlude()
+		let cursor = self.overlays.selector_cursor();
+		let panel = self
+			.overlay_panel(
+				OverlayKind::Selector(
+					self.overlays.selector().unwrap_or(Popover::Repo),
+				),
+				cx,
+			)
 			.w(px(360.))
 			.flex()
 			.flex_col()
@@ -646,9 +639,6 @@ impl WorkbenchModel {
 			.shadow_lg()
 			.p(px(4.))
 			.gap(px(4.))
-			.on_mouse_down_out(
-				cx.listener(|this, _, _, cx| this.close_popover(cx)),
-			)
 			.child(
 				div()
 					.id("selector-input")
@@ -883,11 +873,11 @@ impl WorkbenchModel {
 				fill_text(status.clone())
 					.id("status-text")
 					.debug_selector(|| "status-text".into())
-					.tooltip({
+					.live_tip({
 						// The status is a Msg: read it and the language at
 						// draw time, or an open tooltip keeps old text (#208).
 						let model = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							model
 								.upgrade()
 								.map(|m| {
@@ -896,7 +886,7 @@ impl WorkbenchModel {
 								})
 								.unwrap_or_default()
 								.into()
-						})
+						}
 					})
 					.mr(px(8.))
 			})
@@ -927,12 +917,20 @@ impl WorkbenchModel {
 						.max_w(px(200.))
 						.cursor_pointer()
 						.hover(|s| s.bg(rgb(pal().hover_bg)))
-						.tooltip(tip(t("tip_vcs_branch", loc)))
+						.tip(t("tip_vcs_branch", loc))
 						.on_click(cx.listener(|this, _, window, cx| {
-							this.open_popover(Popover::Ref, window, cx)
+							this.open_popover_from(
+								Popover::Ref,
+								TriggerId::StatusBranch,
+								window,
+								cx,
+							)
 						}))
 						.child(icon(Icon::Branch, 12.))
 						.child(clip_text(b).text_color(rgb(pal().text)))
+						.child(
+							self.overlay_trigger_slot(TriggerId::StatusBranch),
+						)
 						.children(probe(&self.probes, "status-vcs")),
 				)
 			})
@@ -948,7 +946,7 @@ impl WorkbenchModel {
 				.px(px(6.))
 				.text_size(px(SMALL_TEXT))
 				.text_color(rgb(pal().text_muted))
-				.tooltip(tip(t("tip_language", loc)))
+				.tip(t("tip_language", loc))
 				.on_click(cx.listener(|this, _, _, cx| this.toggle_locale(cx)))
 				.children(probe(&self.probes, "btn-locale")),
 			)
