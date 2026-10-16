@@ -7649,7 +7649,7 @@ mod tests {
 			let probe = listed_tree_result(
 				TreeIo {
 					key: NodeKey::root(),
-					epoch: 0,
+					epoch: crate::gen::Stamp::for_tests(0),
 					dir: root.clone(),
 					base: root.clone(),
 					depth: 1,

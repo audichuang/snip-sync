@@ -57,6 +57,12 @@ impl<L> Gen<L> {
 		self.n = self.n.wrapping_add(1);
 	}
 
+	/// Whether the lane ever moved from its starting point (a lane that
+	/// starts at zero: something was begun).
+	pub(crate) fn has_moved(&self) -> bool {
+		self.n != 0
+	}
+
 	/// The stamp of now.
 	pub(crate) fn current(&self) -> Stamp<L> {
 		Stamp {
