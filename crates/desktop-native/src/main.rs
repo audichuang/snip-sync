@@ -16005,10 +16005,18 @@ mod tests {
 				merge7: String,
 			}
 
+			/// The viewer's own commit on HEAD: 56 of the widest capital,
+			/// whose three-letter floor is wider in the weight it is drawn
+			/// in than in the regular one (#229 review).
+			const OWN_AUTHOR: &str = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW <me@x>";
+
 			fn fit_fixture(dir: &Path) -> FitFixture {
 				let r = dir.join("solo");
 				fs::create_dir(&r).unwrap();
 				git(&r, &["init", "-q", "-b", "main"]);
+				// The viewer is `me@x`: the HEAD commit below is theirs, so
+				// its author is drawn in the viewer's own weight.
+				git(&r, &["config", "user.email", "me@x"]);
 				let commit = |file: &str,
 				              subject: &str,
 				              author: Option<&str>,
@@ -16077,7 +16085,7 @@ mod tests {
 				commit(
 					"head.txt",
 					"a subject long enough to want the whole row for itself and then some more words",
-					None,
+					Some(OWN_AUTHOR),
 					"2025-12-21T15:30:00Z",
 				);
 				git(&r, &["tag", "release-0.3.0-candidate-2"]);
@@ -16237,6 +16245,110 @@ mod tests {
 					}
 				}
 				assert_clean(bad);
+			}
+
+			/// How many graphemes of `text` a box `visible` wide shows when
+			/// drawn in `weight`, shaped here from the text system and not
+			/// through the code under test: gpui keeps the longest prefix
+			/// whose width and the ellipsis's fit.
+			fn shown_in_weight(
+				window: &gpui::Window,
+				text: &str,
+				visible: f32,
+				weight: gpui::FontWeight,
+			) -> usize {
+				use unicode_segmentation::UnicodeSegmentation;
+				let width = |s: &str| {
+					let mut font = gpui::font(crate::theme::UI_FONT);
+					font.weight = weight;
+					let run = gpui::TextRun {
+						len: s.len(),
+						font,
+						color: gpui::black(),
+						background_color: None,
+						underline: None,
+						strikethrough: None,
+					};
+					f32::from(
+						window
+							.text_system()
+							.shape_line(
+								s.to_string().into(),
+								gpui::px(crate::theme::UI_TEXT),
+								&[run],
+								None,
+							)
+							.width,
+					)
+				};
+				let graphemes: Vec<&str> = text.graphemes(true).collect();
+				if width(text) <= visible + 0.5 {
+					return graphemes.len();
+				}
+				(0..=graphemes.len())
+					.rev()
+					.find(|&k| {
+						width(&format!("{}\u{2026}", graphemes[..k].concat()))
+							<= visible + 0.01
+					})
+					.unwrap_or(0)
+			}
+
+			/// The viewer's own name is drawn in semibold, and the column,
+			/// the rule's floor and TEXT_FIT must all count that weight: at
+			/// 1080 wide with the default panes and long labels the author
+			/// column is at its floor, and three letters must be in sight
+			/// as drawn, not as a regular face would draw them.
+			#[gpui::test]
+			fn the_viewers_own_author_keeps_three_graphemes_in_the_weight_drawn(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1080.,
+					720.,
+					false,
+					Panes::Default,
+				) else {
+					return;
+				};
+				let s = snapshot(&model, cx);
+				let author = s
+					.iter()
+					.find(|t| {
+						t.row == Some(0)
+							&& t.role == FitRole::Author
+							&& t.present
+					})
+					.expect("the HEAD row draws its author");
+				assert!(
+					author.text.starts_with("WWW"),
+					"{}",
+					author.describe()
+				);
+				let own = cx.update(|window, _| {
+					shown_in_weight(
+						window,
+						&author.text,
+						author.visible,
+						gpui::FontWeight::SEMIBOLD,
+					)
+				});
+				assert!(
+					own >= 3,
+					"semibold shows {own} graphemes, below the rule: {}",
+					author.describe()
+				);
+				assert_eq!(
+					author.shown,
+					own,
+					"TEXT_FIT counts what is drawn: {}",
+					author.describe()
+				);
 			}
 
 			macro_rules! fit_rows_cells {
