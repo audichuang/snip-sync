@@ -138,6 +138,10 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
     index 裡的既有項目(以較早的 commit 處理後為準)或同一個 commit 的另一個路徑只差大小寫時,
     整個 commit 同樣在預覽與 Apply 都拒絕(`CaseAlias`)。磁碟會把它當成既有的項目,`git commit --only`
     卻區分大小寫比對 index,寫入後才失敗(#140)。只改大小寫的改名(`Foo.txt` → `foo.txt`)也算。
+    磁碟上的項目不論有沒有被追蹤、有沒有被忽略、是不是空目錄都算:git 只有在這次所有路徑的共同前綴
+    剛好涵蓋那一層資料夾時才會成功,檔案這一層一定失敗,所以一律拒絕,不依 git 的內部細節放行(#146)。
+    經由未追蹤的別名刪除或改名,git 雖然成功,卻會刪掉使用者在另一個拼法下的未追蹤檔案,也拒絕;
+    這和「精確拼法的未追蹤檔照樣刪除」不對稱,是刻意的。
     拒絕訊息提示改用檔案模式貼上(寫進磁碟上既有的拼法,不建立 commit),或先把名稱改成一致。
     index 拼法要完整讀到才能排除別名:讀取失敗、逾時、取消或超過輸出上限時,預覽與 Apply 都回報錯誤,
     不當成空 index 繼續。
@@ -287,7 +291,8 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 執行環境強化照舊:固定 argv 前綴 `-c core.fsmonitor= -c protocol.allow=never -c core.hooksPath=/dev/null`(Windows 為 `NUL`),注入 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`,清除 `GIT_DIR`、`GIT_WORK_TREE` 等變數。
 - **資源規則**:
   - 獨立名額池：遠端讀取使用 `gitrun` 獨立的 `GitPool::Served`（並行 1、佇列 4），不計入 worker 主人的 `Local` 名額池，遠端 master 的請求絕不排擠 worker 主人自己的 UI 操作，也不會卡住桌面版的工作區切換或結束（drain）。master 端亦對遠端 Git 呼叫限制最多 4 個並行請求。
-  - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。worker 每秒發送 `Pending` heartbeat 幀；master 斷線或取消請求時立即中止 worker 背景 job。
+  - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。協定 ≥2 時，**每個請求**（含 `OpenWorkspace`／`ListDir`／`Stat`／`Read` 這類 worker 自己回答的請求）在 worker 計算期間每秒發送一個 `Pending` heartbeat 幀；自己回答的請求也有 View 的期限（60 秒），不經 job 名額（不會收到 `Busy`）。這些請求拿到 job 的取消 token 與期限並真的使用：`ListDir` 每頁、每筆項目前都看期限與取消，過期就停止走訪並回 `Timeout`（或 `Cancelled`），不把走到一半的清單當成結果；單次呼叫的請求在開始前先看。期限過後工作若還停在無法中斷的系統呼叫裡，worker 繼續送 `Pending`（`Timeout` 是該請求的最後一幀），不會靜默到工作結束。協定 1 的 master 不認得 `Timeout`，它的請求沿用舊行為跑到結束。協定 1 的 master 不認得 `Pending`，只收到回覆。master 斷線或取消請求時立即中止 worker 背景 job。
+  - master 的沉默上限：回覆的第一個位元組之前 5 秒（讓休眠或 NAT 逾時而斷掉的池中連線快速失敗），回覆開始之後（frame 中途、同一個回覆的兩個 frame 之間、heartbeat 之後）30 秒；整個呼叫另受絕對期限限制，收尾靠取消而不是靠上限。逾時訊息帶出已收到的位元組數與經過時間，並分出「沉默」（no data for）與「期限」（time limit passed）兩種結束方式；`GitError` 保留這段文字，不再一律寫成 90 秒。
 - **已知限制**:
   - tag 與參照極多（refs 輸出超過 `SERVED_MAX_STDOUT = 4 MiB`）的 repo，在遠端會顯示「遠端參照資料過大」（`remote_refs_too_large`）錯誤（本機可看）。
   - Refresh 時，開著的 Changes 列預覽若不屬於正在重新載入的 repo（或尚未讀完），預覽會清掉，回到該 repo 的預設畫面，不保留也不重讀；本機與遠端相同。專案樹開著的檔案照常重讀。
@@ -295,7 +300,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 每條連線是一個 ssh 程序；每個 Client 最多留 2 條閒置連線。同一 RemoteHost 連線設定的握手（connect＋Hello）跨 Client 最多同時 2 個，排隊有期限且可取消；不同主機互不阻塞。這是新握手上限，不是整個 App 的存活 SSH 連線上限。worker 的 job 與 `Served` 名額限制仍以單一程序計。
 - **版本相容**:
   - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 8:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求、`REPLAY_PREVIEW_VERSION = 6` commit 貼上目的端的有界文字／檔案種類讀取、`PREPARED_IMPORT_VERSION = 7` 精簡檔案預覽與單次 payload token、`PREPARED_REPLAY_VERSION = 8` commit 重放的單次 payload token）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。舊 worker 缺少 commit 預覽基準資訊時，詳情明示無法比較，不能把每筆都與初始磁碟相比或冒充新增；檔案貼上對協定 4–6 沿用 `ImportPlan`／`ImportApply`，協定低於 4 明確拒絕；既有安全門禁維持相容。
-  - 錯誤原因（`Reason`）是五個加法欄位（皆無版本門檻、寬鬆讀取，沒有原因或為空時不輸出該鍵，與舊 worker 的 frame 逐位元組相同）：`Response::Error.reason`、`ScannedRepo.reason`、`RepoScan.error_reasons`（與 `errors` 依索引對齊）、`ReplayFailure.reason`、`Response::Imported` 的 restore 失敗 `failures[].reason`（沒有 `ErrorCode` 的框，變體一律保留，路徑與 OS 文字清空；由 `codeless` 模組統一產生）；另有兩個加法的子欄位：`Reason::Internal.condition`（使用者造成的固定條件，舊 peer 不送也不讀，讀成沒有條件）與 `StartReason::NoCommand`／`CannotRun`（啟動失敗的細分；舊 peer 不認得的值讀成沒有啟動原因）；未知的變體讀成沒有原因，不使整個 frame 失敗。舊 worker 不送 `reason`，新 master 不再從英文訊息猜原因，所以回退為通用措辭：桌面 App 對 Stale、Collision、Busy 拒絕顯示該拒絕碼的通用字串，而非 worker 的英文原文；沒有原因的 replay 失敗顯示通用的遠端拒絕（`remote_refused_io`）。同理，對舊 worker 的掃描錯誤列與摘要失敗的 repo，因 `ScannedRepo.reason`／`RepoScan.error_reasons` 缺席，一律顯示通用的 `remote_refused_io` 措辭，而非 worker 的原文（例如 git status 失敗的說明）（已接受的相容成本）。CLI 對舊 worker 的 repo-busy 拒絕只印 worker 的訊息，少了「; try again when the other paste finishes」後綴（已接受的相容成本）；新 worker 搭配舊 master 則多送的欄位被忽略。
+  - 錯誤原因（`Reason`）是五個加法欄位（皆無版本門檻、寬鬆讀取，沒有原因或為空時不輸出該鍵，與舊 worker 的 frame 逐位元組相同）：`Response::Error.reason`、`ScannedRepo.reason`、`RepoScan.error_reasons`（與 `errors` 依索引對齊）、`ReplayFailure.reason`、`Response::Imported` 的 restore 失敗 `failures[].reason`（沒有 `ErrorCode` 的框，變體一律保留，路徑與 OS 文字清空；由 `codeless` 模組統一產生）；另有兩個加法的子欄位：`Reason::Internal.condition`（使用者造成的固定條件，舊 peer 不送也不讀，讀成沒有條件）與 `StartReason::NoCommand`／`CannotRun`（啟動失敗的細分；舊 peer 不認得的值讀成沒有啟動原因）；未知的變體讀成沒有原因，不使整個 frame 失敗。舊 worker 不送 `reason`，新 master 不再從英文訊息猜原因，所以回退為通用措辭：桌面 App 對 Stale、Collision、Busy 拒絕顯示該拒絕碼的通用字串，而非 worker 的英文原文；沒有原因的 replay 失敗顯示通用的遠端拒絕（`remote_refused_io`）。同理，對舊 worker 的掃描錯誤列與摘要失敗的 repo，因 `ScannedRepo.reason`／`RepoScan.error_reasons` 缺席，一律顯示通用的 `remote_refused_io` 措辭，而非 worker 的原文（例如 git status 失敗的說明）（已接受的相容成本）。CLI 對舊 worker 的 repo-busy 拒絕只印 worker 的訊息，少了「; try again when the other paste finishes」後綴（已接受的相容成本）；新 worker 搭配舊 master 則多送的欄位被忽略。`worker_closed`（worker 在回覆之間結束了串流）只在 master 端產生，不會上線。#225 之前的 worker 只送還原失敗的英文文字（例如 `sub/x: unsafe path`）；master 原樣接在通用標題之後顯示（`Datum::old_peer_text`），這是已接受的相容成本：路徑無法從英文安全切出來，拿掉就看不出是哪個檔案失敗。
   - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
   - 能寫進 `.git` 就能寫 `.git/config`、hooks 或 filter,等於讓 master 在 worker 執行程式。這條守門在 snip-core 的貼上引擎裡(§3.2 安全規則),本機與遠端是同一段程式:payload 路徑含 `.git` 片段,或目標經 symlink 解析後落在 Git 目錄裡的,都是略過列、不寫入,其餘照寫。worker 另外只要求目的地與每個前綴對應的資料夾在工作區內(遠端的存取範圍);commit 重放和本機一樣進到目的地所在的 repo,即使它的頂層在工作區之上。

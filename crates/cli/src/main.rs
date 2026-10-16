@@ -1042,7 +1042,14 @@ mod tests {
 			"too many callers"
 		);
 		assert_eq!(
-			remote(RemoteError::Connect("ssh: no route".into())),
+			remote(RemoteError::Start {
+				kind: snip_remote::ConnectFailureKind::Other,
+				reason: None,
+				detail: snip_core::reason::Datum::transport_stderr(
+					"ssh: no route"
+				),
+				message: "ssh: no route".into(),
+			}),
 			"ssh: no route"
 		);
 		assert_eq!(

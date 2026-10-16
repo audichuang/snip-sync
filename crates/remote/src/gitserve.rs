@@ -15,7 +15,7 @@ use snip_core::gitview::{
 use snip_core::reason::{Failure, Reason};
 use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
-use crate::codeless;
+use crate::codeless::Codeless;
 use crate::proto::{
 	valid_log_query, valid_rel_path, valid_rev, valid_tips, ErrorCode,
 	GitQuery, GitReply, RepoScan, Response, ScannedRepo, REMOTE_MAX_LOG_LIMIT,
@@ -47,6 +47,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		Reason::Refused { .. }
 		| Reason::Start { .. }
 		| Reason::Disconnected { .. }
+		| Reason::WorkerClosed
 		| Reason::Protocol
 		| Reason::WorkerTooOld { .. }
 		| Reason::TimedOut
@@ -98,7 +99,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		),
 		Policy::Scrub => scrub(&failure.message, share),
 	};
-	(text, codeless::scan_reason(failure.reason.clone()))
+	(text, failure.reason.clone())
 }
 
 /// Answers a ScanRepos request within the shared root.
@@ -150,7 +151,7 @@ pub(crate) fn scan(
 	let now = Instant::now();
 	let budget_deadline = job_deadline.checked_sub(reserve);
 	if budget_deadline.is_none_or(|d| now >= d) {
-		return Response::Repos(RepoScan {
+		return Response::Repos(Codeless::new(RepoScan {
 			repos: Vec::new(),
 			errors: Vec::new(),
 			error_reasons: Vec::new(),
@@ -158,7 +159,7 @@ pub(crate) fn scan(
 			depth_limited: Vec::new(),
 			depth_overflow: 0,
 			status: ScanStatus::Incomplete,
-		});
+		}));
 	}
 
 	let budget = ScanBudget {
@@ -230,8 +231,7 @@ pub(crate) fn scan(
 						&root.path,
 					),
 				));
-				error_reasons
-					.push(Some(codeless::scan_reason(Reason::OutsideShare)));
+				error_reasons.push(Some(Reason::OutsideShare));
 			}
 		}
 	}
@@ -279,7 +279,7 @@ pub(crate) fn scan(
 		})
 		.collect();
 
-	Response::Repos(RepoScan {
+	Response::Repos(Codeless::new(RepoScan {
 		repos,
 		errors,
 		error_reasons,
@@ -287,7 +287,7 @@ pub(crate) fn scan(
 		depth_limited,
 		depth_overflow: ws_scan.depth_overflow,
 		status: ws_scan.status,
-	})
+	}))
 }
 
 /// Replaces the share's absolute path (both raw and canonical) with share-relative
@@ -961,6 +961,7 @@ fn open_repo(
 mod tests {
 	use super::*;
 	use snip_core::browser::LogQuery;
+	use snip_core::reason::Datum;
 	use snip_core::workspace::RepoKind;
 	use std::path::{Path, PathBuf};
 
@@ -1070,9 +1071,14 @@ mod tests {
 			stderr: secret.into(),
 			code: Some(128),
 		};
-		let gone = |f: &Failure| sanitize_scan_error(f, share);
+		// The reason is scrubbed when the frame is built (`Codeless::new`);
+		// scrub it here as that does, to see what the master receives.
+		let gone = |f: &Failure| {
+			let (text, reason) = sanitize_scan_error(f, share);
+			(text, reason.scrubbed())
+		};
 		let git_failed = Reason::GitFailed {
-			stderr: String::new(),
+			stderr: Datum::default(),
 		};
 		// The words the CLI and old masters saw, label and context kept.
 		for (context, text) in [
@@ -1146,7 +1152,7 @@ mod tests {
 		assert_eq!(
 			typed.reason.clone().scrubbed(),
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(
 					snip_core::gitsrc::Condition::GitmodulesNotFile
 				),
@@ -1156,14 +1162,14 @@ mod tests {
 		let bare = Failure::new(
 			secret,
 			Reason::GitFailed {
-				stderr: secret.into(),
+				stderr: Datum::for_test(secret),
 			},
 		);
 		assert_eq!(gone(&bare).0, "git failed (details withheld)");
 		let bare = Failure::new(
 			secret,
 			Reason::Internal {
-				detail: secret.into(),
+				detail: Datum::for_test(secret),
 				condition: None,
 			},
 		);
@@ -1173,7 +1179,7 @@ mod tests {
 		let other = Failure::new(
 			"git status failed: x",
 			Reason::Io {
-				detail: "/Volumes/secret".into(),
+				detail: Datum::for_test("/Volumes/secret"),
 			},
 		);
 		assert_eq!(
@@ -1181,7 +1187,7 @@ mod tests {
 			(
 				"git status failed: x".to_string(),
 				Reason::Io {
-					detail: String::new()
+					detail: Datum::default()
 				}
 			)
 		);
@@ -1546,7 +1552,7 @@ mod tests {
 					code: Some(128),
 				},
 				Some(Reason::GitFailed {
-					stderr: String::new(),
+					stderr: Datum::default(),
 				}),
 			),
 			(
@@ -1555,7 +1561,7 @@ mod tests {
 					output: format!("{secret} odd"),
 				},
 				Some(Reason::Internal {
-					detail: String::new(),
+					detail: Datum::default(),
 					condition: None,
 				}),
 			),
@@ -1565,7 +1571,7 @@ mod tests {
 					message: secret.into(),
 				},
 				Some(Reason::Internal {
-					detail: String::new(),
+					detail: Datum::default(),
 					condition: None,
 				}),
 			),

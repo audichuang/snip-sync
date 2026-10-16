@@ -838,7 +838,7 @@ pub fn identify_repos_stopped(
 						)),
 					});
 				}
-				SubmoduleState::Unreadable(reason)
+				SubmoduleState::Unreadable { detail, message }
 					if seen_roots.insert(canonical_sub) =>
 				{
 					list.push(FoundRepo {
@@ -847,8 +847,8 @@ pub fn identify_repos_stopped(
 						kind: FoundKind::UninitializedSubmodule,
 						identity: None,
 						summary: Err(Failure::new(
-							format!("Submodule unreadable: {reason}"),
-							Reason::SubmoduleUnreadable { detail: reason },
+							format!("Submodule unreadable: {message}"),
+							Reason::SubmoduleUnreadable { detail },
 						)),
 					});
 				}

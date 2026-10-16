@@ -18,7 +18,10 @@ use serde::{de::DeserializeOwned, Serialize};
 pub mod client;
 pub(crate) mod codeless;
 pub(crate) mod copyserve;
+#[doc(hidden)]
+pub mod fault;
 pub(crate) mod gitserve;
+pub(crate) mod iofault;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
 pub mod pastetarget;
@@ -28,6 +31,7 @@ pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
+pub use codeless::Codeless;
 pub use pastetarget::{
 	FilePastePlan, PasteError, PasteRoute, PasteTarget, PreparedReplay,
 	REPO_BUSY_TEXT,
@@ -37,7 +41,7 @@ pub use proto::{
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
-pub use snip_core::reason::{Reason, StaleChange};
+pub use snip_core::reason::{Datum, Reason, StaleChange};
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
 /// Typed reason a transport ended before the worker's hello. Keep this
@@ -55,20 +59,45 @@ pub enum ConnectFailureKind {
 
 pub use snip_core::gitsrc::StartReason;
 
+/// How a wait for a worker's answer ended ([`RemoteError::Stalled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEnd {
+	/// No byte arrived for longer than the call tolerates.
+	Silence,
+	/// The call's absolute time limit passed, bytes flowing or not.
+	Deadline,
+}
+
+fn stalled_text(
+	ended: WaitEnd,
+	silent: f64,
+	received: u64,
+	elapsed: f64,
+) -> String {
+	match ended {
+		WaitEnd::Silence => format!(
+			"the worker did not answer in time: no data for {silent:.1} s; \
+			 {received} bytes of its reply arrived in {elapsed:.1} s"
+		),
+		WaitEnd::Deadline => format!(
+			"the worker did not answer in time: the call's time limit passed \
+			 after {elapsed:.1} s; {received} bytes of its reply arrived, the \
+			 last {silent:.1} s ago"
+		),
+	}
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
 	#[error(transparent)]
 	Io(#[from] io::Error),
-	/// The worker did not start: ssh's message, or a missing snip.
-	#[error("{0}")]
-	Connect(String),
 	#[error("{message}")]
 	Start {
 		kind: ConnectFailureKind,
 		/// The known cause, when the start failure is one of them.
 		reason: Option<StartReason>,
 		/// The transport's own stderr, unchanged; empty when it said nothing.
-		detail: String,
+		detail: Datum,
 		message: String,
 	},
 	/// The worker answered with an error.
@@ -91,12 +120,16 @@ pub enum RemoteError {
 	Cancelled,
 	#[error("the worker did not answer in time")]
 	TimedOut,
-	/// The stream went silent mid-call past the idle bound: no byte for `silent` s; `received` bytes of the answer arrived in `elapsed` s since the request.
-	#[error("the worker did not answer in time: no data for {silent:.1} s; {received} bytes of its reply arrived in {elapsed:.1} s")]
+	/// A call that had started to be answered ended unanswered: the stream
+	/// went silent past its bound, or the call's time limit passed ([`WaitEnd`]).
+	/// `received` bytes of the answer arrived in `elapsed` s since the request,
+	/// the last of them `silent` s ago.
+	#[error("{}", stalled_text(*ended, *silent, *received, *elapsed))]
 	Stalled {
 		silent: f64,
 		received: u64,
 		elapsed: f64,
+		ended: WaitEnd,
 	},
 	#[error(
 		"snip-sync on {worker} is too old for this (it speaks protocol {have}, this needs {need}); update it there"
@@ -113,15 +146,14 @@ impl RemoteError {
 	/// stays the CLI's. An exhaustive match: a new variant must decide.
 	pub fn reason(&self) -> Reason {
 		match self {
-			Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => {
-				Reason::TimedOut
-			}
-			Self::Io(e) => Reason::Disconnected {
-				detail: e.to_string(),
-			},
-			Self::Connect(detail) => Reason::Start {
-				start: None,
-				detail: detail.clone(),
+			// A fault this layer raised is worded by its variant; anything
+			// else is the OS's, and only its own text is data.
+			Self::Io(e) => match iofault::IoFault::of(e) {
+				Some(fault) => fault.reason(),
+				None if e.kind() == io::ErrorKind::TimedOut => Reason::TimedOut,
+				None => Reason::Disconnected {
+					detail: Datum::os_error(e),
+				},
 			},
 			Self::Start { reason, detail, .. } => Reason::Start {
 				start: *reason,
@@ -310,4 +342,79 @@ pub fn save_json<T: Serialize + ?Sized>(
 		let _ = fs::remove_file(&tmp);
 	}
 	res
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::io::ErrorKind;
+
+	/// An error read off a byte stream, the way `read_frame` meets it.
+	fn frame_error(bytes: &[u8]) -> io::Error {
+		proto::read_frame::<proto::Response>(&mut &bytes[..]).unwrap_err()
+	}
+
+	/// What the remote layer raises itself is our sentence (or std's, or
+	/// serde's): none of it becomes data a front end words. Only the OS's
+	/// own text does. Rows: the error, whether a read may be tried again,
+	/// the reason's variant.
+	#[test]
+	fn remote_io_reasons_carry_no_text_of_ours() {
+		let mut over = 0x7fff_ffffu32.to_be_bytes().to_vec();
+		over.extend_from_slice(b"x");
+		let mut bad = 3u32.to_be_bytes().to_vec();
+		bad.extend_from_slice(b"abc");
+		let mut short = 10u32.to_be_bytes().to_vec();
+		short.extend_from_slice(b"abc");
+		let rows: Vec<(io::Error, bool, &str)> = vec![
+			(
+				io::Error::new(
+					ErrorKind::UnexpectedEof,
+					"the worker closed the connection",
+				),
+				true,
+				// Not raised by the remote layer: the funnel rule only.
+				"disconnected",
+			),
+			(
+				io::Error::new(
+					ErrorKind::BrokenPipe,
+					"the transport's writer was abandoned",
+				),
+				true,
+				"disconnected",
+			),
+			(frame_error(&over), false, "protocol"),
+			(frame_error(&bad), false, "protocol"),
+			(frame_error(&short), true, "disconnected"),
+		];
+		for (e, transient, variant) in rows {
+			let shown = e.to_string();
+			let err = RemoteError::Io(e);
+			let v = serde_json::to_value(err.reason()).unwrap();
+			for ours in [
+				"worker",
+				"writer",
+				"frame of",
+				"expected",
+				"fill",
+				"abandoned",
+			] {
+				assert!(
+					!v.to_string().contains(ours),
+					"`{shown}` leaks {ours:?}: {v}"
+				);
+			}
+			assert_eq!(v["r"], variant, "`{shown}`: {v}");
+			assert_eq!(err.is_transient_read_failure(), transient, "{shown}");
+			assert!(err.outcome_unknown(), "{shown}");
+		}
+		#[cfg(unix)]
+		let os = io::Error::from_raw_os_error(32);
+		#[cfg(windows)]
+		let os = io::Error::from_raw_os_error(232);
+		let v = serde_json::to_value(RemoteError::Io(os).reason()).unwrap();
+		assert_eq!(v["r"], "disconnected");
+		assert!(!v["detail"].as_str().unwrap_or("").is_empty(), "{v}");
+	}
 }

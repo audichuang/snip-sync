@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use snip_core::reason::{io_reason, Reason};
-use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
+use snip_core::workspace::{DirectoryScan, ScanError, ScanStatus};
 
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
@@ -116,6 +116,9 @@ struct State {
 	hello_hold: (Mutex<bool>, Condvar),
 	active_hellos: AtomicUsize,
 	max_hellos: AtomicUsize,
+	/// Faults a test injected ([`crate::fault`]); only read while `armed`.
+	faults: Mutex<crate::fault::FaultBook>,
+	armed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -154,6 +157,8 @@ impl Worker {
 				hello_hold: (Mutex::new(false), Condvar::new()),
 				active_hellos: AtomicUsize::new(0),
 				max_hellos: AtomicUsize::new(0),
+				faults: Mutex::default(),
+				armed: AtomicBool::new(false),
 			}),
 		}
 	}
@@ -209,6 +214,32 @@ impl Worker {
 	#[doc(hidden)]
 	pub fn prepared_cache_usage_for_tests(&self) -> (usize, usize) {
 		self.state.prepared.usage_for_tests()
+	}
+
+	/// Arms a fault for the requests `rule` names ([`crate::fault`]). For
+	/// tests: nothing else arms one.
+	#[doc(hidden)]
+	pub fn inject_fault_for_tests(&self, rule: crate::fault::FaultRule) {
+		lock(&self.state.faults).add(rule);
+		self.state.armed.store(true, Ordering::SeqCst);
+	}
+
+	/// Drops every injected fault and disarms the book.
+	#[doc(hidden)]
+	pub fn clear_faults_for_tests(&self) {
+		lock(&self.state.faults).clear();
+		self.state.armed.store(false, Ordering::SeqCst);
+	}
+
+	/// Requests of `kind` the dispatch has seen while a fault was armed
+	/// (counting starts at the first [`Self::inject_fault_for_tests`]). A
+	/// hello is answered before dispatch and is not counted.
+	#[doc(hidden)]
+	pub fn requests_seen_for_tests(
+		&self,
+		kind: crate::fault::RequestKind,
+	) -> usize {
+		lock(&self.state.faults).seen(kind)
 	}
 
 	#[doc(hidden)]
@@ -495,6 +526,12 @@ fn serve(
 				}
 			}
 		}
+		let fault = if state.armed.load(Ordering::SeqCst) {
+			lock(&state.faults).take(&request)
+		} else {
+			None
+		};
+		let mut answer = crate::jobs::Answer::new(&mut writer, fault);
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
@@ -513,28 +550,24 @@ fn serve(
 				match fault {
 					Some(Err(())) => return Ok(()),
 					Some(Ok(Some(code))) => {
-						crate::jobs::write_response(
-							&mut writer,
-							&error(code, "injected scan refusal".into()),
-						)?;
+						answer.reply(&error(
+							code,
+							"injected scan refusal".into(),
+						))?;
 						continue;
 					}
 					_ => {}
 				}
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut writer,
-						&error(
-							ErrorCode::Unsupported,
-							"Git views are not available on this worker yet"
-								.into(),
-						),
-					)?;
+					answer.reply(&error(
+						ErrorCode::Unsupported,
+						"Git views are not available on this worker yet".into(),
+					))?;
 				} else {
 					let (_, scan_deadline) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut writer,
+						&mut answer,
 						scan_deadline,
 						cancel,
 						|job_cancel, job_deadline| match state.jobs.admit(
@@ -575,26 +608,19 @@ fn serve(
 			} => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut writer,
-						&error(
-							ErrorCode::Unsupported,
-							"Git views are not available on this worker yet"
-								.into(),
-						),
-					)?;
+					answer.reply(&error(
+						ErrorCode::Unsupported,
+						"Git views are not available on this worker yet".into(),
+					))?;
 				} else if let Err(msg) =
 					crate::gitserve::validate(&repo, &query)
 				{
-					crate::jobs::write_response(
-						&mut writer,
-						&error(ErrorCode::BadRequest, msg),
-					)?;
+					answer.reply(&error(ErrorCode::BadRequest, msg))?;
 				} else {
 					let (view_deadline, _) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut writer,
+						&mut answer,
 						view_deadline,
 						cancel,
 						|job_cancel, _job_deadline| match state.jobs.admit(
@@ -638,7 +664,7 @@ fn serve(
 				file_limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -658,7 +684,7 @@ fn serve(
 				selected,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -679,7 +705,7 @@ fn serve(
 				file_limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -700,7 +726,7 @@ fn serve(
 				retain,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -727,7 +753,7 @@ fn serve(
 				expect,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -753,7 +779,7 @@ fn serve(
 				mapping,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -775,7 +801,7 @@ fn serve(
 				expect,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -795,7 +821,7 @@ fn serve(
 				limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -814,7 +840,7 @@ fn serve(
 				text,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -834,7 +860,7 @@ fn serve(
 				retain,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -865,7 +891,7 @@ fn serve(
 					Job::PasteApply
 				};
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -897,7 +923,7 @@ fn serve(
 					Job::PasteApply
 				};
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -911,8 +937,13 @@ fn serve(
 				)?;
 			}
 			other => {
-				let response = state.handle(other);
-				crate::jobs::write_response(&mut writer, &response)?;
+				let (view_deadline, _) = *lock(&state.deadlines);
+				crate::jobs::run_inline(
+					&mut answer,
+					negotiated,
+					view_deadline,
+					|ctx| state.handle(other, ctx),
+				)?;
 			}
 		}
 	}
@@ -935,7 +966,7 @@ enum Job {
 /// old cannot even parse never reaches dispatch (the master gates on its
 /// `needs_version`), so this is the semantic gate beside it.
 fn serve_copy(
-	writer: &mut impl Write,
+	answer: &mut crate::jobs::Answer<'_, impl Write>,
 	state: &State,
 	negotiated: u32,
 	workspace: &str,
@@ -948,13 +979,10 @@ fn serve_copy(
 		Job::PastePlan | Job::PasteApply => "paste",
 	};
 	if negotiated < need {
-		return crate::jobs::write_response(
-			writer,
-			&error(
-				ErrorCode::Unsupported,
-				format!("{what} is not available on this worker yet"),
-			),
-		);
+		return answer.reply(&error(
+			ErrorCode::Unsupported,
+			format!("{what} is not available on this worker yet"),
+		));
 	}
 	let (view_deadline, _) = *lock(&state.deadlines);
 	let deadline = if job == Job::PasteApply {
@@ -971,7 +999,7 @@ fn serve_copy(
 		crate::jobs::DeadlineReply::Fail
 	};
 	crate::jobs::run_job_with(
-		writer,
+		answer,
 		crate::jobs::HEARTBEAT,
 		deadline,
 		cancel,
@@ -1082,28 +1110,34 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 
 impl State {
 	#[allow(clippy::result_large_err)]
-	fn handle(&self, request: Request) -> Response {
+	fn handle(&self, request: Request, ctx: &crate::jobs::JobCtx) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
 			}
-			Request::OpenWorkspace { path } => match SharedRoot::open(&path) {
-				Ok(root) => {
-					if let Some(fault) =
-						lock(&self.scan_faults).get_mut(&root.id)
-					{
-						fault.first_open.get_or_insert_with(|| {
-							self.open_sequence.fetch_add(1, Ordering::SeqCst)
-						});
-					}
-					Response::Workspace(RemoteWorkspace {
-						id: root.id,
-						name: root.name,
-						path: root.path.display().to_string(),
-					})
+			Request::OpenWorkspace { path } => {
+				if let Err(stop) = ctx.unit() {
+					return stop;
 				}
-				Err(err) => io_error(err),
-			},
+				match SharedRoot::open(&path) {
+					Ok(root) => {
+						if let Some(fault) =
+							lock(&self.scan_faults).get_mut(&root.id)
+						{
+							fault.first_open.get_or_insert_with(|| {
+								self.open_sequence
+									.fetch_add(1, Ordering::SeqCst)
+							});
+						}
+						Response::Workspace(RemoteWorkspace {
+							id: root.id,
+							name: root.name,
+							path: root.path.display().to_string(),
+						})
+					}
+					Err(err) => io_error(err),
+				}
+			}
 			Request::ListDir {
 				workspace,
 				path,
@@ -1112,22 +1146,31 @@ impl State {
 				.resolve(&workspace, &path)
 				.and_then(|(root, dir)| {
 					let cap = self.dir_cap.load(Ordering::SeqCst);
-					list_dir(&root, &dir, cap, folders_only)
+					list_dir(&root, &dir, cap, folders_only, ctx)
 				})
 				.unwrap_or_else(|e| e),
-			Request::Stat { workspace, path } => self
-				.resolve(&workspace, &path)
-				.and_then(|(_, p)| stat(&p))
-				.unwrap_or_else(|e| e),
-			Request::Read { workspace, path } => match self.root(&workspace) {
-				Ok(root) => {
-					match snip_core::browser::file_preview(&root, &path) {
-						Ok(p) => Response::Text { content: p.content },
-						Err(err) => io_error(err),
-					}
+			Request::Stat { workspace, path } => {
+				if let Err(stop) = ctx.unit() {
+					return stop;
 				}
-				Err(e) => e,
-			},
+				self.resolve(&workspace, &path)
+					.and_then(|(_, p)| stat(&p))
+					.unwrap_or_else(|e| e)
+			}
+			Request::Read { workspace, path } => {
+				if let Err(stop) = ctx.unit() {
+					return stop;
+				}
+				match self.root(&workspace) {
+					Ok(root) => {
+						match snip_core::browser::file_preview(&root, &path) {
+							Ok(p) => Response::Text { content: p.content },
+							Err(err) => io_error(err),
+						}
+					}
+					Err(e) => e,
+				}
+			}
 			Request::ScanRepos { .. } | Request::GitView { .. } => {
 				self.git_requests.fetch_add(1, Ordering::SeqCst);
 				error(
@@ -1199,12 +1242,14 @@ fn list_dir(
 	dir: &Path,
 	cap: usize,
 	folders_only: bool,
+	ctx: &crate::jobs::JobCtx,
 ) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
 	'scan: loop {
-		let page = match scan.next_page(&ScanBudget::visits(256)) {
+		ctx.unit()?;
+		let page = match scan.next_page(&ctx.budget(256)) {
 			Ok(page) => page,
 			Err(ScanError::Changed) => {
 				return Err(error(
@@ -1214,20 +1259,32 @@ fn list_dir(
 			}
 			Err(ScanError::Io(err)) => return Err(io_error(err)),
 		};
+		// A page cut short by the job's end is no result: the listing must
+		// not pass for the whole folder, and nothing is read after it.
+		if let Some(stop) = crate::jobs::JobCtx::refusal_for(page.status) {
+			return Err(stop);
+		}
 		for entry in page.entries {
+			// A page holds up to 256 entries, each one a stat or two on a
+			// slow disk: the job's end is looked at for every one.
+			if let Some(stop) = ctx.stop() {
+				return Err(stop);
+			}
 			if entries.len() >= cap {
 				truncated = true;
 				break 'scan;
+			}
+			// The filter runs before the push, so the cap above counts only
+			// the entries a folder picker is shown. A hidden name is out
+			// whatever it is, so it is not looked into.
+			if folders_only && entry.name.to_string_lossy().starts_with('.') {
+				continue;
 			}
 			let path = dir.join(&entry.name);
 			let directory = entry.directory
 				|| (entry.symlink
 					&& snip_core::transfer::is_safe_dir_symlink(root, &path));
-			// The filter runs before the push, so the cap above counts only
-			// the entries a folder picker is shown.
-			if folders_only
-				&& (!directory || entry.name.to_string_lossy().starts_with('.'))
-			{
+			if folders_only && !directory {
 				continue;
 			}
 			let nested_repo =
@@ -1242,10 +1299,13 @@ fn list_dir(
 		}
 		match page.status {
 			ScanStatus::Complete => break,
-			ScanStatus::Incomplete
-			| ScanStatus::LimitReached
-			| ScanStatus::Cancelled
-			| ScanStatus::TimedOut => {
+			ScanStatus::Incomplete | ScanStatus::LimitReached => {
+				truncated = true;
+				break;
+			}
+			// Ended the job: returned above. Should that ever change, a
+			// half-read folder still says so rather than pass as whole.
+			ScanStatus::Cancelled | ScanStatus::TimedOut => {
 				truncated = true;
 				break;
 			}
@@ -1331,6 +1391,105 @@ mod tests {
 		}
 		assert_eq!(a.name, "real");
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
+	}
+
+	/// Whether `State::handle` does work for this kind, so a job's end must
+	/// reach it. Every kind is named, so a new request has to decide.
+	fn handled_inline(kind: crate::fault::RequestKind) -> bool {
+		use crate::fault::RequestKind as K;
+		match kind {
+			K::OpenWorkspace | K::ListDir | K::Stat | K::Read => true,
+			// Answered at once, with no work behind them, or served as jobs.
+			K::Hello
+			| K::ReplayRead
+			| K::Write
+			| K::Rename
+			| K::ScanRepos
+			| K::GitView
+			| K::Export
+			| K::ExportCommits
+			| K::ExportChanges
+			| K::ImportPlan
+			| K::PrepareImport
+			| K::ApplyPrepared
+			| K::ImportApply
+			| K::ReplayPlan
+			| K::ReplayApply
+			| K::PrepareReplay
+			| K::ApplyPreparedReplay
+			| K::Chunk
+			| K::FrameChunk
+			| K::FrameJoin => false,
+		}
+	}
+
+	/// An op that is handed a cancel and a deadline must use them: a job
+	/// that must stop gets its refusal back, and the work is not started.
+	/// The folder has a file, so a listing that ignored the job would be
+	/// seen answering with it.
+	#[test]
+	fn every_inline_op_refuses_a_stopped_job() {
+		use crate::fault::RequestKind as K;
+		use snip_core::gitrun::CancelToken;
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a.txt"), "hello").unwrap();
+		let root = dir.path().display().to_string();
+		let worker = Worker::new(WorkerOptions::default());
+		let state = &worker.state;
+		let request = |kind: K| match kind {
+			K::OpenWorkspace => Request::OpenWorkspace { path: root.clone() },
+			K::ListDir => Request::ListDir {
+				workspace: root.clone(),
+				path: String::new(),
+				folders_only: false,
+			},
+			K::Stat => Request::Stat {
+				workspace: root.clone(),
+				path: "a.txt".into(),
+			},
+			K::Read => Request::Read {
+				workspace: root.clone(),
+				path: "a.txt".into(),
+			},
+			other => panic!("{other:?} is not an inline op"),
+		};
+		let live = || crate::jobs::JobCtx::for_tests(CancelToken::new(), None);
+		let cancelled = || {
+			let cancel = CancelToken::new();
+			cancel.cancel();
+			crate::jobs::JobCtx::for_tests(cancel, None)
+		};
+		let expired = || {
+			crate::jobs::JobCtx::for_tests(
+				CancelToken::new(),
+				Some(Instant::now()),
+			)
+		};
+		let kinds: Vec<K> = crate::fault::ALL_REQUEST_KINDS
+			.into_iter()
+			.filter(|k| handled_inline(*k))
+			.collect();
+		assert_eq!(kinds.len(), 4, "{kinds:?}");
+		for kind in kinds {
+			let answer = state.handle(request(kind), &live());
+			assert!(
+				!matches!(answer, Response::Error { .. }),
+				"{kind:?} fails with a live job: {answer:?}"
+			);
+			for (ctx, want) in [
+				(cancelled(), ErrorCode::Cancelled),
+				(expired(), ErrorCode::Timeout),
+			] {
+				match state.handle(request(kind), &ctx) {
+					Response::Error { code, .. } => {
+						assert_eq!(code, want, "{kind:?}")
+					}
+					other => {
+						panic!("{kind:?} worked for a stopped job: {other:?}")
+					}
+				}
+			}
+		}
 	}
 
 	#[test]
