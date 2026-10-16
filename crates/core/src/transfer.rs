@@ -6787,4 +6787,60 @@ mod case_policy_tests {
 			});
 		assert_eq!(plan.new_dirs().requested.len(), 2, "{:?}", plan.new_dirs());
 	}
+
+	/// Two folders that differ only in the case of an existing ancestor are
+	/// two folders, however the new names below them fold: `Α/new` is not
+	/// `α/new` when `Α` and `α` are two folders. Pure logic, so it runs on
+	/// a filesystem that folds case too.
+	#[test]
+	fn a_new_folder_under_one_existing_folder_is_not_one_under_another() {
+		let mut names = NewFolderNames::default();
+		let upper = PathBuf::from("/ws/\u{391}/new");
+		let lower = PathBuf::from("/ws/\u{3b1}/new");
+		assert_eq!(names.spell_named(upper.clone()), upper);
+		assert_eq!(names.spell(lower.clone()), lower);
+	}
+
+	/// Two destination roots that are two folders though their paths read
+	/// alike in lower case (`\u{391}` and `\u{3b1}`), each with a new folder
+	/// of the same name. When case cannot be told both fold, and the folder
+	/// the user named under the second root must still ask for consent: it
+	/// was once taken for the first root's, dropped from the agreement and
+	/// made without asking.
+	#[test]
+	fn a_named_folder_under_another_root_is_not_the_first_roots_folder() {
+		let (_tmp, ws) = tmp();
+		let (upper, lower) = (ws.join("\u{391}"), ws.join("\u{3b1}"));
+		fs::create_dir(&upper).unwrap();
+		if fs::create_dir(&lower).is_err() {
+			// One folder on a filesystem that folds case (macOS, Windows):
+			// the scenario cannot be built there. Linux must build it.
+			assert!(
+				!cfg!(target_os = "linux"),
+				"cannot make two folders that differ in case on Linux"
+			);
+			return;
+		}
+		let placed =
+			|root: &Path| PlacedRoot::resolve(None, &root.join("new")).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed(&upper));
+		mapping.map_prefix("q", placed(&lower));
+		let roots = [upper.clone(), lower.clone()];
+		let plan = with_probe_override(CaseSensitivity::Unknown, None, || {
+			plan_import("// file: q/b.txt\nB\n", "", &roots, &mapping).unwrap()
+		});
+		let want = NewDirs {
+			requested: vec![lower.join("new")],
+			incidental: Vec::new(),
+		};
+		assert_eq!(plan.new_dirs(), want);
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs, vec![lower.join("new")]);
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert!(!lower.join("new").exists());
+		assert!(!upper.join("new").exists());
+	}
 }
