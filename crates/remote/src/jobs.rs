@@ -270,9 +270,20 @@ impl<'w, W: Write> Answer<'w, W> {
 
 	/// Extra time the work behind this request takes: a `Fault::Delay`.
 	pub(crate) fn work_delay(&self) -> Option<Duration> {
-		// An irrefutable pattern: a new `Fault` stops this compiling until
-		// it decides what it means here.
-		self.fault.as_ref().map(|crate::fault::Fault::Delay(d)| *d)
+		// An exhaustive match: a new `Fault` stops this compiling until it
+		// decides what it means here.
+		match self.fault.as_ref()? {
+			crate::fault::Fault::Delay(d) => Some(*d),
+			crate::fault::Fault::PageDelay(_) => None,
+		}
+	}
+
+	/// Extra time each unit of the work takes: a `Fault::PageDelay`.
+	pub(crate) fn page_delay(&self) -> Option<Duration> {
+		match self.fault.as_ref()? {
+			crate::fault::Fault::PageDelay(d) => Some(*d),
+			crate::fault::Fault::Delay(_) => None,
+		}
 	}
 }
 
@@ -360,7 +371,18 @@ pub(crate) fn write_response<W: Write>(
 
 /// Proof that a request is answered under [`run_inline`]: only this module
 /// makes one.
-pub(crate) struct Covered(());
+pub(crate) struct Covered {
+	page_delay: Option<Duration>,
+}
+
+impl Covered {
+	/// Starts one unit of work: a test's `Fault::PageDelay` passes here.
+	pub(crate) fn unit(&self) {
+		if let Some(d) = self.page_delay {
+			std::thread::sleep(d);
+		}
+	}
+}
 
 /// Answers a request `State::handle` serves. From protocol 2 on the work runs
 /// under heartbeats like any job, so a master hears from a live worker within
@@ -372,11 +394,14 @@ pub(crate) fn run_inline<W: Write>(
 	deadline: Duration,
 	op: impl FnOnce(Covered) -> Response + Send,
 ) -> io::Result<()> {
+	let covered = Covered {
+		page_delay: answer.page_delay(),
+	};
 	if negotiated < crate::proto::GIT_VIEWS_VERSION {
 		if let Some(d) = answer.work_delay() {
 			std::thread::sleep(d);
 		}
-		return answer.reply(&op(Covered(())));
+		return answer.reply(&op(covered));
 	}
 	run_job_with(
 		answer,
@@ -384,7 +409,7 @@ pub(crate) fn run_inline<W: Write>(
 		deadline,
 		CancelToken::new(),
 		DeadlineReply::Fail,
-		|_, _| op(Covered(())),
+		|_, _| op(covered),
 	)
 }
 

@@ -1110,28 +1110,36 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 
 impl State {
 	#[allow(clippy::result_large_err)]
-	fn handle(&self, request: Request, _: crate::jobs::Covered) -> Response {
+	fn handle(
+		&self,
+		request: Request,
+		covered: crate::jobs::Covered,
+	) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
 			}
-			Request::OpenWorkspace { path } => match SharedRoot::open(&path) {
-				Ok(root) => {
-					if let Some(fault) =
-						lock(&self.scan_faults).get_mut(&root.id)
-					{
-						fault.first_open.get_or_insert_with(|| {
-							self.open_sequence.fetch_add(1, Ordering::SeqCst)
-						});
+			Request::OpenWorkspace { path } => {
+				covered.unit();
+				match SharedRoot::open(&path) {
+					Ok(root) => {
+						if let Some(fault) =
+							lock(&self.scan_faults).get_mut(&root.id)
+						{
+							fault.first_open.get_or_insert_with(|| {
+								self.open_sequence
+									.fetch_add(1, Ordering::SeqCst)
+							});
+						}
+						Response::Workspace(RemoteWorkspace {
+							id: root.id,
+							name: root.name,
+							path: root.path.display().to_string(),
+						})
 					}
-					Response::Workspace(RemoteWorkspace {
-						id: root.id,
-						name: root.name,
-						path: root.path.display().to_string(),
-					})
+					Err(err) => io_error(err),
 				}
-				Err(err) => io_error(err),
-			},
+			}
 			Request::ListDir {
 				workspace,
 				path,
@@ -1140,22 +1148,27 @@ impl State {
 				.resolve(&workspace, &path)
 				.and_then(|(root, dir)| {
 					let cap = self.dir_cap.load(Ordering::SeqCst);
-					list_dir(&root, &dir, cap, folders_only)
+					list_dir(&root, &dir, cap, folders_only, &covered)
 				})
 				.unwrap_or_else(|e| e),
-			Request::Stat { workspace, path } => self
-				.resolve(&workspace, &path)
-				.and_then(|(_, p)| stat(&p))
-				.unwrap_or_else(|e| e),
-			Request::Read { workspace, path } => match self.root(&workspace) {
-				Ok(root) => {
-					match snip_core::browser::file_preview(&root, &path) {
-						Ok(p) => Response::Text { content: p.content },
-						Err(err) => io_error(err),
+			Request::Stat { workspace, path } => {
+				covered.unit();
+				self.resolve(&workspace, &path)
+					.and_then(|(_, p)| stat(&p))
+					.unwrap_or_else(|e| e)
+			}
+			Request::Read { workspace, path } => {
+				covered.unit();
+				match self.root(&workspace) {
+					Ok(root) => {
+						match snip_core::browser::file_preview(&root, &path) {
+							Ok(p) => Response::Text { content: p.content },
+							Err(err) => io_error(err),
+						}
 					}
+					Err(e) => e,
 				}
-				Err(e) => e,
-			},
+			}
 			Request::ScanRepos { .. } | Request::GitView { .. } => {
 				self.git_requests.fetch_add(1, Ordering::SeqCst);
 				error(
@@ -1227,11 +1240,13 @@ fn list_dir(
 	dir: &Path,
 	cap: usize,
 	folders_only: bool,
+	covered: &crate::jobs::Covered,
 ) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
 	'scan: loop {
+		covered.unit();
 		let page = match scan.next_page(&ScanBudget::visits(256)) {
 			Ok(page) => page,
 			Err(ScanError::Changed) => {

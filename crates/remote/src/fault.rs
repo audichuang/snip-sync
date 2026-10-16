@@ -136,6 +136,11 @@ pub enum Fault {
 	/// work runs, so heartbeats cover it as they cover slow work (protocol 2
 	/// and up).
 	Delay(Duration),
+	/// Each unit of work behind the request takes this much longer: a page
+	/// of a folder listing, or the one call of a request that is a single
+	/// call. Like a slow filesystem call it is not interrupted by a cancel,
+	/// so a test sees what the work does once its deadline has passed.
+	PageDelay(Duration),
 }
 
 /// Which requests a [`FaultRule`] applies to.
