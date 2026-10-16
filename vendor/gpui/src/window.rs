@@ -1278,9 +1278,12 @@ impl Window {
     }
 }
 
+/// What dispatching an event came to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+pub struct DispatchEventResult {
+    /// The event went on to the elements that did not stop it.
     pub propagate: bool,
+    /// An element asked for the default action not to run.
     pub default_prevented: bool,
 }
 
