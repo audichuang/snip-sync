@@ -278,6 +278,33 @@ mod tests {
 		out
 	}
 
+	/// An invariant's line: its label is the id, last; its detail is text
+	/// the app wrote, so it travels encoded like a covering id.
+	#[test]
+	fn an_invariant_broken_line_reads_back_whole() {
+		for id in ["L4", "O(O4)", "P10"] {
+			for detail in [
+				"a detail with spaces",
+				"has ] and 100% and\nlines",
+				"ws_tab=2 id=x by=y",
+				"",
+			] {
+				for tag in TAGS {
+					let line = format!(
+						"[APP:INVARIANT_BROKEN: {tag}detail={} id={id}]",
+						encode_by(detail)
+					);
+					assert_eq!(
+						parse_invariant_broken(&line),
+						Some((id.to_string(), detail.to_string())),
+						"{line}"
+					);
+				}
+			}
+		}
+		assert_eq!(parse_invariant_broken("[APP:CTRL_GONE: id=a]"), None);
+	}
+
 	#[test]
 	fn text_fit_lines_are_parsed() {
 		let line = "[APP:TEXT_FIT: rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79 id=text-fit:row:ab12:subject]";
