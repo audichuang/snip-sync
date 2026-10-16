@@ -2743,6 +2743,9 @@ impl WorkbenchModel {
 		self.selected_list_row = 0;
 		self.clear_preview();
 		self.preview_loading = false;
+		// The selection above is gone, and so is the Log's claim on the
+		// latest preview read (L6 of `invariants`).
+		self.preview_pending_from_log = false;
 		self.preview_error = None;
 		self.reader.release_retained();
 		self.tree_queue = VecDeque::new();
@@ -6241,6 +6244,9 @@ impl WorkbenchModel {
 		self.log_selected.clear();
 		self.compare = None;
 		self.reset_commit_view();
+		// The Log's read no longer owns the preview: its selection is gone
+		// (L6 of `invariants`).
+		self.preview_pending_from_log = false;
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
 	}
