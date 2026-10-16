@@ -49,7 +49,8 @@ use snip_core::transfer::{
 	plan_import, plan_import_with, selection_from_paths,
 	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
-	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
+	PlacedRoot, SourceFreshnessSnapshot, SourceKind, TransferError,
+	CLIPBOARD_PAYLOAD_MAX,
 };
 
 struct TestRepo {
@@ -8252,7 +8253,6 @@ fn test_matches_preview_compares_the_symlinks_the_preview_recorded() {
 
 /// A canonical folder that is not a repository, for the destinations the
 /// tests below replace after a preview.
-#[cfg(unix)]
 fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dunce::canonicalize(dir.path()).unwrap();
@@ -8422,5 +8422,1452 @@ fn test_a_nested_root_replaced_is_stale_whichever_one_it_is() {
 		assert_stale_and_untouched(plan.apply(&overwrite()), replaced);
 		assert!(!ext.join("sub/x.txt").exists(), "{replaced}");
 		assert!(!ext.join("y.txt").exists(), "{replaced}");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 38. A destination folder or import path that does not exist yet (#241)
+// ---------------------------------------------------------------------------
+
+fn placed(path: &Path) -> PlacedRoot {
+	PlacedRoot::resolve(None, path).unwrap()
+}
+
+/// Every path below `dir`, sorted.
+fn scan_tree(dir: &Path) -> Vec<PathBuf> {
+	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let path = entry.unwrap().path();
+			out.push(path.clone());
+			if path.is_dir() {
+				walk(&path, out);
+			}
+		}
+	}
+	let mut out = Vec::new();
+	walk(dir, &mut out);
+	out.sort();
+	out
+}
+
+/// Plans `text` against `mapping` (its anchors as the roots) and checks that
+/// planning wrote nothing below `ws`.
+fn plan_placed(
+	ws: &Path,
+	text: &str,
+	mapping: &ImportMapping,
+) -> snip_core::transfer::TransferImportPlan {
+	let before = scan_tree(ws);
+	let plan = plan_import(text, "", &roots_of(mapping), mapping).unwrap();
+	assert_eq!(scan_tree(ws), before, "planning must not write");
+	plan
+}
+
+/// The destination roots a mapping points at, each once.
+fn roots_of(mapping: &ImportMapping) -> Vec<PathBuf> {
+	let mut roots: Vec<PathBuf> = Vec::new();
+	for placed in mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+	{
+		let anchor = placed.anchor().path().to_path_buf();
+		if !roots.contains(&anchor) {
+			roots.push(anchor);
+		}
+	}
+	roots
+}
+
+fn create_paths(
+	plan: &snip_core::transfer::TransferImportPlan,
+) -> Vec<(PathBuf, String)> {
+	let mut out: Vec<_> = plan
+		.create_operations()
+		.iter()
+		.map(|op| (op.absolute_path.clone(), op.relative_path.clone()))
+		.collect();
+	out.sort();
+	out
+}
+
+/// T1: a destination that is a folder to make keeps its tail in every route:
+/// the prefix that points at it, and a path no prefix claims.
+#[test]
+fn test_placed_destination_tail_is_kept_by_prefix_and_primary_routes() {
+	let (_tmp, ws) = canonical_tmp();
+	let dest = placed(&ws.join("new"));
+	assert_eq!(dest.tail(), ["new"]);
+	let mut mapping = ImportMapping::with_primary(dest.clone());
+	mapping.map_prefix("p", dest);
+	let plan = plan_placed(
+		&ws,
+		"// file: p/rest.txt\nr\n// file: q/x.txt\nx\n",
+		&mapping,
+	);
+	assert_eq!(
+		create_paths(&plan),
+		vec![
+			(ws.join("new/q/x.txt"), "new/q/x.txt".to_string()),
+			(ws.join("new/rest.txt"), "new/rest.txt".to_string()),
+		]
+	);
+}
+
+fn base(base: RestoreBase) -> RestoreBaseSuggestion {
+	RestoreBaseSuggestion {
+		base,
+		label: String::new(),
+		matched: 1,
+		total: 1,
+	}
+}
+
+/// T2 and T3: the restore base works on a folder to make as on one that exists.
+#[test]
+fn test_placed_destination_follows_the_restore_base() {
+	let (_tmp, ws) = canonical_tmp();
+	let strip = ImportMapping::from_restore_base(
+		&base(RestoreBase::Strip {
+			segment: "sub".into(),
+		}),
+		placed(&ws.join("new")),
+	);
+	let plan = plan_placed(&ws, "// file: sub/a.ts\nA\n", &strip);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("new/a.ts"), "new/a.ts".to_string())]
+	);
+
+	let add = ImportMapping::from_restore_base(
+		&base(RestoreBase::Add {
+			prefix: "src".into(),
+		}),
+		placed(&ws.join("new")),
+	);
+	let plan = plan_placed(&ws, "// file: a.ts\nA\n", &add);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("new/src/a.ts"), "new/src/a.ts".to_string())]
+	);
+}
+
+/// T4: an absolute entry path matches the folder to make and the folders
+/// that exist, not the anchor the folder to make hangs from.
+#[cfg(unix)]
+#[test]
+fn test_placed_destination_is_not_an_absolute_path_root_through_its_anchor() {
+	let (_tmp, ws) = canonical_tmp();
+	let other = ws.join("other.txt");
+	let inside = ws.join("new/a.txt");
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let text = format!(
+		"// file: {}\nO\n// file: {}\nI\n// file: [DELETED] {}\n",
+		other.display(),
+		inside.display(),
+		other.display()
+	);
+	let plan = plan_placed(&ws, &text, &mapping);
+	assert_eq!(plan.create_operations().len(), 2, "{plan:?}");
+	let rels: Vec<String> = plan
+		.create_operations()
+		.iter()
+		.map(|op| op.relative_path.clone())
+		.collect();
+	assert!(rels.contains(&"new/a.txt".to_string()), "{rels:?}");
+	let other_rel = format!("new/{}", other.display()).replace("//", "/");
+	assert!(rels.contains(&other_rel), "{rels:?} lacks {other_rel}");
+	assert!(
+		!plan
+			.create_operations()
+			.iter()
+			.any(|op| op.absolute_path == other),
+		"an absolute path under the anchor, outside the folder, must not land in the anchor"
+	);
+	assert!(plan
+		.skipped_operations()
+		.iter()
+		.any(|s| s.reason == SkipReason::UnresolvedPath));
+	assert!(plan.delete_operations().is_empty());
+}
+
+/// T5: a first name of the tail that is the anchor's own name is not read
+/// as the root's label and stripped.
+#[test]
+fn test_placed_destination_tail_named_like_its_anchor_is_kept() {
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir_all(ws.join("src")).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("src/src")));
+	let plan = plan_placed(&ws.join("src"), "// file: a.ts\nA\n", &mapping);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("src/src/a.ts"), "src/a.ts".to_string())]
+	);
+}
+
+fn confirmed(
+	plan: &snip_core::transfer::TransferImportPlan,
+	selection: RestoreSelection,
+) -> RestoreSelection {
+	RestoreSelection {
+		confirmed_placed: plan
+			.new_dirs_for(&selection)
+			.placed
+			.into_iter()
+			.collect(),
+		..selection
+	}
+}
+
+fn create_index(
+	plan: &snip_core::transfer::TransferImportPlan,
+	rel: &str,
+) -> usize {
+	plan.create_operations()
+		.iter()
+		.position(|op| op.relative_path.ends_with(rel))
+		.unwrap_or_else(|| panic!("no create of {rel}"))
+}
+
+/// T7: the folders the user named and the ones a file's path implies are
+/// told apart, and the first are a subset of the snapshot's missing folders.
+#[test]
+fn test_new_dirs_tell_the_named_folder_from_the_one_a_path_implies() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let nd = plan.new_dirs();
+	assert_eq!(nd.requested, vec![ws.join("new")]);
+	assert_eq!(nd.incidental, vec![ws.join("new/sub")]);
+	let fresh = plan.destination_freshness();
+	let missing = fresh.missing_dirs.as_ref().unwrap();
+	let requested = fresh.requested_dirs.as_ref().unwrap();
+	assert!(requested.is_subset(missing));
+	assert_eq!(requested.len(), 1);
+}
+
+/// T8: a row that is unchecked, or that overwrites a file, needs no folder.
+#[test]
+fn test_new_dirs_follow_the_rows_that_are_kept() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(
+		&ws,
+		"// file: s1/a.txt\nA\n// file: s2/b.txt\nB\n",
+		&mapping,
+	);
+	let all = plan.new_dirs();
+	assert_eq!(all.requested, vec![ws.join("new")]);
+	assert_eq!(all.incidental, vec![ws.join("new/s1"), ws.join("new/s2")]);
+	let drop_one = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "s1/a.txt")].into(),
+		..Default::default()
+	};
+	let nd = plan.new_dirs_for(&drop_one);
+	assert_eq!(nd.requested, vec![ws.join("new")]);
+	assert_eq!(nd.incidental, vec![ws.join("new/s2")]);
+	let drop_all = RestoreSelection {
+		unchecked_creates: [0, 1].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&drop_all), Default::default());
+
+	// A file that exists is overwritten in a folder that exists.
+	fs::create_dir_all(ws.join("here")).unwrap();
+	fs::write(ws.join("here/a.txt"), "old\n").unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("here")));
+	let plan = plan_placed(&ws, "// file: a.txt\nnew\n", &mapping);
+	assert_eq!(plan.new_dirs(), Default::default());
+}
+
+/// T9: a plan with no folder to make records none, and its snapshot is the
+/// one it always was on the wire.
+#[test]
+fn test_a_plan_without_a_tail_records_no_requested_dirs() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let fresh = plan.destination_freshness();
+	assert!(fresh.requested_dirs.is_none());
+	assert!(fresh.placed.is_none());
+	assert!(fresh.new_dirs.is_none());
+	let wire = serde_json::to_string(fresh).unwrap();
+	assert!(!wire.contains("requested_dirs"));
+	assert!(!wire.contains("placed"));
+	assert!(!wire.contains("routes"));
+	assert!(!wire.contains("new_dirs"));
+	assert_eq!(plan.new_dirs().placed, Vec::<usize>::new());
+	// Nor does a selection that agrees to no folder.
+	let selection =
+		serde_json::to_string(&RestoreSelection::default()).unwrap();
+	assert_eq!(
+		selection,
+		r#"{"overwrite_existing":false,"skip_existing":false,"unchecked_creates":[],"unchecked_deletes":[]}"#
+	);
+	assert_eq!(plan.new_dirs().requested, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().incidental, vec![ws.join("sub")]);
+}
+
+/// T10: the folder the user named is strict: whatever is there at Apply was
+/// not there at preview. A folder a path implies is not.
+#[test]
+fn test_a_named_folder_that_appears_after_preview_is_stale() {
+	for make in [true, false] {
+		let (_tmp, ws) = canonical_tmp();
+		let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+		let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+		let sel = confirmed(&plan, RestoreSelection::default());
+		if make {
+			fs::create_dir(ws.join("new")).unwrap();
+		} else {
+			fs::write(ws.join("new"), "x").unwrap();
+		}
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert!(!ws.join("new/sub").exists());
+	}
+
+	// A folder a path implies, made after the preview, still applies.
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir_all(ws.join("dest")).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("dest")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	fs::create_dir(ws.join("dest/sub")).unwrap();
+	let result = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(result.created_count, 1);
+}
+
+/// A1: no agreement, no folder and no file.
+#[test]
+fn test_apply_without_consent_makes_nothing() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match &err {
+		TransferError::NewDirsNotConfirmed { dirs } => {
+			assert_eq!(dirs, &vec![ws.join("new")])
+		}
+		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+	}
+	assert_eq!(err.reason(), Reason::NewDirsNotConfirmed { count: 1 });
+	assert!(!ws.join("new").exists());
+}
+
+/// A1b: one existing folder reached by two spellings is one folder. On
+/// macOS `/System/Volumes/Data/private/...` and `/private/...` are one
+/// folder (a firmlink), yet two canonical paths: the folder the user named
+/// under it, reached by a payload that goes through the other spelling,
+/// still asks for consent. macOS only: it is the one place a test can make
+/// two spellings of a folder without a mount.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_named_folder_reached_through_another_spelling_of_its_anchor_is_asked_for(
+) {
+	use std::os::unix::fs::MetadataExt;
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	let (a, b) = (
+		fs::metadata(&root).unwrap(),
+		fs::metadata(&spelled).expect("the data volume's firmlink is there"),
+	);
+	assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let plan = plan_placed(&ws, "// file: q/Sub/new/b.txt\nB\n", &mapping);
+	assert_eq!(plan.new_dirs().incidental, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match &err {
+		TransferError::NewDirsNotConfirmed { dirs } => {
+			assert_eq!(dirs.len(), 1, "{dirs:?}")
+		}
+		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+	}
+	assert!(!root.join("Sub/new").exists());
+}
+
+/// The same two spellings with a payload for both routes, agreed to: both
+/// spellings are listed, the folder is made once, and both files are
+/// written. (The second route's `mkdir` once met the folder the first had
+/// just made, took it for someone else's, and took the paste back; it is
+/// this Apply's own object now.)
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_named_folder_reached_through_two_spellings_is_made_once() {
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	fs::metadata(&spelled).expect("the data volume's firmlink is there");
+
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let plan = plan_placed(
+		&ws,
+		"// file: a.txt\nA\n// file: q/Sub/new/b.txt\nB\n",
+		&mapping,
+	);
+	let new = plan.new_dirs();
+	assert_eq!(
+		new.requested,
+		vec![root.join("Sub/new"), spelled.join("Sub/new")],
+		"{new:?}"
+	);
+	assert_eq!(new.incidental, Vec::<PathBuf>::new());
+	let agreed = RestoreSelection {
+		confirmed_placed: new.placed.into_iter().collect(),
+		..Default::default()
+	};
+	let result = plan.apply(&agreed).unwrap();
+	assert_eq!(result.created_count, 2);
+	assert_eq!(result.created_dirs, 1);
+	assert_eq!(fs::read_to_string(root.join("Sub/new/a.txt")).unwrap(), "A");
+	assert_eq!(fs::read_to_string(root.join("Sub/new/b.txt")).unwrap(), "B");
+}
+
+/// A1c: the anchor the two spellings lead to cannot be read (a drop box,
+/// `-wx`). It is still one object, so the folder named under it still asks:
+/// told by a canonical path it was two folders, and the named one was made
+/// as an incidental one, without consent.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_an_unreadable_anchor_reached_through_another_spelling_is_asked_for() {
+	use std::os::unix::fs::PermissionsExt;
+
+	struct Restore(PathBuf);
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			let _ =
+				fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+		}
+	}
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let _restore = Restore(root.join("Sub"));
+	fs::set_permissions(root.join("Sub"), fs::Permissions::from_mode(0o311))
+		.unwrap();
+	// Not `plan_placed`: its tree scan cannot read the folder either.
+	let plan = plan_import(
+		"// file: q/Sub/new/b.txt\nB\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan.new_dirs().incidental, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert!(
+		matches!(err, TransferError::NewDirsNotConfirmed { .. }),
+		"{err:?}"
+	);
+	assert!(!root.join("Sub/new").exists());
+}
+
+/// A1d: the plan identifies every existing folder a payload goes through, and
+/// that costs no file descriptor. A terminal's default limit is 256, and a
+/// plan with a named folder and 400 existing ones under another root used to
+/// fail to start git.
+#[cfg(unix)]
+#[test]
+fn test_planning_with_many_existing_folders_needs_no_descriptor_for_each() {
+	use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+	// One test per process under nextest, so the limit stays here.
+	let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+	setrlimit(Resource::RLIMIT_NOFILE, 256.min(hard).min(soft), hard).unwrap();
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	let mut text = String::new();
+	for i in 0..400 {
+		fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+		text.push_str(&format!("// file: q/d{i}/x/f.txt\nF\n"));
+	}
+	text.push_str("// file: b.txt\nB\n");
+	let mut mapping = ImportMapping::with_primary(placed(&root.join("new")));
+	mapping.map_prefix("q", placed(&root));
+	let plan = plan_placed(&ws, &text, &mapping);
+	let dirs = plan.new_dirs();
+	assert_eq!(dirs.requested, vec![root.join("new")]);
+	assert_eq!(dirs.incidental.len(), 400);
+}
+
+/// A2: with the agreement the folder is made and the file written.
+#[test]
+fn test_apply_with_consent_makes_the_folder_and_writes() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let sel = confirmed(&plan, RestoreSelection::default());
+	let result = plan.apply(&sel).unwrap();
+	assert_eq!(result.created_count, 1);
+	assert_eq!(result.created_dirs, 1);
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(fs::read_to_string(ws.join("new/sub/a.txt")).unwrap(), "A");
+}
+
+/// A3: an agreement to some of the folders is not an agreement to all.
+#[test]
+fn test_apply_with_consent_to_only_one_of_two_folders_makes_neither() {
+	let (_tmp, ws) = canonical_tmp();
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&ws.join("newp")));
+	let plan =
+		plan_placed(&ws, "// file: x.txt\nX\n// file: p/y.txt\nY\n", &mapping);
+	assert_eq!(plan.new_dirs().requested.len(), 2);
+	let sel = RestoreSelection {
+		confirmed_placed: [0].into(),
+		..Default::default()
+	};
+	let err = plan.apply(&sel).unwrap_err();
+	assert_eq!(err.reason(), Reason::NewDirsNotConfirmed { count: 1 });
+	assert!(!ws.join("new").exists());
+	assert!(!ws.join("newp").exists());
+}
+
+/// A5b (I4): only the folders the rows kept need are made, whatever was
+/// agreed to.
+#[test]
+fn test_apply_makes_only_the_folders_the_kept_rows_need() {
+	let (_tmp, ws) = canonical_tmp();
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&ws.join("newp")));
+	let plan =
+		plan_placed(&ws, "// file: x.txt\nX\n// file: p/y.txt\nY\n", &mapping);
+	// Agree to both, drop the row for one: only the other is made.
+	let drop_p = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "y.txt")].into(),
+		confirmed_placed: plan.new_dirs().placed.into_iter().collect(),
+		..Default::default()
+	};
+	let result = plan.apply(&drop_p).unwrap();
+	assert_eq!(result.created_count, 1);
+	assert_eq!(result.created_dirs, 1);
+	assert!(ws.join("new/x.txt").exists());
+	assert!(!ws.join("newp").exists());
+
+	// Every row dropped: nothing is made although everything was agreed to.
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: a.txt\nA\n", &mapping);
+	let none = RestoreSelection {
+		unchecked_creates: [0].into(),
+		confirmed_placed: [0].into(),
+		..Default::default()
+	};
+	let result = plan.apply(&none).unwrap();
+	assert_eq!(result.created_count, 0);
+	assert_eq!(result.created_dirs, 0);
+	assert!(!ws.join("new").exists());
+}
+
+// ---------------------------------------------------------------------------
+// 39. The routed path stays below its folder; planning writes nothing; one
+//     identity per new folder (#241 review)
+// ---------------------------------------------------------------------------
+
+/// Every route that can hand the planner a path with no file name in it
+/// (`.`, `/`, a prefix and nothing after it), by the folder that route lands
+/// in. A tail must not turn such a path into the folder itself: the file
+/// written would be the folder to make.
+fn pathless_entries(ws: &Path, dest: &Path) -> Vec<(String, ImportMapping)> {
+	let to = |dest: &Path| placed(dest);
+	let mut out = Vec::new();
+	// A path no prefix claims, under the primary destination.
+	for raw in [".", "./", "/", "//", "/./"] {
+		out.push((raw.to_string(), ImportMapping::with_primary(to(dest))));
+	}
+	// A prefix and nothing (or only a dot) after it.
+	for raw in ["p/", "p//", "p/.", "p/./"] {
+		let mut mapping = ImportMapping::with_primary(to(&ws.join("other")));
+		mapping.map_prefix("p", to(dest));
+		out.push((raw.to_string(), mapping));
+	}
+	// The restore base: Strip consumes the segment, Add puts one in front.
+	for raw in ["sub/", "sub/."] {
+		out.push((
+			raw.to_string(),
+			ImportMapping::from_restore_base(
+				&base(RestoreBase::Strip {
+					segment: "sub".into(),
+				}),
+				to(dest),
+			),
+		));
+	}
+	// Add puts a folder in front of every relative path: a path with no file
+	// name in it stays without one, and is not the folder it was put under.
+	for raw in [".", "./", "./.", ".//"] {
+		out.push((
+			raw.to_string(),
+			ImportMapping::from_restore_base(
+				&base(RestoreBase::Add {
+					prefix: "src".into(),
+				}),
+				to(dest),
+			),
+		));
+	}
+	// An absolute path that names the destination itself.
+	for suffix in ["", "/"] {
+		out.push((
+			format!("{}{suffix}", dest.display()),
+			ImportMapping::with_primary(to(dest)),
+		));
+	}
+	out
+}
+
+/// P1: whatever the route, a path that names no file below the destination
+/// is skipped, whether the destination exists or is to be made. Before, a
+/// tail made `.` into `new`, and Apply wrote a file where the folder was to
+/// be, with no consent asked.
+#[test]
+fn test_a_routed_path_without_a_file_name_is_skipped_below_any_destination() {
+	for exists in [true, false] {
+		let (_tmp, ws) = canonical_tmp();
+		let dest = ws.join("new");
+		if exists {
+			fs::create_dir_all(&dest).unwrap();
+		}
+		for (raw, mapping) in pathless_entries(&ws, &dest) {
+			let text = format!("// file: {raw}\nBODY\n");
+			let plan = plan_placed(&ws, &text, &mapping);
+			assert!(
+				plan.create_operations().is_empty(),
+				"exists={exists} {raw:?}: planned {:?}",
+				create_paths(&plan)
+			);
+			assert!(
+				plan.new_dirs() == Default::default(),
+				"exists={exists} {raw:?}: planned folders {:?}",
+				plan.new_dirs()
+			);
+			let result = plan.apply(&RestoreSelection::default()).unwrap();
+			assert_eq!(result.created_count, 0, "exists={exists} {raw:?}");
+			if !exists {
+				assert!(!dest.exists(), "{raw:?} made the destination");
+			} else {
+				assert!(dest.is_dir(), "{raw:?} replaced the destination");
+			}
+		}
+	}
+}
+
+/// P1c: under Add, a path with no file name beside a real file is skipped
+/// alone; the real file lands below the folder Add names. Before, `.` became
+/// `src`, a plain file where the folder `src` was to be, and the real file
+/// failed with "File exists" at Apply.
+#[test]
+fn test_add_skips_a_path_without_a_file_name_beside_a_real_file() {
+	for exists in [true, false] {
+		let (_tmp, ws) = canonical_tmp();
+		let dest = ws.join("new");
+		if exists {
+			fs::create_dir_all(&dest).unwrap();
+		}
+		let mapping = ImportMapping::from_restore_base(
+			&base(RestoreBase::Add {
+				prefix: "src".into(),
+			}),
+			placed(&dest),
+		);
+		let plan = plan_placed(
+			&ws,
+			"// file: .\nDOT\n// file: ./\nSLASH\n// file: a.txt\nA\n",
+			&mapping,
+		);
+		assert_eq!(
+			create_paths(&plan),
+			vec![(
+				ws.join("new/src/a.txt"),
+				if exists { "src/a.txt" } else { "new/src/a.txt" }.to_string()
+			)],
+			"exists={exists}"
+		);
+		assert!(plan
+			.skipped_operations()
+			.iter()
+			.any(|s| s.reason == SkipReason::UnresolvedPath));
+		let sel = confirmed(&plan, RestoreSelection::default());
+		let result = plan.apply(&sel).unwrap();
+		assert_eq!(result.created_count, 1, "exists={exists}");
+		assert!(ws.join("new/src").is_dir(), "exists={exists}");
+		assert_eq!(fs::read_to_string(ws.join("new/src/a.txt")).unwrap(), "A");
+	}
+}
+
+/// P1b: the same names beside a real file are still planned below the
+/// destination, and the destination is made as a folder.
+#[test]
+fn test_a_routed_path_with_a_file_name_still_lands_below_the_tail() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(
+		&ws,
+		"// file: ./a.txt\nA\n// file: /b.txt\nB\n// file: sub/./c.txt\nC\n",
+		&mapping,
+	);
+	assert_eq!(
+		create_paths(&plan),
+		vec![
+			(ws.join("new/a.txt"), "new/a.txt".to_string()),
+			(ws.join("new/b.txt"), "new/b.txt".to_string()),
+			(ws.join("new/sub/c.txt"), "new/sub/c.txt".to_string()),
+		]
+	);
+	let sel = confirmed(&plan, RestoreSelection::default());
+	plan.apply(&sel).unwrap();
+	assert!(ws.join("new").is_dir());
+}
+
+/// The mtime of `dir` set far in the past, so that any entry made and
+/// removed in it moves it, whatever the clock's grain.
+#[cfg(unix)]
+fn age(dir: &Path) -> std::time::SystemTime {
+	let old = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	let handle = fs::File::open(dir).unwrap();
+	handle.set_modified(old).unwrap();
+	drop(handle);
+	fs::metadata(dir).unwrap().modified().unwrap()
+}
+
+/// P2: planning is read-only, down to the folders it only reads. An empty
+/// folder gave the case-sensitivity probe nothing to compare, so it made and
+/// removed a file there: the directory listing came back the same, but its
+/// mtime moved, and a watcher saw a write nobody had agreed to.
+#[cfg(unix)]
+#[test]
+fn test_planning_does_not_touch_the_folders_it_reads() {
+	for dest_exists in [false, true] {
+		let (_tmp, ws) = canonical_tmp();
+		let anchor = ws.join("empty");
+		fs::create_dir_all(&anchor).unwrap();
+		let dest = if dest_exists {
+			anchor.clone()
+		} else {
+			anchor.join("new")
+		};
+		let (anchor_before, ws_before) = (age(&anchor), age(&ws));
+		let mapping = ImportMapping::with_primary(placed(&dest));
+		let text = "// file: a.txt\nA\n// file: sub/b.txt\nB\n";
+		let plan =
+			plan_import(text, "", std::slice::from_ref(&anchor), &mapping)
+				.unwrap();
+		assert_eq!(plan.create_operations().len(), 2);
+		assert_eq!(
+			fs::metadata(&anchor).unwrap().modified().unwrap(),
+			anchor_before,
+			"dest_exists={dest_exists}: planning wrote into the anchor"
+		);
+		assert_eq!(
+			fs::metadata(&ws).unwrap().modified().unwrap(),
+			ws_before,
+			"dest_exists={dest_exists}: planning wrote beside the anchor"
+		);
+		assert!(fs::read_dir(&anchor).unwrap().next().is_none());
+	}
+}
+
+/// P2b: a probe that cannot write still tells an empty folder that folds
+/// case from one that does not: two files whose names differ by case collide
+/// in it exactly when the filesystem says they are one.
+#[test]
+fn test_an_empty_destination_still_folds_case_without_a_probe_file() {
+	let (_tmp, ws) = canonical_tmp();
+	let ci = test_dir_case_insensitive(&ws);
+	let empty = ws.join("empty");
+	fs::create_dir_all(&empty).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&empty));
+	let result = plan_import(
+		"// file: B.txt\nB\n// file: b.txt\nb\n",
+		"",
+		std::slice::from_ref(&empty),
+		&mapping,
+	);
+	assert_eq!(result.is_err(), ci, "{result:?}");
+	assert!(fs::read_dir(&empty).unwrap().next().is_none());
+}
+
+fn two_spellings(
+	ws: &Path,
+	first: &str,
+	second: &str,
+) -> (ImportMapping, &'static str) {
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("other")));
+	mapping.map_prefix("p", placed(&ws.join(first)));
+	mapping.map_prefix("q", placed(&ws.join(second)));
+	(mapping, "// file: p/a.txt\nA\n// file: q/b.txt\nB\n")
+}
+
+/// P3: two names for one folder, on a filesystem that folds case: both are
+/// listed and agreed to, and the folder is made once. Before, the second
+/// `create_dir` met the first's folder: the apply failed as an outside
+/// change, and failed again every time. It is this Apply's own object.
+#[test]
+fn test_two_spellings_of_one_new_folder_are_made_once_and_both_files_land() {
+	let (_tmp, ws) = canonical_tmp();
+	let ci = test_dir_case_insensitive(&ws);
+	let (mapping, text) = two_spellings(&ws, "new", "NEW");
+	let plan = plan_placed(&ws, text, &mapping);
+	let nd = plan.new_dirs();
+	assert_eq!(nd.requested.len(), 2, "{nd:?}");
+	let sel = confirmed(&plan, RestoreSelection::default());
+	let result = plan.apply(&sel).unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.created_count, 2);
+	assert_eq!(result.created_dirs, if ci { 1 } else { 2 });
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
+	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
+	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");
+}
+
+/// P3b: a folder a prefix names under another spelling, and a path that
+/// implies it: the folders the user named are listed, the agreement is to
+/// the placed folders, and what is one folder is made once, as the
+/// filesystem says.
+#[test]
+fn test_one_identity_for_new_folders_in_consent_requested_and_mkdir() {
+	let (_tmp, ws) = canonical_tmp();
+	let ci = test_dir_case_insensitive(&ws);
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new/sub")));
+	mapping.map_prefix("q", placed(&ws.join("NEW/Sub/deep")));
+	mapping.map_prefix("r", placed(&ws));
+	let text = "// file: x.txt\nX\n// file: q/y.txt\nY\n// file: r/NEW/sub/w.txt\nW\n// file: r/NEW/other/z.txt\nZ\n";
+	let plan = plan_placed(&ws, text, &mapping);
+	let nd = plan.new_dirs();
+	let fresh = plan.destination_freshness();
+	let missing = fresh.missing_dirs.as_ref().unwrap();
+	let requested = fresh.requested_dirs.as_ref().unwrap();
+	assert!(requested.is_subset(missing));
+	for level in plan.placed_folders().iter().flatten() {
+		assert!(nd.requested.contains(level), "{level:?} in {nd:?}");
+	}
+	assert_eq!(nd.placed, vec![0, 1]);
+	let sel = confirmed(&plan, RestoreSelection::default());
+	let result = plan.apply(&sel).unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.created_count, 4);
+	assert_eq!(result.created_dirs, if ci { 3 } else { 5 });
+	if ci {
+		for rel in [
+			"new/sub/x.txt",
+			"new/sub/deep/y.txt",
+			"new/sub/w.txt",
+			"new/other/z.txt",
+		] {
+			assert!(ws.join(rel).is_file(), "{rel}");
+		}
+	}
+}
+
+/// P3c: a plan with no folder the user named keeps the spellings the
+/// payload wrote (ClipCode's too): `Dir/a.txt` and `dir/b.txt` pasted into
+/// an existing folder are two paths, each as written, even on a filesystem
+/// that folds case.
+#[test]
+fn test_a_plan_without_a_named_folder_keeps_the_payload_spellings() {
+	let (_tmp, ws) = canonical_tmp();
+	let repo = ws.join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&repo));
+	let plan = plan_placed(
+		&ws,
+		"// file: Dir/a.txt\nA\n// file: dir/b.txt\nB\n",
+		&mapping,
+	);
+	let rels: Vec<&str> = plan
+		.create_operations()
+		.iter()
+		.map(|op| op.relative_path.as_str())
+		.collect();
+	assert_eq!(rels, vec!["Dir/a.txt", "dir/b.txt"]);
+	assert_eq!(
+		plan.create_operations()[1].absolute_path,
+		repo.join("dir/b.txt")
+	);
+}
+
+/// P3d: two spellings of one new folder are one folder, so an outside
+/// `create_dir` of it, in any spelling, makes the plan stale: Apply refuses
+/// and writes nothing.
+#[test]
+fn test_an_outside_create_of_a_two_spelling_folder_makes_apply_stale() {
+	for outside in ["new", "NEW", "nEw"] {
+		let (_tmp, ws) = canonical_tmp();
+		let ci = test_dir_case_insensitive(&ws);
+		if !ci && outside == "nEw" {
+			continue;
+		}
+		let (mapping, text) = two_spellings(&ws, "new", "NEW");
+		let plan = plan_placed(&ws, text, &mapping);
+		let sel = confirmed(&plan, RestoreSelection::default());
+		fs::create_dir(ws.join(outside)).unwrap();
+		let before = scan_tree(&ws);
+		let err = plan.apply(&sel).unwrap_err();
+		assert!(
+			matches!(err, TransferError::StaleDestination { .. }),
+			"{outside}: {err:?}"
+		);
+		assert_eq!(scan_tree(&ws), before, "{outside}: wrote something");
+	}
+}
+
+/// A folder of a placed destination's tail that exists by the time of
+/// planning breaks what `resolve` promised (the anchor is the nearest
+/// existing ancestor): the plan is stale, not a plan with that folder as
+/// an incidental create.
+#[test]
+fn test_a_placed_tail_folder_created_before_planning_is_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	let dest = placed(&ws.join("new").join("sub"));
+	fs::create_dir(ws.join("new")).unwrap();
+	let mapping = ImportMapping::with_primary(dest);
+	let err =
+		plan_import("// file: a.txt\nA\n", "", &roots_of(&mapping), &mapping)
+			.unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"expected StaleDestination, got {err:?}"
+	);
+	assert!(!ws.join("new/sub").exists());
+}
+
+/// Two destinations that name one new folder in two cases (on a filesystem
+/// that folds case), the first level created between resolving and
+/// planning: not an unconfirmed-free plan that makes the folder.
+#[test]
+fn test_two_spellings_of_a_new_folder_created_before_planning_are_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	if !test_dir_case_insensitive(&ws) {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+				|| cfg!(target_os = "linux"),
+			"needs a case-insensitive filesystem"
+		);
+		return;
+	}
+	let primary = placed(&ws.join("new").join("sub"));
+	let other = placed(&ws.join("NEW").join("SUB"));
+	fs::create_dir(ws.join("new")).unwrap();
+	let mut mapping = ImportMapping::with_primary(primary);
+	mapping.map_prefix("q", other);
+	let err =
+		plan_import("// file: q/b.txt\nB\n", "", &roots_of(&mapping), &mapping)
+			.unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"expected StaleDestination, got {err:?}"
+	);
+	assert!(!ws.join("new/sub").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Target collisions are judged on the paths the plan finally writes
+// ---------------------------------------------------------------------------
+
+/// `/System/Volumes/Data` followed by `ws`: the macOS data volume's
+/// firmlink, another spelling of the same folder.
+#[cfg(target_os = "macos")]
+fn data_volume_spelling(ws: &Path) -> PathBuf {
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(ws.strip_prefix("/").unwrap());
+	fs::metadata(&spelled).expect("the data volume's firmlink is there");
+	spelled
+}
+
+/// Two routes to one new folder, through the two spellings of the folder
+/// above it, each with a file of the same name. Moving both into one
+/// spelling of the folder made them one target; the collision was checked
+/// before that, on the two spellings, and Apply wrote the second file over
+/// the first. One target written twice is refused whole, and nothing is
+/// written.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_two_routes_to_one_new_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	let spelled = data_volume_spelling(&ws);
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&spelled.join("new")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: p/a.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
+
+/// The same with the folder already there: no folder to make, so nothing
+/// moves the two spellings together, and the two targets are still one
+/// file. A collision is told by the folder the filesystem has, not by how
+/// its path reads.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_two_routes_to_one_existing_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir(ws.join("new")).unwrap();
+	let spelled = data_volume_spelling(&ws);
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&spelled.join("new")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: p/a.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), vec![ws.join("new")]);
+}
+
+/// Two routes to one new folder named in two cases, on a filesystem that
+/// folds case: one folder, so one target, and the paste is refused.
+#[test]
+fn test_two_cases_of_one_new_folder_with_one_file_name_collide() {
+	let (_tmp, ws) = canonical_tmp();
+	if !test_dir_case_insensitive(&ws) {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+				|| cfg!(target_os = "linux"),
+			"needs a case-insensitive filesystem"
+		);
+		return;
+	}
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("q", placed(&ws.join("NEW")));
+	let res = plan_import(
+		"// file: a.txt\nFIRST\n// file: q/A.txt\nSECOND\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	);
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
+
+/// A plan that reaches Apply with two writes to one target (from a peer, or
+/// a planning mistake) is refused before anything is written.
+#[test]
+fn test_apply_refuses_a_plan_that_writes_one_target_twice() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws));
+	let plan = plan_import(
+		"// file: a.txt\nFIRST\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	)
+	.unwrap();
+	let mut restore_plan = plan.restore_plan().clone();
+	let mut second = restore_plan.create_operations[0].clone();
+	second.content = "SECOND\n".into();
+	restore_plan.create_operations.push(second);
+	let plan = snip_core::transfer::TransferImportPlan::from_parts(
+		plan.roots().to_vec(),
+		restore_plan,
+		plan.destination_freshness().clone(),
+	);
+	let res = plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(res, Err(TransferError::TargetCollision { .. })),
+		"expected TargetCollision, got {res:?}"
+	);
+	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
+}
+
+// ---------------------------------------------------------------------------
+// A master reads a worker's paths as they are, not as its own
+// ---------------------------------------------------------------------------
+
+/// What a Windows worker sends for a paste into `C:\ws\new` (a folder to
+/// make) with `new/sub/a.txt` and `new/b.txt`: the folders each create
+/// needs, worked out there.
+const WINDOWS_WORKER_PLAN: &str = r#"{
+	"roots": ["C:\\ws"],
+	"restore_plan": {
+		"roots": ["C:\\ws"],
+		"createOperations": [
+			{
+				"relativePath": "new/sub/a.txt",
+				"absolutePath": "C:\\ws\\new\\sub\\a.txt",
+				"content": "A",
+				"existed": false,
+				"rootPath": "C:\\ws"
+			},
+			{
+				"relativePath": "new/b.txt",
+				"absolutePath": "C:\\ws\\new\\b.txt",
+				"content": "B",
+				"existed": false,
+				"rootPath": "C:\\ws"
+			}
+		],
+		"deleteOperations": [],
+		"skippedOperations": []
+	},
+	"destination_freshness": {
+		"roots": {
+			"C:\\ws": {"head_commit": null, "head_ref": null, "index_hash": null}
+		},
+		"target_files": {},
+		"repos": {},
+		"missing_dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+		"symlinked_dirs": {},
+		"requested_dirs": ["C:\\ws\\new"],
+		"placed": [["C:\\ws\\new"]],
+		"new_dirs": {
+			"dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+			"needs": [[0, 1], [0]],
+			"routes": [0, 0]
+		}
+	}
+}"#;
+
+/// A master on any OS lists the folders a Windows worker's plan makes, and
+/// agrees to the ones the rows it keeps need: it does not take the worker's
+/// paths apart by its own rules (on Unix `\` is part of a name, so every
+/// path was one name, no folder was listed, and `--create-dirs` sent an
+/// empty agreement).
+#[test]
+fn test_a_windows_workers_new_folders_are_listed_on_any_master() {
+	let plan: snip_core::transfer::TransferImportPlan =
+		serde_json::from_str(WINDOWS_WORKER_PLAN).unwrap();
+	let (new, sub) =
+		(PathBuf::from(r"C:\ws\new"), PathBuf::from(r"C:\ws\new\sub"));
+	assert_eq!(
+		plan.new_dirs(),
+		snip_core::transfer::NewDirs {
+			requested: vec![new.clone()],
+			incidental: vec![sub.clone()],
+			placed: vec![0],
+		}
+	);
+	// Only `new/b.txt` kept: `sub` is not needed.
+	let keep_b = RestoreSelection {
+		unchecked_creates: [0].into(),
+		..Default::default()
+	};
+	assert_eq!(
+		plan.new_dirs_for(&keep_b),
+		snip_core::transfer::NewDirs {
+			requested: vec![new.clone()],
+			incidental: Vec::new(),
+			placed: vec![0],
+		}
+	);
+	// What `snip paste --create-dirs` agrees to.
+	let agreed = confirmed(&plan, RestoreSelection::default());
+	assert_eq!(agreed.confirmed_placed, [0].into());
+	let none = RestoreSelection {
+		unchecked_creates: [0, 1].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&none), Default::default());
+}
+
+/// A plan from a worker that does not send the folders (an older one) is
+/// read as before: by this machine's path rules, right when both are the
+/// same OS. A local plan with a folder to make lists the same folders
+/// either way.
+#[test]
+fn test_new_folders_without_the_workers_list_follow_the_paths() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(
+		&ws,
+		"// file: sub/a.txt\nA\n// file: b.txt\nB\n",
+		&mapping,
+	);
+	let mut json = serde_json::to_value(plan.destination_freshness()).unwrap();
+	assert!(json.get("new_dirs").is_some(), "{json}");
+	json.as_object_mut().unwrap().remove("new_dirs");
+	let older = snip_core::transfer::TransferImportPlan::from_parts(
+		plan.roots().to_vec(),
+		plan.restore_plan().clone(),
+		serde_json::from_value(json).unwrap(),
+	);
+	let want = snip_core::transfer::NewDirs {
+		requested: vec![ws.join("new")],
+		incidental: vec![ws.join("new/sub")],
+		placed: vec![0],
+	};
+	assert_eq!(plan.new_dirs(), want);
+	assert_eq!(older.new_dirs(), want);
+	let keep_b = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "sub/a.txt")].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&keep_b), older.new_dirs_for(&keep_b));
+	// The list is derived from the plan: a worker does not hold an older
+	// master's preview, which lacks it, to it.
+	assert!(older
+		.destination_freshness()
+		.matches_preview(plan.destination_freshness()));
+	assert!(plan
+		.destination_freshness()
+		.matches_preview(older.destination_freshness()));
+}
+
+// ---------------------------------------------------------------------------
+// A new file's empty reservation changed by someone else before its row wrote
+// ---------------------------------------------------------------------------
+
+/// How someone else changes `b.txt` after the Apply made it empty and
+/// before its row writes.
+#[derive(Clone, Copy)]
+enum Interloper {
+	/// Writes into the empty file itself (the same object).
+	WritesInto(&'static [u8]),
+	/// Renames another file over it (a new object at the name).
+	RenamesOver(&'static [u8]),
+}
+
+impl Interloper {
+	fn run(self, target: &Path) {
+		match self {
+			Self::WritesInto(bytes) => fs::write(target, bytes).unwrap(),
+			Self::RenamesOver(bytes) => {
+				let other = target.with_file_name("other.tmp");
+				fs::write(&other, bytes).unwrap();
+				fs::rename(&other, target).unwrap();
+			}
+		}
+	}
+
+	fn bytes(self) -> &'static [u8] {
+		match self {
+			Self::WritesInto(b) | Self::RenamesOver(b) => b,
+		}
+	}
+}
+
+/// Two new files; between the first row's write and the second's, the
+/// interloper changes the second one's reservation.
+fn apply_with_reservation_changed(
+	selection: RestoreSelection,
+	how: Interloper,
+) -> (restore::RestoreExecutionResult, TestRepo) {
+	apply_with_b_changed(selection, |b| how.run(b))
+}
+
+/// Two new files; between the first row's write and the second's, `change`
+/// runs on the second one's reservation, `b.txt`.
+fn apply_with_b_changed(
+	selection: RestoreSelection,
+	change: impl FnOnce(&Path),
+) -> (restore::RestoreExecutionResult, TestRepo) {
+	let mut change = Some(change);
+	let dst = TestRepo::new("dest-repo");
+	dst.write("keep.txt", "k");
+	dst.commit("base");
+	let text = "// file: a.txt\nfirst\n// file: b.txt\nsecond\n";
+	let plan = plan_import(
+		text,
+		"// file: $FILE_PATH",
+		&[dst.path().to_path_buf()],
+		&ImportMapping::with_primary(dst.canonical_id()),
+	)
+	.unwrap();
+	let b = dst.path().join("b.txt");
+	let mut writes = 0;
+	let result = plan
+		.apply_observed(&selection, &mut |op, _| {
+			writes += 1;
+			if writes == 1 {
+				assert_eq!(op.relative_path, "a.txt");
+				assert_eq!(fs::read(&b).unwrap(), b"", "b.txt is reserved");
+				(change.take().unwrap())(&b);
+			}
+		})
+		.unwrap();
+	assert_eq!(writes, result.created_count + result.overwritten_count);
+	assert_eq!(dst.read("a.txt"), "first");
+	assert!(!dst.exists("other.tmp"));
+	(result, dst)
+}
+
+fn assert_reservation_kept(
+	result: &restore::RestoreExecutionResult,
+	dst: &TestRepo,
+	how: Interloper,
+) {
+	assert!(result.errors.is_empty(), "{result:?}");
+	assert_eq!(result.created_count, 1, "{result:?}");
+	assert_eq!(result.overwritten_count, 0, "{result:?}");
+	assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+	assert_eq!(
+		fs::read(dst.path().join("b.txt")).unwrap(),
+		how.bytes(),
+		"what someone else put there is kept"
+	);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_kept_without_overwrite() {
+	let how = Interloper::WritesInto(b"external\n");
+	let (result, dst) =
+		apply_with_reservation_changed(RestoreSelection::default(), how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_kept_with_skip_existing() {
+	let how = Interloper::WritesInto(b"external\n");
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	let (result, dst) = apply_with_reservation_changed(selection, how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_replaced_by_another_file_is_kept() {
+	let how = Interloper::RenamesOver(b"replaced\n");
+	let (result, dst) =
+		apply_with_reservation_changed(RestoreSelection::default(), how);
+	assert_reservation_kept(&result, &dst, how);
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	let (result, dst) = apply_with_reservation_changed(selection, how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_overwritten_only_when_allowed() {
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for how in [
+		Interloper::WritesInto(b"external\n"),
+		Interloper::RenamesOver(b"replaced\n"),
+	] {
+		let (result, dst) =
+			apply_with_reservation_changed(selection.clone(), how);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.overwritten_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 0, "{result:?}");
+		assert_eq!(dst.read("b.txt"), "second");
+	}
+}
+
+#[test]
+fn a_reserved_file_given_binary_content_is_never_overwritten() {
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for how in [
+		Interloper::WritesInto(&[0xff, 0xfe, 0x00, 0x41, 0x00, 0x0a]),
+		Interloper::RenamesOver(&[0xa4, 0xe9, 0xa5, 0xbb, 0x0a]),
+	] {
+		let (result, dst) =
+			apply_with_reservation_changed(selection.clone(), how);
+		assert_reservation_kept(&result, &dst, how);
+	}
+}
+
+/// Empties `target` again, as an editor saving an empty buffer does: the
+/// length stays 0, the time it was last modified does not.
+fn empty_it_again(target: &Path) {
+	let file = fs::OpenOptions::new()
+		.write(true)
+		.truncate(true)
+		.open(target)
+		.unwrap();
+	let earlier = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	file.set_modified(earlier).unwrap();
+}
+
+#[test]
+fn a_reserved_file_emptied_again_by_someone_else_is_kept() {
+	let skip_existing = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	for selection in [RestoreSelection::default(), skip_existing] {
+		let (result, dst) = apply_with_b_changed(selection, empty_it_again);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+		assert!(
+			dst.exists("b.txt"),
+			"the file someone else emptied is theirs, not taken back"
+		);
+		assert_eq!(dst.read("b.txt"), "");
+	}
+}
+
+/// Runs on every OS: `fs::hard_link` makes a hard link on Windows too
+/// (there it is only built, by clippy, on a Mac).
+#[test]
+fn a_reserved_file_given_a_hard_link_outside_is_not_written_through() {
+	let overwrite = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for (selection, b_after) in
+		[(RestoreSelection::default(), ""), (overwrite, "second")]
+	{
+		let mut alias = PathBuf::new();
+		let (result, dst) = apply_with_b_changed(selection, |b| {
+			alias = b.parent().unwrap().parent().unwrap().join("alias.txt");
+			fs::hard_link(b, &alias).unwrap();
+		});
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(
+			fs::read(&alias).unwrap(),
+			b"",
+			"a name outside the destination never receives the paste"
+		);
+		assert!(dst.exists("b.txt"), "{result:?}");
+		assert_eq!(dst.read("b.txt"), b_after, "{result:?}");
+		if b_after.is_empty() {
+			assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+		} else {
+			assert_eq!(result.overwritten_count, 1, "{result:?}");
+		}
 	}
 }

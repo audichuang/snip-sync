@@ -39,7 +39,7 @@ pub use pastetarget::{
 pub use proto::{
 	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
-	Request, Response, ScannedRepo, PROTOCOL_MAX,
+	Request, Response, ScannedRepo, CREATE_DIRS_VERSION, PROTOCOL_MAX,
 };
 pub use snip_core::reason::{Datum, Reason, StaleChange};
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};

@@ -777,6 +777,7 @@ fn serve(
 							text,
 							mapping,
 							retain,
+							negotiated,
 							&state.prepared,
 							cancel,
 						)
@@ -804,6 +805,7 @@ fn serve(
 							&token,
 							&selection,
 							&expect,
+							negotiated,
 							&state.prepared,
 							cancel,
 						)
@@ -825,7 +827,7 @@ fn serve(
 					crate::proto::PASTE_VERSION,
 					|root, cancel| {
 						crate::pasteserve::import_plan(
-							root, &dest, &text, &mapping, cancel,
+							root, &dest, &text, &mapping, negotiated, cancel,
 						)
 					},
 				)?;
@@ -848,7 +850,7 @@ fn serve(
 					|root, cancel| {
 						crate::pasteserve::import_apply(
 							root, &dest, &text, &mapping, &selection, &expect,
-							cancel,
+							negotiated, cancel,
 						)
 					},
 				)?;

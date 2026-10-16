@@ -551,9 +551,10 @@ fn reason_variant(r: &Reason) -> usize {
 		Reason::ScanErrorsOmitted { .. } => 43,
 		Reason::DepthLimitedOmitted { .. } => 44,
 		Reason::WorkerClosed => 45,
+		Reason::NewDirsNotConfirmed { .. } => 46,
 	}
 }
-const REASON_VARIANTS: usize = 46;
+const REASON_VARIANTS: usize = 47;
 
 fn stale_changes() -> Vec<StaleChange> {
 	vec![
@@ -642,6 +643,10 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 			Reason::PermissionDenied { path: d() },
 		),
 		("EmptySelection".into(), Reason::EmptySelection),
+		(
+			"NewDirsNotConfirmed".into(),
+			Reason::NewDirsNotConfirmed { count: 2 },
+		),
 		("UnsafePath".into(), Reason::UnsafePath { path: d() }),
 		(
 			"NotRegularFile".into(),
@@ -799,14 +804,22 @@ fn transfer_variant(e: &TransferError) -> usize {
 		TransferError::Git(_) => 18,
 		TransferError::Commit(_) => 19,
 		TransferError::Io(_) => 20,
+		TransferError::NewDirsNotConfirmed { .. } => 21,
+		TransferError::NotTakenBack { .. } => 22,
 	}
 }
-const TRANSFER_VARIANTS: usize = 21;
+const TRANSFER_VARIANTS: usize = 23;
 
 fn transfer_samples() -> Vec<(String, TransferError)> {
 	let d = || D.to_string();
 	let mut v: Vec<(String, TransferError)> = vec![
 		("EmptySelection".into(), TransferError::EmptySelection),
+		(
+			"NewDirsNotConfirmed".into(),
+			TransferError::NewDirsNotConfirmed {
+				dirs: vec![p(), p()],
+			},
+		),
 		("UnsafePath".into(), TransferError::UnsafePath(d())),
 		("SpecialFile".into(), TransferError::SpecialFile(d())),
 		(
@@ -887,6 +900,16 @@ fn transfer_samples() -> Vec<(String, TransferError)> {
 			}),
 		),
 		("Io".into(), TransferError::Io(std::io::Error::other(D))),
+		(
+			"NotTakenBack".into(),
+			TransferError::NotTakenBack {
+				cause: Box::new(TransferError::TargetCollision {
+					path: p(),
+					msg: W.into(),
+				}),
+				left: vec![d(), d()],
+			},
+		),
 	];
 	for (i, change) in stale_changes().into_iter().enumerate() {
 		v.push((

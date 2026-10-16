@@ -17,14 +17,15 @@ use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
 	plan_import_parsed_with, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
+	DestinationError, DestinationFreshnessSnapshot, PlacedRoot, TransferError,
+	TransferImportPlan,
 };
 
 use crate::codeless::Codeless;
 use crate::prepared::{self, CacheError, CachedImport, PreparedCache};
 use crate::proto::{
 	valid_rel_path, ErrorCode, ImportExpect, ImportPlanned, PasteMapping,
-	ReplayExpect, Response,
+	ReplayExpect, Response, CREATE_DIRS_VERSION,
 };
 use crate::worker::{io_error, SharedRoot};
 
@@ -78,6 +79,8 @@ fn transfer_refusal(err: TransferError, cancel: &CancelToken) -> Refusal {
 	let code = match &err {
 		TransferError::StaleDestination { .. } => ErrorCode::Stale,
 		TransferError::TargetCollision { .. } => ErrorCode::Collision,
+		// A master that sent no agreement for a folder it asked for.
+		TransferError::NewDirsNotConfirmed { .. } => ErrorCode::BadRequest,
 		TransferError::Commit(
 			snip_core::commits::CommitError::OutsideScope { .. },
 		) => ErrorCode::Forbidden,
@@ -138,6 +141,44 @@ fn destination(root: &SharedRoot, rel: &str) -> Result<PathBuf, Refusal> {
 	Ok(path)
 }
 
+/// A file paste's folder `rel` as a [`PlacedRoot`]: as [`destination`] does,
+/// unless the master asked for folders that may not exist yet on a protocol
+/// that has them. Then the folder may be missing, as long as its nearest
+/// existing ancestor, symlinks resolved, is inside the workspace, and the
+/// names below it are plain ones; nothing is made here.
+fn placed_destination(
+	root: &SharedRoot,
+	rel: &str,
+	allow_new: bool,
+) -> Result<PlacedRoot, Refusal> {
+	if !valid_rel_path(rel, true) {
+		return Err(refused(ErrorCode::BadRequest, "invalid destination"));
+	}
+	if !allow_new {
+		let path = destination(root, rel)?;
+		return CanonicalRootId::new(&path)
+			.map(PlacedRoot::from)
+			.map_err(|e| Box::new(io_error(e)));
+	}
+	let path = if rel.is_empty() {
+		root.path.clone()
+	} else {
+		root.path.join(rel)
+	};
+	PlacedRoot::resolve(Some(&root.path), &path).map_err(|e| match e {
+		DestinationError::OutsideBound { .. } => {
+			refused(ErrorCode::Forbidden, "Path leaves the workspace")
+		}
+		DestinationError::NotADirectory { .. }
+		| DestinationError::InvalidName { .. } => refused_with(
+			ErrorCode::BadRequest,
+			e.to_string(),
+			e.reason().beside_code(),
+		),
+		DestinationError::Io(e) => Box::new(io_error(e)),
+	})
+}
+
 /// The paths a master sent back with a snapshot must be ones this paste
 /// could have recorded: under `base`. The snapshot's `repos` keys are not
 /// checked here: a repository's top can lie above the workspace, and what
@@ -154,6 +195,18 @@ fn check_snapshot(
 			.iter()
 			.all(|(p, t)| inside(p) && inside(t.root.path()))
 		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p))
+		&& freshness.requested_dirs.iter().flatten().all(|p| inside(p))
+		&& freshness
+			.placed
+			.iter()
+			.flatten()
+			.flatten()
+			.all(|p| inside(p))
+		&& freshness
+			.new_dirs
+			.iter()
+			.flat_map(|n| &n.dirs)
+			.all(|p| inside(p))
 		&& freshness
 			.symlinked_dirs
 			.iter()
@@ -176,6 +229,8 @@ fn digest(plan: &RestorePlan) -> Result<String, Refusal> {
 
 struct Planned {
 	plan: TransferImportPlan,
+	/// The destination folder, which may not exist yet.
+	primary: PlacedRoot,
 	suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
 	create_entries: Vec<usize>,
 }
@@ -187,14 +242,14 @@ fn plan(
 	dest: &str,
 	text: &str,
 	mapping: &PasteMapping,
+	negotiated: u32,
 	cancel: &CancelToken,
 ) -> Result<Planned, Refusal> {
 	if cancel.is_cancelled() {
 		return Err(refused(ErrorCode::Cancelled, "cancelled"));
 	}
-	let primary = destination(root, dest)?;
-	let primary_id =
-		CanonicalRootId::new(&primary).map_err(|e| Box::new(io_error(e)))?;
+	let allow_new = negotiated >= CREATE_DIRS_VERSION && mapping.allow_new_dirs;
+	let primary = placed_destination(root, dest, allow_new)?;
 	let header = mapping.header_format.as_str();
 	let entries = snip_core::format::parse_clipboard(text, header);
 	if cancel.is_cancelled() {
@@ -207,24 +262,23 @@ fn plan(
 		));
 	}
 	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-	let suggestion = crate::pastetarget::suggest(&primary, &paths, text);
+	let suggestion = crate::pastetarget::suggest(&primary.path(), &paths, text);
 	// From here a refusal keeps the suggestion, as a local paste's note
 	// does: it names this payload against this destination, whatever the
 	// engine says to the plan after it.
 	let keep = |refusal: Refusal| with_suggestion(refusal, suggestion.as_ref());
 	let (import, roots) = crate::pastetarget::import_mapping(
-		primary,
-		primary_id,
+		primary.clone(),
+		None,
 		suggestion.as_ref().filter(|_| mapping.adjust_paths),
 		mapping.prefixes.iter().map(|(prefix, rel)| {
 			if prefix.is_empty() || prefix.contains(['/', '\\']) {
 				return Err(refused(ErrorCode::BadRequest, "invalid prefix"));
 			}
-			Ok::<_, Refusal>((prefix.clone(), destination(root, rel)?))
+			let placed = placed_destination(root, rel, allow_new)?;
+			let spelled = placed.path();
+			Ok::<_, Refusal>((prefix.clone(), placed, spelled))
 		}),
-		|folder| {
-			CanonicalRootId::new(folder).map_err(|e| Box::new(io_error(e)))
-		},
 	)
 	.map_err(keep)?;
 	let (plan, create_entries) =
@@ -232,6 +286,7 @@ fn plan(
 			.map_err(|e| keep(transfer_refusal(e, cancel)))?;
 	Ok(Planned {
 		plan,
+		primary,
 		suggestion,
 		create_entries,
 	})
@@ -243,12 +298,13 @@ pub(crate) fn import_plan(
 	dest: &str,
 	text: &str,
 	mapping: &PasteMapping,
+	negotiated: u32,
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
 		let Planned {
 			plan, suggestion, ..
-		} = plan(root, dest, text, mapping, cancel)?;
+		} = plan(root, dest, text, mapping, negotiated, cancel)?;
 		Ok(Response::ImportPlanned(ImportPlanned {
 			digest: digest(plan.restore_plan())?,
 			plan,
@@ -258,12 +314,14 @@ pub(crate) fn import_plan(
 	run().unwrap_or_else(|reply| *reply)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_import(
 	root: &SharedRoot,
 	dest: &str,
 	text: String,
 	mapping: PasteMapping,
 	retain: bool,
+	negotiated: u32,
 	cache: &PreparedCache,
 	cancel: &CancelToken,
 ) -> Response {
@@ -276,18 +334,19 @@ pub(crate) fn prepare_import(
 		}
 		let Planned {
 			plan,
+			primary,
 			suggestion,
 			create_entries,
-		} = plan(root, dest, &text, &mapping, cancel)?;
+		} = plan(root, dest, &text, &mapping, negotiated, cancel)?;
 		let metadata = crate::proto::ImportMetadata::of_entry_indices(
 			&plan,
 			&create_entries,
 		)
 		.map_err(|message| refused(ErrorCode::BadRequest, message))?;
 		let digest = digest(plan.restore_plan())?;
-		let destination = plan.roots().first().cloned().ok_or_else(|| {
-			refused(ErrorCode::BadRequest, "no paste destination")
-		})?;
+		// The folder pasted into, which may not exist yet: the roots'
+		// first is only its anchor.
+		let destination = primary.path();
 		drop(plan);
 		if cancel.is_cancelled() {
 			return Err(refused(ErrorCode::Cancelled, "cancelled"));
@@ -336,19 +395,26 @@ fn cache_refusal(why: CacheError) -> Response {
 	*refused_with(code, message, reason)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_prepared(
 	root: &SharedRoot,
 	dest: &str,
 	token: &str,
 	selection: &RestoreSelection,
 	expect: &ImportExpect,
+	negotiated: u32,
 	cache: &PreparedCache,
 	cancel: &CancelToken,
 ) -> Response {
-	let at = match destination(root, dest) {
-		Ok(at) => at,
-		Err(reply) => return *reply,
-	};
+	// Only the key of the cached preview: `allow_new` is as loose as the
+	// protocol allows. What the Apply may make is decided by the cached
+	// mapping, in `import_apply`.
+	let at =
+		match placed_destination(root, dest, negotiated >= CREATE_DIRS_VERSION)
+		{
+			Ok(at) => at.path(),
+			Err(reply) => return *reply,
+		};
 	let lease = match cache.take(token, &root.path, &at, &expect.digest) {
 		Ok(lease) => lease,
 		Err(why) => return cache_refusal(why),
@@ -369,6 +435,7 @@ pub(crate) fn apply_prepared(
 		&payload.mapping,
 		selection,
 		expect,
+		negotiated,
 		cancel,
 	);
 	// A refusal from before the first write keeps the payload for a retry.
@@ -404,6 +471,7 @@ fn hold_after_first_write() {
 /// Answers [`crate::proto::Request::ImportApply`]: the preview's snapshot
 /// is checked first, as a local Apply does, then the plan made again must
 /// be the one previewed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn import_apply(
 	root: &SharedRoot,
 	dest: &str,
@@ -411,6 +479,7 @@ pub(crate) fn import_apply(
 	mapping: &PasteMapping,
 	selection: &RestoreSelection,
 	expect: &ImportExpect,
+	negotiated: u32,
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
@@ -419,7 +488,8 @@ pub(crate) fn import_apply(
 			.freshness
 			.revalidate()
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		let Planned { plan, .. } = plan(root, dest, text, mapping, cancel)?;
+		let Planned { plan, .. } =
+			plan(root, dest, text, mapping, negotiated, cancel)?;
 		if digest(plan.restore_plan())? != expect.digest
 			|| !plan
 				.destination_freshness()
@@ -907,6 +977,7 @@ mod prepared_import_tests {
 			text.into(),
 			mapping.clone(),
 			true,
+			crate::proto::PROTOCOL_MAX,
 			cache,
 			&CancelToken::new(),
 		) {
@@ -932,6 +1003,7 @@ mod prepared_import_tests {
 				.hydrate(text, &mapping.header_format)
 				.unwrap()
 				.expect(),
+			crate::proto::PROTOCOL_MAX,
 			cache,
 			&CancelToken::new(),
 		)
@@ -1067,7 +1139,7 @@ mod prepared_import_tests {
 		assert!(reply.token.is_none());
 		let full = reply.hydrate(text, "").unwrap();
 		assert!(
-			matches!(import_apply(&root,"",text,&mapping,&RestoreSelection::default(),&full.expect(),&CancelToken::new()),Response::Imported(r) if r.created_count==1)
+			matches!(import_apply(&root,"",text,&mapping,&RestoreSelection::default(),&full.expect(),crate::proto::PROTOCOL_MAX,&CancelToken::new()),Response::Imported(r) if r.created_count==1)
 		);
 		assert_eq!(cache.usage_for_tests(), (0, 0));
 	}
@@ -1123,6 +1195,7 @@ mod prepared_import_tests {
 					..Default::default()
 				},
 				false,
+				crate::proto::PROTOCOL_MAX,
 				&cache,
 				&CancelToken::new(),
 			)
@@ -1154,6 +1227,7 @@ mod prepared_import_tests {
 			text.into(),
 			PasteMapping::default(),
 			false,
+			crate::proto::PROTOCOL_MAX,
 			&cache,
 			&CancelToken::new(),
 		) {
