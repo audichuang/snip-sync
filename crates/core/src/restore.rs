@@ -517,6 +517,31 @@ impl Reserved {
 	}
 }
 
+/// A step of an Apply a test makes fail: `"write"` (a reserved row's
+/// write), `"release"` (taking an empty file back) or `"reserve"` (making
+/// a new file), with the path it is at.
+#[cfg(test)]
+pub(crate) type FailPoint = Box<dyn Fn(&str, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+	pub(crate) static FAIL_POINT: std::cell::RefCell<Option<FailPoint>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_point(step: &str, path: &Path) -> std::io::Result<()> {
+	FAIL_POINT.with(|slot| match slot.borrow().as_ref() {
+		Some(f) => f(step, path),
+		None => Ok(()),
+	})
+}
+
+#[cfg(not(test))]
+pub(crate) fn fail_point(_step: &str, _path: &Path) -> std::io::Result<()> {
+	Ok(())
+}
+
 /// Whether the shared write path refuses `op` before writing anything.
 pub(crate) fn create_is_refused(
 	roots: &[PathBuf],
@@ -663,6 +688,9 @@ fn run_reserved_create(
 			},
 		};
 		return (Err(refused), true);
+	}
+	if let Err(e) = fail_point("write", &op.absolute_path) {
+		return (Err(failure(e)), true);
 	}
 	let mut file = match reserved.open_untouched(&op.absolute_path) {
 		Ok(Some(file)) => file,

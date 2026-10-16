@@ -2319,6 +2319,9 @@ impl TransferImportPlan {
 				Err(e) => return Err(Reserve::Row(e)),
 			}
 		}
+		if let Err(e) = restore::fail_point("reserve", path) {
+			return Err(Reserve::Batch(TransferError::Io(e)));
+		}
 		let mut options = fs::OpenOptions::new();
 		options.write(true).create_new(true);
 		match options.open(path) {
@@ -2505,7 +2508,9 @@ impl Made {
 		};
 		// The handle is closed before the name is removed: on Windows the
 		// name of an open file lingers, and its folder is not empty yet.
-		let untouched = reserved.is_untouched(path).unwrap_or(false);
+		let untouched = restore::fail_point("release", path)
+			.and_then(|()| reserved.is_untouched(path))
+			.unwrap_or(false);
 		if untouched {
 			let _ = fs::remove_file(path);
 		}
@@ -7858,3 +7863,6 @@ mod unicode_name_tests {
 
 #[cfg(test)]
 mod fs_decides_tests;
+
+#[cfg(test)]
+mod fd_budget_tests;
