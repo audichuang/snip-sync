@@ -1500,6 +1500,28 @@ fn innermost_root<'a>(
 		.max_by_key(|r| r.components().count())
 }
 
+/// The root a planned file's `relative` path is relative to: the one of
+/// `roots` that is `absolute` with `relative` taken off its end. Compared
+/// as text with `/` separators, so a worker's Windows paths read the same on
+/// any master. `None` when no root has that spelling.
+fn plan_root_of<'a>(
+	roots: &'a [PathBuf],
+	absolute: &Path,
+	relative: &str,
+) -> Option<&'a PathBuf> {
+	let slashed = |p: &Path| {
+		let text = p.to_string_lossy().replace('\\', "/");
+		text.trim_end_matches('/').to_string()
+	};
+	let absolute = slashed(absolute);
+	// The name must start right after a separator: `sub` + `g.txt` is not
+	// the file `subg.txt`.
+	let base = absolute
+		.strip_suffix(relative.trim_matches('/'))?
+		.strip_suffix('/')?;
+	roots.iter().find(|r| slashed(r) == base)
+}
+
 /// Whether `path` lies inside folder `dir` (not merely shares its start).
 fn path_under(path: &str, dir: &str) -> bool {
 	path.strip_prefix(dir)
@@ -2651,9 +2673,15 @@ impl PastePreviewPlan {
 			)?;
 		}
 		for (op_idx, op) in plan.delete_operations.iter().enumerate() {
-			let dest_root = innermost_root(&roots, &op.absolute_path)
-				.cloned()
-				.unwrap_or_else(|| primary.clone());
+			// The root the delete's path is relative to, as a create's
+			// `root_path` is: the tree places a row at root + path, and
+			// Apply deletes `absolute_path`. The innermost root above the
+			// file is only a fallback: a nested root can lie between.
+			let dest_root =
+				plan_root_of(&roots, &op.absolute_path, &op.relative_path)
+					.or_else(|| innermost_root(&roots, &op.absolute_path))
+					.cloned()
+					.unwrap_or_else(|| primary.clone());
 			let item = PasteItem {
 				path: op.relative_path.clone(),
 				dest_root_name: root_name(&dest_root),
@@ -4280,6 +4308,31 @@ pub(crate) mod tests {
 			]
 		);
 		assert_eq!(plan.counts().deletes, 1);
+	}
+
+	#[test]
+	fn a_rows_root_is_the_one_its_relative_path_is_relative_to() {
+		let roots: Vec<PathBuf> =
+			["/w/dest", "/w/dest/sub"].map(Into::into).into();
+		let of = |abs: &str, rel: &str| {
+			plan_root_of(&roots, Path::new(abs), rel).cloned()
+		};
+		assert_eq!(
+			of("/w/dest/sub/g.txt", "sub/g.txt"),
+			Some(roots[0].clone())
+		);
+		assert_eq!(of("/w/dest/sub/g.txt", "g.txt"), Some(roots[1].clone()));
+		assert_eq!(of("/w/dest/g.txt", "g.txt"), Some(roots[0].clone()));
+		// No root spelled that way: the caller falls back.
+		assert_eq!(of("/w/other/g.txt", "g.txt"), None);
+		assert_eq!(of("/w/dest/subg.txt", "g.txt"), None);
+		// A worker's Windows spelling.
+		let win: Vec<PathBuf> =
+			[r"C:\w\dest", r"C:\w\dest\sub"].map(Into::into).into();
+		assert_eq!(
+			plan_root_of(&win, Path::new(r"C:\w\dest\sub\g.txt"), "g.txt"),
+			Some(&win[1])
+		);
 	}
 
 	#[test]
