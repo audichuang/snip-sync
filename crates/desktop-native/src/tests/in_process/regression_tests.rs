@@ -284,3 +284,43 @@ fn fuzz_regression_hiding_the_log_closes_its_dropdown(cx: &mut TestAppContext) {
 		settle(cx);
 	}
 }
+
+/// L6, L8: switching the open repo drops the Log's selection, and so must
+/// drop the details read of the commit that was selected: it landed on a Log
+/// with nothing selected (found by `fuzz_local_workbench_keeps_derived_state`:
+/// right-click a row, then a repo chevron).
+#[gpui::test]
+fn fuzz_regression_switching_the_repo_drops_the_details_read_in_flight(
+	cx: &mut TestAppContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	let alpha = repo(ws.path(), "alpha", &[]);
+	fs::write(alpha.join("a.txt"), "one").unwrap();
+	git(&alpha, &["add", "."]);
+	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	repo(ws.path(), "beta", &[]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the Log and both repos", |cx| {
+		model.read_with(cx, |m, _| {
+			!m.commits.is_empty() && m.repos.len() == 2 && !m.is_loading
+		})
+	});
+	// One turn of the event loop: the details read has not run when the
+	// repo changes.
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx);
+		assert!(m.selected_commit.is_some());
+		let other = 1 - m.selected_repo_idx.expect("a repo is open");
+		m.select_repo(other, cx);
+		assert!(
+			m.selected_commit.is_none(),
+			"the switch drops the selection"
+		);
+	});
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		invariants::assert_holds(m, cx, &[L6, L8]);
+	});
+}
