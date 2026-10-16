@@ -30389,6 +30389,8 @@ mod tests {
 		/// drive it (#230): `src/tests/in_process/invariant_tests.rs`, a file
 		/// of its own as `paste/zh_leaks_tests.rs` is.
 		mod invariant_tests;
+		/// What the lanes found, rebuilt by hand (`fuzz_regression_*`).
+		mod regression_tests;
 	}
 
 	mod folder_copy {
