@@ -3701,7 +3701,10 @@ impl WorkbenchModel {
 	pub fn sync_log_scope(&mut self, cx: &mut Context<Self>) {
 		// The open repo's read is in flight and reloads the log when it
 		// lands: reloading here too would read it twice.
-		if self.log_reload_for == Some(self.generation) {
+		if self
+			.log_reload_for
+			.is_some_and(|s| self.generation.is_current(s))
+		{
 			return;
 		}
 		if self.log_deferred {

@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 
 /// The counter of one lane: bumped whenever what is in flight for the lane
 /// stops being wanted.
-pub(crate) struct Gen<L> {
+pub struct Gen<L> {
 	n: u64,
 	_lane: PhantomData<fn() -> L>,
 }
@@ -24,7 +24,7 @@ pub(crate) struct Gen<L> {
 /// A value a lane's counter had. A read keeps the stamp it left with and
 /// asks the counter whether it is still current.
 #[must_use]
-pub(crate) struct Stamp<L> {
+pub struct Stamp<L> {
 	n: u64,
 	_lane: PhantomData<fn() -> L>,
 }
@@ -145,7 +145,7 @@ impl<L> fmt::Debug for Stamp<L> {
 /// The lanes. Each is only a name the compiler tells the counters apart by.
 macro_rules! lanes {
 	($($(#[$doc:meta])* $name:ident),+ $(,)?) => {
-		$($(#[$doc])* pub(crate) enum $name {})+
+		$($(#[$doc])* pub enum $name {})+
 	};
 }
 
@@ -174,8 +174,6 @@ lanes! {
 	RemoteOpenLane,
 	/// A host's folder listing in the workspace menu.
 	BrowseLane,
-	/// The retry timer of a restoring remote tab.
-	RestoreTimerLane,
 	/// The workspace the tab shows: the whole drain.
 	WorkspaceLane,
 }

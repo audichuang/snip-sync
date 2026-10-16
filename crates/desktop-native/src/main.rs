@@ -995,7 +995,7 @@ pub struct WorkbenchModel {
 	pub is_loading: bool,
 	pub is_copying: bool,
 	pub locale: Locale,
-	pub generation: u64,
+	pub generation: crate::gen::Gen<crate::gen::RepoLoadLane>,
 	pub preview_generation: crate::gen::Gen<crate::gen::PreviewLane>,
 	pub history_generation: crate::gen::Gen<crate::gen::HistoryLane>,
 	/// Replace loads of the log that got past the discovery wait: a test
@@ -1102,7 +1102,7 @@ pub struct WorkbenchModel {
 	pub log_deferred: bool,
 	/// The `generation` of the repo read whose landing reloads the Log: the
 	/// scope sync leaves the reload to it, so one change reads the Log once.
-	log_reload_for: Option<u64>,
+	log_reload_for: Option<crate::gen::Stamp<crate::gen::RepoLoadLane>>,
 	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
 	pub remote_path_input: Entity<TextInput>,
@@ -1539,7 +1539,7 @@ impl WorkbenchModel {
 			is_loading: workspace.is_some(),
 			is_copying: false,
 			locale: loc,
-			generation: 0,
+			generation: Default::default(),
 			preview_generation: Default::default(),
 			history_generation: Default::default(),
 			#[cfg(test)]
@@ -2476,7 +2476,7 @@ impl WorkbenchModel {
 				// A workspace open/close is under way: an in-flight remote
 				// open that lands later must not touch it (remote.rs).
 				self.remote.open_seq.invalidate();
-				self.generation = self.generation.wrapping_add(1);
+				self.generation.invalidate();
 				self.preview_generation.invalidate();
 				self.held_selection = None;
 				self.history_generation.invalidate();
@@ -2677,7 +2677,7 @@ impl WorkbenchModel {
 	/// Drops everything that belongs to the open repo and stops its reads, so
 	/// a late result cannot repopulate it.
 	fn release_repo_state(&mut self) {
-		self.generation = self.generation.wrapping_add(1);
+		self.generation.invalidate();
 		self.preview_generation.invalidate();
 		self.held_selection = None;
 		self.history_generation.invalidate();
@@ -4038,11 +4038,11 @@ impl WorkbenchModel {
 			self.clear_preview();
 			self.preview_error = None;
 		}
-		self.generation += 1;
+		self.generation.invalidate();
 		self.preview_generation.invalidate();
 		// The reads that could have restored it are dropped.
 		self.held_selection = None;
-		let task_generation = self.generation;
+		let task_generation = self.generation.current();
 		if reload_log {
 			self.history_generation.invalidate();
 			let _ = arm_cancel(&mut self.history_cancel);
@@ -4257,7 +4257,7 @@ impl WorkbenchModel {
 				.await;
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.generation != task_generation {
+				if !model.generation.is_current(task_generation) {
 					return;
 				}
 				match working_res {
@@ -5498,7 +5498,7 @@ impl WorkbenchModel {
 				text,
 				dest: target_dest,
 				roots: known_roots,
-				generation: self.generation,
+				generation: self.generation.current(),
 				remote: self
 					.remote
 					.session
@@ -23041,7 +23041,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: 0,
+						generation: crate::gen::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");
@@ -23649,7 +23649,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: 0,
+						generation: crate::gen::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");

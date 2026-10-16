@@ -212,7 +212,7 @@ impl WorkbenchModel {
 		match self.paste.retarget(
 			folder.path,
 			roots,
-			self.generation,
+			self.generation.current(),
 			self.preview.as_ref(),
 		) {
 			crate::paste::preview::Remapped::NoPlan => {}
