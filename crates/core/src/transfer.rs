@@ -4007,6 +4007,28 @@ pub fn plan_import_parsed_with(
 		}
 	}
 
+	// A placed folder's tail is what did not exist when it was resolved. One
+	// layer of it that exists now (made by someone else in between) voids
+	// that premise: the anchor is no longer the nearest existing ancestor,
+	// and the folder the user named would be told from an incidental one by
+	// an identity that no longer holds (two spellings of one new folder on
+	// a case-folding filesystem would slip past consent).
+	for placed in mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+	{
+		cancelled_err(opts, "plan-import")?;
+		for dir in placed.new_chain() {
+			if fs::symlink_metadata(&dir).is_ok() {
+				return Err(created_where_a_folder_was_needed_at(
+					placed.anchor().path(),
+					&dir,
+				));
+			}
+		}
+	}
+
 	let mut root_case_insensitive: HashMap<PathBuf, bool> = HashMap::new();
 	for root in &canonical_dest_roots {
 		cancelled_err(opts, "plan-import")?;

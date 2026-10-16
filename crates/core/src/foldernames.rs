@@ -63,11 +63,19 @@ fn object_of(path: &Path) -> Option<(u64, u64)> {
 	Some((md.dev(), md.ino()))
 }
 
-/// Opened with no access rights, as `same_file` does, and released as soon
-/// as the index is read.
+/// Opened with access mode 0 (no read or write right, so a folder one
+/// cannot read still has an identity) and `FILE_FLAG_BACKUP_SEMANTICS` (a
+/// folder can be opened at all), and released as soon as the index is read.
 #[cfg(windows)]
 fn object_of(path: &Path) -> Option<(u64, u64)> {
-	let handle = winapi_util::Handle::from_path_any(path).ok()?;
+	use std::os::windows::fs::OpenOptionsExt;
+	const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+	let file = fs::OpenOptions::new()
+		.access_mode(0)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+		.open(path)
+		.ok()?;
+	let handle = winapi_util::Handle::from_file(file);
 	let info = winapi_util::file::information(&handle).ok()?;
 	Some((info.volume_serial_number(), info.file_index()))
 }
@@ -308,10 +316,11 @@ impl NewFolderNames {
 			}
 		}
 		// A named folder, spelled as named, that a create needs is
-		// requested whatever the identity above made of it. (A folder that
-		// appeared between resolving and planning moves its tail's anchor,
-		// so the two can differ: asking is the safe side, and the plan is
-		// found stale when it is applied.)
+		// requested whatever the identity above made of it. (Planning
+		// refuses a placed folder whose tail already exists, so the anchor
+		// here is the one `resolve` found; this is a second net for a
+		// spelling the identity folds differently from the filesystem,
+		// where asking is the safe side.)
 		for dir in named_paths {
 			if missing.contains(dir) {
 				requested.insert(dir.clone());

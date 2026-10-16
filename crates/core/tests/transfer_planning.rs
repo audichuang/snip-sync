@@ -9335,13 +9335,9 @@ fn test_two_spellings_of_a_new_folder_created_before_planning_are_stale() {
 	fs::create_dir(ws.join("new")).unwrap();
 	let mut mapping = ImportMapping::with_primary(primary);
 	mapping.map_prefix("q", other);
-	let err = plan_import(
-		"// file: q/b.txt\nB\n",
-		"",
-		&roots_of(&mapping),
-		&mapping,
-	)
-	.unwrap_err();
+	let err =
+		plan_import("// file: q/b.txt\nB\n", "", &roots_of(&mapping), &mapping)
+			.unwrap_err();
 	assert!(
 		matches!(err, TransferError::StaleDestination { .. }),
 		"expected StaleDestination, got {err:?}"
