@@ -73,6 +73,10 @@ pub fn bindings() -> Vec<gpui::KeyBinding> {
 		KeyBinding::new("shift-enter", SubmitPrev, c),
 		KeyBinding::new("up", MoveUp, c),
 		KeyBinding::new("down", MoveDown, c),
+		// A deeper context's `NoAction` switches the shallower binding of a
+		// key off, so a space typed here is text, not the preview's row
+		// toggle (`PastePanel` binds it).
+		KeyBinding::new("space", gpui::NoAction, c),
 	]
 }
 
@@ -198,6 +202,14 @@ impl TextInput {
 		self.selected_range = len..len;
 		self.marked_range = None;
 		cx.emit(InputEvent::Changed);
+		cx.notify();
+	}
+
+	/// Selects the whole text, as Select All does, for a field opened over
+	/// text the user is likely to replace.
+	pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+		self.selected_range = 0..self.content.len();
+		self.selection_reversed = false;
 		cx.notify();
 	}
 

@@ -3,7 +3,8 @@
 //! A *floating layer* (workspace menu, Log dropdown, repo / ref selector,
 //! context menu) is an anchored panel over the panes; at most one is open.
 //! An *inline layer* (the reader's find bar, the Project pane's add-repo
-//! field) is part of its pane and stays open while a floating one opens.
+//! field, the paste panel's typed destination) is part of its pane and
+//! stays open while a floating one opens.
 //!
 //! The rules every layer shares live here and nowhere else: which layers
 //! may be open together, what Escape does, where the keyboard goes when a
@@ -23,6 +24,7 @@ use gpui::{
 };
 
 use crate::menu::{ContextMenu, MenuOrigin};
+use crate::paste::dest::DestEdit;
 use crate::text_input::TextInput;
 use crate::ui::LogMenu;
 use crate::{Popover, WorkbenchModel};
@@ -39,12 +41,14 @@ pub(crate) enum OverlayKind {
 	// Inline.
 	FindBar,
 	AddRepoField,
+	/// The paste panel's typed destination folder (#238).
+	PasteDestField,
 }
 
 impl OverlayKind {
 	/// Every value, for the tests that must not miss a kind.
 	#[cfg(test)]
-	pub(crate) const ALL: [OverlayKind; 12] = [
+	pub(crate) const ALL: [OverlayKind; 13] = [
 		OverlayKind::WorkspaceMenu,
 		OverlayKind::LogMenu(LogMenu::Repo),
 		OverlayKind::LogMenu(LogMenu::Branch),
@@ -57,6 +61,7 @@ impl OverlayKind {
 		OverlayKind::ContextMenu,
 		OverlayKind::FindBar,
 		OverlayKind::AddRepoField,
+		OverlayKind::PasteDestField,
 	];
 
 	/// Anchored over the panes, one at a time.
@@ -66,14 +71,17 @@ impl OverlayKind {
 			| OverlayKind::LogMenu(_)
 			| OverlayKind::Selector(_)
 			| OverlayKind::ContextMenu => true,
-			OverlayKind::FindBar | OverlayKind::AddRepoField => false,
+			OverlayKind::FindBar
+			| OverlayKind::AddRepoField
+			| OverlayKind::PasteDestField => false,
 		}
 	}
 
 	/// The layer gives the keyboard back to where it was opened from, so a
 	/// layer opened over another one's keyboard inherits where that one
 	/// would have sent it. The others have a fixed place: a Log dropdown
-	/// the Log, a context menu its pane, the find bar the reader.
+	/// the Log, a context menu its pane, the find bar the reader, the
+	/// paste destination field the paste panel.
 	pub(crate) const fn returns_to_opener(self) -> bool {
 		match self {
 			OverlayKind::WorkspaceMenu
@@ -81,7 +89,8 @@ impl OverlayKind {
 			| OverlayKind::AddRepoField => true,
 			OverlayKind::LogMenu(_)
 			| OverlayKind::ContextMenu
-			| OverlayKind::FindBar => false,
+			| OverlayKind::FindBar
+			| OverlayKind::PasteDestField => false,
 		}
 	}
 
@@ -94,7 +103,9 @@ impl OverlayKind {
 			| OverlayKind::LogMenu(_)
 			| OverlayKind::Selector(_)
 			| OverlayKind::ContextMenu => true,
-			OverlayKind::FindBar | OverlayKind::AddRepoField => false,
+			OverlayKind::FindBar
+			| OverlayKind::AddRepoField
+			| OverlayKind::PasteDestField => false,
 		}
 	}
 
@@ -108,6 +119,7 @@ impl OverlayKind {
 			OverlayKind::ContextMenu => "context-menu",
 			OverlayKind::FindBar => "find-bar",
 			OverlayKind::AddRepoField => "input-add-repo",
+			OverlayKind::PasteDestField => "paste-dest-input",
 		}
 	}
 }
@@ -159,9 +171,15 @@ pub(crate) enum DropScope {
 /// What a layer keeps besides being open.
 pub(crate) enum LayerState {
 	None,
-	WorkspaceMenu { picker: bool },
-	Selector { cursor: usize },
+	WorkspaceMenu {
+		picker: bool,
+	},
+	Selector {
+		cursor: usize,
+	},
 	ContextMenu(ContextMenu),
+	/// The typed destination: why the last typed path was refused.
+	PasteDest(DestEdit),
 }
 
 impl LayerState {
@@ -174,6 +192,9 @@ impl LayerState {
 			OverlayKind::Selector(_) => LayerState::Selector { cursor: 0 },
 			OverlayKind::ContextMenu => {
 				unreachable!("a context menu opens with its entries")
+			}
+			OverlayKind::PasteDestField => {
+				LayerState::PasteDest(DestEdit::default())
 			}
 			OverlayKind::LogMenu(_)
 			| OverlayKind::FindBar
@@ -189,6 +210,7 @@ impl LayerState {
 			(OverlayKind::WorkspaceMenu, LayerState::WorkspaceMenu { .. })
 				| (OverlayKind::Selector(_), LayerState::Selector { .. })
 				| (OverlayKind::ContextMenu, LayerState::ContextMenu(_))
+				| (OverlayKind::PasteDestField, LayerState::PasteDest(_))
 				| (
 					OverlayKind::LogMenu(_)
 						| OverlayKind::FindBar
@@ -262,6 +284,7 @@ pub(crate) struct OverlayStack {
 	floating: Option<Layer>,
 	find_bar: Option<Layer>,
 	add_repo: Option<Layer>,
+	paste_dest: Option<Layer>,
 	triggers: RefCell<HashMap<TriggerId, TriggerSlot>>,
 	/// A layer closed and its keyboard target is waiting for the next
 	/// frame: (target, the closed layer's handles).
@@ -277,6 +300,7 @@ impl OverlayStack {
 			floating: None,
 			find_bar: None,
 			add_repo: None,
+			paste_dest: None,
 			triggers: RefCell::new(HashMap::new()),
 			pending_return: None,
 			published_gate: Cell::new(None),
@@ -287,6 +311,7 @@ impl OverlayStack {
 		match kind {
 			OverlayKind::FindBar => &self.find_bar,
 			OverlayKind::AddRepoField => &self.add_repo,
+			OverlayKind::PasteDestField => &self.paste_dest,
 			_ => &self.floating,
 		}
 	}
@@ -295,6 +320,7 @@ impl OverlayStack {
 		match kind {
 			OverlayKind::FindBar => &mut self.find_bar,
 			OverlayKind::AddRepoField => &mut self.add_repo,
+			OverlayKind::PasteDestField => &mut self.paste_dest,
 			_ => &mut self.floating,
 		}
 	}
@@ -360,6 +386,23 @@ impl OverlayStack {
 	pub(crate) fn context_menu_mut(&mut self) -> Option<&mut ContextMenu> {
 		match &mut self.floating.as_mut()?.state {
 			LayerState::ContextMenu(m) => Some(m),
+			_ => None,
+		}
+	}
+
+	/// The paste panel's typed destination, while it is open.
+	pub(crate) fn paste_dest_edit(&self) -> Option<&DestEdit> {
+		match &self.paste_dest.as_ref()?.state {
+			LayerState::PasteDest(edit) => Some(edit),
+			_ => None,
+		}
+	}
+
+	/// Why the typed destination was refused, to change it. Does nothing
+	/// once the field is closed.
+	pub(crate) fn paste_dest_edit_mut(&mut self) -> Option<&mut DestEdit> {
+		match &mut self.paste_dest.as_mut()?.state {
+			LayerState::PasteDest(edit) => Some(edit),
 			_ => None,
 		}
 	}
@@ -469,11 +512,16 @@ impl OverlayStack {
 	/// Whether every open layer's state belongs to its kind (O1).
 	#[allow(dead_code)] // the checker of #230 reaches it through `eval`
 	fn states_fit(&self) -> Option<OverlayKind> {
-		[&self.floating, &self.find_bar, &self.add_repo]
-			.into_iter()
-			.flatten()
-			.find(|l| !l.state.fits(l.kind))
-			.map(|l| l.kind)
+		[
+			&self.floating,
+			&self.find_bar,
+			&self.add_repo,
+			&self.paste_dest,
+		]
+		.into_iter()
+		.flatten()
+		.find(|l| !l.state.fits(l.kind))
+		.map(|l| l.kind)
 	}
 }
 
@@ -675,6 +723,7 @@ pub(crate) enum FieldId {
 	LogSearch,
 	Selector,
 	AddRepo,
+	PasteDest,
 	WorkspacePath,
 	RemotePath,
 	LogPath,
@@ -730,13 +779,14 @@ impl FocusTarget {
 
 impl WorkbenchModel {
 	/// Every text field, by id.
-	pub(crate) fn text_inputs(&self) -> [(FieldId, &Entity<TextInput>); 12] {
+	pub(crate) fn text_inputs(&self) -> [(FieldId, &Entity<TextInput>); 13] {
 		[
 			(FieldId::Find, &self.find_input),
 			(FieldId::Goto, &self.goto_input),
 			(FieldId::LogSearch, &self.log_search_input),
 			(FieldId::Selector, &self.selector_input),
 			(FieldId::AddRepo, &self.add_repo_input),
+			(FieldId::PasteDest, &self.paste_dest_input),
 			(FieldId::WorkspacePath, &self.workspace_path_input),
 			(FieldId::RemotePath, &self.remote_path_input),
 			(FieldId::LogPath, &self.log_path_input),
@@ -830,6 +880,7 @@ impl WorkbenchModel {
 				self.find_bar_focus.clone(),
 			],
 			OverlayKind::AddRepoField => vec![h(&self.add_repo_input)],
+			OverlayKind::PasteDestField => vec![h(&self.paste_dest_input)],
 		}
 	}
 
@@ -996,6 +1047,11 @@ impl WorkbenchModel {
 				self.run_find(&q, cx);
 				app_log!("[APP:FIND_BAR: open]");
 			}
+			OverlayKind::PasteDestField => {
+				let h = self.paste_dest_input.read(cx).handle();
+				self.focus_into(h, window);
+				app_log!("[APP:PASTE_DEST_EDIT: open]");
+			}
 			OverlayKind::AddRepoField => {}
 		}
 	}
@@ -1059,6 +1115,7 @@ impl WorkbenchModel {
 			self.overlays.floating.as_ref(),
 			self.overlays.find_bar.as_ref(),
 			self.overlays.add_repo.as_ref(),
+			self.overlays.paste_dest.as_ref(),
 		]
 		.into_iter()
 		.flatten()
@@ -1101,6 +1158,13 @@ impl WorkbenchModel {
 				app_log!("[APP:FIND_BAR: closed]");
 			}
 			OverlayKind::AddRepoField => {}
+			// What was typed is dropped with the field: the next open fills
+			// it with the folder again. The folder itself stays.
+			OverlayKind::PasteDestField => {
+				if why == CloseWhy::Escape {
+					app_log!("[APP:PASTE_DEST_EDIT: closed]");
+				}
+			}
 		}
 	}
 
@@ -1160,6 +1224,15 @@ impl WorkbenchModel {
 			FocusTarget::Field(FieldId::AddRepo) => {
 				self.close_overlay(
 					OverlayKind::AddRepoField,
+					CloseWhy::Escape,
+					cx,
+				);
+				true
+			}
+			// The typed destination first, the panel at the next Escape.
+			FocusTarget::Field(FieldId::PasteDest) => {
+				self.close_overlay(
+					OverlayKind::PasteDestField,
 					CloseWhy::Escape,
 					cx,
 				);
@@ -1360,6 +1433,16 @@ mod tests {
 		assert!(s.is_open(OverlayKind::FindBar));
 		assert!(s.is_open(OverlayKind::AddRepoField));
 		assert!(s.floating().is_none(), "an inline open drops the menu");
+		s.install(layer(OverlayKind::Selector(Popover::Repo), None));
+		s.install(layer(OverlayKind::PasteDestField, None));
+		assert!(s.is_open(OverlayKind::PasteDestField));
+		assert!(s.is_open(OverlayKind::FindBar));
+		assert!(s.is_open(OverlayKind::AddRepoField));
+		assert!(
+			s.floating().is_none(),
+			"the typed destination drops the menu too"
+		);
+		assert!(s.paste_dest_edit().is_some());
 	}
 
 	/// The control that opened a layer closes what it opened last, even
@@ -1402,7 +1485,7 @@ mod tests {
 	/// apart.
 	#[test]
 	fn every_kind_has_policy() {
-		assert_eq!(OverlayKind::ALL.len(), 12);
+		assert_eq!(OverlayKind::ALL.len(), 13);
 		let mut seen = std::collections::HashSet::new();
 		for k in OverlayKind::ALL {
 			assert!(seen.insert(k), "{k:?} listed once");
@@ -1412,7 +1495,7 @@ mod tests {
 			.iter()
 			.map(|k| k.panel_selector())
 			.collect();
-		assert_eq!(selectors.len(), 6, "one selector per kind of panel");
+		assert_eq!(selectors.len(), 7, "one selector per kind of panel");
 		// A tooltip is muted by exactly the floating layers (the user's
 		// decision): an inline layer leaves them alone.
 		for k in OverlayKind::ALL {
