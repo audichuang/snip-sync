@@ -8253,7 +8253,6 @@ fn test_matches_preview_compares_the_symlinks_the_preview_recorded() {
 
 /// A canonical folder that is not a repository, for the destinations the
 /// tests below replace after a preview.
-#[cfg(unix)]
 fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dunce::canonicalize(dir.path()).unwrap();
@@ -8459,7 +8458,18 @@ fn plan_placed(
 	mapping: &ImportMapping,
 ) -> snip_core::transfer::TransferImportPlan {
 	let before = scan_tree(ws);
-	let plan = plan_import(text, "", &[ws.to_path_buf()], mapping).unwrap();
+	let mut roots: Vec<PathBuf> = Vec::new();
+	for placed in mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+	{
+		let anchor = placed.anchor().path().to_path_buf();
+		if !roots.contains(&anchor) {
+			roots.push(anchor);
+		}
+	}
+	let plan = plan_import(text, "", &roots, mapping).unwrap();
 	assert_eq!(scan_tree(ws), before, "planning must not write");
 	plan
 }
@@ -8561,10 +8571,7 @@ fn test_placed_destination_is_not_an_absolute_path_root_through_its_anchor() {
 		.collect();
 	assert!(rels.contains(&"new/a.txt".to_string()), "{rels:?}");
 	let other_rel = format!("new/{}", other.display()).replace("//", "/");
-	assert!(
-		rels.iter().any(|r| *r == other_rel),
-		"{rels:?} lacks {other_rel}"
-	);
+	assert!(rels.contains(&other_rel), "{rels:?} lacks {other_rel}");
 	assert!(
 		!plan
 			.create_operations()
@@ -8591,4 +8598,215 @@ fn test_placed_destination_tail_named_like_its_anchor_is_kept() {
 		create_paths(&plan),
 		vec![(ws.join("src/src/a.ts"), "src/a.ts".to_string())]
 	);
+}
+
+fn confirmed(
+	plan: &snip_core::transfer::TransferImportPlan,
+	selection: RestoreSelection,
+) -> RestoreSelection {
+	RestoreSelection {
+		confirmed_new_dirs: plan
+			.new_dirs_for(&selection)
+			.requested
+			.into_iter()
+			.collect(),
+		..selection
+	}
+}
+
+fn create_index(
+	plan: &snip_core::transfer::TransferImportPlan,
+	rel: &str,
+) -> usize {
+	plan.create_operations()
+		.iter()
+		.position(|op| op.relative_path.ends_with(rel))
+		.unwrap_or_else(|| panic!("no create of {rel}"))
+}
+
+/// T7: the folders the user named and the ones a file's path implies are
+/// told apart, and the first are a subset of the snapshot's missing folders.
+#[test]
+fn test_new_dirs_tell_the_named_folder_from_the_one_a_path_implies() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let nd = plan.new_dirs();
+	assert_eq!(nd.requested, vec![ws.join("new")]);
+	assert_eq!(nd.incidental, vec![ws.join("new/sub")]);
+	let fresh = plan.destination_freshness();
+	let missing = fresh.missing_dirs.as_ref().unwrap();
+	let requested = fresh.requested_dirs.as_ref().unwrap();
+	assert!(requested.is_subset(missing));
+	assert_eq!(requested.len(), 1);
+}
+
+/// T8: a row that is unchecked, or that overwrites a file, needs no folder.
+#[test]
+fn test_new_dirs_follow_the_rows_that_are_kept() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(
+		&ws,
+		"// file: s1/a.txt\nA\n// file: s2/b.txt\nB\n",
+		&mapping,
+	);
+	let all = plan.new_dirs();
+	assert_eq!(all.requested, vec![ws.join("new")]);
+	assert_eq!(all.incidental, vec![ws.join("new/s1"), ws.join("new/s2")]);
+	let drop_one = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "s1/a.txt")].into(),
+		..Default::default()
+	};
+	let nd = plan.new_dirs_for(&drop_one);
+	assert_eq!(nd.requested, vec![ws.join("new")]);
+	assert_eq!(nd.incidental, vec![ws.join("new/s2")]);
+	let drop_all = RestoreSelection {
+		unchecked_creates: [0, 1].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&drop_all), Default::default());
+
+	// A file that exists is overwritten in a folder that exists.
+	fs::create_dir_all(ws.join("here")).unwrap();
+	fs::write(ws.join("here/a.txt"), "old\n").unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("here")));
+	let plan = plan_placed(&ws, "// file: a.txt\nnew\n", &mapping);
+	assert_eq!(plan.new_dirs(), Default::default());
+}
+
+/// T9: a plan with no folder to make records none, and its snapshot is the
+/// one it always was on the wire.
+#[test]
+fn test_a_plan_without_a_tail_records_no_requested_dirs() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let fresh = plan.destination_freshness();
+	assert!(fresh.requested_dirs.is_none());
+	assert!(!serde_json::to_string(fresh)
+		.unwrap()
+		.contains("requested_dirs"));
+	assert_eq!(plan.new_dirs().requested, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().incidental, vec![ws.join("sub")]);
+}
+
+/// T10: the folder the user named is strict: whatever is there at Apply was
+/// not there at preview. A folder a path implies is not.
+#[test]
+fn test_a_named_folder_that_appears_after_preview_is_stale() {
+	for make in [true, false] {
+		let (_tmp, ws) = canonical_tmp();
+		let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+		let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+		let sel = confirmed(&plan, RestoreSelection::default());
+		if make {
+			fs::create_dir(ws.join("new")).unwrap();
+		} else {
+			fs::write(ws.join("new"), "x").unwrap();
+		}
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert!(!ws.join("new/sub").exists());
+	}
+
+	// A folder a path implies, made after the preview, still applies.
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir_all(ws.join("dest")).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("dest")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	fs::create_dir(ws.join("dest/sub")).unwrap();
+	let result = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(result.created_count, 1);
+}
+
+/// A1: no agreement, no folder and no file.
+#[test]
+fn test_apply_without_consent_makes_nothing() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match &err {
+		TransferError::NewDirsNotConfirmed { dirs } => {
+			assert_eq!(dirs, &vec![ws.join("new")])
+		}
+		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+	}
+	assert_eq!(err.reason(), Reason::NewDirsNotConfirmed { count: 1 });
+	assert!(!ws.join("new").exists());
+}
+
+/// A2: with the agreement the folder is made and the file written.
+#[test]
+fn test_apply_with_consent_makes_the_folder_and_writes() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
+	let sel = confirmed(&plan, RestoreSelection::default());
+	let result = plan.apply(&sel).unwrap();
+	assert_eq!(result.created_count, 1);
+	assert_eq!(result.created_dirs, 1);
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(fs::read_to_string(ws.join("new/sub/a.txt")).unwrap(), "A");
+}
+
+/// A3: an agreement to some of the folders is not an agreement to all.
+#[test]
+fn test_apply_with_consent_to_only_one_of_two_folders_makes_neither() {
+	let (_tmp, ws) = canonical_tmp();
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&ws.join("newp")));
+	let plan =
+		plan_placed(&ws, "// file: x.txt\nX\n// file: p/y.txt\nY\n", &mapping);
+	assert_eq!(plan.new_dirs().requested.len(), 2);
+	let sel = RestoreSelection {
+		confirmed_new_dirs: [ws.join("new")].into(),
+		..Default::default()
+	};
+	let err = plan.apply(&sel).unwrap_err();
+	assert_eq!(err.reason(), Reason::NewDirsNotConfirmed { count: 1 });
+	assert!(!ws.join("new").exists());
+	assert!(!ws.join("newp").exists());
+}
+
+/// A5b (I4): only the folders the rows kept need are made, whatever was
+/// agreed to.
+#[test]
+fn test_apply_makes_only_the_folders_the_kept_rows_need() {
+	let (_tmp, ws) = canonical_tmp();
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("p", placed(&ws.join("newp")));
+	let plan =
+		plan_placed(&ws, "// file: x.txt\nX\n// file: p/y.txt\nY\n", &mapping);
+	// Agree to both, drop the row for one: only the other is made.
+	let drop_p = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "y.txt")].into(),
+		confirmed_new_dirs: plan.new_dirs().requested.into_iter().collect(),
+		..Default::default()
+	};
+	let result = plan.apply(&drop_p).unwrap();
+	assert_eq!(result.created_count, 1);
+	assert_eq!(result.created_dirs, 1);
+	assert!(ws.join("new/x.txt").exists());
+	assert!(!ws.join("newp").exists());
+
+	// Every row dropped: nothing is made although everything was agreed to.
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(&ws, "// file: a.txt\nA\n", &mapping);
+	let none = RestoreSelection {
+		unchecked_creates: [0].into(),
+		confirmed_new_dirs: [ws.join("new")].into(),
+		..Default::default()
+	};
+	let result = plan.apply(&none).unwrap();
+	assert_eq!(result.created_count, 0);
+	assert_eq!(result.created_dirs, 0);
+	assert!(!ws.join("new").exists());
 }

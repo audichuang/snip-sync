@@ -1890,6 +1890,10 @@ impl TransferImportPlan {
 		let mut made: Vec<PathBuf> = Vec::new();
 		for dir in dirs {
 			let step = (|| -> Result<(), TransferError> {
+				// The planner refuses such a folder first (`PlacedRoot::resolve`,
+				// test P10); this is the guard for one that came to lie in a Git
+				// directory since. A repository that appears under the anchor
+				// after the preview is stopped even earlier, by the lock.
 				if paths::lands_in_git_dir(dir) {
 					return Err(TransferError::UnsafePath(
 						dir.display().to_string(),
@@ -6400,5 +6404,226 @@ mod freshness_helper_tests {
 		let root = Path::new("root");
 		assert_eq!(slash_rel(root, &root.join("a").join("b")), "a/b");
 		assert_eq!(slash_rel(root, &root.join("a")), "a");
+	}
+}
+
+#[cfg(test)]
+mod new_dir_tests {
+	use super::*;
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	/// Installs the hook for this thread until dropped. A test runs in its
+	/// own process under nextest, and the slot is thread-local besides.
+	struct HookGuard;
+
+	impl Drop for HookGuard {
+		fn drop(&mut self) {
+			NEW_DIR_HOOK.with(|slot| *slot.borrow_mut() = None);
+		}
+	}
+
+	fn hook(
+		f: impl Fn(NewDirStage, &Path) -> io::Result<()> + 'static,
+	) -> HookGuard {
+		NEW_DIR_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+		HookGuard
+	}
+
+	/// A plan pasting `a.txt` into the folder `dest` (which may not exist),
+	/// and the selection that agrees to the folders it would make.
+	fn plan(ws: &Path, dest: &Path) -> (TransferImportPlan, RestoreSelection) {
+		let placed = PlacedRoot::resolve(None, dest).unwrap();
+		let plan = plan_import_with(
+			"// file: a.txt\nA\n",
+			"",
+			&[placed.anchor().path().to_path_buf()],
+			&ImportMapping::with_primary(placed),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let _ = ws;
+		let selection = RestoreSelection {
+			confirmed_new_dirs: plan.new_dirs().requested.into_iter().collect(),
+			..Default::default()
+		};
+		(plan, selection)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let path = entry.unwrap().path();
+				out.push(path.clone());
+				if path.is_dir() && !path.is_symlink() {
+					walk(&path, out);
+				}
+			}
+		}
+		let mut out = Vec::new();
+		walk(dir, &mut out);
+		out.sort();
+		out
+	}
+
+	/// A4: a folder that is there by the time it is made is a change the
+	/// preview did not show, not something to carry on into.
+	#[test]
+	fn a_named_folder_that_exists_when_made_is_stale() {
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let _hook = hook(|stage, dir| {
+			if stage == NewDirStage::BeforeCreate {
+				fs::create_dir(dir)?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), vec![ws.join("new")], "no file written");
+	}
+
+	/// A5 (a): a failure part-way takes back the folders already made.
+	#[test]
+	fn a_failure_while_making_folders_takes_back_the_ones_made() {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		assert_eq!(sel.confirmed_new_dirs.len(), 2);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::BeforeCreate && dir == target {
+				return Err(io::ErrorKind::PermissionDenied.into());
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::Io(e)) => {
+				assert_eq!(e.kind(), io::ErrorKind::PermissionDenied)
+			}
+			other => panic!("expected an io error, got {other:?}"),
+		}
+		assert!(scan(&ws).is_empty(), "{:?}", scan(&ws));
+	}
+
+	/// A5 (b): the last level taken by a file in the meantime is stale, and
+	/// the level made before it is taken back as far as it can be (it holds
+	/// the interloper, which stays).
+	#[test]
+	fn a_file_where_a_folder_was_to_be_made_is_stale_and_the_rest_is_taken_back(
+	) {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::BeforeCreate && dir == target {
+				fs::write(dir, "interloper")?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new/deeper"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert_eq!(fs::read_to_string(&deeper).unwrap(), "interloper");
+		assert_eq!(scan(&ws), vec![ws.join("new"), deeper]);
+	}
+
+	/// A5 (c): nothing written and a folder with something in it stays.
+	#[test]
+	fn a_made_folder_with_something_in_it_stays_when_nothing_was_written() {
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let _hook = hook(|stage, dir| {
+			if stage == NewDirStage::AfterCreate {
+				fs::create_dir(dir.join("a.txt"))?;
+			}
+			Ok(())
+		});
+		let result = plan.apply(&sel).unwrap();
+		assert_eq!(result.created_count, 0);
+		assert_eq!(result.skipped_existing_count, 1);
+		assert_eq!(result.created_dirs, 1);
+		assert!(ws.join("new/a.txt").is_dir());
+	}
+
+	/// A5 (d): a failure right after the last level was made takes back every
+	/// level, that one included.
+	#[test]
+	fn a_failure_after_the_last_level_takes_back_every_level() {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::AfterCreate && dir == target {
+				return Err(io::ErrorKind::PermissionDenied.into());
+			}
+			Ok(())
+		});
+		assert!(matches!(plan.apply(&sel), Err(TransferError::Io(_))));
+		assert!(scan(&ws).is_empty(), "{:?}", scan(&ws));
+	}
+
+	/// A5 (d), the end of an Apply: nothing written leaves no empty folder it
+	/// made; something written keeps them; a folder with content stays.
+	#[test]
+	fn finishing_takes_back_empty_folders_only_when_nothing_was_written() {
+		let (_tmp, ws) = tmp();
+		let (a, b) = (ws.join("a"), ws.join("a").join("b"));
+		let make = || {
+			fs::create_dir_all(&b).unwrap();
+			vec![a.clone(), b.clone()]
+		};
+		let made = make();
+		assert_eq!(finish_new_dirs(&made, true), 2);
+		assert!(b.is_dir());
+		assert_eq!(finish_new_dirs(&made, false), 0);
+		assert!(!a.exists());
+
+		let made = make();
+		fs::write(b.join("keep.txt"), "x").unwrap();
+		assert_eq!(finish_new_dirs(&made, false), 2);
+		assert!(b.join("keep.txt").exists());
+	}
+
+	/// A6: a symlink put where the folder was just made is stale, and nothing
+	/// reaches what it points at.
+	#[cfg(unix)]
+	#[test]
+	fn a_folder_swapped_for_a_symlink_right_after_it_was_made_is_stale() {
+		let (_tmp, ws) = tmp();
+		let elsewhere = ws.join("elsewhere");
+		fs::create_dir(&elsewhere).unwrap();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let target = elsewhere.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::AfterCreate {
+				fs::remove_dir(dir)?;
+				std::os::unix::fs::symlink(&target, dir)?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Preview,
+				..
+			}) => {}
+			other => panic!("expected a stale Preview, got {other:?}"),
+		}
+		assert!(scan(&elsewhere).is_empty());
 	}
 }
