@@ -286,6 +286,27 @@ impl PlacedRoot {
 				name: path.display().to_string(),
 			});
 		}
+		// Windows reads `new\..\x` as `x` without looking at `new`, so a
+		// `..` after a name that does not exist would pass there and be
+		// refused elsewhere: refused on every system.
+		let mut prefix = PathBuf::new();
+		let mut missing = false;
+		for part in path.components() {
+			if missing && part == std::path::Component::ParentDir {
+				return Err(DestinationError::InvalidName {
+					name: "..".to_string(),
+				});
+			}
+			prefix.push(part);
+			if !missing && matches!(part, std::path::Component::Normal(_)) {
+				missing = fs::symlink_metadata(&prefix).is_err_and(|e| {
+					matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					)
+				});
+			}
+		}
 		let mut cur = path;
 		let mut tail: Vec<String> = Vec::new();
 		let anchor = loop {
@@ -2386,6 +2407,15 @@ impl TransferImportPlan {
 				Ok(reserved)
 			}
 			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+				Err(Reserve::Batch(self.met(op, path, made, existing)))
+			}
+			// Windows refuses to make a file over a folder (or a file being
+			// deleted) as access denied: something is there all the same.
+			Err(e)
+				if cfg!(windows)
+					&& e.kind() == io::ErrorKind::PermissionDenied
+					&& fs::symlink_metadata(path).is_ok() =>
+			{
 				Err(Reserve::Batch(self.met(op, path, made, existing)))
 			}
 			Err(e) => Err(Reserve::Row(e)),
