@@ -2486,11 +2486,7 @@ impl WorkbenchModel {
 				// A workspace open/close is under way: an in-flight remote
 				// open that lands later must not touch it (remote.rs).
 				self.remote.open_seq.invalidate();
-				self.generation.invalidate();
-				self.preview_generation.invalidate();
-				self.held_selection = None;
-				self.history_generation.invalidate();
-				self.tree_generation.invalidate();
+				self.invalidate_workspace_reads(true);
 				for slot in [
 					&mut self.history_cancel,
 					&mut self.preview_cancel,
@@ -2684,14 +2680,26 @@ impl WorkbenchModel {
 		self.repos_changed(change, cx);
 	}
 
-	/// Drops everything that belongs to the open repo and stops its reads, so
-	/// a late result cannot repopulate it.
-	fn release_repo_state(&mut self) {
+	/// Makes every read in flight for the open workspace stale: the repo's
+	/// own, the file preview (and the selection a read holds aside for it),
+	/// the project tree and, when `history` is set, the Log. The three
+	/// places that start a workspace or repo over each do this together, and
+	/// differ only in the Log (a plain repo switch keeps it) and in what
+	/// they cancel besides, which stays with them.
+	fn invalidate_workspace_reads(&mut self, history: bool) {
 		self.generation.invalidate();
 		self.preview_generation.invalidate();
 		self.held_selection = None;
-		self.history_generation.invalidate();
+		if history {
+			self.history_generation.invalidate();
+		}
 		self.tree_generation.invalidate();
+	}
+
+	/// Drops everything that belongs to the open repo and stops its reads, so
+	/// a late result cannot repopulate it.
+	fn release_repo_state(&mut self) {
+		self.invalidate_workspace_reads(true);
 		self.tree_worker.invalidate();
 		for slot in [
 			&mut self.history_cancel,
@@ -4048,17 +4056,13 @@ impl WorkbenchModel {
 			self.clear_preview();
 			self.preview_error = None;
 		}
-		self.generation.invalidate();
-		self.preview_generation.invalidate();
-		// The reads that could have restored it are dropped.
-		self.held_selection = None;
+		// The reads that could have restored the selection are dropped.
+		self.invalidate_workspace_reads(reload_log);
 		let task_generation = self.generation.current();
 		if reload_log {
-			self.history_generation.invalidate();
 			let _ = arm_cancel(&mut self.history_cancel);
 			self.log_reload_for = Some(task_generation);
 		}
-		self.tree_generation.invalidate();
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
