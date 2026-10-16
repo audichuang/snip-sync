@@ -726,13 +726,14 @@ fn all_parts(present: Vec<Part<LogCell>>) -> Vec<Part<LogCell>> {
 /// once from the worst row of each kind. One order for every shortfall (ADR
 /// 0005): the date is whole before anything else (or the column is gone, on
 /// a list under about 250px); the subject gets its readable floor; the ref
-/// labels' floors, then the collapsed chip, come before the author column,
-/// so the author goes first and then, when even the labels' floors do not
-/// fit, the labels are dropped as a group. The collapsed chip only explains
-/// the `+` in the gutter, so it never costs a row its labels: it is the
-/// first of them to go. Then the labels grow, the subject to its comfortable
-/// width, the author, the date and the gutter, and the subject takes the
-/// rest.
+/// labels' floors come before the author column, so the author goes first
+/// and then, when even the labels' floors do not fit, the labels are dropped
+/// as a group. The collapsed chip only explains the `+` in the gutter, so it
+/// comes after the author's floor: one merge row's chip never costs the
+/// whole list its author column, nor a row its labels. It is the first of
+/// them to go (a row without room for it just has none). Then the labels
+/// grow, the subject to its comfortable width, the author, the date and the
+/// gutter, and the subject takes the rest.
 pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
 	let avail = i.list_w - ROW_PAD_R;
 	let date = Part::new(
@@ -782,11 +783,11 @@ pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
 	if !label_cells.is_empty() {
 		claims.push(Claim::Atomic(label_cells));
 	}
-	if i.collapsed.is_some() {
-		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
-	}
 	if i.author_floor.is_some() {
 		claims.push(Claim::Atomic(vec![LogCell::Author]));
+	}
+	if i.collapsed.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
 	}
 	if !kinds.is_empty() {
 		claims.push(Claim::ShortestFirst(kinds));
