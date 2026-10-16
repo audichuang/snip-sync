@@ -21118,7 +21118,7 @@ mod tests {
 			}
 
 			/// Rests the mouse on control `id` until its tooltip is up.
-			fn hover_id(
+			pub(super) fn hover_id(
 				cx: &mut VisualTestContext,
 				id: &str,
 			) -> gpui::Point<gpui::Pixels> {
@@ -23095,7 +23095,10 @@ mod tests {
 		/// rules (Escape, exclusion, return of the focus, a tab switch) are
 		/// pinned over every layer, not over the one that last broke.
 		mod overlays {
-			use super::workspace_tabs::{active, tab, two_tabs, wait_scaled};
+			use super::workspace_tabs::{
+				active, hover_id, sel, tab, tooltip_shown, two_tabs,
+				wait_scaled,
+			};
 			use super::*;
 			use gpui::{Modifiers, MouseButton};
 
@@ -24031,6 +24034,189 @@ mod tests {
 					"a tab switch must close the floating layers:\n{}",
 					failures.join("\n")
 				);
+			}
+
+			/// The pointer rests in a corner no control is in.
+			fn park_mouse(cx: &mut VisualTestContext) {
+				cx.simulate_mouse_move(
+					gpui::point(gpui::px(2.), gpui::px(2.)),
+					None,
+					Modifiers::none(),
+				);
+				settle(cx);
+			}
+
+			/// Tab 0 of two workspaces at 1080 wide with its Log loaded and a
+			/// status line: the places a tooltip can rest while a layer is
+			/// open. Both tooltips are up when no layer is, so what follows is
+			/// the rule, not an accident of the fixture.
+			fn tooltip_fixture(
+				cx: &mut TestAppContext,
+			) -> (
+				tempfile::TempDir,
+				Entity<WorkbenchModel>,
+				String,
+				String,
+				gpui::Bounds<gpui::Pixels>,
+				&mut VisualTestContext,
+			) {
+				let (tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let tab0 = tab(&root, cx, 0);
+				for _ in 0..50 {
+					settle(cx);
+					if tab0.read_with(cx, |m, _| !m.commits.is_empty())
+						&& cx.debug_bounds("log-filter-branch").is_some()
+					{
+						break;
+					}
+				}
+				// A status line gives `status-text` something to say.
+				tab0.update(cx, |m, cx| {
+					m.set_status("workspace_opening", [String::from("here")]);
+					cx.notify();
+				});
+				settle(cx);
+				let status =
+					tab0.read_with(cx, |m, _| m.status.render(m.locale));
+				assert!(!status.is_empty());
+				let tab_tip = a.display().to_string();
+				let status_b =
+					cx.debug_bounds("status-text").expect("status drawn");
+				hover_id(cx, "status-text");
+				assert!(tooltip_shown(cx, &status), "the status tooltip is up");
+				hover_id(cx, "ws-tab:0");
+				assert!(tooltip_shown(cx, &tab_tip), "the tab tooltip is up");
+				park_mouse(cx);
+				(tmp, tab0, status, tab_tip, status_b, cx)
+			}
+
+			/// While a floating layer is open no tooltip shows, wherever the
+			/// pointer rests: a tooltip would land on the layer or on the
+			/// controls under it (#203 as a class, not one guard per button).
+			#[gpui::test]
+			fn no_tooltip_while_a_floating_layer_is_open(
+				cx: &mut TestAppContext,
+			) {
+				use crate::overlay::OverlayKind as K;
+				let (_tmp, tab0, status, tab_tip, status_b, cx) =
+					tooltip_fixture(cx);
+				let mut failures = Vec::new();
+				for opener in [
+					Opener::Click("btn-workspace-menu", "workspace-menu"),
+					Opener::Click("btn-repo-selector", "selector:Repo"),
+					Opener::Click("log-filter-branch", "log-menu:Branch"),
+					Opener::RightLogRow,
+				] {
+					opener.fire(&tab0, cx);
+					assert_eq!(floating_now(&tab0, cx), [opener.opens()]);
+					let panel = cx
+						.debug_bounds(match opener.opens() {
+							"workspace-menu" => {
+								K::WorkspaceMenu.panel_selector()
+							}
+							"selector:Repo" => {
+								K::Selector(crate::Popover::Repo)
+									.panel_selector()
+							}
+							"log-menu:Branch" => {
+								K::LogMenu(crate::ui::LogMenu::Branch)
+									.panel_selector()
+							}
+							_ => K::ContextMenu.panel_selector(),
+						})
+						.expect("the panel is drawn");
+					// A panel over the status line would hide it from the
+					// pointer by itself: that line is only tried where the
+					// panel leaves it free.
+					let status_free = !bounds_intersect(panel, status_b);
+					for (id, text) in
+						[("status-text", &status), ("ws-tab:0", &tab_tip)]
+					{
+						if id == "status-text" && !status_free {
+							continue;
+						}
+						hover_id(cx, id);
+						if tooltip_shown(cx, text) {
+							failures.push(format!(
+								"{}: the tooltip of {id} shows over the layer",
+								opener.label()
+							));
+						}
+					}
+					reset(&tab0, cx);
+					park_mouse(cx);
+				}
+				assert!(failures.is_empty(), "{}", failures.join("\n"));
+			}
+
+			/// A tooltip already up goes when a layer opens, and an inline
+			/// layer takes none away.
+			#[gpui::test]
+			fn a_shown_tooltip_goes_when_a_floating_layer_opens(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, tab0, status, tab_tip, _status_b, cx) =
+					tooltip_fixture(cx);
+				hover_id(cx, "status-text");
+				assert!(tooltip_shown(cx, &status), "the status tooltip is up");
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &tab0);
+				assert!(
+					!tooltip_shown(cx, &status),
+					"opening a layer takes the tooltip that was up"
+				);
+				reset(&tab0, cx);
+				park_mouse(cx);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &tab0);
+				hover_id(cx, "ws-tab:0");
+				assert!(
+					tooltip_shown(cx, &tab_tip),
+					"the find bar leaves the tooltips alone"
+				);
+			}
+
+			/// A press on each opener, rested on first, leaves no tooltip of
+			/// its own over the layer it opened (#203).
+			#[gpui::test]
+			fn opening_a_layer_drops_its_triggers_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let branch = model.read_with(cx, |m, _| m.header_ref_label());
+				let mut failures = Vec::new();
+				for (id, text) in [
+					(
+						"btn-repo-selector",
+						crate::i18n::t("tip_repo_selector", loc).to_string(),
+					),
+					(
+						"btn-ref-selector",
+						crate::i18n::tf("tip_ref_selector", loc, &[&branch]),
+					),
+					(
+						"btn-log-more",
+						crate::i18n::t("tip_log_more", loc).to_string(),
+					),
+				] {
+					let at =
+						cx.debug_bounds(id).expect("opener drawn").center();
+					cx.simulate_mouse_move(at, None, Modifiers::none());
+					cx.simulate_click(at, Modifiers::none());
+					cx.executor().advance_clock(Duration::from_millis(700));
+					settle_checked(cx, &model);
+					if cx.debug_bounds(sel(format!("tooltip:{text}"))).is_some()
+					{
+						failures.push(format!("{id}: its tooltip stays up"));
+					}
+					reset(&model, cx);
+					park_mouse(cx);
+				}
+				assert!(failures.is_empty(), "{}", failures.join("\n"));
 			}
 
 			/// One rule for the keyboard after a layer closes (the user's
