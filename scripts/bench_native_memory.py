@@ -520,13 +520,14 @@ DELETED_FILE_MARKER = b"// This file has been deleted in this change"
 # file name can: spaces, `=`, `:`, `]`, even a field's own name (`x=`, `rule=`). So no reader cuts an
 # id at its first space or `=`. The id is everything between `id=` and the fixed fields at the end of
 # the line (`x= y= w= h=`, `rule= ... shown=`, `fit= drawn=`), so these patterns are anchored at the
-# end and take the id greedily. A background tab's TEXT_FIT lines end in ` ws_tab=<n>` before the `]`
-# (the controls of a tab that is not shown are not read: CTRL_* lines of one carry no tab tag here).
-# `crates/native-e2e/src/lib.rs` reads the same lines by the same rule; scripts/real_ui_round.py and
-# scripts/check_native_ime.py use these patterns instead of their own.
+# end and take the id greedily. A line of a background tab ends in ` ws_tab=<n>` before the `]`, which
+# every pattern allows. `crates/native-e2e/src/lib.rs` reads the same lines by the same rule;
+# scripts/real_ui_round.py and scripts/check_native_ime.py use these patterns instead of their own.
 APP_TAB = r"(?: ws_tab=\d+)?"
-BOUNDS_RE = re.compile(r"\[APP:CTRL_BOUNDS: id=(?P<id>.+) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+)\]\s*$")
-CTRL_GONE_RE = re.compile(r"\[APP:CTRL_GONE: id=(?P<id>.+)\]\s*$")
+BOUNDS_RE = re.compile(
+    rf"\[APP:CTRL_BOUNDS: id=(?P<id>.+) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+){APP_TAB}\]\s*$"
+)
+CTRL_GONE_RE = re.compile(rf"\[APP:CTRL_GONE: id=(?P<id>.+?){APP_TAB}\]\s*$")
 TEXT_FIT_RE = re.compile(
     r"\[APP:TEXT_FIT: id=(?P<id>.+) rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
     r"fit=(?P<fit>-|-?\d+) drawn=(?P<drawn>-?\d+) visible=(?P<visible>-?\d+) clipped=(?P<clipped>[01]) "

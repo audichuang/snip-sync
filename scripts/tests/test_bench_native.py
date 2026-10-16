@@ -212,6 +212,13 @@ class TestBoundsOfOddIds(unittest.TestCase):
                 self.assertEqual(parse_bounds(lines), {control: (7, -8, 90, 12)})
                 lines.append(f"[APP:CTRL_GONE: id={control}]")
                 self.assertEqual(parse_bounds(lines), {})
+                # A line of a background tab ends in its tab tag; the id does not.
+                tagged = [
+                    f"[APP:CTRL_BOUNDS: id={control} x=7 y=-8 w=90 h=12 ws_tab=2]",
+                ]
+                self.assertEqual(parse_bounds(tagged), {control: (7, -8, 90, 12)})
+                tagged.append(f"[APP:CTRL_GONE: id={control} ws_tab=2]")
+                self.assertEqual(parse_bounds(tagged), {})
 
 
 class TestParseXwininfo(unittest.TestCase):
