@@ -204,7 +204,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 - 範圍:`transfer::plan_import_with`(`crates/core/src/transfer.rs`)。
   - D8:每筆 entry 在 `sanitize_relative_path` 之前先解析絕對路徑(root 內部 → 相對;`cross_machine_suffix_candidate` → 相對;絕對 [DELETED] 對不到任何 root → 以 unsafe/unresolved 跳過、不刪任何檔;絕對寫入對不到 root → 維持照原樣放主 root,磁碟機代號 → `UNRESOLVED_PATH`),行為對齊 `restore::plan_restore`/TS。GUI 行為因共用 core 函式一併修正(修正先前絕對路徑 payload 巢狀寫入與巢狀刪除的 bug)。
-  - D10:探測目的端(root)檔案系統是否不分大小寫,若是,`TargetCollision` 的身分檢查(`canonical_target_identity`/`path_key`)對新目標路徑也摺疊大小寫,消除 macOS 等平台上的 gap。
+  - D10:探測目的端(root)檔案系統是否不分大小寫,若是,`TargetCollision` 的身分檢查(現為 `foldernames.rs` 的 `TargetId`,#241)對新目標路徑也摺疊大小寫,消除 macOS 等平台上的 gap。
 - 測試:
   - `crates/core/tests/transfer_planning.rs`:root 內部絕對寫入、跨機器後綴、絕對 [DELETED] 對不到 root 被拒且不刪任何檔、磁碟機代號 `UNRESOLVED_PATH`、root 以 symlink 拼寫的版本;D10 的 `[NEW] B.txt`+`[NEW] b.txt` 與 `D/x.txt`+`d/x.txt` 在不分大小寫 FS 上觸發 `TargetCollision`,測試先探測 FS,Linux 等區分大小寫 FS 則斷言兩檔都建立。
   - GUI regression:`crates/desktop-native/src/paste.rs` 單元測試或 `tests::in_process`(貼上含 root 內部絕對路徑 / 絕對 [DELETED] 的 payload)。
