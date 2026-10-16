@@ -31,6 +31,7 @@ pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
+pub use codeless::Codeless;
 pub use pastetarget::{
 	FilePastePlan, PasteError, PasteRoute, PasteTarget, PreparedReplay,
 	REPO_BUSY_TEXT,

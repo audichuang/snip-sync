@@ -2079,7 +2079,7 @@ impl Client {
 					None,
 					APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
 				) {
-				Ok(Response::Imported(result)) => Ok(result),
+				Ok(Response::Imported(result)) => Ok(result.into_inner()),
 				Ok(_) => Err(unexpected()),
 				Err(error) => Err(error),
 			};
@@ -2317,7 +2317,7 @@ impl Client {
 				.call(request, None, limit.saturating_sub(start.elapsed()))
 			{
 				Ok(Response::Replayed(result)) if !check_only => {
-					Ok(Some(result))
+					Ok(Some(result.into_inner()))
 				}
 				Ok(Response::Fresh) if check_only => Ok(None),
 				Ok(_) => Err(unexpected()),
@@ -2397,7 +2397,7 @@ impl Client {
 			expect: expect.clone(),
 		};
 		match self.call_with(&req, cancel, APPLY_CALL_LIMIT)? {
-			Response::Imported(result) => Ok(result),
+			Response::Imported(result) => Ok(result.into_inner()),
 			_ => Err(unexpected()),
 		}
 	}
@@ -2456,7 +2456,9 @@ impl Client {
 			APPLY_CALL_LIMIT
 		};
 		match self.call_with(&req, cancel, limit)? {
-			Response::Replayed(result) if !check_only => Ok(Some(result)),
+			Response::Replayed(result) if !check_only => {
+				Ok(Some(result.into_inner()))
+			}
 			Response::Fresh if check_only => Ok(None),
 			_ => Err(unexpected()),
 		}
@@ -2494,7 +2496,7 @@ impl Client {
 			under: under.map(str::to_string),
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
-			Response::Repos(scan) => Ok(scan),
+			Response::Repos(scan) => Ok(scan.into_inner()),
 			_ => Err(unexpected()),
 		}
 	}
@@ -3022,6 +3024,7 @@ impl From<RemoteError> for GitError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::codeless::Codeless;
 	use crate::proto::write_frame;
 
 	/// A worker that cannot be started for a reason of ours is typed, with
@@ -3275,7 +3278,9 @@ mod tests {
 				..
 			})
 		));
-		fixture.answer(Some(Response::Imported(Default::default())));
+		fixture.answer(Some(Response::Imported(Codeless::new(
+			Default::default(),
+		))));
 		join_prepared(first).unwrap();
 		let before = fixture.writes.lock().unwrap().len();
 		assert!(matches!(
@@ -3363,7 +3368,9 @@ mod tests {
 		let before = fixture.writes.lock().unwrap().len();
 		let second = fixture.start();
 		wait_for_request(before);
-		fixture.answer(Some(Response::Imported(Default::default())));
+		fixture.answer(Some(Response::Imported(Codeless::new(
+			Default::default(),
+		))));
 		join_prepared(second).unwrap();
 		assert!(fixture.lease.retained_heap_bytes() <= ready);
 	}

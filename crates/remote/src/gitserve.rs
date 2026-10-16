@@ -15,7 +15,7 @@ use snip_core::gitview::{
 use snip_core::reason::{Failure, Reason};
 use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
-use crate::codeless;
+use crate::codeless::Codeless;
 use crate::proto::{
 	valid_log_query, valid_rel_path, valid_rev, valid_tips, ErrorCode,
 	GitQuery, GitReply, RepoScan, Response, ScannedRepo, REMOTE_MAX_LOG_LIMIT,
@@ -99,7 +99,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		),
 		Policy::Scrub => scrub(&failure.message, share),
 	};
-	(text, codeless::scan_reason(failure.reason.clone()))
+	(text, failure.reason.clone())
 }
 
 /// Answers a ScanRepos request within the shared root.
@@ -151,7 +151,7 @@ pub(crate) fn scan(
 	let now = Instant::now();
 	let budget_deadline = job_deadline.checked_sub(reserve);
 	if budget_deadline.is_none_or(|d| now >= d) {
-		return Response::Repos(RepoScan {
+		return Response::Repos(Codeless::new(RepoScan {
 			repos: Vec::new(),
 			errors: Vec::new(),
 			error_reasons: Vec::new(),
@@ -159,7 +159,7 @@ pub(crate) fn scan(
 			depth_limited: Vec::new(),
 			depth_overflow: 0,
 			status: ScanStatus::Incomplete,
-		});
+		}));
 	}
 
 	let budget = ScanBudget {
@@ -231,8 +231,7 @@ pub(crate) fn scan(
 						&root.path,
 					),
 				));
-				error_reasons
-					.push(Some(codeless::scan_reason(Reason::OutsideShare)));
+				error_reasons.push(Some(Reason::OutsideShare));
 			}
 		}
 	}
@@ -280,7 +279,7 @@ pub(crate) fn scan(
 		})
 		.collect();
 
-	Response::Repos(RepoScan {
+	Response::Repos(Codeless::new(RepoScan {
 		repos,
 		errors,
 		error_reasons,
@@ -288,7 +287,7 @@ pub(crate) fn scan(
 		depth_limited,
 		depth_overflow: ws_scan.depth_overflow,
 		status: ws_scan.status,
-	})
+	}))
 }
 
 /// Replaces the share's absolute path (both raw and canonical) with share-relative
@@ -1072,7 +1071,12 @@ mod tests {
 			stderr: secret.into(),
 			code: Some(128),
 		};
-		let gone = |f: &Failure| sanitize_scan_error(f, share);
+		// The reason is scrubbed when the frame is built (`Codeless::new`);
+		// scrub it here as that does, to see what the master receives.
+		let gone = |f: &Failure| {
+			let (text, reason) = sanitize_scan_error(f, share);
+			(text, reason.scrubbed())
+		};
 		let git_failed = Reason::GitFailed {
 			stderr: Datum::default(),
 		};

@@ -18,6 +18,7 @@ use snip_core::gitview::{
 use snip_core::graph::MAX_REF_NAME_LEN;
 use snip_core::workspace::ScanStatus;
 
+use crate::codeless::Codeless;
 use crate::iofault::IoFault;
 
 /// Base protocol, both sides must speak it.
@@ -696,7 +697,7 @@ pub enum Response {
 		content: Option<String>,
 	},
 	Pending,
-	Repos(RepoScan),
+	Repos(Codeless<RepoScan>),
 	Git(GitReply),
 	Copied(snip_core::transfer::CopyOutcome),
 	CommitsCopied(snip_core::commits::CommitCopyOutcome),
@@ -710,11 +711,11 @@ pub enum Response {
 	Joined,
 	ImportPlanned(ImportPlanned),
 	ImportPrepared(ImportPrepared),
-	Imported(snip_core::restore::RestoreExecutionResult),
+	Imported(Codeless<snip_core::restore::RestoreExecutionResult>),
 	ReplayPlanned(ReplayExpect),
 	ReplayPrepared(ReplayPrepared),
 	ReplayRead(snip_core::transfer::ReplayPreviewRead),
-	Replayed(snip_core::commits::ReplayResult),
+	Replayed(Codeless<snip_core::commits::ReplayResult>),
 	/// A `check_only` replay found nothing changed.
 	Fresh,
 	Error {
@@ -1185,7 +1186,7 @@ mod tests {
 	}
 
 	fn replayed(reason: Option<Reason>) -> Response {
-		Response::Replayed(snip_core::commits::ReplayResult {
+		Response::Replayed(Codeless::new(snip_core::commits::ReplayResult {
 			created: vec!["abc".into()],
 			failure: Some(snip_core::commits::ReplayFailure {
 				index: 1,
@@ -1195,7 +1196,7 @@ mod tests {
 				conflict_path: None,
 				reason,
 			}),
-		})
+		}))
 	}
 
 	/// The same four cases through `ReplayResult`, which travels in
@@ -1250,7 +1251,7 @@ mod tests {
 		reason: Option<Reason>,
 		error_reasons: Vec<Option<Reason>>,
 	) -> Response {
-		Response::Repos(RepoScan {
+		Response::Repos(Codeless::new(RepoScan {
 			repos: vec![ScannedRepo {
 				rel: "sub".into(),
 				utf8: true,
@@ -1268,7 +1269,7 @@ mod tests {
 			depth_limited: Vec::new(),
 			depth_overflow: 0,
 			status: ScanStatus::Complete,
-		})
+		}))
 	}
 
 	/// The scan rows' reasons are additive, through the real tagged
@@ -1551,15 +1552,19 @@ mod tests {
 			Response::Pending,
 			Response::Joined,
 			Response::Fresh,
-			Response::Imported(snip_core::restore::RestoreExecutionResult {
-				created_count: 1,
-				errors: vec!["x: denied".into()],
-				..Default::default()
-			}),
-			Response::Replayed(snip_core::commits::ReplayResult {
-				created: vec!["abcd".into()],
-				failure: None,
-			}),
+			Response::Imported(Codeless::new(
+				snip_core::restore::RestoreExecutionResult {
+					created_count: 1,
+					errors: vec!["x: denied".into()],
+					..Default::default()
+				},
+			)),
+			Response::Replayed(Codeless::new(
+				snip_core::commits::ReplayResult {
+					created: vec!["abcd".into()],
+					failure: None,
+				},
+			)),
 			Response::Error {
 				code: ErrorCode::Stale,
 				message: "stale destination in '/w': gone".into(),
@@ -1572,7 +1577,7 @@ mod tests {
 				patch: false,
 				reason: None,
 			},
-			Response::Repos(RepoScan {
+			Response::Repos(Codeless::new(RepoScan {
 				repos: vec![ScannedRepo {
 					rel: "sub".into(),
 					utf8: true,
@@ -1591,7 +1596,7 @@ mod tests {
 				depth_limited: vec!["depth_path".into()],
 				depth_overflow: 0,
 				status: ScanStatus::Complete,
-			}),
+			})),
 			Response::Git(GitReply::Commit("abc".into())),
 			Response::Error {
 				code: ErrorCode::NotARepository,
@@ -1823,7 +1828,67 @@ mod tests {
 			})
 		);
 		assert_eq!(result.failures[1].reason, None);
-		round_trip_check(&Response::Imported(result));
+		round_trip_check(&Response::Imported(Codeless::new(
+			result.into_inner(),
+		)));
+	}
+
+	/// `Codeless` is the bare payload on the wire: the frames are byte for
+	/// byte what a worker sent before the type existed.
+	#[test]
+	fn codeless_frames_are_byte_identical_to_bare_payloads() {
+		#[derive(Serialize)]
+		#[serde(tag = "reply", rename_all = "snake_case")]
+		enum Bare<'a> {
+			Repos(&'a RepoScan),
+			Imported(&'a snip_core::restore::RestoreExecutionResult),
+			Replayed(&'a snip_core::commits::ReplayResult),
+		}
+		let scan = RepoScan {
+			repos: vec![ScannedRepo {
+				rel: "sub".into(),
+				utf8: true,
+				name: "sub".into(),
+				kind: FoundKind::Main,
+				summary: Err("x".into()),
+				reason: Some(Reason::TimedOut),
+			}],
+			errors: vec![("a".into(), "first".into())],
+			error_reasons: vec![Some(Reason::GitBusy)],
+			error_overflow: 0,
+			depth_limited: Vec::new(),
+			depth_overflow: 0,
+			status: ScanStatus::Complete,
+		};
+		let restore = snip_core::restore::RestoreExecutionResult {
+			created_count: 1,
+			errors: vec!["x: denied".into()],
+			failures: vec![snip_core::restore::RestoreFailure {
+				path: "x".into(),
+				reason: Some(Reason::Cancelled),
+			}],
+			..Default::default()
+		};
+		let replay = snip_core::commits::ReplayResult {
+			created: vec!["abcd".into()],
+			failure: None,
+		};
+		for (wire, bare) in [
+			(
+				Response::Repos(Codeless::new(scan.clone())),
+				serde_json::to_string(&Bare::Repos(&scan)).unwrap(),
+			),
+			(
+				Response::Imported(Codeless::new(restore.clone())),
+				serde_json::to_string(&Bare::Imported(&restore)).unwrap(),
+			),
+			(
+				Response::Replayed(Codeless::new(replay.clone())),
+				serde_json::to_string(&Bare::Replayed(&replay)).unwrap(),
+			),
+		] {
+			assert_eq!(serde_json::to_string(&wire).unwrap(), bare);
+		}
 	}
 
 	#[test]
@@ -2365,11 +2430,12 @@ mod prepared_metadata_tests {
 		// What develop sent for the same result: no typed failures.
 		let mut legacy = result.clone();
 		legacy.failures.clear();
-		let expected = Response::Imported(result);
+		let expected = Response::Imported(Codeless::new(result));
 		let new_len = serde_json::to_string(&expected).unwrap().len();
-		let old_len = serde_json::to_string(&Response::Imported(legacy))
-			.unwrap()
-			.len();
+		let old_len =
+			serde_json::to_string(&Response::Imported(Codeless::new(legacy)))
+				.unwrap()
+				.len();
 		assert!(new_len > MAX_FRAME, "the fixture must pass a frame");
 		assert!(
 			new_len < old_len * 3,
