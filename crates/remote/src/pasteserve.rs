@@ -139,7 +139,11 @@ fn check_snapshot(
 			.iter()
 			.all(|(p, t)| inside(p) && inside(t.root.path()))
 		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p))
-		&& freshness.symlinked_dirs.iter().flatten().all(|p| inside(p));
+		&& freshness
+			.symlinked_dirs
+			.iter()
+			.flat_map(|m| m.keys())
+			.all(|p| inside(p));
 	if ok {
 		Ok(())
 	} else {

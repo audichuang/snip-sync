@@ -764,12 +764,13 @@ pub struct DestinationFreshnessSnapshot {
 	/// symlink there is stale.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub missing_dirs: Option<HashSet<PathBuf>>,
-	/// Folders on a planned create's path that were symlinks to a folder at
-	/// preview (below the target's root). A folder that is a symlink now but
-	/// was not one then would carry the write somewhere the preview did not
-	/// show, so it is stale. `None`: not recorded.
+	/// Folders on a planned target's path that were symlinks to a folder at
+	/// preview (below the target's root), each with the canonical folder it
+	/// pointed at then. A folder that is a symlink now but was not one then,
+	/// or that points elsewhere, would carry the write somewhere the preview
+	/// did not show, so it is stale. `None`: not recorded.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub symlinked_dirs: Option<HashSet<PathBuf>>,
+	pub symlinked_dirs: Option<HashMap<PathBuf, PathBuf>>,
 }
 
 impl DestinationFreshnessSnapshot {
@@ -817,16 +818,24 @@ impl DestinationFreshnessSnapshot {
 					);
 			}
 		}
-		for dirs in [&self.missing_dirs, &self.symlinked_dirs]
-			.into_iter()
-			.flatten()
-		{
+		if let Some(dirs) = &self.missing_dirs {
 			bytes = bytes
 				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
 					dirs.capacity(),
 				));
 			for dir in dirs {
 				bytes = bytes.saturating_add(dir.capacity());
+			}
+		}
+		if let Some(dirs) = &self.symlinked_dirs {
+			bytes = bytes
+				.saturating_add(fresh_capture_table_bytes::<PathBuf, PathBuf>(
+					dirs.capacity(),
+				));
+			for (dir, target) in dirs {
+				bytes = bytes
+					.saturating_add(dir.capacity())
+					.saturating_add(target.capacity());
 			}
 		}
 		bytes
@@ -1082,7 +1091,7 @@ impl DestinationFreshnessSnapshot {
 									.map_err(TransferError::Io)?
 									.file_type()
 									.is_symlink();
-								if now_a_link && !linked.contains(dir) {
+								if now_a_link && !linked.contains_key(dir) {
 									return Err(
 										created_where_a_folder_was_needed_at(
 											root, dir,
@@ -1218,9 +1227,9 @@ fn not_a_directory() -> io::Error {
 fn capture_folder_chain(
 	plan: &RestorePlan,
 	opts: &RunOptions,
-) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>), TransferError> {
+) -> Result<(HashSet<PathBuf>, HashMap<PathBuf, PathBuf>), TransferError> {
 	let mut missing = HashSet::new();
-	let mut linked = HashSet::new();
+	let mut linked = HashMap::new();
 	let mut seen = HashSet::new();
 	for op in &plan.create_operations {
 		cancelled_err(opts, "import-freshness")?;
@@ -1243,7 +1252,10 @@ fn capture_folder_chain(
 					if meta.file_type().is_symlink()
 						&& fs::metadata(d).is_ok_and(|m| m.is_dir()) =>
 				{
-					linked.insert(d.to_path_buf());
+					linked.insert(
+						d.to_path_buf(),
+						dunce::canonicalize(d).map_err(TransferError::Io)?,
+					);
 				}
 				Ok(_) => return Err(TransferError::Io(not_a_directory())),
 				Err(e)
