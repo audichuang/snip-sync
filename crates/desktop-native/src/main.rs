@@ -29586,6 +29586,49 @@ mod tests {
 				assert_eq!(file(&ws.join("sub/a.ts")).as_deref(), Some("x"));
 			}
 
+			/// A new paste opened on a folder the engine refuses as it
+			/// stands (a regular file `sub` is where the directory `sub/`
+			/// would go) lands like a retarget does: the panel stays open,
+			/// not executable, with the restore-base suggestion, and
+			/// [Adjust paths] recovers it (#240).
+			#[gpui::test]
+			fn a_new_paste_into_a_refused_folder_still_offers_the_adjustment(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				fs::create_dir(ws.join("sub")).unwrap();
+				fs::write(ws.join("sub/sub"), "a file named like its folder")
+					.unwrap();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text(
+					"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+				)
+				.unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:sub");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("sub"));
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(!plan.executable());
+					assert!(plan.error.is_some(), "the engine refused it");
+				});
+				assert!(
+					cx.debug_bounds("paste-restore-base").is_some(),
+					"the refusal closed the panel and lost the way back"
+				);
+
+				click_probed(&model, cx, "paste-adjust");
+				landed(&model, cx);
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(plan.executable(), "{:?}", plan.error);
+				});
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("sub/a.ts")).as_deref(), Some("x"));
+			}
+
 			/// `multi_repo_ws` plus folders whose names begin or end with a
 			/// space, or are nothing else (a real name on a real disk), next
 			/// to the plain ones they would be mistaken for. Unix only: Win32
