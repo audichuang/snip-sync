@@ -2328,4 +2328,50 @@ mod prepared_metadata_tests {
 		assert!(count > 1);
 		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
 	}
+	/// A restore result whose JSON passes a frame (thousands of long failed
+	/// paths beside a success) is joined from chunks, and arrives whole.
+	#[test]
+	fn imported_larger_than_a_frame_is_joined_whole() {
+		use snip_core::restore::{RestoreExecutionResult, RestoreFailure};
+		let mut result = RestoreExecutionResult {
+			created_count: 1,
+			..Default::default()
+		};
+		for i in 0..24_000 {
+			let path = format!("{i:05}{}", "p".repeat(175));
+			result.errors.push(format!("{path}: denied"));
+			result.failures.push(RestoreFailure {
+				path,
+				reason: Some(snip_core::reason::Reason::UnsafePath {
+					path: String::new(),
+				}),
+			});
+		}
+		// What develop sent for the same result: no typed failures.
+		let mut legacy = result.clone();
+		legacy.failures.clear();
+		let expected = Response::Imported(result);
+		let new_len = serde_json::to_string(&expected).unwrap().len();
+		let old_len = serde_json::to_string(&Response::Imported(legacy))
+			.unwrap()
+			.len();
+		assert!(new_len > MAX_FRAME, "the fixture must pass a frame");
+		assert!(
+			new_len < old_len * 3,
+			"typed failures stay a small factor of the legacy lines"
+		);
+		let mut bytes = Vec::new();
+		crate::jobs::write_response(&mut bytes, &expected).unwrap();
+		let mut reader = std::io::Cursor::new(bytes);
+		let mut json = String::new();
+		loop {
+			match read_frame::<Response>(&mut reader).unwrap().unwrap() {
+				Response::Chunk { data } => json.push_str(&data),
+				Response::Joined => break,
+				other => panic!("not delivered whole: {other:?}"),
+			}
+		}
+		assert!(json.len() <= JOINED_MAX);
+		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
+	}
 }
