@@ -348,6 +348,7 @@ impl WorkbenchModel {
 				edit.error = None;
 			}
 			self.pending_focus = Some(self.paste_dest_input.read(cx).handle());
+			app_log!("[APP:PASTE_DEST_EDIT: open]");
 		} else {
 			self.open_overlay(
 				OverlayKind::PasteDestField,

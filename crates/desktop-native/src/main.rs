@@ -2620,6 +2620,9 @@ impl WorkbenchModel {
 		self.paste.invalidate_job();
 		if !self.paste_busy() {
 			self.paste.clear(self.preview.as_ref());
+			// A vanished repo or a wiped remote scan ends the preview here,
+			// not through `restore_log_after_paste`: its typed field too.
+			self.drop_paste_dest_edit();
 		}
 		self.discovery = None;
 		self.discovery_status = None;
