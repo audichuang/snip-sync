@@ -2670,6 +2670,75 @@ fn a_path_with_no_file_name_is_not_the_missing_destination_on_either_side() {
 	}
 }
 
+/// R10: when the restore base is Add, a path with no file name in the payload
+/// is not the folder Add names, on a worker and locally: it is skipped, and
+/// the files beside it land where Add puts them.
+#[test]
+fn add_does_not_turn_a_path_without_a_file_name_into_its_folder_on_either_side()
+{
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local = tmp.path().join("local");
+	for root in [&ws, &local] {
+		fs::create_dir_all(root.join("proj/src/lib")).unwrap();
+	}
+	let text = [
+		entry("lib/a.rs", "A"),
+		entry("lib/b.rs", "B"),
+		entry(".", "DOT"),
+		entry("./", "SLASH"),
+		entry("c.txt", "C"),
+	]
+	.concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = remote_target(client, id, "proj");
+	let here = PasteTarget::Local {
+		dest: local.join("proj"),
+		bound: None,
+	};
+	let route = PasteRoute {
+		adjust_paths: true,
+		..Default::default()
+	};
+	let expected = ["src/c.txt", "src/lib/a.rs", "src/lib/b.rs"];
+	for (name, target, dir) in
+		[("worker", &remote, &ws), ("local", &here, &local)]
+	{
+		let mut base = None;
+		let mut note = |s: &snip_core::restore::RestoreBaseSuggestion| {
+			base = Some(s.base.clone())
+		};
+		let plan = target
+			.plan_files(&text, &route, &RunOptions::default(), Some(&mut note))
+			.unwrap();
+		assert_eq!(
+			base,
+			Some(snip_core::restore::RestoreBase::Add {
+				prefix: "src".into()
+			}),
+			"{name}"
+		);
+		let mut planned: Vec<String> = plan
+			.restore_plan()
+			.create_operations
+			.iter()
+			.map(|op| op.relative_path.clone())
+			.collect();
+		planned.sort();
+		assert_eq!(planned, expected, "{name}");
+		let result = target
+			.apply_files(&text, &route, &plan, &RestoreSelection::default())
+			.unwrap();
+		assert_eq!(result.created_count, 3, "{name}");
+		for rel in expected {
+			assert!(dir.join("proj").join(rel).is_file(), "{name} {rel}");
+		}
+		assert!(dir.join("proj/src/lib").is_dir(), "{name}");
+	}
+}
+
 /// R8: a worker's planning does not write into the empty folder it only
 /// reads, the mtime the proof: a probe file made and removed there moves it.
 #[cfg(unix)]

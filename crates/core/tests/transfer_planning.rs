@@ -8845,6 +8845,19 @@ fn pathless_entries(ws: &Path, dest: &Path) -> Vec<(String, ImportMapping)> {
 			),
 		));
 	}
+	// Add puts a folder in front of every relative path: a path with no file
+	// name in it stays without one, and is not the folder it was put under.
+	for raw in [".", "./", "./.", ".//"] {
+		out.push((
+			raw.to_string(),
+			ImportMapping::from_restore_base(
+				&base(RestoreBase::Add {
+					prefix: "src".into(),
+				}),
+				to(dest),
+			),
+		));
+	}
 	// An absolute path that names the destination itself.
 	for suffix in ["", "/"] {
 		out.push((
@@ -8888,6 +8901,46 @@ fn test_a_routed_path_without_a_file_name_is_skipped_below_any_destination() {
 				assert!(dest.is_dir(), "{raw:?} replaced the destination");
 			}
 		}
+	}
+}
+
+/// P1c: under Add, a path with no file name beside a real file is skipped
+/// alone; the real file lands below the folder Add names. Before, `.` became
+/// `src`, a plain file where the folder `src` was to be, and the real file
+/// failed with "File exists" at Apply.
+#[test]
+fn test_add_skips_a_path_without_a_file_name_beside_a_real_file() {
+	for exists in [true, false] {
+		let (_tmp, ws) = canonical_tmp();
+		let dest = ws.join("new");
+		if exists {
+			fs::create_dir_all(&dest).unwrap();
+		}
+		let mapping = ImportMapping::from_restore_base(
+			&base(RestoreBase::Add {
+				prefix: "src".into(),
+			}),
+			placed(&dest),
+		);
+		let plan = plan_placed(
+			&ws,
+			"// file: .\nDOT\n// file: ./\nSLASH\n// file: a.txt\nA\n",
+			&mapping,
+		);
+		assert_eq!(
+			create_paths(&plan),
+			vec![(ws.join("new/src/a.txt"), "new/src/a.txt".to_string())],
+			"exists={exists}"
+		);
+		assert!(plan
+			.skipped_operations()
+			.iter()
+			.any(|s| s.reason == SkipReason::UnresolvedPath));
+		let sel = confirmed(&plan, RestoreSelection::default());
+		let result = plan.apply(&sel).unwrap();
+		assert_eq!(result.created_count, 1, "exists={exists}");
+		assert!(ws.join("new/src").is_dir(), "exists={exists}");
+		assert_eq!(fs::read_to_string(ws.join("new/src/a.txt")).unwrap(), "A");
 	}
 }
 
