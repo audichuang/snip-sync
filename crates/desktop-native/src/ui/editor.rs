@@ -294,6 +294,7 @@ impl WorkbenchModel {
 			);
 		div()
 			.id("find-bar")
+			.debug_selector(|| OverlayKind::FindBar.panel_selector().into())
 			.relative()
 			.flex()
 			.flex_row()
@@ -389,7 +390,13 @@ impl WorkbenchModel {
 					true,
 					39,
 				)
-				.on_click(cx.listener(|this, _, _, cx| this.close_find(cx)))
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.close_overlay(
+						crate::overlay::OverlayKind::FindBar,
+						crate::overlay::CloseWhy::Picked,
+						cx,
+					)
+				}))
 				.children(probe(log, "btn-find-close")),
 			)
 			.children(probe(log, "find-bar"))
@@ -601,16 +608,6 @@ impl WorkbenchModel {
 				.on_action(cx.listener(|this, _: &ReaderPageDown, _, cx| {
 					this.move_cursor_line(30, cx)
 				}))
-				.on_action(cx.listener(|this, _: &ReaderClear, _, cx| {
-					// Esc clears the selection, then closes the find bar.
-					if this.reader.selection().is_some() {
-						this.reader.anchor = None;
-						this.reader.head = None;
-						cx.notify();
-					} else {
-						this.close_find(cx);
-					}
-				}))
 				.flex()
 				.flex_col()
 				.flex_1()
@@ -710,7 +707,10 @@ impl WorkbenchModel {
 					})
 					.child(toolbar),
 			)
-			.when(self.reader.find_open, |d| d.child(self.find_bar(cx)))
+			.when(
+				self.overlays.is_open(crate::overlay::OverlayKind::FindBar),
+				|d| d.child(self.find_bar(cx)),
+			)
 			.child(body)
 			.into_any_element()
 	}

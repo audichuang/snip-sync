@@ -140,12 +140,20 @@ impl WorkbenchModel {
 						12,
 					)
 					.debug_selector(|| "btn-add-repo".into())
-					.when(self.is_adding_repo, |b| {
-						b.bg(rgb(pal().rail_active_bg))
-					})
-					.on_click(cx.listener(|this, _, _, cx| {
-						this.is_adding_repo = !this.is_adding_repo;
-						cx.notify();
+					.when(
+						self.overlays
+							.is_open(crate::overlay::OverlayKind::AddRepoField),
+						|b| b.bg(rgb(pal().rail_active_bg)),
+					)
+					.on_click(cx.listener(|this, _, window, cx| {
+						let ret = this.return_here(window, cx);
+						this.toggle_overlay(
+							crate::overlay::OverlayKind::AddRepoField,
+							None,
+							ret,
+							Some(window),
+							cx,
+						);
 					}))
 					.children(probe(&self.probes, "btn-add-repo")),
 				)
@@ -311,28 +319,34 @@ impl WorkbenchModel {
 			.bg(rgb(pal().panel_bg))
 			.rounded(px(ISLAND_RADIUS))
 			.child(header)
-			.when(is_project && self.is_adding_repo, |d| {
-				d.child(
-					div()
-						.flex()
-						.flex_row()
-						.items_center()
-						.px(px(6.))
-						.py(px(4.))
-						.gap(px(4.))
-						.child(
-							div()
-								.flex_1()
-								.id(SharedString::from("input-add-repo"))
-								.debug_selector(|| "input-add-repo".into())
-								.child(self.add_repo_input.clone())
-								.children(probe(
-									&self.probes,
-									"input-add-repo",
-								)),
-						),
-				)
-			})
+			.when(
+				is_project
+					&& self
+						.overlays
+						.is_open(crate::overlay::OverlayKind::AddRepoField),
+				|d| {
+					d.child(
+						div()
+							.flex()
+							.flex_row()
+							.items_center()
+							.px(px(6.))
+							.py(px(4.))
+							.gap(px(4.))
+							.child(
+								div()
+									.flex_1()
+									.id(SharedString::from("input-add-repo"))
+									.debug_selector(|| "input-add-repo".into())
+									.child(self.add_repo_input.clone())
+									.children(probe(
+										&self.probes,
+										"input-add-repo",
+									)),
+							),
+					)
+				},
+			)
 			.when(is_project && !self.discovery_errors.is_empty(), |d| {
 				let err_msg = crate::i18n::Msg::new(
 					"scan_errors_count",
@@ -638,26 +652,31 @@ impl WorkbenchModel {
 					.rounded(px(4.))
 					.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
 					.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(self.chrome.menu.is_none(), |d| {
-						// Carries the locale-dependent counts legend (#208).
-						// Found by root, not row position: a rescan can
-						// reorder or shrink `repos` under an open tooltip.
-						let model = cx.weak_entity();
-						let root = repo.root.clone();
-						d.tooltip(live_tip(move |cx| {
-							model
-								.upgrade()
-								.and_then(|m| {
-									let m = m.read(cx);
-									m.repos
-										.iter()
-										.find(|r| r.root == root)
-										.map(|r| m.project_repo_tooltip(r))
-								})
-								.unwrap_or_default()
-								.into()
-						}))
-					})
+					.when(
+						!self
+							.overlays
+							.is_open(crate::overlay::OverlayKind::ContextMenu),
+						|d| {
+							// Carries the locale-dependent counts legend (#208).
+							// Found by root, not row position: a rescan can
+							// reorder or shrink `repos` under an open tooltip.
+							let model = cx.weak_entity();
+							let root = repo.root.clone();
+							d.tooltip(live_tip(move |cx| {
+								model
+									.upgrade()
+									.and_then(|m| {
+										let m = m.read(cx);
+										m.repos
+											.iter()
+											.find(|r| r.root == root)
+											.map(|r| m.project_repo_tooltip(r))
+									})
+									.unwrap_or_default()
+									.into()
+							}))
+						},
+					)
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.tree_cursor = ix;
 						this.toggle_repo_row(idx, cx);

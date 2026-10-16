@@ -11,10 +11,11 @@ use crate::githost::GitHost;
 use crate::graph_view;
 use crate::i18n::Msg;
 use crate::multi_log;
+use crate::overlay::{CloseWhy, OverlayKind, ReturnFocus, TriggerId};
 use crate::reader::{fnv1a, Preview, PreviewSource};
 use crate::syntax::Language;
 use crate::{e2e_on, WorkbenchModel, WorkbenchTab};
-use gpui::{Context, ScrollStrategy};
+use gpui::{Context, ScrollStrategy, Window};
 use snip_core::browser::{self, BlobText, CommitSummary, TreeEntry, TreeKind};
 use snip_core::gitsrc::GitSource;
 use snip_core::gitview::{ChangedPathList, Read, ReadProfile, RepoView};
@@ -1883,7 +1884,7 @@ impl WorkbenchModel {
 		author: Option<String>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_filter.author = author
 			.filter(|a| !a.is_empty())
 			.map(|a| clip_utf8(a, MAX_USER_EMAIL));
@@ -1896,7 +1897,7 @@ impl WorkbenchModel {
 		since: Option<&'static str>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_date_error = false;
 		self.log_filter.since = since.map(str::to_string);
 		self.log_filter.until = None;
@@ -1911,7 +1912,7 @@ impl WorkbenchModel {
 		match date_range(&since, &until) {
 			Some((since, until)) => {
 				// The fields go with the menu; the log keeps the keyboard.
-				self.dismiss_log_menu(cx);
+				self.close_log_menus(CloseWhy::Picked, cx);
 				self.log_date_error = false;
 				self.log_filter.since = since;
 				self.log_filter.until = until;
@@ -1990,7 +1991,7 @@ impl WorkbenchModel {
 
 	/// Repo chip ✕ outside a repository scope: every path.
 	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_filter.paths.clear();
 		self.apply_log_filter(cx);
 	}
@@ -2016,68 +2017,23 @@ impl WorkbenchModel {
 		}
 	}
 
-	pub fn toggle_log_menu(
+	/// A press on a Log chip, or on More: opens its dropdown, or closes the
+	/// one that control opened. The keyboard goes back to the Log.
+	pub(crate) fn toggle_log_menu(
 		&mut self,
 		menu: crate::ui::LogMenu,
+		trigger: TriggerId,
+		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		// The click that dismissed this menu (mouse down outside it) lands on
-		// its own chip: that click closes, it does not reopen.
-		// ponytail: time window, not hit testing; a >400ms press reopens.
-		if let Some((m, at)) = self.log_menu_dismissed.take() {
-			if m == menu && at.elapsed() < std::time::Duration::from_millis(400)
-			{
-				cx.notify();
-				return;
-			}
-		}
-		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
-		if self.log_menu == Some(crate::ui::LogMenu::Repo) {
-			self.pending_focus =
-				Some(self.log_path_input.read(cx).handle().clone());
-			self.load_picker_dir("", cx);
-		}
-		// IntelliJ's Branch popup opens with an empty field, sections shut.
-		if self.log_menu == Some(crate::ui::LogMenu::Branch) {
-			self.log_branch_menu_input
-				.update(cx, |i, _| i.clear_retained());
-			self.log_branch_menu_open.clear();
-			self.pending_focus =
-				Some(self.log_branch_menu_input.read(cx).handle().clone());
-		}
-		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
-		cx.notify();
-	}
-
-	/// Esc in a dropdown's field: the log keeps the keyboard, not the
-	/// field that is no longer drawn.
-	pub fn dismiss_log_menu(&mut self, cx: &mut Context<Self>) {
-		self.close_log_menu(cx);
-		self.pending_focus = Some(self.log_focus.clone());
-	}
-
-	/// Closes every workbench popover that is open: the workspace menu, the
-	/// log dropdown and the Repo/Ref selector. True when something was open.
-	/// Only a closed log dropdown hands the focus to the log list.
-	pub fn close_open_popovers(&mut self, cx: &mut Context<Self>) -> bool {
-		let open = self.workspace_menu
-			|| self.log_menu.is_some()
-			|| self.popover.is_some();
-		self.close_popover(cx);
-		if self.workspace_menu {
-			self.close_workspace_menu(cx);
-		}
-		if self.log_menu.is_some() {
-			self.dismiss_log_menu(cx);
-		}
-		open
-	}
-
-	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
-		if let Some(menu) = self.log_menu.take() {
-			self.log_menu_dismissed = Some((menu, std::time::Instant::now()));
-			cx.notify();
-		}
+		let ret = ReturnFocus::To(self.log_focus.clone());
+		self.toggle_overlay(
+			OverlayKind::LogMenu(menu),
+			Some(trigger),
+			ret,
+			Some(window),
+			cx,
+		);
 	}
 
 	/// Authors offered by the User chip: the loaded commits' authors, in
@@ -3766,7 +3722,7 @@ impl WorkbenchModel {
 		roots: Vec<PathBuf>,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		self.log_repo_filter = roots;
 		self.apply_log_repo_filter(cx);
 	}

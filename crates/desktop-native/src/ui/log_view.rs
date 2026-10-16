@@ -50,15 +50,21 @@ impl WorkbenchModel {
 				log_icon_button_tip(
 					"btn-log-more",
 					Icon::More,
-					(self.log_menu != Some(LogMenu::More))
+					(self.overlays.log_menu() != Some(LogMenu::More))
 						.then(|| t("tip_log_more", loc).into()),
 					true,
-					self.log_menu == Some(LogMenu::More),
+					self.overlays.log_menu() == Some(LogMenu::More),
 				)
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.toggle_log_menu(LogMenu::More, cx)
+				.on_click(cx.listener(|this, _, window, cx| {
+					this.toggle_log_menu(
+						LogMenu::More,
+						TriggerId::LogMoreButton,
+						window,
+						cx,
+					)
 				}))
-				.when(self.log_menu == Some(LogMenu::More), |d| {
+				.child(self.overlay_trigger_slot(TriggerId::LogMoreButton))
+				.when(self.overlays.log_menu() == Some(LogMenu::More), |d| {
 					d.child(self.log_menu_panel(LogMenu::More, cx))
 				})
 				.children(probe(log, "btn-log-more")),
@@ -455,7 +461,7 @@ impl WorkbenchModel {
 										.bg(rgb(pal().error_bg))
 										.text_size(px(SMALL_TEXT))
 										.text_color(rgb(pal().error))
-										.when(self.chrome.menu.is_none(), |d| {
+										.when(!self.overlays.is_open(crate::overlay::OverlayKind::ContextMenu), |d| {
 											d.tooltip(tip(self
 												.failed_feed_names()
 												.join("\n")))
@@ -634,7 +640,9 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		// Row tooltips are off while a context menu is open (they would
 		// draw over it).
-		let show_tips = self.chrome.menu.is_none();
+		let show_tips = !self
+			.overlays
+			.is_open(crate::overlay::OverlayKind::ContextMenu);
 		// Every selected row (a range selects its anchor's repository only).
 		let selected = self.log_is_selected(&c.sha);
 		let sha = c.sha.clone();
@@ -1161,9 +1169,12 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(self.chrome.menu.is_none(), |d| {
-						d.tooltip(tip(path.clone()))
-					})
+					.when(
+						!self
+							.overlays
+							.is_open(crate::overlay::OverlayKind::ContextMenu),
+						|d| d.tooltip(tip(path.clone())),
+					)
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
 						let key = key.clone();
@@ -1277,14 +1288,19 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(self.chrome.menu.is_none(), |d| {
-						let mut tip_text = format!("{path}  ({letter})");
-						if let Some(note) = &same_note {
-							tip_text.push('\n');
-							tip_text.push_str(note);
-						}
-						d.tooltip(tip(tip_text))
-					})
+					.when(
+						!self
+							.overlays
+							.is_open(crate::overlay::OverlayKind::ContextMenu),
+						|d| {
+							let mut tip_text = format!("{path}  ({letter})");
+							if let Some(note) = &same_note {
+								tip_text.push('\n');
+								tip_text.push_str(note);
+							}
+							d.tooltip(tip(tip_text))
+						},
+					)
 					.on_click(cx.listener(
 						move |this, ev: &gpui::ClickEvent, _, cx| {
 							// Cmd on macOS, Ctrl elsewhere toggles the file;

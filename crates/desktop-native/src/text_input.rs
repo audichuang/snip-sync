@@ -42,7 +42,6 @@ gpui::actions!(
 		Copy,
 		Submit,
 		SubmitPrev,
-		Dismiss,
 		MoveUp,
 		MoveDown,
 	]
@@ -72,7 +71,6 @@ pub fn bindings() -> Vec<gpui::KeyBinding> {
 		KeyBinding::new("cmd-x", Cut, c),
 		KeyBinding::new("enter", Submit, c),
 		KeyBinding::new("shift-enter", SubmitPrev, c),
-		KeyBinding::new("escape", Dismiss, c),
 		KeyBinding::new("up", MoveUp, c),
 		KeyBinding::new("down", MoveDown, c),
 	]
@@ -84,7 +82,6 @@ pub enum InputEvent {
 	Changed,
 	Submit,
 	SubmitPrev,
-	Dismiss,
 	Up,
 	Down,
 }
@@ -991,9 +988,6 @@ impl Render for TextInput {
 			}))
 			.on_action(cx.listener(|this, _: &SubmitPrev, _, cx| {
 				this.emit(InputEvent::SubmitPrev, cx)
-			}))
-			.on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-				this.emit(InputEvent::Dismiss, cx)
 			}))
 			.on_action(cx.listener(|this, _: &MoveUp, _, cx| {
 				this.emit(InputEvent::Up, cx)

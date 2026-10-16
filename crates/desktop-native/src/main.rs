@@ -273,6 +273,7 @@ pub mod lifecycle;
 mod menu;
 mod multi_log;
 pub mod open_tabs;
+mod overlay;
 pub mod paste;
 mod reader;
 mod reason;
@@ -326,7 +327,6 @@ actions!(
 		CopySelection,
 		PastePreview,
 		ApplyPaste,
-		CancelPaste,
 		Refresh,
 		NavUp,
 		NavDown,
@@ -356,7 +356,6 @@ actions!(
 		ReaderDown,
 		ReaderPageUp,
 		ReaderPageDown,
-		ReaderClear,
 		TreeUp,
 		TreeDown,
 		TreeExpand,
@@ -377,7 +376,6 @@ actions!(
 		MenuUp,
 		MenuDown,
 		MenuConfirm,
-		MenuCancel,
 		LogParent,
 		LogChild,
 		LogPageUp,
@@ -385,7 +383,6 @@ actions!(
 		ToolPageUp,
 		ToolPageDown,
 		HideToolWindow,
-		FocusEditor,
 		OpenTabMenu,
 		// Workspace tabs.
 		PrevWorkspaceTab,
@@ -735,7 +732,7 @@ impl From<snip_core::gitview::FoundRepo> for RepoEntry {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Popover {
 	Repo,
 	Ref,
@@ -855,9 +852,6 @@ pub struct WorkbenchModel {
 	pub log_on_head: Vec<bool>,
 	/// The filter bar as edited; `log_search` is what the log shows.
 	pub log_filter: LogQuery,
-	pub log_menu: Option<ui::LogMenu>,
-	/// The menu a mouse-down outside it just closed, and when.
-	pub log_menu_dismissed: Option<(ui::LogMenu, std::time::Instant)>,
 	pub log_path_input: Entity<TextInput>,
 	/// The Branch chip's filter field, and its opened sections.
 	pub log_branch_menu_input: Entity<TextInput>,
@@ -936,8 +930,8 @@ pub struct WorkbenchModel {
 	pub goto_input: Entity<TextInput>,
 	pub log_search_input: Entity<TextInput>,
 	pub selector_input: Entity<TextInput>,
-	pub popover: Option<Popover>,
-	pub popover_cursor: usize,
+	/// Every floating and inline layer, and the rules they share.
+	pub(crate) overlays: overlay::OverlayStack,
 
 	/// Project rows stay selected across a tree rebuild (repo switch,
 	/// Refresh): an outgoing tree leaves its selected paths here, by root.
@@ -972,7 +966,6 @@ pub struct WorkbenchModel {
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
 	restore_ws_expanded: Vec<String>,
 	add_cancel: Option<CancelToken>,
-	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
@@ -1040,12 +1033,6 @@ pub struct WorkbenchModel {
 	#[cfg(test)]
 	pub(crate) e2e_paste_diff_hold: Option<std::time::Duration>,
 	pub workspace_open: bool,
-	pub workspace_menu: bool,
-	/// Where the workspace menu button was drawn: a press there toggles the
-	/// menu, so the menu's outside-press close must leave it alone.
-	pub workspace_menu_button:
-		std::rc::Rc<std::cell::Cell<Option<Bounds<gpui::Pixels>>>>,
-	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
 	/// Remembered workspaces, newest first.
 	pub recent_workspaces: Vec<PathBuf>,
@@ -1229,7 +1216,6 @@ impl WorkbenchModel {
 					let p = input.read(cx).text().trim().to_string();
 					this.add_log_path(p, cx);
 				}
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
 				// The picker filters by the text as it is typed.
 				InputEvent::Changed => cx.notify(),
 				_ => {}
@@ -1239,20 +1225,18 @@ impl WorkbenchModel {
 		let log_branch_menu_input = cx.new(|cx| {
 			TextInput::new(i18n::t("log_branch_placeholder", loc), 0, cx)
 		});
-		cx.subscribe(&log_branch_menu_input, |this, _, ev: &InputEvent, cx| {
-			match ev {
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
-				InputEvent::Changed => cx.notify(),
-				_ => {}
+		cx.subscribe(&log_branch_menu_input, |_, _, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Changed) {
+				cx.notify();
 			}
 		})
 		.detach();
 		let date_input = |key: &'static str, cx: &mut Context<Self>| {
 			let input = cx.new(|cx| TextInput::new(i18n::t(key, loc), 0, cx));
-			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => this.apply_log_date_range(cx),
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
-				_ => {}
+			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
+					this.apply_log_date_range(cx);
+				}
 			})
 			.detach();
 			input
@@ -1283,32 +1267,22 @@ impl WorkbenchModel {
 				InputEvent::SubmitPrev | InputEvent::Up => {
 					this.find_step(false, cx)
 				}
-				InputEvent::Dismiss => this.close_find(cx),
 			}
 		})
 		.detach();
-		cx.subscribe(
-			&goto_input,
-			|this, input, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => {
-					let q = input.read(cx).text().to_string();
-					this.goto_line(&q, cx);
-					this.pending_focus = Some(this.reader_focus.clone());
-				}
-				InputEvent::Dismiss => this.close_find(cx),
-				_ => {}
-			},
-		)
+		cx.subscribe(&goto_input, |this, input, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Submit) {
+				let q = input.read(cx).text().to_string();
+				this.goto_line(&q, cx);
+				this.pending_focus = Some(this.reader_focus.clone());
+			}
+		})
 		.detach();
 		cx.subscribe(&log_search_input, |this, input, ev: &InputEvent, cx| {
 			match ev {
 				InputEvent::Submit => {
 					let q = input.read(cx).text().trim().to_string();
 					this.start_log_search(q, cx);
-				}
-				InputEvent::Dismiss => {
-					input.update(cx, |i, cx| i.set_text("", cx));
-					this.start_log_search(String::new(), cx);
 				}
 				InputEvent::Changed => {
 					let q = input.read(cx).text().trim().to_string();
@@ -1329,20 +1303,17 @@ impl WorkbenchModel {
 			TextInput::new(i18n::t("add_repo_placeholder", loc), 0, cx)
 		});
 		cx.subscribe(&add_repo_input, |this, input, ev: &InputEvent, cx| {
-			match ev {
-				InputEvent::Submit => {
-					let text = input.read(cx).text().trim().to_string();
-					if !text.is_empty() {
-						this.add_repo_path(PathBuf::from(text), cx);
-						input.update(cx, |i, cx| i.set_text("", cx));
-						this.is_adding_repo = false;
-					}
+			if matches!(ev, InputEvent::Submit) {
+				let text = input.read(cx).text().trim().to_string();
+				if !text.is_empty() {
+					this.add_repo_path(PathBuf::from(text), cx);
+					input.update(cx, |i, cx| i.set_text("", cx));
+					this.close_overlay(
+						overlay::OverlayKind::AddRepoField,
+						overlay::CloseWhy::Picked,
+						cx,
+					);
 				}
-				InputEvent::Dismiss => {
-					this.is_adding_repo = false;
-					cx.notify();
-				}
-				_ => {}
 			}
 		})
 		.detach();
@@ -1352,27 +1323,22 @@ impl WorkbenchModel {
 		});
 		cx.subscribe(
 			&workspace_path_input,
-			|this, input, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => {
+			|this, input, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
 					let text = input.read(cx).text().trim().to_string();
 					this.confirm_open_workspace(&text, cx);
 				}
-				InputEvent::Dismiss => this.close_workspace_menu(cx),
-				_ => {}
 			},
 		)
 		.detach();
 		let remote_path_input = cx.new(|cx| {
 			TextInput::new(i18n::t("remote_path_placeholder", loc), 71, cx)
 		});
-		cx.subscribe(
-			&remote_path_input,
-			|this, _, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => this.open_remote_typed(cx),
-				InputEvent::Dismiss => this.close_workspace_menu(cx),
-				_ => {}
-			},
-		)
+		cx.subscribe(&remote_path_input, |this, _, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Submit) {
+				this.open_remote_typed(cx);
+			}
+		})
 		.detach();
 		cx.on_release(|this, _| {
 			this.lifecycle.cancel_cancellable();
@@ -1418,8 +1384,6 @@ impl WorkbenchModel {
 			history_autoload: true,
 			log_on_head: Vec::new(),
 			log_filter: LogQuery::default(),
-			log_menu: None,
-			log_menu_dismissed: None,
 			log_path_input,
 			log_branch_menu_input,
 			log_branch_menu_open: Vec::new(),
@@ -1468,8 +1432,7 @@ impl WorkbenchModel {
 			log_search_input,
 			selector_input,
 			add_repo_input,
-			popover: None,
-			popover_cursor: 0,
+			overlays: overlay::OverlayStack::new(),
 			tree_selections: Vec::new(),
 			history_cancel: None,
 			preview_cancel: None,
@@ -1495,7 +1458,6 @@ impl WorkbenchModel {
 			restore_expanded: Vec::new(),
 			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
-			is_adding_repo: false,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			paste_diff_cancel: None,
 			paste_diff_generation: 0,
@@ -1548,9 +1510,6 @@ impl WorkbenchModel {
 			#[cfg(test)]
 			e2e_paste_diff_hold: None,
 			workspace_open: workspace.is_some(),
-			workspace_menu: false,
-			workspace_menu_button: Default::default(),
-			workspace_picker: false,
 			workspace_path_input,
 			recent_workspaces: recent::load(),
 			lifecycle: lifecycle::Lifecycle::new(1),
@@ -2611,6 +2570,7 @@ impl WorkbenchModel {
 	}
 
 	fn release_workspace_state(&mut self, cx: &mut Context<Self>) {
+		self.drop_overlays(overlay::DropScope::All);
 		self.selected_repo_idx = None;
 		self.release_repo_state();
 		self.ws_tree = None;
@@ -2644,9 +2604,6 @@ impl WorkbenchModel {
 		self.add_cancel = None;
 		self.is_loading = false;
 		self.is_copying = false;
-		self.is_adding_repo = false;
-		self.popover = None;
-		self.popover_cursor = 0;
 		self.scan_cancel = None;
 		self.copy_cancel = None;
 		release_path(&mut self.workspace_root);
@@ -2708,7 +2665,7 @@ impl WorkbenchModel {
 		self.history_autoload = true;
 		release_vec(&mut self.log_on_head);
 		self.log_filter = LogQuery::default();
-		self.log_menu = None;
+		self.drop_overlays(overlay::DropScope::AnyLogMenu);
 		release_vec(&mut self.changed_dirs_collapsed);
 		self.log_date_error = false;
 		release_vec(&mut self.log_paths_expanded);
@@ -2741,19 +2698,12 @@ impl WorkbenchModel {
 	/// a find or a log search.
 	fn clear_workspace_inputs(&mut self, cx: &mut Context<Self>) {
 		self.reader.find_query = String::new();
-		for input in [
-			self.find_input.clone(),
-			self.goto_input.clone(),
-			self.log_search_input.clone(),
-			self.selector_input.clone(),
-			self.add_repo_input.clone(),
-			self.workspace_path_input.clone(),
-			self.log_path_input.clone(),
-			self.log_branch_menu_input.clone(),
-			self.log_since_input.clone(),
-			self.log_until_input.clone(),
-			self.branch_filter_input.clone(),
-		] {
+		let inputs: Vec<_> = self
+			.text_inputs()
+			.into_iter()
+			.map(|(_, input)| input.clone())
+			.collect();
+		for input in inputs {
 			input.update(cx, |field, _| field.clear_retained());
 		}
 	}
@@ -2774,8 +2724,13 @@ impl WorkbenchModel {
 			cx.emit(tabs::TabEvent::Closed);
 			return;
 		}
-		self.workspace_menu = true;
-		self.workspace_picker = false;
+		self.open_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			overlay::ReturnFocus::Root,
+			Some(overlay::TriggerId::Workspace),
+			None,
+			cx,
+		);
 		if e2e_on() {
 			app_log!(
 				"[APP:WORKSPACE: state=closed generation={}]",
@@ -2797,8 +2752,6 @@ impl WorkbenchModel {
 		recent::remember(&mut self.recent_workspaces, &path);
 		self.remote.restoring = None;
 		self.workspace_open = true;
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
 		if e2e_on() {
 			app_log!(
 				"[APP:WORKSPACE: state=open path={} generation={}]",
@@ -2810,38 +2763,40 @@ impl WorkbenchModel {
 		self.reload_repos(cx);
 	}
 
-	/// Escape in one of its fields, or a press outside it.
-	pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
-		cx.notify();
-	}
-
-	/// Closes the workspace menu; its host browse and that browse's ssh end with it (#187).
-	pub(crate) fn hide_workspace_menu(&mut self) {
-		self.workspace_menu = false;
-		self.remote.end_browse();
-	}
-
+	/// The workspace button, without a window: the keyboard goes back to
+	/// the root when the menu closes.
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = !self.workspace_menu;
-		if self.workspace_menu && recent::config_dir().is_some() {
-			// Another workspace tab may have opened something since.
-			self.recent_workspaces = recent::load();
-			self.remote.recent = remote::load_recent();
-		} else if !self.workspace_menu {
-			self.workspace_picker = false;
-			self.remote.end_browse();
-		}
-		cx.notify();
+		self.toggle_workspace_menu_at(None, cx);
+	}
+
+	/// The workspace button (or Cmd+Shift+W / O): a press closes the menu
+	/// it opened.
+	pub(crate) fn toggle_workspace_menu_at(
+		&mut self,
+		window: Option<&mut gpui::Window>,
+		cx: &mut Context<Self>,
+	) {
+		let ret = match window.as_deref() {
+			Some(w) => self.return_here(w, cx),
+			None => overlay::ReturnFocus::Root,
+		};
+		self.toggle_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			Some(overlay::TriggerId::Workspace),
+			ret,
+			window,
+			cx,
+		);
 	}
 
 	/// The OS folder dialog. Without one (Linux with no portal) the typed
 	/// path field opens instead.
 	pub fn open_folder_dialog(&mut self, cx: &mut Context<Self>) {
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
-		cx.notify();
+		self.close_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			overlay::CloseWhy::Picked,
+			cx,
+		);
 		let picked = cx.prompt_for_paths(PathPromptOptions {
 			files: false,
 			directories: true,
@@ -2868,8 +2823,16 @@ impl WorkbenchModel {
 	}
 
 	pub fn show_workspace_picker(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = true;
-		self.workspace_picker = true;
+		if !self.overlays.is_open(overlay::OverlayKind::WorkspaceMenu) {
+			self.open_overlay(
+				overlay::OverlayKind::WorkspaceMenu,
+				overlay::ReturnFocus::Root,
+				Some(overlay::TriggerId::Workspace),
+				None,
+				cx,
+			);
+		}
+		self.overlays.set_workspace_picker(true);
 		self.pending_focus = Some(self.workspace_path_input.read(cx).handle());
 		cx.notify();
 	}
@@ -2911,8 +2874,11 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if self.ws_tab.is_some() {
-			self.hide_workspace_menu();
-			self.workspace_picker = false;
+			self.close_overlay(
+				overlay::OverlayKind::WorkspaceMenu,
+				overlay::CloseWhy::Picked,
+				cx,
+			);
 			cx.emit(tabs::TabEvent::Open(target));
 			cx.notify();
 		} else {
@@ -3034,10 +3000,12 @@ impl WorkbenchModel {
 		self.resume_focus = keep;
 		self.focus_lost_guard = None;
 		self.escape_guard = None;
-		self.chrome.menu = None;
+		// A floating layer needs the pointer and the frame: it does not
+		// outlive the switch, and the host browse it owned ends with it. An
+		// inline layer is part of its pane and stays.
+		self.drop_overlays(overlay::DropScope::Floating);
+		self.overlays.clear_pending_return();
 		self.dragging = None;
-		// A background tab keeps no browse ssh.
-		self.remote.end_browse();
 		cx.notify();
 	}
 
@@ -6448,7 +6416,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("shift-f3", FindPrev, None),
 		// Paste preview panel.
 		KeyBinding::new("enter", ApplyPaste, Some("PastePanel")),
-		KeyBinding::new("escape", CancelPaste, Some("PastePanel")),
 		KeyBinding::new("up", NavUp, Some("PastePanel")),
 		KeyBinding::new("down", NavDown, Some("PastePanel")),
 		KeyBinding::new("space", NavToggle, Some("PastePanel")),
@@ -6460,7 +6427,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("down", ReaderDown, Some("Reader")),
 		KeyBinding::new("pageup", ReaderPageUp, Some("Reader")),
 		KeyBinding::new("pagedown", ReaderPageDown, Some("Reader")),
-		KeyBinding::new("escape", ReaderClear, Some("Reader")),
 		// Project / Changes list.
 		KeyBinding::new("up", TreeUp, Some("ToolList")),
 		KeyBinding::new("down", TreeDown, Some("ToolList")),
@@ -6471,12 +6437,10 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("secondary-d", TreeOpen, Some("ToolList")),
 		KeyBinding::new("pageup", ToolPageUp, Some("ToolList")),
 		KeyBinding::new("pagedown", ToolPageDown, Some("ToolList")),
-		KeyBinding::new("escape", FocusEditor, Some("ToolList")),
 		// Context menu.
 		KeyBinding::new("up", MenuUp, Some("ContextMenu")),
 		KeyBinding::new("down", MenuDown, Some("ContextMenu")),
 		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
-		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
 		KeyBinding::new("ctrl-c", LogCopy, Some("GitLog")),
 		KeyBinding::new("cmd-c", LogCopy, Some("GitLog")),
@@ -6491,7 +6455,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("right", LogChild, Some("GitLog")),
 		KeyBinding::new("pagedown", LogPageDown, Some("GitLog")),
 		KeyBinding::new("pageup", LogPageUp, Some("GitLog")),
-		KeyBinding::new("escape", FocusEditor, Some("GitLog")),
 		// No IntelliJ key for "go to HEAD" in the Log; kept.
 		KeyBinding::new("h", LogHead, Some("GitLog")),
 	];
@@ -7014,7 +6977,12 @@ mod tests {
 			cx: &mut VisualTestContext,
 		) {
 			model.update(cx, |m, cx| {
-				assert!(!m.workspace_menu, "{:?}", m.remote.message);
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"{:?}",
+					m.remote.message
+				);
 				if m.remote.session.is_none() {
 					assert_eq!(
 						m.lifecycle.intent_name(),
@@ -7079,7 +7047,13 @@ mod tests {
 			});
 			cx.run_until_parked();
 			model.update(cx, |m, cx| {
-				m.workspace_menu = true;
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.remote.hosts = hosts;
 				m.remote.recent.clear();
 				cx.notify();
@@ -7144,7 +7118,13 @@ mod tests {
 			cx.run_until_parked();
 			let path = shared.display().to_string();
 			model.update(cx, |m, cx| {
-				m.workspace_menu = true;
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.remote.hosts = vec![host];
 				m.remote.recent.clear();
 				m.browse_remote_host(0, cx);
@@ -7493,7 +7473,12 @@ mod tests {
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
 
-				assert!(m.workspace_open && !m.workspace_menu);
+				assert!(
+					m.workspace_open
+						&& !m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						)
+				);
 				assert_eq!(
 					m.changes_empty_state(),
 					Some(crate::ChangesEmpty::NoRepository)
@@ -7641,7 +7626,12 @@ mod tests {
 			assert_eq!(folders, ["x", "y"]);
 			model.read_with(cx, |m, cx| {
 				assert!(m.remote.session.is_none(), "entering opens nothing");
-				assert!(!m.workspace_open && m.workspace_menu);
+				assert!(
+					!m.workspace_open
+						&& m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						)
+				);
 				assert_eq!(m.lifecycle.intent_name(), "none");
 				assert_eq!(
 					m.remote_path_input.read(cx).text(),
@@ -7706,7 +7696,11 @@ mod tests {
 			});
 			model.read_with(cx, |m, _| {
 				assert!(m.remote.session.is_none());
-				assert!(m.workspace_menu, "the menu stays open");
+				assert!(
+					m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"the menu stays open"
+				);
 				let back =
 					client_of(m).expect("the browse got its client back");
 				assert!(std::sync::Arc::ptr_eq(&back, &c), "same connection");
@@ -7934,7 +7928,11 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape closes the menu");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape closes the menu"
+				);
 				assert!(m.remote.browse.is_none(), "browse ends with the menu");
 			});
 			let mut rounds = 0;
@@ -8311,7 +8309,7 @@ mod tests {
 				.to_string();
 			let (model, cx) = remote_menu(cx);
 			let host = model.update(cx, |m, _| {
-				m.workspace_menu = false;
+				m.drop_overlays(crate::overlay::DropScope::Floating);
 				m.remote.hosts[0].name.clone()
 			});
 
@@ -11542,7 +11540,10 @@ mod tests {
 			cx.simulate_click(open.center(), gpui::Modifiers::none());
 			// The open replies on a worker thread; the menu closes with it.
 			let deadline = std::time::Instant::now() + Duration::from_secs(10);
-			while model.read_with(cx, |m, _| m.workspace_menu) {
+			while model.read_with(cx, |m, _| {
+				m.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu)
+			}) {
 				assert!(
 					std::time::Instant::now() < deadline,
 					"the open never replied"
@@ -11561,7 +11562,11 @@ mod tests {
 			settle(cx);
 			cx.simulate_keystrokes("escape");
 			settle(cx);
-			model.read_with(cx, |m, _| assert!(!m.workspace_menu));
+			model.read_with(cx, |m, _| {
+				assert!(!m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu))
+			});
 			assert!(reaches(cx), "after Escape in the path field");
 		}
 
@@ -11585,7 +11590,9 @@ mod tests {
 			});
 			settle(cx);
 			let field = model.read_with(cx, |m, cx| {
-				assert!(m.workspace_menu);
+				assert!(m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu));
 				m.remote_path_input.read(cx).handle()
 			});
 			assert!(
@@ -11595,7 +11602,11 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape in the path field");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape in the path field"
+				);
 			});
 
 			// Opened by its button, nothing inside focused: Escape still closes.
@@ -11604,11 +11615,19 @@ mod tests {
 				.expect("menu button drawn");
 			cx.simulate_click(button.center(), gpui::Modifiers::none());
 			settle(cx);
-			model.read_with(cx, |m, _| assert!(m.workspace_menu));
+			model.read_with(cx, |m, _| {
+				assert!(m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu))
+			});
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape with no field focused");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape with no field focused"
+				);
 			});
 
 			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
@@ -11619,7 +11638,11 @@ mod tests {
 			cx.simulate_click(button.center(), gpui::Modifiers::none());
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "second press of the button");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"second press of the button"
+				);
 			});
 		}
 
@@ -12199,7 +12222,8 @@ mod tests {
 						b.center().y + gpui::px(dy),
 					);
 					cx.simulate_click(pos, gpui::Modifiers::none());
-					let menu = model.read_with(cx, |m, _| m.log_menu);
+					let menu =
+						model.read_with(cx, |m, _| m.overlays.log_menu());
 					if menu.is_some() {
 						break;
 					}
@@ -12246,8 +12270,14 @@ mod tests {
 				WorkbenchModel::new(None, None, "normal".into(), cx)
 			});
 			cx.run_until_parked();
-			model.update(cx, |m, _| {
-				m.workspace_menu = true;
+			model.update(cx, |m, cx| {
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.recent_workspaces = vec![local.path().to_path_buf()];
 				m.remote.hosts =
 					vec![snip_remote::RemoteHost::in_process(worker.clone())];
@@ -16207,17 +16237,17 @@ mod tests {
 			cx.simulate_keystrokes("alt-shift-r");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.popover, Some(crate::Popover::Repo));
+				assert_eq!(m.overlays.selector(), Some(crate::Popover::Repo));
 			});
 			cx.simulate_keystrokes("down");
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.repos[m.popover_cursor].name, "c");
+				assert_eq!(m.repos[m.overlays.selector_cursor()].name, "c");
 			});
 			repo(ws.path(), "b", &[]);
 			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
 			repos_settled(&model, cx, 3);
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.popover, Some(crate::Popover::Repo));
+				assert_eq!(m.overlays.selector(), Some(crate::Popover::Repo));
 			});
 			cx.simulate_keystrokes("enter");
 			settle(cx);
@@ -18154,184 +18184,6 @@ mod tests {
 			}
 		}
 
-		/// Escape closes the Log "more" menu opened by its chip, with no
-		/// text field focused (#212).
-		#[gpui::test]
-		fn log_more_menu_closes_on_escape(cx: &mut TestAppContext) {
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "my-repo", &[]);
-			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
-			git(&r, &["add", "."]);
-			git(&r, &["commit", "-q", "-m", "commit c1"]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
-			for _ in 0..50 {
-				settle(cx);
-				let ready = model.read_with(cx, |m, _| {
-					!m.commits.is_empty() && m.log_width.get() > 0.
-				});
-				if ready {
-					break;
-				}
-			}
-			settle(cx);
-			let more_b = cx
-				.debug_bounds("log-filter-more")
-				.expect("log-filter-more drawn at 900w");
-			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
-			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.log_menu, Some(crate::ui::LogMenu::FilterMore));
-			});
-			cx.simulate_keystrokes("escape");
-			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.log_menu, None, "Escape closes the more menu");
-			});
-		}
-
-		/// One rule (#212): while a workbench popover is open, Escape closes
-		/// it first, whatever pane had the focus when it was opened.
-		#[gpui::test]
-		fn escape_closes_every_popover_from_every_focus(
-			cx: &mut TestAppContext,
-		) {
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "my-repo", &[]);
-			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
-			git(&r, &["add", "."]);
-			git(&r, &["commit", "-q", "-m", "commit c1"]);
-			// A dirty tracked file gives the Changes list a row to preview.
-			fs::write(r.join("base.txt"), "dirty").unwrap();
-			// A second repo makes the repo filter chip appear.
-			repo(ws.path(), "other-repo", &[]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
-			for _ in 0..50 {
-				settle(cx);
-				if model.read_with(cx, |m, _| {
-					!m.commits.is_empty() && m.log_width.get() > 0.
-				}) {
-					break;
-				}
-			}
-			settle(cx);
-			// Reader origin: a real preview, picked through the Changes list.
-			cx.simulate_keystrokes("alt-0");
-			settle(cx);
-			let row = model.read_with(cx, |m, _| {
-				m.files.iter().position(|f| f.path == "base.txt")
-			});
-			assert!(row.is_some(), "the dirty file is listed");
-			click_probed(&model, cx, "change-repo-toggle:unstaged:my-repo");
-			click_probed(&model, cx, "change-row@my-repo:unstaged:base.txt");
-			settle(cx);
-			assert!(
-				model.read_with(cx, |m, _| m.preview.is_some()),
-				"clicking the change opened a preview"
-			);
-			let popover_open = |cx: &mut VisualTestContext| {
-				model.read_with(cx, |m, _| {
-					m.workspace_menu
-						|| m.log_menu.is_some()
-						|| m.popover.is_some()
-				})
-			};
-			let menus = [
-				"btn-workspace-menu",
-				"btn-repo-selector",
-				"btn-ref-selector",
-				"log-filter-more",
-				"log-filter-repo",
-			];
-			// At 900w the branch and paths chips fold into "more"; the exact
-			// set drawn is pinned so a layout change cannot drop a case.
-			let drawn: Vec<&str> = [
-				"btn-workspace-menu",
-				"btn-repo-selector",
-				"btn-ref-selector",
-				"log-filter-more",
-				"log-filter-branch",
-				"log-filter-paths",
-				"log-filter-repo",
-			]
-			.into_iter()
-			.filter(|id| cx.debug_bounds(id).is_some())
-			.collect();
-			assert_eq!(drawn, menus, "the popover openers drawn at 900w");
-			// Origins come from the Escape bindings in the key map: GitLog,
-			// ToolList, Reader, TextInput (Dismiss), the find bar (a
-			// TextInput) and the bare root. PastePanel and ContextMenu cannot
-			// be open together with these menus: opening either takes the
-			// focus and the click that opened the menu closes the other. The
-			// root rule covers them all the same.
-			let mut cases = 0;
-			for origin in [
-				"log-row",
-				"tree",
-				"reader",
-				"none",
-				"log-search",
-				"find-bar",
-				"goto-bar",
-			] {
-				for id in menus {
-					click(cx, id);
-					settle(cx);
-					assert!(popover_open(cx), "{id} opened");
-					// The menu is open; the focus is in `origin` (a click on a
-					// button leaves it at the root, a row or Alt+N moves it).
-					if origin == "find-bar" || origin == "goto-bar" {
-						let goto = origin == "goto-bar";
-						model
-							.update_in(cx, |m, w, cx| m.open_find(goto, w, cx));
-					}
-					let focused = cx.update(|window, cx| {
-						let m = model.read(cx);
-						let h = match origin {
-							"find-bar" | "goto-bar" => window
-								.focused(cx)
-								.unwrap_or_else(|| m.focus_handle.clone()),
-							"log-search" => {
-								m.log_search_input.read(cx).handle()
-							}
-							"log-row" => m.log_focus.clone(),
-							"tree" => m.tree_focus.clone(),
-							"reader" => m.reader_focus.clone(),
-							_ => m.focus_handle.clone(),
-						};
-						window.focus(&h);
-						(h.clone(), m.focus_handle.clone())
-					});
-					settle(cx);
-					cx.update(|window, _| {
-						assert!(
-							focused.0.is_focused(window),
-							"{origin} holds the focus before Escape ({id})"
-						);
-						if origin == "find-bar" || origin == "goto-bar" {
-							assert!(
-								focused.0 != focused.1,
-								"the {origin} field took the focus"
-							);
-						}
-					});
-					assert!(
-						popover_open(cx),
-						"{id} is still open with the focus in {origin}"
-					);
-					cx.simulate_keystrokes("escape");
-					settle(cx);
-					assert!(
-						!popover_open(cx),
-						"Escape closes {id} opened from {origin}"
-					);
-					cases += 1;
-				}
-			}
-			assert_eq!(cases, 7 * menus.len());
-		}
-
 		/// The same rule when only the user's gestures set the focus: click a
 		/// log row, click a popover opener (the click moves the focus to the
 		/// root), press Alt+1 (the tree takes the focus, the menu stays
@@ -18378,9 +18230,10 @@ mod tests {
 				let (open, focused) = cx.update(|window, cx| {
 					let m = model.read(cx);
 					(
-						m.workspace_menu
-							|| m.log_menu.is_some()
-							|| m.popover.is_some(),
+						m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu,
+						) || m.overlays.log_menu().is_some()
+							|| m.overlays.selector().is_some(),
 						m.tree_focus.is_focused(window),
 					)
 				});
@@ -18393,9 +18246,10 @@ mod tests {
 				settle(cx);
 				model.read_with(cx, |m, _| {
 					assert!(
-						!(m.workspace_menu
-							|| m.log_menu.is_some()
-							|| m.popover.is_some()),
+						!(m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						) || m.overlays.log_menu().is_some()
+							|| m.overlays.selector().is_some()),
 						"Escape closes {opener} opened after a log click"
 					);
 				});
@@ -18461,7 +18315,7 @@ mod tests {
 			// Verify User menu is now open, and refresh was not triggered
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -18835,7 +18689,7 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -18883,7 +18737,7 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -20414,7 +20268,9 @@ mod tests {
 				assert_eq!(count(&root, cx), 2);
 				assert_eq!(active(&root, cx), Some(1));
 				let empty = tab(&root, cx, 1);
-				assert!(empty.read_with(cx, |m, _| m.workspace_menu));
+				assert!(empty.read_with(cx, |m, _| m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu)));
 				assert!(focused_in(&empty, cx));
 
 				// Asking it for A shows tab A and drops the empty tab.
@@ -21095,7 +20951,13 @@ mod tests {
 						let m = tab(root, cx, ix);
 						let host = host.clone();
 						m.update(cx, |m, cx| {
-							m.workspace_menu = true;
+							m.open_overlay(
+								crate::overlay::OverlayKind::WorkspaceMenu,
+								crate::overlay::ReturnFocus::Root,
+								Some(crate::overlay::TriggerId::Workspace),
+								None,
+								cx,
+							);
 							m.remote.hosts = vec![host];
 							m.browse_remote_host(0, cx);
 							m.open_remote_path(0, path, cx);
@@ -21464,7 +21326,9 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(700));
 				settle(cx);
 				assert!(
-					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					tab(&root, cx, 0).read_with(cx, |m, _| m
+						.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu)),
 					"the menu is open"
 				);
 				assert!(
@@ -21519,7 +21383,9 @@ mod tests {
 				assert!(tooltip_shown(cx, &text), "the tooltip is up");
 				click_id(cx, "btn-workspace-menu".into());
 				assert!(
-					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					tab(&root, cx, 0).read_with(cx, |m, _| m
+						.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu)),
 					"the menu is open"
 				);
 				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
@@ -23209,7 +23075,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(700));
 				settle(cx);
 				assert_eq!(
-					model.read_with(cx, |m, _| m.log_menu),
+					model.read_with(cx, |m, _| m.overlays.log_menu()),
 					Some(crate::ui::LogMenu::More),
 					"the menu is open"
 				);
@@ -23235,23 +23101,19 @@ mod tests {
 
 			/// Every open layer by name: the one place a test reads them.
 			fn open_kinds(m: &WorkbenchModel) -> Vec<String> {
+				use crate::overlay::OverlayKind as K;
 				let mut v = Vec::new();
-				if m.workspace_menu {
-					v.push("workspace-menu".to_string());
+				match m.overlays.floating() {
+					Some(K::WorkspaceMenu) => v.push("workspace-menu".into()),
+					Some(K::LogMenu(k)) => v.push(format!("log-menu:{k:?}")),
+					Some(K::Selector(k)) => v.push(format!("selector:{k:?}")),
+					Some(K::ContextMenu) => v.push("context-menu".into()),
+					Some(K::FindBar | K::AddRepoField) | None => {}
 				}
-				if let Some(k) = m.log_menu {
-					v.push(format!("log-menu:{k:?}"));
-				}
-				if let Some(k) = m.popover {
-					v.push(format!("selector:{k:?}"));
-				}
-				if m.chrome.menu.is_some() {
-					v.push("context-menu".to_string());
-				}
-				if m.reader.find_open {
+				if m.overlays.is_open(K::FindBar) {
 					v.push("find-bar".to_string());
 				}
-				if m.is_adding_repo {
+				if m.overlays.is_open(K::AddRepoField) {
 					v.push("add-repo".to_string());
 				}
 				v
@@ -23435,7 +23297,7 @@ mod tests {
 								panic!("opener {id} is not drawn")
 							});
 							cx.simulate_click(b.center(), Modifiers::none());
-							settle(cx);
+							settle_checked(cx, model);
 						}
 						Opener::RightLogRow => {
 							let b = cx
@@ -23445,7 +23307,7 @@ mod tests {
 						}
 						Opener::RightRepoRow => {
 							cx.simulate_keystrokes("alt-1");
-							settle(cx);
+							settle_checked(cx, model);
 							let at = probed_center(model, cx, "repo-row:alpha");
 							right_press(cx, at);
 						}
@@ -23485,6 +23347,91 @@ mod tests {
 				"own",
 			];
 
+			/// Settles, then holds every overlay invariant and the checks only
+			/// a driver can make (what is drawn, where the keyboard is).
+			pub(crate) fn settle_checked(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				settle(cx);
+				model.read_with(cx, |m, cx| {
+					let broken =
+						crate::overlay::OverlayStack::check_invariants(m, cx);
+					assert!(
+						broken.is_empty(),
+						"overlay invariants broken: {broken:?}"
+					);
+				});
+				assert_overlay_panels_match(cx, model);
+				assert_focus_not_in_closed_layer(cx, model);
+			}
+
+			/// A layer is open exactly when its panel is drawn. The add-repo
+			/// field belongs to the Project pane: drawn only while it shows.
+			pub(crate) fn assert_overlay_panels_match(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				use crate::overlay::OverlayKind;
+				let (open, project) = model.read_with(cx, |m, _| {
+					(
+						OverlayKind::ALL
+							.into_iter()
+							.filter(|k| m.overlays.is_open(*k))
+							.collect::<Vec<_>>(),
+						m.active_tab == crate::WorkbenchTab::FileExplorer,
+					)
+				});
+				let mut selectors: Vec<&'static str> = OverlayKind::ALL
+					.iter()
+					.map(|k| k.panel_selector())
+					.collect();
+				selectors.dedup();
+				selectors.sort_unstable();
+				selectors.dedup();
+				for sel in selectors {
+					if sel == OverlayKind::AddRepoField.panel_selector()
+						&& !project
+					{
+						continue;
+					}
+					let want = open.iter().any(|k| k.panel_selector() == sel);
+					let drawn = cx.debug_bounds(sel).is_some();
+					assert_eq!(
+						drawn, want,
+						"panel {sel}: drawn {drawn}, open layers {open:?}"
+					);
+				}
+			}
+
+			/// The keyboard is on no handle of a layer that is not open.
+			pub(crate) fn assert_focus_not_in_closed_layer(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				use crate::overlay::OverlayKind;
+				cx.update(|window, cx| {
+					let m = model.read(cx);
+					for kind in OverlayKind::ALL {
+						if m.overlays.is_open(kind) {
+							continue;
+						}
+						// A handle two kinds share is open while either is.
+						for h in m.owned_handles(kind, cx) {
+							let shared =
+								OverlayKind::ALL.into_iter().any(|k| {
+									m.overlays.is_open(k)
+										&& m.owned_handles(k, cx).contains(&h)
+								});
+							assert!(
+								shared || !h.is_focused(window),
+								"the keyboard is on a handle of {kind:?}, which is closed"
+							);
+						}
+					}
+				});
+			}
+
 			/// Closes whatever a failed cell left open, so one failure does not
 			/// become every later cell's.
 			fn reset(
@@ -23492,14 +23439,7 @@ mod tests {
 				cx: &mut VisualTestContext,
 			) {
 				model.update(cx, |m, cx| {
-					m.workspace_menu = false;
-					m.workspace_picker = false;
-					m.remote.end_browse();
-					m.log_menu = None;
-					m.popover = None;
-					m.chrome.menu = None;
-					m.reader.find_open = false;
-					m.is_adding_repo = false;
+					m.drop_overlays(crate::overlay::DropScope::All);
 					cx.notify();
 				});
 				focus_origin(model, cx, "root");
@@ -23541,7 +23481,7 @@ mod tests {
 					}
 				});
 				cx.update(|window, _| window.focus(&h));
-				settle(cx);
+				settle_checked(cx, model);
 				assert!(
 					cx.update(|window, _| h.is_focused(window)),
 					"{origin} holds the keyboard (it is drawn)"
@@ -23567,7 +23507,7 @@ mod tests {
 							"goto-bar" => cx.simulate_keystrokes("ctrl-g"),
 							_ => {}
 						}
-						settle(cx);
+						settle_checked(cx, model);
 						opener.fire(model, cx);
 						let open = floating_now(model, cx);
 						assert!(
@@ -23579,7 +23519,7 @@ mod tests {
 						focus_origin(model, cx, origin);
 						let before = model.read_with(cx, |m, _| inline(m));
 						cx.simulate_keystrokes("escape");
-						settle(cx);
+						settle_checked(cx, model);
 						let (after, inl) = model
 							.read_with(cx, |m, _| (floating(m), inline(m)));
 						if !after.is_empty() {
@@ -23634,6 +23574,37 @@ mod tests {
 					"a bare Escape belongs to the root rule \
 					 (`WorkbenchModel::on_escape`), not to a pane or a field:\n{}",
 					offenders.join("\n")
+				);
+			}
+
+			/// Every key context the keymap names has a focus target, so the
+			/// one Escape rule decides for it.
+			#[test]
+			fn every_keymap_context_has_a_focus_target() {
+				use crate::overlay::FocusTarget;
+				use gpui::KeyBindingContextPredicate as P;
+				let mut named = std::collections::BTreeSet::new();
+				for b in crate::key_bindings() {
+					match b.predicate().as_deref() {
+						None => {}
+						Some(P::Identifier(name)) => {
+							named.insert(name.to_string());
+						}
+						Some(other) => {
+							panic!("a context this test cannot read: {other}")
+						}
+					}
+				}
+				let targets: std::collections::BTreeSet<String> =
+					FocusTarget::KINDS
+						.iter()
+						.filter_map(|t| t.context())
+						.map(String::from)
+						.collect();
+				assert_eq!(
+					named, targets,
+					"a key context needs a FocusTarget (and a decision in \
+					 `WorkbenchModel::on_escape`)"
 				);
 			}
 
@@ -23716,7 +23687,7 @@ mod tests {
 			) {
 				let (_ws, model, cx) = fixture(cx, 1080., 720.);
 				cx.simulate_keystrokes("alt-1");
-				settle(cx);
+				settle_checked(cx, &model);
 				let at = probed_center(&model, cx, "repo-row:alpha");
 				right_press(cx, at);
 				assert_eq!(
@@ -23725,9 +23696,9 @@ mod tests {
 					"the row's menu is open"
 				);
 				cx.simulate_keystrokes("alt-1");
-				settle(cx);
+				settle_checked(cx, &model);
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(
 					floating_now(&model, cx),
 					Vec::<String>::new(),
@@ -23744,14 +23715,14 @@ mod tests {
 			) {
 				let (_ws, model, cx) = fixture(cx, 1080., 720.);
 				cx.simulate_keystrokes("ctrl-f");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["find-bar"]);
 				// Alt+9 hides a visible Log; the keyboard moves there the way a
 				// click on a row leaves it.
 				focus_origin(&model, cx, "log-row");
 				assert_eq!(focus_name(&model, cx), "log");
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(
 					model.read_with(cx, |m, _| inline(m)),
 					["find-bar"],
@@ -23761,7 +23732,7 @@ mod tests {
 				// With a selection, the first Escape only clears it.
 				model.update(cx, |m, cx| m.select_all_text(cx));
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(
 					model.read_with(cx, |m, _| inline(m)),
 					["find-bar"],
@@ -23771,7 +23742,7 @@ mod tests {
 					model.read_with(cx, |m, _| m.reader.selection().is_none())
 				);
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert!(
 					model.read_with(cx, |m, _| inline(m).is_empty()),
 					"the second Escape closes the find bar"
@@ -23830,7 +23801,7 @@ mod tests {
 						MouseButton::Left,
 						Modifiers::none(),
 					);
-					settle(cx);
+					settle_checked(cx, &model);
 					let left = floating_now(&model, cx);
 					if !left.is_empty() {
 						failures.push(format!(
@@ -23860,7 +23831,7 @@ mod tests {
 					.debug_bounds("log-filter-more:user")
 					.expect("the User filter is listed in the overflow menu");
 				cx.simulate_click(b.center(), Modifiers::none());
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(floating_now(&model, cx), ["log-menu:User"]);
 				more.fire(&model, cx);
 				assert_eq!(
@@ -23886,7 +23857,7 @@ mod tests {
 					{
 						opener.fire(&model, cx);
 						cx.simulate_keystrokes(key);
-						settle(cx);
+						settle_checked(cx, &model);
 						let (open, inl) = model
 							.read_with(cx, |m, _| (floating(m), inline(m)));
 						let want: Vec<String> = match (key, opener) {
@@ -24011,7 +23982,7 @@ mod tests {
 									floating(m),
 									m.remote.browse.is_some(),
 									// The menu open implies its browse is the host's.
-									!m.workspace_menu
+									!m.overlays.is_open(crate::overlay::OverlayKind::WorkspaceMenu)
 										|| m.remote
 											.browse
 											.as_ref()
@@ -24080,13 +24051,13 @@ mod tests {
 				};
 				// 1: a selector opened from the project tree.
 				cx.simulate_keystrokes("alt-1");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(focus_name(&model, cx), "tree");
 				cx.simulate_keystrokes("alt-shift-r");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				check("1 selector, Escape", focus_name(&model, cx), "tree");
 				assert!(floating_now(&model, cx).is_empty());
 
@@ -24104,7 +24075,7 @@ mod tests {
 					paste.x
 				);
 				cx.simulate_click(blank, Modifiers::none());
-				settle(cx);
+				settle_checked(cx, &model);
 				assert!(floating_now(&model, cx).is_empty());
 				check(
 					"2 Log chip, outside press",
@@ -24116,14 +24087,14 @@ mod tests {
 				Opener::RightRepoRow.fire(&model, cx);
 				assert_eq!(floating_now(&model, cx), ["context-menu"]);
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				check("3 context menu, Escape", focus_name(&model, cx), "tree");
 
 				// 4: the find bar.
 				cx.simulate_keystrokes("ctrl-f");
-				settle(cx);
+				settle_checked(cx, &model);
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				check("4 find bar, Escape", focus_name(&model, cx), "reader");
 
 				// 5: the workspace menu's path field.
@@ -24131,10 +24102,10 @@ mod tests {
 					.fire(&model, cx);
 				let at = probed_center(&model, cx, "btn-open-workspace");
 				cx.simulate_click(at, Modifiers::none());
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(focus_name(&model, cx), "workspace-field");
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert!(floating_now(&model, cx).is_empty());
 				check(
 					"5 workspace field, Escape",
@@ -24147,7 +24118,7 @@ mod tests {
 					.fire(&model, cx);
 				let at = probed_center(&model, cx, "repo-row:alpha");
 				cx.simulate_click(at, Modifiers::none());
-				settle(cx);
+				settle_checked(cx, &model);
 				assert!(floating_now(&model, cx).is_empty());
 				check(
 					"6 outside press on the tree",
@@ -24169,7 +24140,7 @@ mod tests {
 			) {
 				let (_ws, model, cx) = fixture(cx, 1080., 720.);
 				cx.simulate_keystrokes("alt-shift-r");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
 				let input =
 					model.read_with(cx, |m, _| m.selector_input.clone());
@@ -24178,7 +24149,7 @@ mod tests {
 				});
 				assert!(input.read_with(cx, |i, _| i.marked_range().is_some()));
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(
 					floating_now(&model, cx),
 					["selector:Repo"],
@@ -24192,7 +24163,7 @@ mod tests {
 					i.handle_unmark();
 				});
 				cx.simulate_keystrokes("escape");
-				settle(cx);
+				settle_checked(cx, &model);
 				assert_eq!(
 					floating_now(&model, cx),
 					Vec::<String>::new(),

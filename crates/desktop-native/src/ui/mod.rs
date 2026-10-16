@@ -24,6 +24,7 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf, Locale};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
+use crate::overlay::{CloseWhy, OverlayKind, ReturnFocus, TriggerId};
 use crate::paste::{
 	split_dir, PasteItem, PasteNode, PastePreviewPlan, RowAction, SkipCause,
 };
@@ -60,16 +61,15 @@ pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
 
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
-	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
-	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
-	LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
-	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
-	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
-	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
-	ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse,
-	TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel,
-	WorkbenchTab,
+	ApplyPaste, CloseWorkspace, CopySelection, FindInFile, FindNext, FindPrev,
+	FocusNext, FocusPrev, GotoLine, HistoryNextPage, HistoryPrevPage, LogCopy,
+	LogDown, LogExtendDown, LogExtendUp, LogHead, LogOpen, LogSearchFocus,
+	LogUp, NavDown, NavToggle, NavUp, OpenRefSelector, OpenRepoSelector,
+	OpenWorkspace, PastePreview, Popover, Quit, ReaderCopy, ReaderDown,
+	ReaderPageDown, ReaderPageUp, ReaderSelectAll, ReaderUp, Refresh,
+	RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges, ShowProject,
+	Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse, TreeDown,
+	TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
@@ -1556,6 +1556,9 @@ impl Render for WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		// A closed layer's keyboard target first; a focus asked for in the
+		// same turn wins over it.
+		self.apply_pending_return(window, cx);
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}
@@ -1577,13 +1580,11 @@ impl Render for WorkbenchModel {
 					cx.notify();
 				}));
 		}
-		// One rule: while a popover is open, a bare Escape closes it first,
-		// whatever has the focus (a pane list, the reader, a text field, the
-		// find bar, the paste panel, a context menu). Each of those binds its
-		// own Escape action in a deeper key context, and actions run before
-		// any key-down listener, so only a keystroke interceptor, which runs
-		// ahead of both, can take the key for the root. It deliberately
-		// takes Escape ahead of an IME composition while a popover is open.
+		// One rule for a bare Escape (`WorkbenchModel::on_escape`): whatever
+		// has the focus, the open floating layer closes first. No pane or
+		// field binds Escape itself: actions run before any key-down
+		// listener, so only a keystroke interceptor, which runs ahead of
+		// both, can take the key for the root. An IME composition keeps it.
 		if self.escape_guard.is_none() {
 			let me = cx.weak_entity();
 			let win = window.window_handle().window_id();
@@ -1595,10 +1596,10 @@ impl Render for WorkbenchModel {
 					{
 						return;
 					}
-					let closed = me
-						.update(cx, |this, cx| this.close_open_popovers(cx))
+					let taken = me
+						.update(cx, |this, cx| this.on_escape(window, cx))
 						.unwrap_or(false);
-					if closed {
+					if taken {
 						cx.stop_propagation();
 					}
 				}));
@@ -1622,7 +1623,7 @@ impl Render for WorkbenchModel {
 			app_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);
 		}
 		// A context menu keeps its list looking focused while it is open.
-		let menu_origin = self.chrome.menu.as_ref().map(|m| m.origin);
+		let menu_origin = self.overlays.context_menu().map(|m| m.origin);
 		self.left_active = self.tree_focus.is_focused(window)
 			|| menu_origin == Some(crate::menu::MenuOrigin::Left);
 		self.log_active = self.log_focus.is_focused(window)
@@ -1670,9 +1671,6 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &ApplyPaste, _, cx| {
 				this.apply_paste_restore(cx)
-			}))
-			.on_action(cx.listener(|this, _: &CancelPaste, _, cx| {
-				this.cancel_paste_preview(cx)
 			}))
 			.on_action(
 				cx.listener(|this, _: &Refresh, _, cx| this.reload_repos(cx)),
@@ -1743,9 +1741,6 @@ impl Render for WorkbenchModel {
 			})
 			.on_action(cx.listener(|this, _: &crate::HideToolWindow, w, cx| {
 				this.hide_active_tool(w, cx)
-			}))
-			.on_action(cx.listener(|this, _: &crate::FocusEditor, w, cx| {
-				this.escape_to_editor(w, cx)
 			}))
 			.on_action(cx.listener(|this, _: &crate::LogParent, _, cx| {
 				this.log_go(true, cx)

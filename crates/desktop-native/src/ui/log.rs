@@ -5,7 +5,7 @@ use super::*;
 // ───────────────────────── log helpers (IJ-2a) ─────────────────────────
 
 /// Dropdowns of the log: the filter chips and the More (⋮) button.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogMenu {
 	Repo,
 	Branch,
@@ -964,7 +964,7 @@ impl WorkbenchModel {
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
 		let selector = id.clone();
-		let open = self.log_menu == Some(menu);
+		let open = self.overlays.log_menu() == Some(menu);
 		let active = value.is_some();
 		let text_cap = match active {
 			true => self.log_filter_layout.text_cap(),
@@ -990,11 +990,9 @@ impl WorkbenchModel {
 			.text_size(px(UI_TEXT))
 			.when(open, |d| d.bg(rgb(pal().hover_bg)))
 			.hover(|s| s.bg(rgb(pal().hover_bg)))
-			.on_click(
-				cx.listener(move |this, _, _, cx| {
-					this.toggle_log_menu(menu, cx)
-				}),
-			)
+			.on_click(cx.listener(move |this, _, window, cx| {
+				this.toggle_log_menu(menu, TriggerId::LogChip(menu), window, cx)
+			}))
 			.child(
 				div()
 					.max_w(px(text_cap))
@@ -1044,6 +1042,7 @@ impl WorkbenchModel {
 				.absolute()
 				.size_full()
 			})
+			.child(self.overlay_trigger_slot(TriggerId::LogChip(menu)))
 			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
 			.children(probe(log, id))
 			.into_any_element()
@@ -1062,13 +1061,12 @@ impl WorkbenchModel {
 		let active = hidden_menus
 			.iter()
 			.any(|m| self.log_menu_value(*m, loc).1.is_some());
-		let open_menu = match self.log_menu {
+		let open_menu = match self.overlays.log_menu() {
 			Some(LogMenu::FilterMore) => Some(LogMenu::FilterMore),
 			Some(m) if hidden_menus.contains(&m) => Some(m),
 			_ => None,
 		};
 		let open = open_menu.is_some();
-		let hidden = hidden_menus.clone();
 		div()
 			.id(SharedString::from(id.clone()))
 			.debug_selector(move || selector)
@@ -1085,15 +1083,14 @@ impl WorkbenchModel {
 			.when(open, |d| d.bg(rgb(pal().hover_bg)))
 			.when(active, |d| d.border_1().border_color(rgb(pal().focus_ring)))
 			.hover(|s| s.bg(rgb(pal().hover_bg)))
-			.on_click(cx.listener(move |this, _, _, cx| {
-				if this.log_menu == Some(LogMenu::FilterMore)
-					|| (this.log_menu.is_some()
-						&& hidden.contains(&this.log_menu.unwrap()))
-				{
-					this.close_log_menu(cx);
-				} else {
-					this.toggle_log_menu(LogMenu::FilterMore, cx);
-				}
+			.on_click(cx.listener(move |this, _, window, cx| {
+				// The sub-menu it opened last is closed by it too.
+				this.toggle_log_menu(
+					LogMenu::FilterMore,
+					TriggerId::LogFilterMore,
+					window,
+					cx,
+				)
 			}))
 			.child(
 				div()
@@ -1106,6 +1103,7 @@ impl WorkbenchModel {
 				)
 			})
 			.child(icon(Icon::ChevronDown, 10.))
+			.child(self.overlay_trigger_slot(TriggerId::LogFilterMore))
 			.when_some(open_menu, |d, m| d.child(self.log_menu_panel(m, cx)))
 			.children(probe(log, id))
 			.into_any_element()
@@ -1327,7 +1325,7 @@ impl WorkbenchModel {
 		menu: LogMenu,
 		cx: &mut Context<Self>,
 	) {
-		self.log_menu = None;
+		self.close_log_menus(CloseWhy::Picked, cx);
 		match menu {
 			LogMenu::Repo => {
 				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
@@ -1670,7 +1668,10 @@ impl WorkbenchModel {
 										label,
 										checked,
 										Box::new(move |this, cx| {
-											this.dismiss_log_menu(cx);
+											this.close_log_menus(
+												CloseWhy::Picked,
+												cx,
+											);
 											this.filter_by_ref(
 												Some(target.clone()),
 												cx,
@@ -1811,7 +1812,7 @@ impl WorkbenchModel {
 						t(label, loc).to_string(),
 						checked,
 						Box::new(move |this, cx| {
-							this.log_menu = None;
+							this.close_log_menus(CloseWhy::Picked, cx);
 							match key {
 								"details" => {
 									this.log_details_visible =
@@ -1850,7 +1851,16 @@ impl WorkbenchModel {
 						display,
 						is_active,
 						Box::new(move |this, cx| {
-							this.toggle_log_menu(m, cx);
+							// A sub-menu replaces the overflow menu; the
+							// overflow chip still closes it.
+							let ret = ReturnFocus::To(this.log_focus.clone());
+							this.open_overlay(
+								OverlayKind::LogMenu(m),
+								ret,
+								Some(TriggerId::LogFilterMore),
+								None,
+								cx,
+							);
 						}),
 						cx,
 					));
@@ -1874,9 +1884,8 @@ impl WorkbenchModel {
 				}
 			}
 		}
-		let panel = div()
-			.id("log-menu")
-			.occlude()
+		let panel = self
+			.overlay_panel(OverlayKind::LogMenu(menu), cx)
 			.min_w(px(200.))
 			.max_w(px(360.))
 			.max_h(px(if menu == LogMenu::Repo { 480. } else { 320. }))
@@ -1891,9 +1900,6 @@ impl WorkbenchModel {
 			.shadow_lg()
 			.text_size(px(UI_TEXT))
 			.text_color(rgb(pal().text))
-			.on_mouse_down_out(
-				cx.listener(|this, _, _, cx| this.close_log_menu(cx)),
-			)
 			.children(items);
 		div()
 			.absolute()

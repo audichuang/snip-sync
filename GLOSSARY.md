@@ -16,6 +16,14 @@ _Avoid_: 分頁（單獨使用，易與工具視窗混淆）、視窗
 工作區分頁內的 Project、Changes、Log 等面板。
 _Avoid_: tab、分頁
 
+**浮層**（floating layer）:
+錨定在窗格之上的面板：工作區選單、Log 下拉選單、repo／ref 選擇器、右鍵選單。同時最多開一個，開新的會取代舊的，分頁切走時它關掉。
+_Avoid_: popover、popup、dropdown（泛指時）、menu（單獨使用，易與右鍵選單混淆）
+
+**內嵌層**（inline layer）:
+屬於某個窗格的一塊介面：閱讀器的搜尋／跳行列、Project 窗格的加入 repo 輸入框。開浮層不會關它，分頁切走時它留著。
+_Avoid_: 工具列、bar（泛指時）
+
 ## 貼上
 
 **貼上目標**（paste target）:
