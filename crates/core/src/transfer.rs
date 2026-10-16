@@ -2233,8 +2233,7 @@ impl TransferImportPlan {
 		new_dir_hook(NewDirStage::BeforeCreate, dir)?;
 		match fs::create_dir(dir) {
 			Ok(()) => {
-				let key = DirKey::of(dir);
-				made.dir(dir, key.clone(), true);
+				let key = made.dir(dir, true);
 				new_dir_hook(NewDirStage::AfterCreate, dir)?;
 				// Someone put a symlink or another folder where the folder
 				// was just made: the rows would land somewhere the preview
@@ -2304,7 +2303,9 @@ impl TransferImportPlan {
 		}
 		for dir in missing.into_iter().rev() {
 			match fs::create_dir(dir) {
-				Ok(()) => made.dir(dir, DirKey::of(dir), false),
+				Ok(()) => {
+					made.dir(dir, false);
+				}
 				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 					// A folder by now (made under another name of it, or
 					// one a path implies that someone made): the file is
@@ -2326,11 +2327,12 @@ impl TransferImportPlan {
 				// name a moment later may be someone else's.
 				let key =
 					DirKey::of_file(&file).unwrap_or_else(|| DirKey::of(path));
-				// Released at once: one held per new file would run out of
+				// Closed at once, except on Linux within its budget (see
+				// `Made`): one held per new file would run out of
 				// descriptors on a large paste, and Windows cannot replace
 				// an open file.
-				drop(file);
-				// Read after the release, as the row will read it.
+				made.pin(file);
+				// Read by name, as the row will read it.
 				let modified = fs::symlink_metadata(path)
 					.and_then(|info| info.modified())
 					.ok();
@@ -2390,6 +2392,20 @@ enum Reserve {
 
 /// What an Apply made before writing content, each with the object it is,
 /// so that only what is still that object is taken back.
+///
+/// An object is told by its number ([`DirKey`]), and a number says which
+/// object only while that object lives: Linux filesystems (ext4, tmpfs)
+/// give a freed inode number to the next object made, so a folder removed
+/// and made again at once, by someone else, is the same `DirKey`, and its
+/// timestamps tick too coarsely (about 4 ms) to tell them apart. On Linux
+/// each object made is therefore pinned for the rest of the Apply: a handle
+/// held open keeps its inode, and its number, from being freed, so another
+/// object can never carry it ([`Self::pin`]). The pin is `O_PATH` (or the
+/// handle a file was made with) and blocks nothing: the object can still be
+/// written, renamed or removed. macOS and Windows hand a number out again
+/// only much later (APFS object ids grow; an NTFS file index carries a
+/// sequence number), and Windows cannot replace an open file, so nothing is
+/// held there.
 #[derive(Default)]
 struct Made {
 	/// Folders in the order made; `true` for a placed folder's level.
@@ -2398,14 +2414,62 @@ struct Made {
 	files: Vec<(PathBuf, restore::Reserved)>,
 	/// Every object made, with what made it.
 	objects: HashMap<DirKey, String>,
+	/// The handles that keep the objects made from being freed (Linux).
+	#[cfg(target_os = "linux")]
+	pins: Vec<fs::File>,
 }
 
+/// How many objects one Apply pins: a quarter of the usual soft limit on
+/// open files (1024), so its rows and git still have descriptors. Past it,
+/// an object is told by its number alone, as on other systems.
+#[cfg(target_os = "linux")]
+const PIN_BUDGET: usize = 256;
+
 impl Made {
-	fn dir(&mut self, path: &Path, key: DirKey, placed: bool) {
+	/// Records the folder just made at `path` and returns which object it
+	/// is: read by following `path`, as every later check reads it.
+	fn dir(&mut self, path: &Path, placed: bool) -> DirKey {
+		let key = DirKey::of(path);
+		self.pin_dir(path, &key);
 		self.objects
 			.entry(key.clone())
 			.or_insert_with(|| format!("folder {}", path.display()));
-		self.dirs.push((path.to_path_buf(), key, placed));
+		self.dirs.push((path.to_path_buf(), key.clone(), placed));
+		key
+	}
+
+	/// Pins the folder at `path` if it is still `key` (see [`Made`]).
+	#[cfg(target_os = "linux")]
+	fn pin_dir(&mut self, path: &Path, key: &DirKey) {
+		use std::os::unix::fs::OpenOptionsExt;
+		if self.pins.len() >= PIN_BUDGET {
+			return;
+		}
+		// The access mode is ignored with `O_PATH`: no permission on the
+		// folder is needed, so a folder umask left unreadable is pinned too.
+		let handle = fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+			.open(path);
+		if let Ok(handle) = handle {
+			if DirKey::of_file(&handle).as_ref() == Some(key) {
+				self.pins.push(handle);
+			}
+		}
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn pin_dir(&mut self, _path: &Path, _key: &DirKey) {}
+
+	/// Keeps `handle`, the file just made, open for the rest of the Apply
+	/// on Linux (see [`Made`]); elsewhere it is closed here.
+	fn pin(&mut self, handle: fs::File) {
+		#[cfg(target_os = "linux")]
+		if self.pins.len() < PIN_BUDGET {
+			self.pins.push(handle);
+		}
+		#[cfg(not(target_os = "linux"))]
+		drop(handle);
 	}
 
 	fn file(&mut self, path: &Path, reserved: &restore::Reserved, rel: &str) {
@@ -7222,8 +7286,8 @@ mod new_dir_tests {
 		let make = || {
 			fs::create_dir_all(&b).unwrap();
 			let mut made = Made::default();
-			made.dir(&a, DirKey::of(&a), true);
-			made.dir(&b, DirKey::of(&b), true);
+			made.dir(&a, true);
+			made.dir(&b, true);
 			made
 		};
 		let made = make();
@@ -7243,6 +7307,38 @@ mod new_dir_tests {
 		fs::create_dir(&b).unwrap();
 		made.finish(false);
 		assert!(b.is_dir(), "another folder in its place is not ours");
+	}
+
+	/// The file made, removed and made again empty at once by someone
+	/// else, is another file even where the filesystem would reuse its
+	/// inode number and its clock has not ticked (Linux): it is neither
+	/// written nor taken back.
+	#[test]
+	fn a_new_file_replaced_by_another_empty_one_is_not_taken_back() {
+		let (_tmp, ws) = tmp();
+		let path = ws.join("new.txt");
+		let file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.unwrap();
+		let key = DirKey::of_file(&file).unwrap();
+		let mut made = Made::default();
+		made.pin(file);
+		let modified = fs::symlink_metadata(&path)
+			.and_then(|info| info.modified())
+			.ok();
+		let reserved = restore::Reserved { key, modified };
+		made.file(&path, &reserved, "new.txt");
+		fs::remove_file(&path).unwrap();
+		// Made within the same clock tick: Linux stamps a file with a
+		// coarse clock, so its time can equal the one recorded.
+		let other = fs::File::create(&path).unwrap();
+		other.set_modified(modified.unwrap()).unwrap();
+		drop(other);
+		assert!(!reserved.is_untouched(&path).unwrap());
+		made.release_file(&path);
+		assert!(path.exists(), "another file in its place is not ours");
 	}
 
 	/// Restores the process umask when dropped. Safe to change here: each
