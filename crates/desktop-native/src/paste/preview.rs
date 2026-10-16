@@ -1005,6 +1005,42 @@ mod tests {
 		);
 	}
 
+	/// The other way round: the adjusted plan is the one the engine refuses
+	/// (a directory `a.ts` stands where the file goes). The refusal keeps the
+	/// suggestion, so [Use as-is] still undoes the adjustment (#240).
+	#[test]
+	fn an_adjustment_the_engine_refuses_keeps_the_restore_base_hint() {
+		let ws = tempfile::tempdir().unwrap();
+		let sub = ws.path().join("sub");
+		std::fs::create_dir(&sub).unwrap();
+		git_init(&sub);
+		std::fs::create_dir(sub.join("a.ts")).unwrap();
+		std::fs::write(sub.join("a.ts").join("kept"), "x").unwrap();
+		let payload = "// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+		let mut session = landed(payload, &sub, None);
+		assert!(session.plan().unwrap().restore_hint().is_some());
+		let Remapped::Ready(request) = session.adjust_paths(true, None) else {
+			panic!("the hint is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		session.poll(false, None);
+		let plan = session.plan().unwrap();
+		assert!(plan.adjust_paths);
+		assert!(!plan.executable(), "the adjusted plan is refused");
+		assert!(plan.error.is_some());
+		assert!(
+			plan.restore_hint().is_some(),
+			"the refusal threw the hint away: no [Use as-is]"
+		);
+		let Remapped::Ready(request) = session.adjust_paths(false, None) else {
+			panic!("[Use as-is] is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		session.poll(false, None);
+		let plan = session.plan().unwrap();
+		assert!(plan.executable(), "{:?}", plan.error);
+	}
+
 	#[test]
 	fn cancelling_a_preview_keeps_a_held_replay_read_in_repaste_admission() {
 		use snip_core::commits::{
