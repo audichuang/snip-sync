@@ -7,6 +7,7 @@ pub mod commits;
 pub mod copy;
 pub mod filter;
 pub mod format;
+mod fscase;
 pub mod fsutil;
 pub mod gitrun;
 pub mod gitsrc;

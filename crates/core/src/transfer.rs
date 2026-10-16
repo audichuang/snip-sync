@@ -2599,121 +2599,7 @@ fn canonical_target_identity(path: &Path) -> String {
 	paths::path_key(&full.to_string_lossy())
 }
 
-pub(crate) fn fs_is_case_insensitive(root: &Path) -> bool {
-	probe_fs_case_insensitive(root)
-		.unwrap_or(cfg!(any(windows, target_os = "macos")))
-}
-
-fn swap_ascii_case(s: &str) -> Option<String> {
-	let mut swapped = String::with_capacity(s.len());
-	let mut has_ascii_alpha = false;
-	for c in s.chars() {
-		if c.is_ascii_alphabetic() {
-			has_ascii_alpha = true;
-			if c.is_ascii_lowercase() {
-				swapped.push(c.to_ascii_uppercase());
-			} else {
-				swapped.push(c.to_ascii_lowercase());
-			}
-		} else {
-			swapped.push(c);
-		}
-	}
-	if has_ascii_alpha {
-		Some(swapped)
-	} else {
-		None
-	}
-}
-
-#[cfg(unix)]
-fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
-	use std::os::unix::fs::MetadataExt;
-	let m1 = fs::symlink_metadata(p1)?;
-	let m2 = fs::symlink_metadata(p2)?;
-	Ok(m1.dev() == m2.dev() && m1.ino() == m2.ino())
-}
-
-#[cfg(not(unix))]
-fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
-	let c1 = dunce::canonicalize(p1)?;
-	let c2 = dunce::canonicalize(p2)?;
-	Ok(c1 == c2)
-}
-
-/// Whether the filesystem holding `root` folds case, by reading only: a name
-/// that exists is looked up under its other case, first among `root`'s own
-/// entries, then `root` and its ancestors by their own names. Nothing is made
-/// to probe with: planning is read-only, and a probe file made and removed in
-/// an empty folder is a write a watcher sees and nobody agreed to.
-fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
-	if let Ok(entries) = fs::read_dir(root) {
-		for entry in entries.flatten() {
-			let name = entry.file_name();
-			let name_str = name.to_string_lossy();
-			if let Some(swapped) = swap_ascii_case(&name_str) {
-				let orig_path = root.join(&name);
-				let swapped_path = root.join(&swapped);
-				match fs::symlink_metadata(&swapped_path) {
-					Ok(_) => {
-						if let Ok(same) =
-							is_same_file(&orig_path, &swapped_path)
-						{
-							return Ok(same);
-						}
-					}
-					Err(e) if e.kind() == io::ErrorKind::NotFound => {
-						return Ok(false);
-					}
-					Err(_) => {}
-				}
-			}
-		}
-	}
-
-	// Nothing in `root` to compare: its own name, then its parents', each
-	// looked up beside itself. A folder on another device than `root` (a
-	// mount point) says nothing about it, and ends the walk.
-	let mut cur = root;
-	while let (Some(name), Some(parent)) = (cur.file_name(), cur.parent()) {
-		if !same_device(root, parent) {
-			break;
-		}
-		if let Some(swapped) = swap_ascii_case(&name.to_string_lossy()) {
-			let swapped_path = parent.join(swapped);
-			match fs::symlink_metadata(&swapped_path) {
-				Ok(_) => {
-					if let Ok(same) = is_same_file(cur, &swapped_path) {
-						return Ok(same);
-					}
-				}
-				Err(e) if e.kind() == io::ErrorKind::NotFound => {
-					return Ok(false);
-				}
-				Err(_) => {}
-			}
-		}
-		cur = parent;
-	}
-	Err(io::Error::new(
-		io::ErrorKind::Unsupported,
-		"no name to compare under its other case",
-	))
-}
-
-#[cfg(unix)]
-fn same_device(a: &Path, b: &Path) -> bool {
-	use std::os::unix::fs::MetadataExt;
-	match (fs::metadata(a), fs::metadata(b)) {
-		(Ok(a), Ok(b)) => a.dev() == b.dev(),
-		_ => false,
-	}
-}
-
-#[cfg(not(unix))]
-fn same_device(_: &Path, _: &Path) -> bool {
-	true
-}
+pub(crate) use crate::fscase::fs_is_case_insensitive;
 
 fn op_is_case_insensitive(
 	op_root: Option<&Path>,
@@ -6797,5 +6683,86 @@ mod new_dir_tests {
 			other => panic!("expected a stale Preview, got {other:?}"),
 		}
 		assert!(scan(&elsewhere).is_empty());
+	}
+}
+
+#[cfg(test)]
+mod case_policy_tests {
+	use super::*;
+	use crate::fscase::{with_probe_override, CaseSensitivity};
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	/// An empty folder on a filesystem that cannot be told and gives the
+	/// names nothing to compare: two targets that differ only in case are
+	/// one target to the plan, as on any folding filesystem.
+	#[test]
+	fn two_targets_that_differ_in_case_collide_when_case_cannot_be_told() {
+		let (_tmp, ws) = tmp();
+		let result =
+			with_probe_override(CaseSensitivity::Unknown, None, || {
+				plan_import(
+					"// file: B.txt\nB\n// file: b.txt\nb\n",
+					"",
+					std::slice::from_ref(&ws),
+					&ImportMapping::with_primary(
+						CanonicalRootId::new(&ws).unwrap(),
+					),
+				)
+			});
+		assert!(
+			matches!(result, Err(TransferError::TargetCollision { .. })),
+			"{result:?}"
+		);
+	}
+
+	/// The same folder spelled two ways is one folder to make when case
+	/// cannot be told.
+	#[test]
+	fn one_new_folder_spelled_two_ways_is_asked_for_once_when_case_cannot_be_told(
+	) {
+		let (_tmp, ws) = tmp();
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed("new"));
+		mapping.map_prefix("q", placed("NEW"));
+		let plan = with_probe_override(CaseSensitivity::Unknown, None, || {
+			plan_import(
+				"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+				"",
+				std::slice::from_ref(&ws),
+				&mapping,
+			)
+			.unwrap()
+		});
+		assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+	}
+
+	/// The same answer decides for the folders an exact name differs
+	/// under: a definite `Sensitive` keeps them apart.
+	#[test]
+	fn a_known_sensitive_filesystem_keeps_the_two_spellings_apart() {
+		let (_tmp, ws) = tmp();
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed("new"));
+		mapping.map_prefix("q", placed("NEW"));
+		let plan =
+			with_probe_override(CaseSensitivity::Sensitive, None, || {
+				plan_import(
+					"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+					"",
+					std::slice::from_ref(&ws),
+					&mapping,
+				)
+				.unwrap()
+			});
+		assert_eq!(plan.new_dirs().requested.len(), 2, "{:?}", plan.new_dirs());
 	}
 }
