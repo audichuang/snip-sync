@@ -22,7 +22,8 @@ use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::GitError;
 use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{
-	RestoreExecutionResult, RestorePlan, RestoreSelection,
+	RestoreBase, RestoreBaseSuggestion, RestoreExecutionResult, RestorePlan,
+	RestoreSelection,
 };
 use snip_core::transfer::{
 	detect_clipboard_prefixes, CanonicalRootId, CommitReplayPreview,
@@ -32,6 +33,7 @@ use snip_remote::{
 	FilePastePlan, PasteError, PasteRoute, PasteTarget, RemoteError,
 };
 
+use crate::dirtree::{DirTree, TreePath, TreeSink};
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
 use crate::reason::reason_msg;
@@ -46,6 +48,10 @@ pub const MAX_RETAINED_PREVIEW_BYTES: usize =
 	snip_core::transfer::CLIPBOARD_PAYLOAD_MAX;
 // Arc's two counters plus conservative alignment padding for these types.
 const ARC_ALLOWANCE: usize = 3 * size_of::<usize>();
+// A BTreeSet entry's share of its node: slot, edge and padding.
+const SET_ENTRY_ALLOWANCE: usize = 4 * size_of::<usize>();
+/// A preview with more rows than this opens with its first-level folders folded.
+const FOLD_FILES_OVER: usize = 200;
 
 pub fn preview_budget_error() -> Msg {
 	Msg::new("preview_memory_limit", [])
@@ -104,10 +110,25 @@ pub enum PasteRequest {
 		/// under its session root, and its worker plans and writes.
 		remote: Option<RemotePaste>,
 	},
-	Remap {
-		prefix: String,
-		keep: bool,
-	},
+	Remap(Remap),
+}
+
+/// What a deferred re-plan changes, for its log line once it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remap {
+	/// A prefix row: kept under the destination, or a candidate folder.
+	Prefix { prefix: String, keep: bool },
+	/// The restore-base hint: plan with the suggestion (true) or as-is.
+	AdjustPaths(bool),
+}
+
+impl Remap {
+	fn heap_bytes(&self) -> usize {
+		match self {
+			Self::Prefix { prefix, .. } => prefix.capacity(),
+			Self::AdjustPaths(_) => 0,
+		}
+	}
 }
 
 impl PasteRequest {
@@ -121,14 +142,14 @@ impl PasteRequest {
 					.saturating_add(roots.capacity() * size_of::<PathBuf>()),
 				|n, p| n.saturating_add(p.capacity()),
 			),
-			Self::Remap { prefix, .. } => prefix.capacity(),
+			Self::Remap(remap) => remap.heap_bytes(),
 		})
 	}
 }
 
 pub struct PasteOutcome {
 	pub result: Result<PastePreviewPlan, Msg>,
-	pub remap: Option<(String, bool)>,
+	pub remap: Option<Remap>,
 }
 
 impl PasteOutcome {
@@ -137,7 +158,7 @@ impl PasteOutcome {
 			Ok(plan) => plan.retained_bytes(),
 			Err(err) => err.heap_bytes(),
 		}
-		.saturating_add(self.remap.as_ref().map_or(0, |(p, _)| p.capacity()))
+		.saturating_add(self.remap.as_ref().map_or(0, Remap::heap_bytes))
 	}
 }
 
@@ -330,12 +351,11 @@ impl PastePending {
 		};
 		let input = match request {
 			PasteRequest::Clipboard { .. } => PasteInput::Clipboard(request),
-			PasteRequest::Remap { prefix, keep } => {
+			PasteRequest::Remap(remap) => {
 				let Some(plan) = plan else { return Ok(None) };
 				PasteInput::Remap {
 					plan: plan.clone(),
-					prefix,
-					keep,
+					remap,
 				}
 			}
 		};
@@ -377,16 +397,15 @@ enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
 		plan: PastePreviewPlan,
-		prefix: String,
-		keep: bool,
+		remap: Remap,
 	},
 }
 impl PasteInput {
 	fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard(request) => request.bytes(),
-			Self::Remap { plan, prefix, .. } => {
-				plan.retained_bytes().saturating_add(prefix.capacity())
+			Self::Remap { plan, remap } => {
+				plan.retained_bytes().saturating_add(remap.heap_bytes())
 			}
 		})
 	}
@@ -421,15 +440,11 @@ impl PasteWorker {
 				),
 				remap: None,
 			},
-			PasteInput::Remap {
-				mut plan,
-				prefix,
-				keep,
-			} => {
+			PasteInput::Remap { mut plan, remap } => {
 				let result = plan.rebuild_file_plan_with(opts).map(|()| plan);
 				PasteOutcome {
 					result,
-					remap: Some((prefix, keep)),
+					remap: Some(remap),
 				}
 			}
 			_ => unreachable!(
@@ -596,6 +611,12 @@ pub struct PasteItem {
 	pub rename_note: Option<String>,
 }
 
+impl crate::dirtree::TreePath for PasteItem {
+	fn tree_path(&self) -> &str {
+		&self.path
+	}
+}
+
 impl PasteItem {
 	pub fn is_delete(&self) -> bool {
 		matches!(self.op, PlannedOp::Delete)
@@ -603,6 +624,12 @@ impl PasteItem {
 
 	pub fn writes_content(&self) -> bool {
 		matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
+	}
+
+	/// The deleted old path of a commit's rename. It stands beside the new
+	/// path in the tree, so its row names its own full path.
+	pub fn is_rename_source(&self) -> bool {
+		self.is_delete() && self.rename_note.is_some()
 	}
 
 	/// An existing destination file that the user may choose to overwrite.
@@ -669,13 +696,90 @@ impl PasteItem {
 	}
 }
 
+/// Key of a destination root in the preview tree.
+pub type RootKey = PathBuf;
+
+/// A folder row of the paste tree: its root and its path under it ("" is
+/// the root row itself). A commit replay lists each commit's own folders, so
+/// a folder named like another commit's is a different row: `commit` says
+/// whose it is (`None` in a file paste).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirKey {
+	pub commit: Option<usize>,
+	pub root: RootKey,
+	pub path: String,
+}
+
+/// Where the paste cursor is. Commit replays only ever have `Item`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteCursor {
+	Item(usize),
+	Dir(DirKey),
+}
+
+/// A folder's include box. `Locked`: nothing under it can be toggled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tick {
+	All,
+	Partial,
+	Empty,
+	Locked,
+}
+
+/// What a folder row counts over the rows under it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirSummary {
+	/// Every row under it, skipped ones included.
+	pub files: usize,
+	/// Rows whose include box can be toggled (not skipped when planned).
+	pub toggleable: usize,
+	/// Toggleable rows that are included.
+	pub included: usize,
+}
+
+impl DirSummary {
+	pub fn tick(&self) -> Tick {
+		if self.toggleable == 0 {
+			Tick::Locked
+		} else if self.included == self.toggleable {
+			Tick::All
+		} else if self.included == 0 {
+			Tick::Empty
+		} else {
+			Tick::Partial
+		}
+	}
+}
+
+/// What the arrow keys do at the cursor. The session applies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeStep {
+	Nothing,
+	Fold(DirKey),
+	Unfold(DirKey),
+	Move(PasteCursor),
+}
+
 /// One row of the paste change tree (built per frame, never retained).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasteNode {
-	/// A destination repository and how many items land in it.
-	Root(String, usize),
-	/// A directory under that root, as one compressed path ("src/app").
-	Dir(String, usize),
+	/// A destination root; `ord` is its position on screen (probe ids).
+	Root {
+		key: DirKey,
+		ord: usize,
+		label: String,
+		sum: DirSummary,
+		collapsed: bool,
+	},
+	/// A directory under a root, as one compressed path ("src/app").
+	Dir {
+		key: DirKey,
+		ord: usize,
+		name: String,
+		depth: usize,
+		sum: DirSummary,
+		collapsed: bool,
+	},
 	/// An item (index into `items`) at this tree depth.
 	File(usize, usize),
 	/// A commit header (index into the payload's commits).
@@ -1152,10 +1256,24 @@ pub struct PastePreviewPlan {
 	pub whole_commit: bool,
 	/// Commits whose file rows are folded away (commit replay only).
 	pub collapsed_commits: BTreeSet<usize>,
+	/// Folders whose rows are folded away (file mode). Keyed by path, so a
+	/// remap keeps the folds of folders that still exist.
+	pub collapsed_dirs: BTreeSet<DirKey>,
+	/// The folder the cursor is on. `Some` takes precedence over
+	/// `selected_item_idx`.
+	pub cursor_dir: Option<DirKey>,
+	/// The first preview with rows has had its large folders folded.
+	fold_seeded: bool,
 	pub prefix_choices: Vec<PrefixChoice>,
 	/// Digest of the repo roots the candidates were last built from, so a
 	/// landing that brings the same set skips the canonicalize.
 	seen_roots: u64,
+	/// The restore-base suggestion the last plan heard (local engine or the
+	/// worker). Only kept when there are no prefix rows: see `restore_hint`.
+	restore_base: Option<RestoreBaseSuggestion>,
+	/// The hint's [Adjust paths]: plan with `restore_base`. Off on every
+	/// paste, so nothing is adjusted unasked.
+	pub adjust_paths: bool,
 	/// Shared so starting an apply does not copy every file body.
 	pub plan: Arc<RestorePlan>,
 	pub items: Vec<PasteItem>,
@@ -1168,6 +1286,15 @@ pub struct PastePreviewPlan {
 	/// Set in a remote workspace. `import_plan` and `commit_preview` then
 	/// hold the worker's plan, with the worker's paths.
 	pub remote: Option<RemotePaste>,
+}
+
+/// Heap bytes of a suggestion, charged to the plan that keeps it.
+fn suggestion_heap(s: &RestoreBaseSuggestion) -> usize {
+	s.label.capacity()
+		+ match &s.base {
+			RestoreBase::Strip { segment } => segment.capacity(),
+			RestoreBase::Add { prefix } => prefix.capacity(),
+		}
 }
 
 fn empty_plan() -> Arc<RestorePlan> {
@@ -1213,6 +1340,26 @@ impl RowControl {
 		};
 		format!("paste-{kind}:{ix}:{path}")
 	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirControl {
+	Row,
+	Toggle,
+	Include,
+}
+
+/// Element and probe id of a folder row's control:
+/// `paste-dir[-toggle|-include]:<ord>:<rel>`. `ord` is the root's position
+/// on screen (a name can repeat or hold `:`); `rel` is the folder's path
+/// under it, empty for the root row itself.
+pub fn dir_control_id(kind: DirControl, ord: usize, rel: &str) -> String {
+	let kind = match kind {
+		DirControl::Row => "",
+		DirControl::Toggle => "-toggle",
+		DirControl::Include => "-include",
+	};
+	format!("paste-dir{kind}:{ord}:{rel}")
 }
 
 /// Element and probe id of a commit header.
@@ -1304,6 +1451,169 @@ fn destination_error(dest: &Path, err: &std::io::Error) -> Msg {
 		1,
 		reason_msg(&snip_core::reason::io_reason(err, "")),
 	)
+}
+
+fn tally<'a>(items: impl Iterator<Item = &'a PasteItem>) -> PasteCounts {
+	let mut c = PasteCounts::default();
+	for it in items {
+		if it.overwritable() {
+			c.existing += 1;
+		}
+		match it.action() {
+			RowAction::Create => c.creates += 1,
+			RowAction::Overwrite => c.overwrites += 1,
+			RowAction::Delete => c.deletes += 1,
+			RowAction::CommitRefused(_)
+			| RowAction::OverwritePending
+			| RowAction::Excluded { by_commit: true } => {}
+			RowAction::Skip(_)
+			| RowAction::DeleteMissing
+			| RowAction::KeepExisting
+			| RowAction::Excluded { by_commit: false } => c.skips += 1,
+		}
+	}
+	c
+}
+
+/// The items of one destination root.
+struct RootGroup {
+	root: RootKey,
+	label: String,
+	/// Every item of the root.
+	all: Vec<usize>,
+	/// Items with a place under the root.
+	placed: Vec<usize>,
+	/// Items skipped when planned: they only have a raw path.
+	skipped: Vec<usize>,
+}
+
+/// The root a path lies in. With one root inside another (a prefix mapped to
+/// a folder of the destination) it is the inner one, where a write to that
+/// path would be shown too.
+fn innermost_root<'a>(
+	roots: &'a [PathBuf],
+	path: &Path,
+) -> Option<&'a PathBuf> {
+	roots
+		.iter()
+		.filter(|r| path.starts_with(r))
+		.max_by_key(|r| r.components().count())
+}
+
+/// The root a planned file's `relative` path is relative to: the one of
+/// `roots` that is `absolute` with `relative` taken off its end. Compared
+/// as text with `/` separators, so a worker's Windows paths read the same on
+/// any master. `None` when no root has that spelling.
+fn plan_root_of<'a>(
+	roots: &'a [PathBuf],
+	absolute: &Path,
+	relative: &str,
+) -> Option<&'a PathBuf> {
+	let slashed = |p: &Path| {
+		let text = p.to_string_lossy().replace('\\', "/");
+		text.trim_end_matches('/').to_string()
+	};
+	let absolute = slashed(absolute);
+	// The name must start right after a separator: `sub` + `g.txt` is not
+	// the file `subg.txt`.
+	let base = absolute
+		.strip_suffix(relative.trim_matches('/'))?
+		.strip_suffix('/')?;
+	roots.iter().find(|r| slashed(r) == base)
+}
+
+/// Whether `path` lies inside folder `dir` (not merely shares its start).
+fn path_under(path: &str, dir: &str) -> bool {
+	path.strip_prefix(dir)
+		.is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Turns the shared directory tree's rows into the paste tree's nodes.
+struct PasteSink<'a> {
+	plan: &'a PastePreviewPlan,
+	root: &'a RootKey,
+	ord: usize,
+	rows: &'a mut Vec<PasteNode>,
+}
+
+impl TreeSink for PasteSink<'_> {
+	fn dir(
+		&mut self,
+		path: &str,
+		name: &str,
+		members: &[usize],
+		depth: usize,
+	) -> bool {
+		let key = DirKey {
+			commit: None,
+			root: self.root.clone(),
+			path: path.to_string(),
+		};
+		let collapsed = self.plan.collapsed_dirs.contains(&key);
+		self.rows.push(PasteNode::Dir {
+			key,
+			ord: self.ord,
+			name: name.to_string(),
+			depth,
+			sum: self.plan.summary(members),
+			collapsed,
+		});
+		!collapsed
+	}
+
+	fn file(&mut self, ix: usize, depth: usize) {
+		self.rows.push(PasteNode::File(ix, depth));
+	}
+}
+
+/// A commit row's place in the tree, for [`DirTree`].
+struct Placed<'a>(&'a str);
+
+impl TreePath for Placed<'_> {
+	fn tree_path(&self) -> &str {
+		self.0
+	}
+}
+
+/// Turns the directory tree of one commit's rows into paste nodes. The tree
+/// sees the commit's rows only, so its indices start at `base` in `items`.
+struct CommitSink<'a> {
+	plan: &'a PastePreviewPlan,
+	commit: usize,
+	base: usize,
+	rows: &'a mut Vec<PasteNode>,
+}
+
+impl TreeSink for CommitSink<'_> {
+	fn dir(
+		&mut self,
+		path: &str,
+		name: &str,
+		members: &[usize],
+		depth: usize,
+	) -> bool {
+		let key = DirKey {
+			commit: Some(self.commit),
+			root: self.plan.items[self.base].dest_root.clone(),
+			path: path.to_string(),
+		};
+		let collapsed = self.plan.collapsed_dirs.contains(&key);
+		let members: Vec<usize> =
+			members.iter().map(|&m| self.base + m).collect();
+		self.rows.push(PasteNode::Dir {
+			key,
+			ord: self.commit,
+			name: name.to_string(),
+			depth,
+			sum: self.plan.summary(&members),
+			collapsed,
+		});
+		!collapsed
+	}
+
+	fn file(&mut self, ix: usize, depth: usize) {
+		self.rows.push(PasteNode::File(self.base + ix, depth));
+	}
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1439,6 +1749,9 @@ impl PastePreviewPlan {
 	}
 
 	pub fn detail_preview(&self) -> Option<Preview> {
+		if self.cursor_dir.is_some() {
+			return None;
+		}
 		self.detail_at(self.selected_item_idx)
 	}
 
@@ -1468,6 +1781,7 @@ impl PastePreviewPlan {
 				self.prefix_choices.capacity() * size_of::<PrefixChoice>(),
 			)
 			.saturating_add(self.items.capacity() * size_of::<PasteItem>())
+			.saturating_add(self.dir_state_bytes())
 			.saturating_add(size_of::<RestorePlan>() + ARC_ALLOWANCE)
 			.saturating_add(self.plan.retained_heap_bytes());
 		for choice in &self.prefix_choices {
@@ -1489,6 +1803,9 @@ impl PastePreviewPlan {
 				.saturating_add(plan.retained_heap_bytes())
 				.saturating_add(self.commit_prepared.retained_heap_bytes());
 		}
+		if let Some(hint) = &self.restore_base {
+			bytes = bytes.saturating_add(suggestion_heap(hint));
+		}
 		if let Some(error) = &self.error {
 			bytes = bytes
 				.saturating_add(error.args.capacity() * size_of::<String>());
@@ -1499,13 +1816,30 @@ impl PastePreviewPlan {
 		bytes
 	}
 
+	/// The folds and the folder cursor: the keys' buffers and a conservative
+	/// share of the set's nodes.
+	fn dir_state_bytes(&self) -> usize {
+		let key =
+			|k: &DirKey| k.root.capacity().saturating_add(k.path.capacity());
+		self.collapsed_dirs.iter().fold(
+			self.cursor_dir.as_ref().map_or(0, key),
+			|bytes, k| {
+				bytes
+					.saturating_add(size_of::<DirKey>())
+					.saturating_add(key(k))
+					.saturating_add(SET_ENTRY_ALLOWANCE)
+			},
+		)
+	}
+
 	fn apply_clone_bytes(&self) -> usize {
 		let mut bytes = size_of::<Self>()
 			.saturating_add(self.destination.capacity())
 			.saturating_add(
 				self.prefix_choices.capacity() * size_of::<PrefixChoice>(),
 			)
-			.saturating_add(self.items.capacity() * size_of::<PasteItem>());
+			.saturating_add(self.items.capacity() * size_of::<PasteItem>())
+			.saturating_add(self.dir_state_bytes());
 		for choice in &self.prefix_choices {
 			bytes = bytes.saturating_add(choice.retained_heap_bytes());
 		}
@@ -1519,7 +1853,11 @@ impl PastePreviewPlan {
 				.saturating_add(item.dest_root_name.capacity())
 				.saturating_add(item.dest_path.capacity());
 		}
-		bytes.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
+		bytes
+			.saturating_add(
+				self.restore_base.as_ref().map_or(0, suggestion_heap),
+			)
+			.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
 	}
 
 	/// A complete mapping shell alone does not authorize any write.
@@ -1793,8 +2131,13 @@ impl PastePreviewPlan {
 			commit_prepared: Default::default(),
 			whole_commit: false,
 			collapsed_commits: BTreeSet::new(),
+			collapsed_dirs: BTreeSet::new(),
+			cursor_dir: None,
+			fold_seeded: false,
 			prefix_choices: Vec::new(),
 			seen_roots: roots_digest(known_roots),
+			restore_base: None,
+			adjust_paths: false,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -1872,8 +2215,13 @@ impl PastePreviewPlan {
 			commit_prepared: prepared,
 			whole_commit: true,
 			collapsed_commits: BTreeSet::new(),
+			collapsed_dirs: BTreeSet::new(),
+			cursor_dir: None,
+			fold_seeded: false,
 			prefix_choices: Vec::new(),
 			seen_roots: 0,
+			restore_base: None,
+			adjust_paths: false,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -2073,6 +2421,31 @@ impl PastePreviewPlan {
 		Ok(())
 	}
 
+	/// The restore-base suggestion the panel offers: only for a payload
+	/// without prefix rows (a `clipcode-root` export) and not for a commit
+	/// replay. With prefix rows the user routes each prefix instead (D4).
+	pub fn restore_hint(&self) -> Option<&RestoreBaseSuggestion> {
+		if self.whole_commit || !self.prefix_choices.is_empty() {
+			return None;
+		}
+		self.restore_base.as_ref()
+	}
+
+	/// Records the hint's choice only, like [`Self::choose_keep_relative`].
+	pub fn choose_adjust_paths(&mut self, on: bool) -> Result<(), Msg> {
+		if self.restore_hint().is_none() {
+			return Err(Msg::new("paste_adjust_unavailable", []));
+		}
+		self.adjust_paths = on;
+		Ok(())
+	}
+
+	/// Plans with (`true`) or without the suggestion. Blocking, for tests.
+	pub fn set_adjust_paths(&mut self, on: bool) -> Result<(), Msg> {
+		self.choose_adjust_paths(on)?;
+		self.rebuild_file_plan_with(&RunOptions::default())
+	}
+
 	/// Drops the planned writes so a changed mapping cannot apply the old
 	/// ones. A whole-commit replay has no mapping and keeps its plan.
 	pub fn clear_file_plan(&mut self) {
@@ -2122,53 +2495,76 @@ impl PastePreviewPlan {
 		limit: usize,
 	) -> Result<(), Msg> {
 		check_budget(self.retained_bytes(), limit)?;
+		// `restore_base` is left as it was on the early returns below: they
+		// run before any engine hears the payload, so the last suggestion
+		// still describes it and keeps [Use as-is] reachable.
 		if !self.mapping_ready() {
 			self.error = Some(Msg::new("mapping_required", []));
 			return Ok(());
 		}
 		let (target, route) = self.target_route()?;
-		let file_plan =
-			match target.plan_files(&self.raw_payload, &route, opts, None) {
-				Ok(plan) => plan,
-				// No engine answered: the destination did not resolve or the
-				// worker could not be reached.
-				Err(
-					err @ (PasteError::Destination { .. }
-					| PasteError::Remote(
-						RemoteError::Io(_)
-						| RemoteError::Start { .. }
-						| RemoteError::PatchTooLarge { .. }
-						| RemoteError::Protocol(_)
-						| RemoteError::Cancelled
-						| RemoteError::TimedOut
-						| RemoteError::Stalled { .. }
-						| RemoteError::WorkerTooOld { .. },
-					)
-					| PasteError::OutcomeUnknown(_)
-					| PasteError::NoReplayResult),
-				) => {
-					return Err(destination_msg(
-						self.remote.as_ref(),
-						&self.destination,
-						err,
-					));
+		let mut heard: Option<RestoreBaseSuggestion> = None;
+		let planned = {
+			let mut note = |s: &RestoreBaseSuggestion| heard = Some(s.clone());
+			// Only a payload without prefix rows (a `clipcode-root` export)
+			// shows the hint; with rows the user routes each prefix (D4).
+			let note: Option<&mut dyn FnMut(&RestoreBaseSuggestion)> =
+				if self.prefix_choices.is_empty() {
+					Some(&mut note)
+				} else {
+					None
+				};
+			target.plan_files(&self.raw_payload, &route, opts, note)
+		};
+		// A refusal that carried no suggestion (the destination did not
+		// resolve, the worker was unreachable) keeps the last one: the hint
+		// row must stay so [Use as-is] can undo an adjustment the engine
+		// refused. An engine that refused the plan, locally or on a worker,
+		// said what it suggested first, so its refusal updates it.
+		if planned.is_ok() || heard.is_some() {
+			self.restore_base = heard;
+		}
+		let file_plan = match planned {
+			Ok(plan) => plan,
+			// No engine answered: the destination did not resolve or the
+			// worker could not be reached.
+			Err(
+				err @ (PasteError::Destination { .. }
+				| PasteError::Remote(
+					RemoteError::Io(_)
+					| RemoteError::Start { .. }
+					| RemoteError::PatchTooLarge { .. }
+					| RemoteError::Protocol(_)
+					| RemoteError::Cancelled
+					| RemoteError::TimedOut
+					| RemoteError::Stalled { .. }
+					| RemoteError::WorkerTooOld { .. },
+				)
+				| PasteError::OutcomeUnknown(_)
+				| PasteError::NoReplayResult),
+			) => {
+				return Err(destination_msg(
+					self.remote.as_ref(),
+					&self.destination,
+					err,
+				));
+			}
+			// An engine refused the plan, locally or on the worker.
+			Err(err) => {
+				if crate::e2e_on() && err.is_collision() {
+					app_log!(
+						"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+					);
 				}
-				// An engine refused the plan, locally or on the worker.
-				Err(err) => {
-					if crate::e2e_on() && err.is_collision() {
-						app_log!(
-							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-						);
-					}
-					self.error = Some(Msg::with_msg_arg(
-						"paste_err_plan",
-						[String::new()],
-						0,
-						reason_msg(&err.reason()),
-					));
-					return Ok(());
-				}
-			};
+				self.error = Some(Msg::with_msg_arg(
+					"paste_err_plan",
+					[String::new()],
+					0,
+					reason_msg(&err.reason()),
+				));
+				return Ok(());
+			}
+		};
 		let base = self
 			.retained_bytes()
 			.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
@@ -2190,13 +2586,17 @@ impl PastePreviewPlan {
 		self.import_plan = Some(Arc::new(file_plan));
 		self.items = items;
 		self.error = None;
+		self.seed_folds();
 		Ok(())
 	}
 
 	/// This plan's target and the chosen prefix folders, spelled for it.
 	fn target_route(&self) -> Result<(PasteTarget, PasteRoute), Msg> {
 		let target = paste_target(self.remote.as_ref(), &self.destination)?;
-		let mut route = PasteRoute::default();
+		let mut route = PasteRoute {
+			adjust_paths: self.adjust_paths,
+			..Default::default()
+		};
 		for choice in &self.prefix_choices {
 			if choice.keep_relative {
 				continue;
@@ -2222,6 +2622,23 @@ impl PastePreviewPlan {
 	) -> Result<Vec<PasteItem>, Msg> {
 		let mut items = Vec::new();
 		let mut items_heap = 0usize;
+		// The roots as the plan's rows spell them. The engine keeps the
+		// destination as it was given (through a symlink, say), while a
+		// row's own root is the canonical folder; a worker's are its own.
+		let roots: Vec<PathBuf> = file_plan
+			.roots()
+			.iter()
+			.map(|r| match &self.remote {
+				None => dunce::canonicalize(r).unwrap_or_else(|_| r.clone()),
+				Some(_) => r.clone(),
+			})
+			.collect();
+		// The root a row without its own is shown under (a skipped row has
+		// no place at all): the first one, where unprefixed paths land.
+		let primary = roots
+			.first()
+			.cloned()
+			.unwrap_or_else(|| self.destination.clone());
 		for (op_idx, op) in plan.create_operations.iter().enumerate() {
 			let content: Arc<str> = op.content.as_str().into();
 			let bytes = content.len();
@@ -2256,12 +2673,15 @@ impl PastePreviewPlan {
 			)?;
 		}
 		for (op_idx, op) in plan.delete_operations.iter().enumerate() {
-			let dest_root = file_plan
-				.roots()
-				.iter()
-				.find(|r| op.absolute_path.starts_with(r))
-				.cloned()
-				.unwrap_or_else(|| self.destination.clone());
+			// The root the delete's path is relative to, as a create's
+			// `root_path` is: the tree places a row at root + path, and
+			// Apply deletes `absolute_path`. The innermost root above the
+			// file is only a fallback: a nested root can lie between.
+			let dest_root =
+				plan_root_of(&roots, &op.absolute_path, &op.relative_path)
+					.or_else(|| innermost_root(&roots, &op.absolute_path))
+					.cloned()
+					.unwrap_or_else(|| primary.clone());
 			let item = PasteItem {
 				path: op.relative_path.clone(),
 				dest_root_name: root_name(&dest_root),
@@ -2297,8 +2717,8 @@ impl PastePreviewPlan {
 			};
 			let item = PasteItem {
 				path: op.raw_path.clone(),
-				dest_root: self.destination.clone(),
-				dest_root_name: root_name(&self.destination),
+				dest_root: primary.clone(),
+				dest_root_name: root_name(&primary),
 				// There is no admitted destination for a skipped operation.
 				dest_path: self.destination.clone(),
 				dest_exists: false,
@@ -2411,114 +2831,492 @@ impl PastePreviewPlan {
 	/// Up / Down follow the rows on screen (the change tree's order).
 	#[cfg(test)]
 	pub fn select_prev(&mut self) {
-		self.selected_item_idx = self.step_target(false);
+		let target = self.step_target(false);
+		self.put_cursor(target);
 	}
 
 	#[cfg(test)]
 	pub fn select_next(&mut self) {
-		self.selected_item_idx = self.step_target(true);
+		let target = self.step_target(true);
+		self.put_cursor(target);
 	}
 
-	pub fn step_target(&self, forward: bool) -> usize {
-		let order = self.display_order();
-		let Some(pos) = order.iter().position(|&i| i == self.selected_item_idx)
-		else {
-			// The selected row is folded away: re-enter at the near end.
-			let edge = if forward { order.first() } else { order.last() };
-			return edge.copied().unwrap_or(self.selected_item_idx);
+	#[cfg(test)]
+	fn put_cursor(&mut self, cursor: PasteCursor) {
+		match cursor {
+			PasteCursor::Item(ix) => {
+				self.selected_item_idx = ix;
+				self.cursor_dir = None;
+			}
+			PasteCursor::Dir(key) => self.cursor_dir = Some(key),
+		}
+	}
+
+	/// A folder row as the logs and drivers name it: `<ord>:<rel>`, the
+	/// root's position on screen (a replay's: the commit's index) and the
+	/// folder's path under it.
+	pub fn dir_label(&self, key: &DirKey) -> String {
+		// A replay has one root; its folders are told apart by commit.
+		let ord = key.commit.unwrap_or_else(|| {
+			self.root_groups()
+				.iter()
+				.position(|g| g.root == key.root)
+				.unwrap_or(0)
+		});
+		format!("{ord}:{}", key.path)
+	}
+
+	/// Where the cursor is: on a folder row, or on an item.
+	pub fn cursor(&self) -> PasteCursor {
+		self.cursor_dir
+			.clone()
+			.map_or(PasteCursor::Item(self.selected_item_idx), PasteCursor::Dir)
+	}
+
+	/// The rows the cursor can stand on, in screen order, with their tree
+	/// depth and, for a folder, whether it is folded. A commit replay has
+	/// only its file rows (its headers and folders fold, they are not
+	/// selected).
+	pub fn cursor_rows(&self) -> Vec<(PasteCursor, usize, Option<bool>)> {
+		let nodes = if self.whole_commit {
+			self.commit_rows()
+		} else {
+			self.tree_rows()
+		};
+		let by_commit = self.whole_commit;
+		nodes
+			.into_iter()
+			.filter_map(|n| match n {
+				PasteNode::Root { key, collapsed, .. } => {
+					Some((PasteCursor::Dir(key), 0, Some(collapsed)))
+				}
+				// A commit's folders fold like its headers do: they are
+				// clicked, the cursor does not stand on them.
+				PasteNode::Dir { .. } if by_commit => None,
+				PasteNode::Dir {
+					key,
+					depth,
+					collapsed,
+					..
+				} => Some((PasteCursor::Dir(key), depth, Some(collapsed))),
+				PasteNode::File(ix, depth) => {
+					Some((PasteCursor::Item(ix), depth, None))
+				}
+				PasteNode::Commit(_) => None,
+			})
+			.collect()
+	}
+
+	/// The row Up / Down moves to. Changes nothing.
+	pub fn step_target(&self, forward: bool) -> PasteCursor {
+		let rows = self.cursor_rows();
+		let current = self.cursor();
+		let Some(pos) = rows.iter().position(|(c, ..)| *c == current) else {
+			// The cursor row is folded away: re-enter at the near end.
+			let edge = if forward { rows.first() } else { rows.last() };
+			return edge.map_or(current, |(c, ..)| c.clone());
 		};
 		let next = if forward {
 			pos.checked_add(1)
 		} else {
 			pos.checked_sub(1)
 		};
-		next.and_then(|n| order.get(n))
-			.copied()
-			.unwrap_or(self.selected_item_idx)
+		next.and_then(|n| rows.get(n))
+			.map_or(current, |(c, ..)| c.clone())
 	}
 
-	/// Item indices in change-tree order: by destination root, then
-	/// directory (a root's own files first), then name. `items` itself keeps
-	/// the plan's order. A commit replay lists its visible rows in natural
-	/// path order like the Log instead, exactly as [`Self::commit_rows`]
-	/// shows them.
+	/// Item indices in the order the rows show: by destination root, then
+	/// the directory tree (folders before files). A commit replay lists its
+	/// visible rows in natural path order like the Log instead, exactly as
+	/// [`Self::commit_rows`] shows them. Rows folded away are left out.
 	pub fn display_order(&self) -> Vec<usize> {
-		if self.whole_commit {
-			return self
-				.commit_rows()
-				.into_iter()
-				.filter_map(|n| match n {
-					PasteNode::File(ix, _) => Some(ix),
-					_ => None,
-				})
-				.collect();
-		}
-		// Natural path order like the Log (g2 before g10); the root comes first.
+		let nodes = if self.whole_commit {
+			self.commit_rows()
+		} else {
+			self.tree_rows()
+		};
+		nodes
+			.into_iter()
+			.filter_map(|n| match n {
+				PasteNode::File(ix, _) => Some(ix),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// The items of each destination root, roots in natural name order.
+	/// Rows skipped when planned carry their raw clipboard path and no real
+	/// place, so they are kept apart from the rows that have one.
+	fn root_groups(&self) -> Vec<RootGroup> {
+		use crate::ui::natural_cmp;
+		let mut groups: Vec<RootGroup> = Vec::new();
 		let mut order: Vec<usize> = (0..self.items.len()).collect();
 		order.sort_by(|&a, &b| {
 			let (x, y) = (&self.items[a], &self.items[b]);
-			let ((dx, nx), (dy, ny)) = (split_dir(&x.path), split_dir(&y.path));
-			x.dest_root_name
-				.cmp(&y.dest_root_name)
-				.then_with(|| crate::ui::natural_cmp(dx, dy))
-				.then_with(|| crate::ui::natural_cmp(nx, ny))
+			natural_cmp(&x.dest_root_name, &y.dest_root_name)
+				.then_with(|| x.dest_root.cmp(&y.dest_root))
+				.then_with(|| a.cmp(&b))
 		});
-		order
+		for ix in order {
+			let item = &self.items[ix];
+			if groups.last().is_none_or(|g| g.root != item.dest_root) {
+				groups.push(RootGroup {
+					root: item.dest_root.clone(),
+					label: item.dest_root_name.clone(),
+					all: Vec::new(),
+					placed: Vec::new(),
+					skipped: Vec::new(),
+				});
+			}
+			let group = groups.last_mut().expect("a group was just pushed");
+			group.all.push(ix);
+			if item.planned_skip() {
+				group.skipped.push(ix);
+			} else {
+				group.placed.push(ix);
+			}
+		}
+		for group in &mut groups {
+			group.skipped.sort_by(|&a, &b| {
+				natural_cmp(&self.items[a].path, &self.items[b].path)
+			});
+		}
+		groups
+	}
+
+	fn summary(&self, members: &[usize]) -> DirSummary {
+		let mut sum = DirSummary::default();
+		for &ix in members {
+			let item = &self.items[ix];
+			sum.files += 1;
+			if self.whole_commit {
+				// A replay is written whole or not at all: nothing under a
+				// folder can be toggled, and "included" is what Apply writes.
+				sum.included += usize::from(
+					item.selected && !item.action().is_not_written(),
+				);
+			} else if !item.planned_skip() {
+				sum.toggleable += 1;
+				sum.included += usize::from(item.selected);
+			}
+		}
+		sum
 	}
 
 	/// The change tree IntelliJ's Apply Patch dialog shows: one root node per
-	/// destination repository, one node per directory, then its files.
+	/// destination root, one node per directory (a chain of single-child
+	/// directories is one), then its files. Folders come before files.
+	/// Folded folders keep their node and drop their rows.
 	pub fn tree_rows(&self) -> Vec<PasteNode> {
 		let mut rows = Vec::new();
-		let (mut root, mut dir): (Option<&str>, Option<&str>) = (None, None);
-		// Rows of the open root / directory node, counted as files arrive.
-		let (mut root_row, mut dir_row) = (0, None);
-		for ix in self.display_order() {
-			let it = &self.items[ix];
-			if root != Some(it.dest_root_name.as_str()) {
-				root = Some(&it.dest_root_name);
-				dir = None;
-				root_row = rows.len();
-				rows.push(PasteNode::Root(it.dest_root_name.clone(), 0));
+		for (ord, group) in self.root_groups().into_iter().enumerate() {
+			let key = DirKey {
+				commit: None,
+				root: group.root.clone(),
+				path: String::new(),
+			};
+			let collapsed = self.collapsed_dirs.contains(&key);
+			rows.push(PasteNode::Root {
+				key,
+				ord,
+				label: group.label.clone(),
+				sum: self.summary(&group.all),
+				collapsed,
+			});
+			if collapsed {
+				continue;
 			}
-			let (d, _) = split_dir(&it.path);
-			if dir != Some(d) {
-				dir = Some(d);
-				dir_row = (!d.is_empty()).then_some(rows.len());
-				if !d.is_empty() {
-					rows.push(PasteNode::Dir(d.to_string(), 0));
-				}
-			}
-			for row in [Some(root_row), dir_row].into_iter().flatten() {
-				if let PasteNode::Root(_, n) | PasteNode::Dir(_, n) =
-					&mut rows[row]
-				{
-					*n += 1;
-				}
-			}
-			rows.push(PasteNode::File(ix, if d.is_empty() { 1 } else { 2 }));
+			let mut placed = group.placed;
+			let mut sink = PasteSink {
+				plan: self,
+				root: &group.root,
+				ord,
+				rows: &mut rows,
+			};
+			DirTree { files: &self.items }.push(&mut sink, &mut placed, 0, 1);
+			rows.extend(
+				group.skipped.into_iter().map(|ix| PasteNode::File(ix, 1)),
+			);
 		}
 		rows
 	}
 
+	/// Every folder row of the fully open tree: (root, path, depth).
+	fn all_dirs(&self) -> Vec<(RootKey, String, usize)> {
+		struct All(Vec<(RootKey, String, usize)>, RootKey);
+		impl TreeSink for All {
+			fn dir(
+				&mut self,
+				path: &str,
+				_: &str,
+				_: &[usize],
+				depth: usize,
+			) -> bool {
+				self.0.push((self.1.clone(), path.to_string(), depth));
+				true
+			}
+
+			fn file(&mut self, _: usize, _: usize) {}
+		}
+		let mut found = Vec::new();
+		for group in self.root_groups() {
+			let mut all = All(Vec::new(), group.root);
+			let mut placed = group.placed;
+			DirTree { files: &self.items }.push(&mut all, &mut placed, 0, 1);
+			found.extend(all.0);
+		}
+		found
+	}
+
+	/// The outermost folded folder that hides item `ix`, if any.
+	fn hiding_dir(&self, ix: usize) -> Option<DirKey> {
+		let item = self.items.get(ix)?;
+		self.collapsed_dirs
+			.iter()
+			.filter(|k| {
+				k.root == item.dest_root
+					&& (k.path.is_empty()
+						|| (!item.planned_skip()
+							&& path_under(&item.path, &k.path)))
+			})
+			.min_by_key(|k| k.path.len())
+			.cloned()
+	}
+
+	/// Folds the first level of a big preview, once, when its rows first
+	/// arrive (a mapping can make that a later remap, not the first build).
+	/// A cursor the fold hides moves onto the folder that hides it.
+	fn seed_folds(&mut self) {
+		if self.fold_seeded || self.items.is_empty() {
+			return;
+		}
+		self.fold_seeded = true;
+		if self.items.len() <= FOLD_FILES_OVER {
+			return;
+		}
+		for (root, path, depth) in self.all_dirs() {
+			if depth == 1 {
+				self.collapsed_dirs.insert(DirKey {
+					commit: None,
+					root,
+					path,
+				});
+			}
+		}
+		if let Some(key) = self.hiding_dir(self.selected_item_idx) {
+			self.cursor_dir = Some(key);
+		}
+	}
+
+	/// Drops state that no longer names a row, after a remap or a rebuild:
+	/// folds of folders that are gone, a folder cursor that is gone or
+	/// hidden. A cursor left on a hidden item moves onto its folder.
+	/// Only ever makes the state smaller.
+	pub fn normalize_cursor(&mut self) {
+		if self.whole_commit {
+			return;
+		}
+		let mut exists: BTreeSet<DirKey> = self
+			.all_dirs()
+			.into_iter()
+			.map(|(root, path, _)| DirKey {
+				commit: None,
+				root,
+				path,
+			})
+			.collect();
+		exists.extend(self.root_groups().into_iter().map(|g| DirKey {
+			commit: None,
+			root: g.root,
+			path: String::new(),
+		}));
+		self.collapsed_dirs.retain(|k| exists.contains(k));
+		let visible = |plan: &Self| {
+			let cursor = plan.cursor();
+			plan.cursor_rows().iter().any(|(c, ..)| *c == cursor)
+		};
+		if self.cursor_dir.is_some() && !visible(self) {
+			self.cursor_dir = None;
+		}
+		if self.cursor_dir.is_none() && !visible(self) {
+			self.cursor_dir = self.hiding_dir(self.selected_item_idx);
+		}
+	}
+
+	/// Folds or unfolds one folder's rows.
+	///
+	/// Does not move the cursor: the session does, so it can admit the new
+	/// state first. When the fold hides the cursor, returns the folder to
+	/// move onto, so Space and the detail pane never act on a row the user
+	/// cannot see.
+	pub fn toggle_dir_collapsed(
+		&mut self,
+		key: &DirKey,
+	) -> Option<PasteCursor> {
+		if self.whole_commit {
+			// The cursor never stands on a replay's folder: it goes to the
+			// nearest row still shown, as when a header folds.
+			let before = self.display_order();
+			if !self.collapsed_dirs.remove(key) {
+				self.collapsed_dirs.insert(key.clone());
+			}
+			return self.row_left_hidden(&before).map(PasteCursor::Item);
+		}
+		if self.collapsed_dirs.remove(key) {
+			return None;
+		}
+		self.collapsed_dirs.insert(key.clone());
+		let cursor = self.cursor();
+		let visible = self.cursor_rows().iter().any(|(c, ..)| *c == cursor);
+		(!visible).then(|| PasteCursor::Dir(key.clone()))
+	}
+
+	/// What Left does at the cursor: fold an open folder, else go up to the
+	/// folder that holds this row.
+	pub fn nav_left(&self) -> TreeStep {
+		if self.whole_commit {
+			return TreeStep::Nothing;
+		}
+		let rows = self.cursor_rows();
+		let cursor = self.cursor();
+		let Some(pos) = rows.iter().position(|(c, ..)| *c == cursor) else {
+			return TreeStep::Nothing;
+		};
+		let (here, depth, collapsed) = &rows[pos];
+		if let (PasteCursor::Dir(key), Some(false)) = (here, collapsed) {
+			return TreeStep::Fold(key.clone());
+		}
+		rows[..pos]
+			.iter()
+			.rev()
+			.find(|(_, d, _)| d < depth)
+			.map_or(TreeStep::Nothing, |(c, ..)| TreeStep::Move(c.clone()))
+	}
+
+	/// What Right does at the cursor: open a folded folder, else go to its
+	/// first row.
+	pub fn nav_right(&self) -> TreeStep {
+		if self.whole_commit {
+			return TreeStep::Nothing;
+		}
+		let rows = self.cursor_rows();
+		let cursor = self.cursor();
+		let Some(pos) = rows.iter().position(|(c, ..)| *c == cursor) else {
+			return TreeStep::Nothing;
+		};
+		let (here, depth, collapsed) = &rows[pos];
+		match (here, collapsed) {
+			(PasteCursor::Dir(key), Some(true)) => {
+				TreeStep::Unfold(key.clone())
+			}
+			(PasteCursor::Dir(_), Some(false)) => rows
+				.get(pos + 1)
+				.filter(|(_, d, _)| d > depth)
+				.map_or(TreeStep::Nothing, |(c, ..)| TreeStep::Move(c.clone())),
+			_ => TreeStep::Nothing,
+		}
+	}
+
+	/// Items a folder's include box covers: the rows under it that can be
+	/// toggled. A sibling that only shares the name's start is not under it.
+	fn dir_members<'a>(
+		&'a self,
+		key: &'a DirKey,
+	) -> impl Iterator<Item = usize> + 'a {
+		self.items.iter().enumerate().filter_map(move |(ix, item)| {
+			(item.dest_root == key.root
+				&& !item.planned_skip()
+				&& (key.path.is_empty() || path_under(&item.path, &key.path)))
+			.then_some(ix)
+		})
+	}
+
+	/// The include box of a folder: everything under it on unless it is all
+	/// on already, then everything off. `None` when nothing can be toggled
+	/// (a commit replay writes whole or not at all).
+	pub fn set_dir_selected(&mut self, key: &DirKey) -> Option<bool> {
+		if self.whole_commit {
+			return None;
+		}
+		let members: Vec<usize> = self.dir_members(key).collect();
+		if members.is_empty() {
+			return None;
+		}
+		let on = !members.iter().all(|&ix| self.items[ix].selected);
+		for ix in members {
+			self.items[ix].selected = on;
+		}
+		Some(on)
+	}
+
+	/// The folder the detail pane describes: the cursor's folder, while its
+	/// row is shown. A remap clears the rows but keeps the cursor for the
+	/// next landing, and a folder with no rows has nothing to describe.
+	pub fn detail_dir(&self) -> Option<&DirKey> {
+		let key = self.cursor_dir.as_ref()?;
+		(!self.items.is_empty() && self.has_dir_row(key)).then_some(key)
+	}
+
+	/// Whether a folder or root row with this key is shown now.
+	pub fn has_dir_row(&self, key: &DirKey) -> bool {
+		let nodes = if self.whole_commit {
+			self.commit_rows()
+		} else {
+			self.tree_rows()
+		};
+		nodes.iter().any(|n| {
+			matches!(n, PasteNode::Root { key: k, .. }
+				| PasteNode::Dir { key: k, .. } if k == key)
+		})
+	}
+
+	/// Where item `ix` stands in the tree. A commit's rename is a deletion of
+	/// the old path next to a write of the new one, and the pair stays
+	/// together under the new path (#196), where the user will look for it.
+	pub fn place_path(&self, ix: usize) -> &str {
+		let item = &self.items[ix];
+		if item.is_rename_source() {
+			if let Some(next) = self.items.get(ix + 1) {
+				if next.commit == item.commit && next.op_index == item.op_index
+				{
+					return &next.path;
+				}
+			}
+		}
+		&item.path
+	}
+
 	/// The commit replay as the user will see it: each commit's header, in
-	/// replay order, followed by its file rows in natural path order. An empty commit is a header
-	/// with no rows; a collapsed commit keeps only its header.
+	/// replay order, followed by its rows as the same directory tree a file
+	/// paste shows (folders first, natural path order). An empty commit is a
+	/// header with no rows; a collapsed commit keeps only its header, and a
+	/// collapsed folder only its own row.
 	pub fn commit_rows(&self) -> Vec<PasteNode> {
 		let Some(preview) = &self.commit_preview else {
 			return Vec::new();
 		};
 		let mut rows = Vec::with_capacity(self.items.len());
-		let mut ix = 0;
+		let mut start = 0;
 		for c in 0..preview.plan().commits.len() {
 			rows.push(PasteNode::Commit(c));
-			let shown = !self.collapsed_commits.contains(&c);
-			while self.items.get(ix).is_some_and(|i| i.commit == Some(c)) {
-				if shown {
-					rows.push(PasteNode::File(ix, 1));
-				}
-				ix += 1;
+			let len = self.items[start..]
+				.iter()
+				.take_while(|i| i.commit == Some(c))
+				.count();
+			if len > 0 && !self.collapsed_commits.contains(&c) {
+				let places: Vec<Placed> = (start..start + len)
+					.map(|ix| Placed(self.place_path(ix)))
+					.collect();
+				let mut entries: Vec<usize> = (0..len).collect();
+				let mut sink = CommitSink {
+					plan: self,
+					commit: c,
+					base: start,
+					rows: &mut rows,
+				};
+				DirTree { files: &places }.push(&mut sink, &mut entries, 0, 1);
 			}
+			start += len;
 		}
 		rows
 	}
@@ -2535,6 +3333,13 @@ impl PastePreviewPlan {
 		if !self.collapsed_commits.remove(&c) {
 			self.collapsed_commits.insert(c);
 		}
+		self.row_left_hidden(&before)
+	}
+
+	/// After a fold of a replay's rows: when the selected row went out of
+	/// view, the row to select instead (the next one shown, else the
+	/// previous). `before` is the order shown before the fold.
+	fn row_left_hidden(&self, before: &[usize]) -> Option<usize> {
 		let after = self.display_order();
 		if after.contains(&self.selected_item_idx) {
 			return None;
@@ -2547,25 +3352,20 @@ impl PastePreviewPlan {
 	}
 
 	pub fn counts(&self) -> PasteCounts {
-		let mut c = PasteCounts::default();
-		for it in &self.items {
-			if it.overwritable() {
-				c.existing += 1;
-			}
-			match it.action() {
-				RowAction::Create => c.creates += 1,
-				RowAction::Overwrite => c.overwrites += 1,
-				RowAction::Delete => c.deletes += 1,
-				RowAction::CommitRefused(_)
-				| RowAction::OverwritePending
-				| RowAction::Excluded { by_commit: true } => {}
-				RowAction::Skip(_)
-				| RowAction::DeleteMissing
-				| RowAction::KeepExisting
-				| RowAction::Excluded { by_commit: false } => c.skips += 1,
-			}
-		}
-		c
+		tally(self.items.iter())
+	}
+
+	/// The counts of the rows under a folder, skipped rows included at the
+	/// root (they show there).
+	pub fn counts_under(&self, key: &DirKey) -> PasteCounts {
+		tally(self.items.iter().enumerate().filter_map(|(ix, it)| {
+			(it.dest_root == key.root
+				&& it.commit == key.commit
+				&& (key.path.is_empty()
+					|| (!it.planned_skip()
+						&& path_under(self.place_path(ix), &key.path))))
+			.then_some(it)
+		}))
 	}
 
 	/// (rows, not written) of commit `c`; items are grouped by commit.
@@ -3064,6 +3864,236 @@ pub(crate) mod tests {
 		}
 	}
 
+	/// The tree as text (a replay's too): `R label files`,
+	/// `D name files d<depth>`, `F path d<depth>` and `C commit`, a `+` after
+	/// a folded node.
+	fn shape(plan: &PastePreviewPlan) -> Vec<String> {
+		let nodes = if plan.whole_commit {
+			plan.commit_rows()
+		} else {
+			plan.tree_rows()
+		};
+		nodes
+			.iter()
+			.map(|r| match r {
+				PasteNode::Root {
+					label,
+					sum,
+					collapsed,
+					..
+				} => format!(
+					"R {label} {}{}",
+					sum.files,
+					if *collapsed { "+" } else { "" }
+				),
+				PasteNode::Dir {
+					name,
+					depth,
+					sum,
+					collapsed,
+					..
+				} => format!(
+					"D {name} {} d{depth}{}",
+					sum.files,
+					if *collapsed { "+" } else { "" }
+				),
+				PasteNode::File(ix, depth) => {
+					format!("F {} d{depth}", plan.items[*ix].path)
+				}
+				PasteNode::Commit(c) => format!("C {c}"),
+			})
+			.collect()
+	}
+
+	const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+	fn tree_plan(raw: &str) -> (tempfile::TempDir, PastePreviewPlan) {
+		let dir = tempfile::tempdir().unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		(dir, plan)
+	}
+
+	/// The label of the (only) destination root a plan writes into.
+	fn root_label(plan: &PastePreviewPlan) -> String {
+		root_name(
+			&plan
+				.items
+				.iter()
+				.find(|i| !i.planned_skip())
+				.unwrap()
+				.dest_root,
+		)
+	}
+
+	/// The folder `path` ("" is the root row) of the plan's first written root.
+	fn key(plan: &PastePreviewPlan, path: &str) -> DirKey {
+		DirKey {
+			commit: None,
+			root: plan
+				.items
+				.iter()
+				.find(|i| !i.planned_skip())
+				.unwrap()
+				.dest_root
+				.clone(),
+			path: path.into(),
+		}
+	}
+
+	fn ix_of(plan: &PastePreviewPlan, path: &str) -> usize {
+		plan.items.iter().position(|i| i.path == path).unwrap()
+	}
+
+	fn sum_of(plan: &PastePreviewPlan, path: &str) -> DirSummary {
+		plan.tree_rows()
+			.into_iter()
+			.find_map(|n| match n {
+				PasteNode::Root { key, sum, .. }
+				| PasteNode::Dir { key, sum, .. }
+					if key.path == path =>
+				{
+					Some(sum)
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("no folder row {path:?}"))
+	}
+
+	/// Exported from the folder above the destination `sub`: the first path
+	/// segment repeats the destination's name.
+	const RESTORE_BASE_PAYLOAD: &str =
+		"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+
+	fn item_paths(plan: &PastePreviewPlan) -> Vec<&str> {
+		plan.items.iter().map(|i| i.path.as_str()).collect()
+	}
+
+	#[test]
+	fn a_clipcode_root_paste_keeps_the_restore_base_suggestion() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			RESTORE_BASE_PAYLOAD,
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert_eq!(
+			plan.restore_hint().map(|s| &s.base),
+			Some(&RestoreBase::Strip {
+				segment: "sub".into()
+			})
+		);
+		assert!(!plan.adjust_paths);
+		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
+	}
+
+	#[test]
+	fn adjusting_paths_replans_with_the_suggestion_and_as_is_undoes_it() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(tmp.path()).unwrap().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			RESTORE_BASE_PAYLOAD,
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.set_adjust_paths(true).unwrap();
+		assert_eq!(item_paths(&plan), ["a.ts"]);
+		assert_eq!(plan.items[0].dest_path, dest.join("a.ts"));
+		// Apply plans from the same route as the preview did.
+		assert!(plan.target_route().unwrap().1.adjust_paths);
+		// The hint stays so the choice can be undone.
+		assert!(plan.restore_hint().is_some());
+		plan.set_adjust_paths(false).unwrap();
+		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
+		assert!(!plan.adjust_paths);
+		assert!(!plan.target_route().unwrap().1.adjust_paths);
+	}
+
+	#[test]
+	fn an_add_suggestion_nests_everything_under_the_existing_folder() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		fs::create_dir_all(ws.join("app")).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: app\n// FILE: src/a.ts\nx\n",
+			&ws,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert_eq!(
+			plan.restore_hint().map(|s| &s.base),
+			Some(&RestoreBase::Add {
+				prefix: "app".into()
+			})
+		);
+		plan.set_adjust_paths(true).unwrap();
+		assert_eq!(item_paths(&plan), ["app/src/a.ts"]);
+	}
+
+	#[test]
+	fn prefix_rows_hide_the_heuristic_suggestion() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		fs::create_dir_all(ws.join("src/a")).unwrap();
+		fs::create_dir_all(ws.join("src/b")).unwrap();
+		let text = "// FILE: a/x.ts\nx\n// FILE: b/y.ts\ny\n";
+		// The fixture is one the core heuristic does answer.
+		let paths = ["a/x.ts".to_string(), "b/y.ts".to_string()];
+		assert!(matches!(
+			snip_core::restore::suggest_restore_base(
+				&ws.to_string_lossy(),
+				&paths,
+				&snip_core::restore::FsProbe,
+				None,
+			),
+			Some(RestoreBaseSuggestion {
+				base: RestoreBase::Add { .. },
+				..
+			})
+		));
+		let mut plan =
+			PastePreviewPlan::build_from_clipboard_text(text, &ws, &[], 1)
+				.unwrap();
+		plan.set_keep_relative("a").unwrap();
+		plan.set_keep_relative("b").unwrap();
+		assert!(plan.restore_hint().is_none());
+		let err = plan.choose_adjust_paths(true).unwrap_err();
+		assert_eq!(err.key, "paste_adjust_unavailable");
+	}
+
+	#[test]
+	fn a_commit_payload_has_no_restore_hint() {
+		let tmp = tempfile::tempdir().unwrap();
+		let path = tmp.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_modifying_a(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert!(plan.whole_commit);
+		assert!(plan.restore_hint().is_none());
+		assert!(plan.choose_adjust_paths(true).is_err());
+	}
+
 	#[test]
 	fn change_tree_groups_by_root_and_directory_in_display_order() {
 		let dir = tempfile::tempdir().unwrap();
@@ -3075,47 +4105,494 @@ pub(crate) mod tests {
 			1,
 		)
 		.unwrap();
-		let paths: Vec<String> =
-			plan.items.iter().map(|i| i.path.clone()).collect();
-		let path = |ix: usize| paths[ix].clone();
-		let rows = plan.tree_rows();
-		let root = plan.items[0].dest_root_name.clone();
-		let shown: Vec<String> = rows
-			.iter()
-			.map(|r| match r {
-				PasteNode::Root(n, c) => format!("R {n} {c}"),
-				PasteNode::Dir(d, c) => format!("D {d} {c}"),
-				PasteNode::File(ix, depth) => {
-					format!("F {} {depth}", path(*ix))
-				}
-				PasteNode::Commit(c) => format!("C {c}"),
-			})
-			.collect();
+		let root = root_label(&plan);
 		assert_eq!(
-			shown,
+			shape(&plan),
 			[
 				format!("R {root} 4"),
-				"D r 1".into(),
-				"F r/a.txt 2".into(),
-				"D r/b 2".into(),
-				"F r/b/y.txt 2".into(),
-				"F r/b/z.txt 2".into(),
-				"D r/c/d 1".into(),
-				"F r/c/d/e.txt 2".into(),
+				"D r 4 d1".into(),
+				"D b 2 d2".into(),
+				"F r/b/y.txt d3".into(),
+				"F r/b/z.txt d3".into(),
+				"D c/d 1 d2".into(),
+				"F r/c/d/e.txt d3".into(),
+				"F r/a.txt d2".into(),
 			]
 		);
-		// Up / Down walk the tree's order, not the plan's.
-		plan.selected_item_idx =
-			plan.items.iter().position(|i| i.path == "r/a.txt").unwrap();
+		// Up / Down walk the rows on screen, folders included.
+		plan.selected_item_idx = ix_of(&plan, "r/b/y.txt");
 		plan.select_next();
-		assert_eq!(path(plan.selected_item_idx), "r/b/y.txt");
+		assert_eq!(plan.cursor(), PasteCursor::Item(ix_of(&plan, "r/b/z.txt")));
 		plan.select_next();
+		assert_eq!(plan.cursor(), PasteCursor::Dir(key(&plan, "r/c/d")));
 		plan.select_next();
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/c/d/e.txt"))
+		);
 		plan.select_next();
-		assert_eq!(path(plan.selected_item_idx), "r/c/d/e.txt");
+		assert_eq!(plan.cursor(), PasteCursor::Item(ix_of(&plan, "r/a.txt")));
+		plan.select_next();
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/a.txt")),
+			"the last row stays"
+		);
 		plan.select_prev();
-		assert_eq!(path(plan.selected_item_idx), "r/b/z.txt");
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/c/d/e.txt"))
+		);
 	}
+
+	/// #239: a path with several folders is a tree, not one flat folder row.
+	#[test]
+	fn paste_tree_nests_directories() {
+		let (_dir, plan) = tree_plan(SRC_TREE);
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 3"),
+				"D src 3 d1".into(),
+				"D app 2 d2".into(),
+				"F src/app/a.ts d3".into(),
+				"F src/app/b.ts d3".into(),
+				"D lib 1 d2".into(),
+				"F src/lib/c.ts d3".into(),
+			]
+		);
+		let order: Vec<&str> = plan
+			.display_order()
+			.into_iter()
+			.map(|ix| plan.items[ix].path.as_str())
+			.collect();
+		assert_eq!(order, ["src/app/a.ts", "src/app/b.ts", "src/lib/c.ts"]);
+	}
+
+	#[test]
+	fn paste_tree_compresses_single_child_chains_and_counts_actions() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
+		fs::write(dir.path().join("a/b/c/x.ts"), "old\n").unwrap();
+		let raw = "// clipcode-root: a\n// FILE: a/b/c/x.ts\nX\n// FILE: a/b/c/y.ts\nY\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 2"),
+				"D a/b/c 2 d1".into(),
+				"F a/b/c/x.ts d2".into(),
+				"F a/b/c/y.ts d2".into(),
+			]
+		);
+		let folder = key(&plan, "a/b/c");
+		assert_eq!(
+			plan.counts_under(&folder),
+			PasteCounts {
+				creates: 1,
+				overwrites: 0,
+				existing: 1,
+				deletes: 0,
+				skips: 1,
+			}
+		);
+		let x = ix_of(&plan, "a/b/c/x.ts");
+		plan.toggle_overwrite(x);
+		assert_eq!(
+			plan.counts_under(&folder),
+			PasteCounts {
+				creates: 1,
+				overwrites: 1,
+				existing: 1,
+				deletes: 0,
+				skips: 0,
+			}
+		);
+		assert_eq!(sum_of(&plan, "a/b/c").tick(), Tick::All);
+	}
+
+	#[test]
+	fn skipped_rows_stay_at_the_root_level_with_their_raw_path() {
+		let (_dir, plan) = tree_plan(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n// FILE: p/x/.git/hooks/h\n3\n",
+		);
+		assert!(
+			plan.items.iter().any(|i| i.planned_skip()),
+			"the protected paths are skipped rows"
+		);
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 3"),
+				"D p 1 d1".into(),
+				"F p/a.txt d2".into(),
+				"F .git/config d1".into(),
+				"F p/x/.git/hooks/h d1".into(),
+			]
+		);
+	}
+
+	#[test]
+	fn same_named_roots_stay_apart() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let other = tempfile::tempdir().unwrap();
+		let c = ix_of(&plan, "src/lib/c.ts");
+		let name = plan.items[c].dest_root_name.clone();
+		plan.items[c].dest_root = other.path().join(&name);
+		let mut roots: Vec<usize> = shape(&plan)
+			.iter()
+			.filter_map(|l| l.strip_prefix("R "))
+			.map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
+			.collect();
+		roots.sort_unstable();
+		assert_eq!(roots, [1, 2], "{:?}", shape(&plan));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_symlinked_destination_is_one_root() {
+		let tmp = tempfile::tempdir().unwrap();
+		let real = tmp.path().join("real").join("web");
+		fs::create_dir_all(&real).unwrap();
+		fs::create_dir(tmp.path().join("links")).unwrap();
+		let link = tmp.path().join("links").join("web");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n",
+			&link,
+			&[],
+			1,
+		)
+		.unwrap();
+		let roots = shape(&plan).iter().filter(|l| l.starts_with("R ")).count();
+		assert_eq!(roots, 1, "{:?}", shape(&plan));
+	}
+
+	/// A delete's path is resolved by the engine too: through the symlinked
+	/// destination it must still land under the one root, beside the writes.
+	#[cfg(unix)]
+	#[test]
+	fn a_delete_under_a_symlinked_destination_stays_in_its_root() {
+		let tmp = tempfile::tempdir().unwrap();
+		let real = tmp.path().join("real").join("web");
+		fs::create_dir_all(real.join("p")).unwrap();
+		fs::write(real.join("p").join("gone.txt"), "old\n").unwrap();
+		fs::create_dir(tmp.path().join("links")).unwrap();
+		let link = tmp.path().join("links").join("web");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: [DELETED] p/gone.txt\n// This file has been deleted in this change\n",
+			&link,
+			&[],
+			1,
+		)
+		.unwrap();
+		let gone = ix_of(&plan, "p/gone.txt");
+		assert!(plan.items[gone].is_delete(), "{:?}", plan.items[gone].op);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {} 2", root_label(&plan)),
+				"D p 2 d1".to_string(),
+				"F p/a.txt d2".to_string(),
+				"F p/gone.txt d2".to_string(),
+			]
+		);
+		assert_eq!(plan.counts().deletes, 1);
+	}
+
+	#[test]
+	fn a_rows_root_is_the_one_its_relative_path_is_relative_to() {
+		let roots: Vec<PathBuf> =
+			["/w/dest", "/w/dest/sub"].map(Into::into).into();
+		let of = |abs: &str, rel: &str| {
+			plan_root_of(&roots, Path::new(abs), rel).cloned()
+		};
+		assert_eq!(
+			of("/w/dest/sub/g.txt", "sub/g.txt"),
+			Some(roots[0].clone())
+		);
+		assert_eq!(of("/w/dest/sub/g.txt", "g.txt"), Some(roots[1].clone()));
+		assert_eq!(of("/w/dest/g.txt", "g.txt"), Some(roots[0].clone()));
+		// No root spelled that way: the caller falls back.
+		assert_eq!(of("/w/other/g.txt", "g.txt"), None);
+		assert_eq!(of("/w/dest/subg.txt", "g.txt"), None);
+		// A worker's Windows spelling.
+		let win: Vec<PathBuf> =
+			[r"C:\w\dest", r"C:\w\dest\sub"].map(Into::into).into();
+		assert_eq!(
+			plan_root_of(&win, Path::new(r"C:\w\dest\sub\g.txt"), "g.txt"),
+			Some(&win[1])
+		);
+	}
+
+	#[test]
+	fn a_delete_belongs_to_the_innermost_root() {
+		let roots: Vec<PathBuf> = ["/w/dest", "/w/dest/sub", "/w/other"]
+			.map(Into::into)
+			.into();
+		let of = |p: &str| innermost_root(&roots, Path::new(p));
+		assert_eq!(of("/w/dest/a.txt"), Some(&roots[0]));
+		assert_eq!(of("/w/dest/sub/a.txt"), Some(&roots[1]));
+		assert_eq!(of("/w/dest/subway/a.txt"), Some(&roots[0]));
+		assert_eq!(of("/w/other/x"), Some(&roots[2]));
+		assert_eq!(of("/elsewhere/x"), None);
+	}
+
+	/// A row's place in the tree is the place Apply acts on: its root joined
+	/// with its path is its destination file, for a create, an overwrite and a
+	/// delete alike, even where one destination root lies inside another.
+	/// The folder row that holds a row's path then holds the row, so
+	/// unchecking it unchecks the create and the delete beside each other.
+	#[test]
+	fn a_row_in_a_nested_root_sits_where_apply_acts_and_follows_its_folder() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(tmp.path()).unwrap().join("dest");
+		let sub = dest.join("sub");
+		fs::create_dir_all(&sub).unwrap();
+		fs::write(sub.join("gone.txt"), "old\n").unwrap();
+		fs::write(sub.join("over.txt"), "old\n").unwrap();
+		// `p/` is routed into dest/sub; `sub/` keeps its relative path
+		// under dest, so those rows are written into the same folder from
+		// the outer root.
+		let raw = "// FILE: p/a.txt\nA\n\
+			// FILE: sub/new.txt\nN\n\
+			// FILE: sub/over.txt\nO\n\
+			// FILE: [DELETED] sub/gone.txt\n// This file has been deleted in this change\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			&dest,
+			&[dest.clone(), sub.clone()],
+			1,
+		)
+		.unwrap();
+		plan.choose_prefix_destination("p", &sub).unwrap();
+		plan.choose_keep_relative("sub").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+
+		let written: Vec<&PasteItem> =
+			plan.items.iter().filter(|i| !i.planned_skip()).collect();
+		assert_eq!(written.len(), 4, "{:?}", plan.items);
+		for item in &written {
+			assert_eq!(
+				item.dest_root.join(&item.path),
+				item.dest_path,
+				"{:?} {:?} is shown where Apply does not act",
+				item.op,
+				item.path
+			);
+		}
+		let gone = &plan.items[ix_of(&plan, "sub/gone.txt")];
+		assert!(gone.is_delete());
+		assert_eq!(gone.dest_root, dest);
+
+		let folder = DirKey {
+			commit: None,
+			root: dest.clone(),
+			path: "sub".into(),
+		};
+		assert_eq!(plan.set_dir_selected(&folder), Some(false));
+		let selected = |path: &str| plan.items[ix_of(&plan, path)].selected;
+		assert!(!selected("sub/new.txt"));
+		assert!(!selected("sub/over.txt"));
+		assert!(
+			!selected("sub/gone.txt"),
+			"the folder's own delete stays checked beside its creates"
+		);
+		assert!(
+			selected("a.txt"),
+			"a row of the inner root is not in dest/sub"
+		);
+		assert_eq!(plan.counts().deletes, 0);
+	}
+
+	#[test]
+	fn folder_include_is_tri_state_and_ignores_sibling_prefixes() {
+		let (_dir, mut plan) = tree_plan(
+			"// clipcode-root: src\n// FILE: src/a/y.ts\nY\n// FILE: src/ab/x.ts\nX\n// FILE: src/a/z.ts\nZ\n// FILE: .git/config\nG\n",
+		);
+		let sel = |plan: &PastePreviewPlan, path: &str| {
+			plan.items[ix_of(plan, path)].selected
+		};
+		assert_eq!(plan.set_dir_selected(&key(&plan, "src/a")), Some(false));
+		assert!(!sel(&plan, "src/a/y.ts") && !sel(&plan, "src/a/z.ts"));
+		assert!(sel(&plan, "src/ab/x.ts"), "src/ab is not under src/a");
+		assert_eq!(sum_of(&plan, "src").tick(), Tick::Partial);
+		assert_eq!(sum_of(&plan, "src/a").tick(), Tick::Empty);
+		assert_eq!(plan.set_dir_selected(&key(&plan, "src")), Some(true));
+		assert!(["src/a/y.ts", "src/a/z.ts", "src/ab/x.ts"]
+			.iter()
+			.all(|p| sel(&plan, p)));
+		// The root row never reaches a row that was skipped when planned.
+		let root = key(&plan, "");
+		assert_eq!(plan.set_dir_selected(&root), Some(false));
+		assert_eq!(plan.set_dir_selected(&root), Some(true));
+		assert!(!sel(&plan, ".git/config"));
+		assert_eq!(plan.counts().creates, 3);
+	}
+
+	#[test]
+	fn folding_a_folder_moves_the_cursor_onto_it_and_steps_skip_hidden_rows() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let app = key(&plan, "src/app");
+		let b = ix_of(&plan, "src/app/b.ts");
+		plan.selected_item_idx = b;
+		assert_eq!(
+			plan.toggle_dir_collapsed(&app),
+			Some(PasteCursor::Dir(app.clone()))
+		);
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(b),
+			"folding does not move the cursor itself"
+		);
+		// The session applies the move.
+		plan.cursor_dir = Some(app.clone());
+		let order: Vec<&str> = plan
+			.display_order()
+			.into_iter()
+			.map(|ix| plan.items[ix].path.as_str())
+			.collect();
+		assert_eq!(order, ["src/lib/c.ts"]);
+		assert_eq!(
+			plan.step_target(true),
+			PasteCursor::Dir(key(&plan, "src/lib"))
+		);
+		assert_eq!(
+			plan.step_target(false),
+			PasteCursor::Dir(key(&plan, "src"))
+		);
+		// A cursor that stays visible is left alone.
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		plan.selected_item_idx = ix_of(&plan, "src/lib/c.ts");
+		assert_eq!(plan.toggle_dir_collapsed(&key(&plan, "src/app")), None);
+	}
+
+	#[test]
+	fn left_and_right_walk_the_tree() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let (lib, root) = (key(&plan, "src/lib"), key(&plan, ""));
+		let c = ix_of(&plan, "src/lib/c.ts");
+		plan.selected_item_idx = c;
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Move(PasteCursor::Dir(lib.clone()))
+		);
+		assert_eq!(
+			plan.nav_right(),
+			TreeStep::Nothing,
+			"a file has no children"
+		);
+		plan.cursor_dir = Some(lib.clone());
+		assert_eq!(plan.nav_left(), TreeStep::Fold(lib.clone()));
+		assert_eq!(plan.toggle_dir_collapsed(&lib), None);
+		assert_eq!(plan.nav_right(), TreeStep::Unfold(lib.clone()));
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Move(PasteCursor::Dir(key(&plan, "src"))),
+			"a folded folder goes up to its parent"
+		);
+		assert_eq!(plan.toggle_dir_collapsed(&lib), None);
+		assert_eq!(plan.nav_right(), TreeStep::Move(PasteCursor::Item(c)));
+		plan.cursor_dir = Some(root.clone());
+		assert_eq!(plan.nav_left(), TreeStep::Fold(root.clone()));
+		assert_eq!(plan.toggle_dir_collapsed(&root), None);
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Nothing,
+			"nothing above the root"
+		);
+		assert_eq!(plan.nav_right(), TreeStep::Unfold(root));
+
+		// A commit replay is a flat list under its headers.
+		let (_dir, plan) = mixed_plan();
+		assert_eq!(plan.nav_left(), TreeStep::Nothing);
+		assert_eq!(plan.nav_right(), TreeStep::Nothing);
+	}
+
+	#[test]
+	fn big_previews_open_with_the_first_level_folded() {
+		let raw = |n: usize| {
+			let mut raw = String::from("// clipcode-root: p\n");
+			for i in 0..n {
+				raw.push_str(&format!("// FILE: p/d{i}/f.txt\nx\n"));
+			}
+			raw
+		};
+		let (_dir, plan) = tree_plan(&raw(201));
+		assert_eq!(
+			shape(&plan),
+			[format!("R {} 201", root_label(&plan)), "D p 201 d1+".into()]
+		);
+		assert_eq!(plan.cursor(), PasteCursor::Dir(key(&plan, "p")));
+		assert!(plan.detail_preview().is_none());
+
+		let (_dir, plan) = tree_plan(&raw(200));
+		assert!(plan.collapsed_dirs.is_empty());
+		assert!(!shape(&plan).iter().any(|l| l.ends_with('+')));
+	}
+
+	#[test]
+	fn a_remap_keeps_folds_of_folders_that_still_exist() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.choose_keep_relative("a").unwrap();
+		plan.choose_keep_relative("b").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+		let (ax, by) = (key(&plan, "a/x"), key(&plan, "b/y"));
+		assert_eq!(
+			plan.toggle_dir_collapsed(&ax),
+			Some(PasteCursor::Dir(ax.clone()))
+		);
+		plan.cursor_dir = Some(ax.clone());
+		assert_eq!(plan.toggle_dir_collapsed(&by), None);
+		plan.cursor_dir = Some(by.clone());
+
+		plan.choose_keep_relative("a").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+		plan.normalize_cursor();
+		assert!(plan.collapsed_dirs.contains(&ax));
+		assert!(plan.collapsed_dirs.contains(&by));
+		assert_eq!(plan.cursor_dir, Some(by));
+
+		let gone = key(&plan, "gone/dir");
+		plan.collapsed_dirs.insert(gone.clone());
+		plan.normalize_cursor();
+		assert!(!plan.collapsed_dirs.contains(&gone));
+		assert!(plan.collapsed_dirs.contains(&ax));
+	}
+
+	#[test]
+	fn dir_control_ids_keep_the_driver_shape() {
+		assert_eq!(
+			dir_control_id(DirControl::Row, 0, "長路徑/a b"),
+			"paste-dir:0:長路徑/a b"
+		);
+		assert_eq!(
+			dir_control_id(DirControl::Toggle, 1, ""),
+			"paste-dir-toggle:1:"
+		);
+		assert_eq!(
+			dir_control_id(DirControl::Include, 0, "src"),
+			"paste-dir-include:0:src"
+		);
+	}
+
 	use std::fs;
 
 	/// A remote Apply whose answer never came may have written: it is
@@ -3167,6 +4644,7 @@ pub(crate) mod tests {
 			reason: Some(Box::new(snip_remote::Reason::DestinationChanged {
 				change: snip_remote::StaleChange::Created { rel: "a".into() },
 			})),
+			suggestion: None,
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
@@ -3181,6 +4659,7 @@ pub(crate) mod tests {
 			          externally after preview"
 				.into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(old)).key,
@@ -3266,6 +4745,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: busy_git().paste_message(),
 					reason: Some(Box::new(snip_remote::Reason::RepoBusy)),
+					suggestion: None,
 				})
 			),
 			"paste_repo_busy"
@@ -3279,6 +4759,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: busy_git().paste_message(),
 					reason: None,
+					suggestion: None,
 				})
 			),
 			"paste_err_destination"
@@ -3290,6 +4771,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: "too many callers".into(),
 					reason: None,
+					suggestion: None,
 				})
 			),
 			"paste_err_destination"
@@ -3349,6 +4831,7 @@ pub(crate) mod tests {
 				code,
 				message,
 				reason: None,
+				suggestion: None,
 			})
 		};
 		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
@@ -3376,6 +4859,7 @@ pub(crate) mod tests {
 							}
 						}
 					)),
+					suggestion: None,
 				}),
 				false
 			),
@@ -3481,6 +4965,7 @@ pub(crate) mod tests {
 			code,
 			message: raw.into(),
 			reason: None,
+			suggestion: None,
 		};
 		for code in all {
 			if !worded(code) {
@@ -3623,10 +5108,10 @@ pub(crate) mod tests {
 			.admit_ui(None, Some(&shell), None)
 			.unwrap();
 		lock_pending(&pool)
-			.enqueue(PasteRequest::Remap {
+			.enqueue(PasteRequest::Remap(Remap::Prefix {
 				prefix: "a".into(),
 				keep: true,
-			})
+			}))
 			.unwrap();
 		let work = PastePending::start(&pool, Some(&shell), CancelToken::new())
 			.unwrap()
@@ -4413,6 +5898,8 @@ pub(crate) mod tests {
 					let i = &plan.items[*ix];
 					format!("{} {}", header_label(i.op), i.path)
 				}
+				// The rename's two rows share the folder of the new path.
+				PasteNode::Dir { name, .. } => format!("D {name}"),
 				_ => "?".into(),
 			})
 			.collect();
@@ -4420,6 +5907,7 @@ pub(crate) mod tests {
 			shown,
 			[
 				"C0",
+				"D dir",
 				"DELETE old.txt",
 				"CREATE dir/new.txt",
 				"CREATE fresh.txt",
@@ -5553,6 +7041,7 @@ pub(crate) mod tests {
 				code: snip_remote::ErrorCode::Stale,
 				message: "english".into(),
 				reason: Some(Box::new(Reason::DestinationChanged { change })),
+				suggestion: None,
 			})
 		};
 		let file = |e| file_apply_refusal(None, &dest, e).token;
@@ -5586,6 +7075,7 @@ pub(crate) mod tests {
 					code: snip_remote::ErrorCode::Busy,
 					message: "english".into(),
 					reason: None,
+					suggestion: None,
 				}),
 				true
 			),
@@ -5937,6 +7427,7 @@ pub(crate) mod tests {
 					let i = &plan.items[*ix];
 					format!("{:?}:{}", i.action(), i.path)
 				}
+				PasteNode::Dir { name, .. } => format!("D {name}"),
 				_ => "?".into(),
 			})
 			.collect();
@@ -5944,6 +7435,7 @@ pub(crate) mod tests {
 			shape,
 			[
 				"C0",
+				"D dir",
 				"Delete:old.txt",
 				"Create:dir/new.txt",
 				"Create:fresh.txt",
@@ -6050,6 +7542,173 @@ pub(crate) mod tests {
 		assert_eq!(plan.items[0].path, "g1.txt");
 	}
 
+	/// Two commits that both touch `src/`, one with a file outside it.
+	fn shared_folder_plan() -> (tempfile::TempDir, PastePreviewPlan) {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let added = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some(format!("{path}\n")),
+			not_copied: None,
+		};
+		let record = |message: &str, files| CommitRecord {
+			message: message.into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files,
+		};
+		let payload = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record(
+					"first",
+					vec![
+						added("src/a.txt"),
+						added("src/b.txt"),
+						added("top.txt"),
+					],
+				),
+				record("second", vec![added("src/c.txt")]),
+			],
+		});
+		let dir = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+			git_run(dir.path(), args);
+		}
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&payload,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		(dir, plan)
+	}
+
+	/// The folder `path` under commit `c` of a replay plan.
+	fn commit_dir(plan: &PastePreviewPlan, c: usize, path: &str) -> DirKey {
+		DirKey {
+			commit: Some(c),
+			root: plan.items[0].dest_root.clone(),
+			path: path.into(),
+		}
+	}
+
+	#[test]
+	fn commit_rows_nest_folders_and_a_rename_stays_under_its_new_path() {
+		let (_dir, plan) = mixed_plan();
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D dir 2 d1",
+				"F old.txt d2",
+				"F dir/new.txt d2",
+				"F fresh.txt d1",
+				"F img.bin d1",
+				"C 1",
+				"C 2",
+				"F a.txt d1",
+			]
+		);
+		// The deleted old path is placed where the new one is (#196).
+		let old = ix_of(&plan, "old.txt");
+		assert_eq!(plan.place_path(old), "dir/new.txt");
+		assert_eq!(plan.place_path(ix_of(&plan, "fresh.txt")), "fresh.txt");
+		let dir = commit_dir(&plan, 0, "dir");
+		assert_eq!(
+			plan.counts_under(&dir),
+			PasteCounts {
+				creates: 1,
+				deletes: 1,
+				..Default::default()
+			}
+		);
+		// What the folder row shows: both rows written, none toggleable.
+		let sum = plan.summary(&[old, ix_of(&plan, "dir/new.txt")]);
+		assert_eq!((sum.files, sum.included), (2, 2));
+		assert_eq!(sum.tick(), Tick::Locked);
+		assert_eq!(plan.dir_label(&dir), "0:dir");
+	}
+
+	#[test]
+	fn commit_folds_are_keyed_by_commit() {
+		let (_dir, mut plan) = shared_folder_plan();
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D src 2 d1",
+				"F src/a.txt d2",
+				"F src/b.txt d2",
+				"F top.txt d1",
+				"C 1",
+				"D src 1 d1",
+				"F src/c.txt d2",
+			]
+		);
+		let (a, top, c) = (
+			ix_of(&plan, "src/a.txt"),
+			ix_of(&plan, "top.txt"),
+			ix_of(&plan, "src/c.txt"),
+		);
+		let first = commit_dir(&plan, 0, "src");
+		assert_eq!(plan.dir_label(&commit_dir(&plan, 1, "src")), "1:src");
+		assert!(plan.has_dir_row(&first));
+		assert!(!plan.has_dir_row(&commit_dir(&plan, 2, "src")));
+
+		// Folding the first commit's `src` while its `a.txt` is selected
+		// names the row to move to; the cursor itself stays for the session.
+		plan.selected_item_idx = a;
+		assert_eq!(
+			plan.toggle_dir_collapsed(&first),
+			Some(PasteCursor::Item(top))
+		);
+		assert_eq!(plan.selected_item_idx, a);
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D src 2 d1+",
+				"F top.txt d1",
+				"C 1",
+				"D src 1 d1",
+				"F src/c.txt d2",
+			]
+		);
+		assert!(plan.display_order().contains(&c), "the other commit's");
+		// A folder under a folded header is not a row now.
+		plan.toggle_commit_collapsed(0);
+		assert!(!plan.has_dir_row(&first));
+		// Opening it again moves nothing.
+		plan.toggle_commit_collapsed(0);
+		plan.selected_item_idx = top;
+		assert_eq!(plan.toggle_dir_collapsed(&first), None);
+	}
+
+	#[test]
+	fn a_replays_folders_are_not_cursor_rows_and_cannot_be_toggled() {
+		let (_dir, mut plan) = shared_folder_plan();
+		assert!(plan
+			.cursor_rows()
+			.iter()
+			.all(|(c, ..)| matches!(c, PasteCursor::Item(_))));
+		let first = commit_dir(&plan, 0, "src");
+		assert_eq!(plan.nav_left(), TreeStep::Nothing);
+		assert_eq!(plan.nav_right(), TreeStep::Nothing);
+		assert_eq!(plan.set_dir_selected(&first), None);
+		assert!(plan.items.iter().all(|i| i.selected));
+		// A row left out of the replay is not counted as written.
+		plan.items[0].selected = false;
+		let sum = plan.summary(&[0, 1]);
+		assert_eq!((sum.files, sum.included), (2, 1));
+	}
+
 	#[test]
 	fn file_mode_rows_follow_natural_path_order() {
 		let dir = tempfile::tempdir().unwrap();
@@ -6135,13 +7794,13 @@ pub(crate) mod tests {
 			plan.selected_item_idx, 0,
 			"step_target must not mutate selection"
 		);
-		assert_eq!(target, 1);
+		assert_eq!(target, PasteCursor::Item(1));
 		let target_back = plan.step_target(false);
 		assert_eq!(
 			plan.selected_item_idx, 0,
 			"step_target must not mutate selection"
 		);
-		assert_eq!(target_back, 0);
+		assert_eq!(target_back, PasteCursor::Item(0));
 
 		let folded_target = plan.toggle_commit_collapsed(0);
 		assert_eq!(

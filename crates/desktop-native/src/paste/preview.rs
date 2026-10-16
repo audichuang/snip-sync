@@ -45,7 +45,7 @@ pub enum Landed {
 	///
 	/// Invariant: whenever `Landed::Shown` is produced, `self.plan` is guaranteed to be `Some`.
 	Shown {
-		remap: Option<(String, bool)>,
+		remap: Option<Remap>,
 	},
 	Refused {
 		err: Msg,
@@ -58,12 +58,16 @@ pub enum Landed {
 pub enum Nav {
 	Ignored,
 	Moved(usize),
+	/// The cursor is on a folder row now (it has no file detail).
+	MovedDir,
 	Refused(Msg),
 }
 
 #[derive(Debug)]
 pub enum Folded {
 	NoPlan,
+	/// A fold of a folder that is not shown, which does nothing.
+	Ignored,
 	Kept,
 	Reselected(Nav),
 }
@@ -251,7 +255,10 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Landed {
 		let remap = outcome.remap;
-		let built = outcome.result.and_then(|plan| {
+		let built = outcome.result.and_then(|mut plan| {
+			// Folds and the folder cursor survive a remap only where the
+			// folder is still there.
+			plan.normalize_cursor();
 			let detail = plan.detail_preview();
 			pending.admit_ui(ordinary, Some(&plan), detail.as_ref())?;
 			Ok((plan, detail))
@@ -387,6 +394,23 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Remapped {
 		let keep = destination.is_none();
+		self.replan(ordinary, |plan| {
+			match destination {
+				Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
+				None => plan.choose_keep_relative(&prefix),
+			}?;
+			Ok(Remap::Prefix { prefix, keep })
+		})
+	}
+
+	/// Re-plans the shell with a changed choice. The one path every choice
+	/// takes, so an older plan can never be applied while the new one is
+	/// still being built: the file plan is cleared and the UI disarmed first.
+	fn replan(
+		&mut self,
+		ordinary: Option<&Preview>,
+		choose: impl FnOnce(&mut PastePreviewPlan) -> Result<Remap, Msg>,
+	) -> Remapped {
 		self.invalidate_job();
 		let pool = self.pending.clone();
 		let mut pending = lock_pending(&pool);
@@ -396,20 +420,33 @@ impl PastePreview {
 		plan.clear_file_plan();
 		plan.error = None;
 		self.detail = None;
-		let chosen = match destination {
-			Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
-			None => plan.choose_keep_relative(&prefix),
+		let remap = match choose(plan) {
+			Ok(remap) => remap,
+			Err(err) => {
+				release(&mut pending, ordinary, Some(plan), None);
+				return Remapped::Invalid(err);
+			}
 		};
-		if let Err(err) = chosen {
-			release(&mut pending, ordinary, Some(plan), None);
-			return Remapped::Invalid(err);
-		}
 		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
 			self.plan = None;
 			release(&mut pending, ordinary, None, None);
 			return Remapped::Dropped(err);
 		}
-		Remapped::Ready(PasteRequest::Remap { prefix, keep })
+		Remapped::Ready(PasteRequest::Remap(remap))
+	}
+
+	/// Re-plans with the restore-base hint's choice. Goes through
+	/// [`Self::replan`] like a prefix choice, so the plan planned without it
+	/// cannot be applied while the new one is built.
+	pub fn adjust_paths(
+		&mut self,
+		on: bool,
+		ordinary: Option<&Preview>,
+	) -> Remapped {
+		self.replan(ordinary, |plan| {
+			plan.choose_adjust_paths(on)?;
+			Ok(Remap::AdjustPaths(on))
+		})
 	}
 
 	pub fn toggle_overwrite(&mut self, idx: usize) -> Option<bool> {
@@ -437,11 +474,52 @@ impl PastePreview {
 		match pending.admit_ui(ordinary, Some(plan), detail.as_ref()) {
 			Ok(()) => {
 				plan.selected_item_idx = idx;
+				plan.cursor_dir = None;
 				self.detail = detail;
 				self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
 				Nav::Moved(idx)
 			}
 			Err(e) => Nav::Refused(e),
+		}
+	}
+
+	/// Puts the cursor on a folder row. A folder has no file detail.
+	pub fn select_dir(
+		&mut self,
+		key: DirKey,
+		ordinary: Option<&Preview>,
+	) -> Nav {
+		let Some(plan) = self.plan.as_mut() else {
+			return Nav::Ignored;
+		};
+		let on = PasteCursor::Dir(key.clone());
+		if !plan.cursor_rows().iter().any(|(c, ..)| *c == on) {
+			return Nav::Ignored;
+		}
+		let before = plan.cursor_dir.replace(key);
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		match pending.admit_ui(ordinary, Some(plan), None) {
+			Ok(()) => {
+				self.detail = None;
+				Nav::MovedDir
+			}
+			Err(e) => {
+				plan.cursor_dir = before;
+				Nav::Refused(e)
+			}
+		}
+	}
+
+	/// Moves the cursor to a row `step_target` or an arrow key chose.
+	pub fn move_to(
+		&mut self,
+		cursor: PasteCursor,
+		ordinary: Option<&Preview>,
+	) -> Nav {
+		match cursor {
+			PasteCursor::Item(idx) => self.select(idx, ordinary),
+			PasteCursor::Dir(key) => self.select_dir(key, ordinary),
 		}
 	}
 
@@ -454,7 +532,9 @@ impl PastePreview {
 		let Some(plan) = self.plan.as_ref() else {
 			return Err(Msg::new("paste_err_nothing", []));
 		};
-		if plan.selected_item_idx != idx {
+		// A read that finishes after the cursor moved on, to another file
+		// or to a folder, is not shown.
+		if plan.selected_item_idx != idx || plan.cursor_dir.is_some() {
 			return Ok(());
 		}
 		let pool = self.pending.clone();
@@ -470,7 +550,73 @@ impl PastePreview {
 			return Nav::Ignored;
 		};
 		let target = plan.step_target(forward);
-		self.select(target, ordinary)
+		self.move_to(target, ordinary)
+	}
+
+	/// Folds or unfolds a folder. The fold grows the retained state (its
+	/// key), so unlike a commit fold it is admitted first and a refusal
+	/// undoes all of it, never leaving a cursor on a row nobody can see.
+	/// A key that names no row shown now (a click from a frame the plan has
+	/// left behind) does nothing.
+	pub fn toggle_dir_fold(
+		&mut self,
+		key: DirKey,
+		ordinary: Option<&Preview>,
+	) -> Folded {
+		let Some(plan) = self.plan.as_mut() else {
+			return Folded::NoPlan;
+		};
+		if !plan.has_dir_row(&key) {
+			return Folded::Ignored;
+		}
+		let was_folded = plan.collapsed_dirs.contains(&key);
+		let (item_before, dir_before) =
+			(plan.selected_item_idx, plan.cursor_dir.clone());
+		let moved = plan.toggle_dir_collapsed(&key);
+		let (nav, moved_detail) = match moved {
+			Some(PasteCursor::Dir(on)) => {
+				plan.cursor_dir = Some(on);
+				(Some(Nav::MovedDir), None)
+			}
+			Some(PasteCursor::Item(ix)) => {
+				plan.selected_item_idx = ix;
+				plan.cursor_dir = None;
+				(Some(Nav::Moved(ix)), plan.detail_at(ix))
+			}
+			None => (None, None),
+		};
+		let detail = if nav.is_some() {
+			moved_detail.as_ref()
+		} else {
+			self.detail.as_ref()
+		};
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		match pending.admit_ui(ordinary, Some(plan), detail) {
+			Ok(()) => match nav {
+				Some(nav) => {
+					self.detail = moved_detail;
+					self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+					Folded::Reselected(nav)
+				}
+				None => Folded::Kept,
+			},
+			Err(e) => {
+				if was_folded {
+					plan.collapsed_dirs.insert(key);
+				} else {
+					plan.collapsed_dirs.remove(&key);
+				}
+				plan.selected_item_idx = item_before;
+				plan.cursor_dir = dir_before;
+				Folded::Reselected(Nav::Refused(e))
+			}
+		}
+	}
+
+	/// The include box of a folder.
+	pub fn toggle_dir_selected(&mut self, key: &DirKey) -> Option<bool> {
+		self.plan.as_mut()?.set_dir_selected(key)
 	}
 
 	pub fn toggle_fold(
@@ -777,6 +923,155 @@ mod tests {
 		);
 	}
 
+	/// Plans the writes again for `prefix` (kept under the destination) and
+	/// lands the result, as a click on its "keep" button does.
+	fn land_remap(s: &mut PastePreview, prefix: &str) {
+		let Remapped::Ready(request) = s.remap(prefix.into(), None, None)
+		else {
+			panic!("{prefix}: no remap to run");
+		};
+		s.enqueue(request).unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(1, cancel);
+		assert!(matches!(
+			s.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+	}
+
+	/// A remap resets the cursor to the first row. When a fold that survived
+	/// the remap hides that row, the cursor goes to the folder instead of
+	/// staying on a row nobody can see (and Space, the detail pane and a
+	/// diff read would act on it).
+	#[test]
+	fn a_remap_whose_first_row_is_folded_away_lands_on_its_folder() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(
+			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
+			dir.path(),
+			None,
+		);
+		land_remap(&mut s, "a");
+		land_remap(&mut s, "b");
+		let (first, other) =
+			(index_of(&s, "a/x/1.txt"), index_of(&s, "b/y/2.txt"));
+		assert_eq!(first, 0, "the remap's reset cursor is on the first row");
+		let ax = dir_key(&s, "a/x");
+		assert_eq!(s.select(other, None), Nav::Moved(other));
+		assert!(matches!(s.toggle_dir_fold(ax.clone(), None), Folded::Kept));
+
+		land_remap(&mut s, "a");
+		let plan = s.plan().unwrap();
+		assert!(plan.collapsed_dirs.contains(&ax), "the fold survived");
+		assert_eq!(plan.cursor(), PasteCursor::Dir(ax));
+		assert!(plan.detail_preview().is_none());
+		assert!(s.detail().is_none());
+	}
+
+	const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+	fn dir_key(s: &PastePreview, path: &str) -> DirKey {
+		let plan = s.plan().unwrap();
+		DirKey {
+			commit: None,
+			root: plan.items[0].dest_root.clone(),
+			path: path.into(),
+		}
+	}
+
+	fn index_of(s: &PastePreview, path: &str) -> usize {
+		s.plan()
+			.unwrap()
+			.items
+			.iter()
+			.position(|i| i.path == path)
+			.unwrap()
+	}
+
+	/// A click carries the key its frame drew. When the plan has moved on, a
+	/// key that names no row now must not leave a fold (or a cursor) behind.
+	#[test]
+	fn folding_a_folder_that_is_not_shown_does_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let before = s.plan().unwrap().cursor();
+		let ghost = dir_key(&s, "src/gone");
+		assert!(matches!(s.toggle_dir_fold(ghost, None), Folded::Ignored));
+		assert!(s.plan().unwrap().collapsed_dirs.is_empty());
+		assert_eq!(s.plan().unwrap().cursor(), before);
+
+		// `src/app` is no row while `src` is folded.
+		let (src, app) = (dir_key(&s, "src"), dir_key(&s, "src/app"));
+		assert!(matches!(
+			s.toggle_dir_fold(src.clone(), None),
+			Folded::Reselected(Nav::MovedDir)
+		));
+		assert!(matches!(s.toggle_dir_fold(app, None), Folded::Ignored));
+		assert_eq!(s.plan().unwrap().collapsed_dirs.len(), 1);
+		assert!(s.plan().unwrap().collapsed_dirs.contains(&src));
+	}
+
+	/// A folder fold grows the retained set (its key), so unlike a commit
+	/// fold (#refused_fold_reselect_keeps_the_hidden_row_with_its_detail)
+	/// a refusal undoes the whole fold, not only the move.
+	#[test]
+	fn refused_dir_fold_leaves_tree_and_cursor_unchanged() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut o = small_ordinary();
+		let mut s = landed(SRC_TREE, dir.path(), Some(&o));
+		let c = index_of(&s, "src/lib/c.ts");
+		assert_eq!(s.select(c, Some(&o)), Nav::Moved(c));
+		fill_budget(&s, &mut o);
+		let app = dir_key(&s, "src/app");
+		let res = s.toggle_dir_fold(app, Some(&o));
+		assert!(
+			matches!(res, Folded::Reselected(Nav::Refused(ref e)) if e.key == "preview_memory_limit"),
+			"{res:?}"
+		);
+		let plan = s.plan().unwrap();
+		assert!(plan.collapsed_dirs.is_empty());
+		assert_eq!(plan.selected_item_idx, c);
+		assert!(plan.cursor_dir.is_none());
+		assert_eq!(
+			s.detail().and_then(|d| d.path.as_deref()),
+			Some("src/lib/c.ts")
+		);
+		// With room, the same fold goes through.
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let c = index_of(&s, "src/lib/c.ts");
+		assert_eq!(s.select(c, None), Nav::Moved(c));
+		let app = dir_key(&s, "src/app");
+		assert!(matches!(s.toggle_dir_fold(app.clone(), None), Folded::Kept));
+		assert!(s.plan().unwrap().collapsed_dirs.contains(&app));
+	}
+
+	#[test]
+	fn selecting_a_folder_drops_the_detail_and_a_file_brings_it_back() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let b = index_of(&s, "src/app/b.ts");
+		assert_eq!(s.select(b, None), Nav::Moved(b));
+		assert!(s.detail().is_some());
+		let app = dir_key(&s, "src/app");
+		assert_eq!(s.select_dir(app.clone(), None), Nav::MovedDir);
+		assert!(s.detail().is_none());
+		assert_eq!(s.plan().unwrap().cursor_dir, Some(app));
+		// A late diff read for the file the cursor left is not shown.
+		let stale = s.plan().unwrap().detail_at(b).unwrap();
+		assert!(s.replace_detail(b, stale, None).is_ok());
+		assert!(s.detail().is_none());
+		assert_eq!(s.select(b, None), Nav::Moved(b));
+		assert!(s.plan().unwrap().cursor_dir.is_none());
+		assert_eq!(
+			s.detail().and_then(|d| d.path.as_deref()),
+			Some("src/app/b.ts")
+		);
+	}
+
 	#[test]
 	fn refused_navigation_keeps_plan_selection_detail_and_busy_state() {
 		let dir = tempfile::tempdir().unwrap();
@@ -894,6 +1189,7 @@ mod tests {
 				code: ErrorCode::Busy,
 				message: "the worker is busy".into(),
 				reason: None,
+				suggestion: None,
 			},
 			|| nav = Some(s.select(1, Some(&o))),
 		);
@@ -1309,8 +1605,57 @@ mod tests {
 		let res2 = s.remap("repo-a".into(), None, None);
 		assert!(matches!(
 			res2,
-			Remapped::Ready(PasteRequest::Remap { keep: true, .. })
+			Remapped::Ready(PasteRequest::Remap(Remap::Prefix {
+				keep: true,
+				..
+			}))
 		));
+	}
+
+	#[test]
+	fn adjusting_paths_disarms_the_old_plan_until_the_replan_lands() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let mut s = landed(
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+			&dest,
+			None,
+		);
+		let paths = |s: &PastePreview| -> Vec<String> {
+			s.plan()
+				.unwrap()
+				.items
+				.iter()
+				.map(|i| i.path.clone())
+				.collect()
+		};
+		assert_eq!(paths(&s), ["sub/a.ts"]);
+
+		let Remapped::Ready(req) = s.adjust_paths(true, None) else {
+			panic!("the hint is there, so the choice is accepted");
+		};
+		assert!(matches!(req, PasteRequest::Remap(Remap::AdjustPaths(true))));
+		// The plan made without the adjustment cannot be applied meanwhile.
+		assert!(s.plan().unwrap().items.is_empty());
+		assert!(!s.plan().unwrap().executable());
+		assert_eq!(s.begin_apply().err(), Some(ApplyRefused::NotExecutable));
+
+		s.enqueue(req).unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(2, cancel);
+		assert!(matches!(
+			s.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown {
+					remap: Some(Remap::AdjustPaths(true))
+				}),
+				..
+			}
+		));
+		assert_eq!(paths(&s), ["a.ts"]);
+		assert!(s.plan().unwrap().executable());
 	}
 
 	#[test]

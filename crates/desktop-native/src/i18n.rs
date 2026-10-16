@@ -453,7 +453,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_refusal_cause_dir_in_way" => "目錄佔住了檔案位置",
 			"reason_refusal_cause_file_in_way" => "父目錄被檔案佔住",
 			"reason_refusal_cause_case_alias" => "路徑和目的地或這個 commit 裡的另一個路徑只差大小寫；可以改用檔案模式貼上，或先把名稱改成一致",
-			"paste_keys" => "Enter 套用 · Esc 取消 · ↑↓ 切換項目 · 空白鍵切換",
+			"paste_keys" => {
+				"Enter 套用 · Esc 取消 · ↑↓ 切換項目 · ←→ 收合／展開 · 空白鍵切換"
+			},
 			"copy_from" => "複製來源",
 			"selected" => "已選",
 			"repos_count" => "個儲存庫",
@@ -682,6 +684,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"mapping_keep" => "留在主要目錄",
 			"mapping_unknown_prefix" => "未知的來源前綴 {}",
 			"mapping_unknown_dest" => "目的地不在可選清單：{}",
+			"paste_adjust_strip" => "路徑開頭多了一層「{}/」，建議去掉，讓檔案直接落在目的地",
+			"paste_adjust_add" => "這些路徑看起來屬於「{}/」，建議全部放到它底下",
+			"paste_adjust" => "調整路徑",
+			"paste_as_is" => "照原樣",
+			"paste_adjust_unavailable" => "這次貼上沒有路徑調整建議",
 			"commit_subset_rejected" => "提交重放必須套用整段內容與中繼資料。取消任一項會在寫入前拒絕，不會只寫其餘檔案",
 			"commit_overwrite_required" => "目的地已有檔案，覆寫預設關閉。請允許覆寫後再套用，否則不會寫入",
 			"commit_will_be_refused" => "第 {} 個 commit「{}」會被拒絕，重播將在此停止",
@@ -972,7 +979,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_refusal_cause_dir_in_way" => "a directory is in the way of the file",
 			"reason_refusal_cause_file_in_way" => "a file is in the way of its parent directory",
 			"reason_refusal_cause_case_alias" => "the path differs only in letter case from another one in the destination or the commit; paste in file mode instead, or rename it to match first",
-			"paste_keys" => "Enter apply · Esc cancel · ↑↓ item · Space toggle",
+			"paste_keys" => {
+				"Enter apply · Esc cancel · ↑↓ item · ←→ fold · Space toggle"
+			},
 			"copy_from" => "Copy from",
 			"selected" => "selected",
 			"repos_count" => "repos",
@@ -1201,6 +1210,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"mapping_keep" => "Keep under primary",
 			"mapping_unknown_prefix" => "Unknown source prefix {}",
 			"mapping_unknown_dest" => "Destination is not a candidate: {}",
+			"paste_adjust_strip" => "The paths start with an extra \"{}/\"; adjusting removes it",
+			"paste_adjust_add" => "These paths look like they belong under \"{}/\"; adjusting places them there",
+			"paste_adjust" => "Adjust paths",
+			"paste_as_is" => "Use as-is",
+			"paste_adjust_unavailable" => "This paste has no path adjustment to apply",
 			"commit_subset_rejected" => "Commit replay keeps the whole commit content and metadata. Unchecking any item rejects the replay before any write",
 			"commit_overwrite_required" => "A destination file already exists and overwrite starts off. Allow overwrite before applying; nothing is written until you do",
 			"commit_will_be_refused" => "Commit #{} \"{}\" will be refused; replay will stop there",
@@ -1399,6 +1413,11 @@ mod tests {
 	#[test]
 	fn test_i18n_keys_parity() {
 		let test_keys = [
+			"paste_adjust_strip",
+			"paste_adjust_add",
+			"paste_adjust",
+			"paste_as_is",
+			"paste_adjust_unavailable",
 			"btn_back_to_working",
 			"btn_browse_tree",
 			"diff_inline",

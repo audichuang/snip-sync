@@ -364,6 +364,7 @@ pub(crate) fn write_response<W: Write>(
 				message: err.to_string(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 		),
 		other => other,
@@ -418,6 +419,7 @@ impl JobCtx {
 			message: message.into(),
 			patch: false,
 			reason: None,
+			suggestion: None,
 		}
 	}
 

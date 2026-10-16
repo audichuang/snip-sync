@@ -109,6 +109,9 @@ pub enum RemoteError {
 		/// old one) or whose code says it all. Boxed: `Reason` is large and
 		/// this error travels in every `Result`.
 		reason: Option<Box<Reason>>,
+		/// With a refused paste plan: the worker's restore-base suggestion
+		/// for the destination, which a plan that succeeded carries too.
+		suggestion: Option<Box<snip_core::restore::RestoreBaseSuggestion>>,
 	},
 	/// A `TooLarge` refusal whose file is fine: the diff built from it is
 	/// over the limit (#214). The same wire code as [`Self::Refused`].

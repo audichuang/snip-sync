@@ -736,7 +736,27 @@ pub enum Response {
 			skip_serializing_if = "Option::is_none"
 		)]
 		reason: Option<Reason>,
+		/// With a refused paste plan: what the worker suggests for the
+		/// destination, as it does beside a plan, so a refusal keeps the
+		/// restore-base hint a local paste shows. A peer that does not
+		/// know the field ignores it; an old worker sends none. Absent when
+		/// `None`, so every other frame is byte-identical to before.
+		#[serde(
+			default,
+			deserialize_with = "lenient_suggestion",
+			skip_serializing_if = "Option::is_none"
+		)]
+		suggestion: Option<Box<snip_core::restore::RestoreBaseSuggestion>>,
 	},
+}
+
+/// A refusal's suggestion that a newer peer worded in a way this build does
+/// not know reads as `None`: it must not cost the frame its refusal.
+fn lenient_suggestion<'de, D: serde::Deserializer<'de>>(
+	d: D,
+) -> Result<Option<Box<snip_core::restore::RestoreBaseSuggestion>>, D::Error> {
+	let v = Option::<serde_json::Value>::deserialize(d)?;
+	Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1115,6 +1135,7 @@ mod tests {
 			message: "busy".into(),
 			patch: false,
 			reason,
+			suggestion: None,
 		}
 	}
 
@@ -1181,6 +1202,63 @@ mod tests {
 					.unwrap_or_else(|e| panic!("{reason}: {e}")),
 				error_with(None),
 				"{reason}"
+			);
+		}
+	}
+
+	/// `suggestion` is additive on `Response::Error` too: an old master
+	/// ignores it, an old worker's frame has none, a frame without one is
+	/// byte-identical to before, and one a newer worker worded in a way
+	/// this build cannot read still decodes as a refusal.
+	#[test]
+	fn error_suggestion_is_compatible_in_both_directions() {
+		use snip_core::restore::{RestoreBase, RestoreBaseSuggestion};
+		let suggestion = RestoreBaseSuggestion {
+			base: RestoreBase::Strip {
+				segment: "proj".into(),
+			},
+			label: "remove the leading \"proj/\"".into(),
+			matched: 2,
+			total: 2,
+		};
+		let with = Response::Error {
+			code: ErrorCode::Collision,
+			message: "collision".into(),
+			patch: false,
+			reason: None,
+			suggestion: Some(Box::new(suggestion)),
+		};
+		let wire = serde_json::to_string(&with).unwrap();
+		assert!(wire.contains("\"suggestion\""), "{wire}");
+		// Old decoder, new frame: the key is ignored.
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&wire).unwrap(),
+			OldResponse::Error {
+				code: ErrorCode::Collision,
+				message: "collision".into(),
+				patch: false
+			}
+		);
+		// Round trip.
+		assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), with);
+		// New decoder, old frame: none, and a frame without one is
+		// byte-identical to an old worker's.
+		let old = r#"{"reply":"error","code":"busy","message":"busy"}"#;
+		assert_eq!(serde_json::to_string(&error_with(None)).unwrap(), old,);
+		// A suggestion from a newer peer reads as none.
+		for suggestion in [
+			r#"{"base":{"kind":"from_the_future"},"label":"x","matched":1,"total":1}"#,
+			r#""not even an object""#,
+			"null",
+		] {
+			let frame = format!(
+				r#"{{"reply":"error","code":"busy","message":"busy","suggestion":{suggestion}}}"#
+			);
+			assert_eq!(
+				serde_json::from_str::<Response>(&frame)
+					.unwrap_or_else(|e| panic!("{suggestion}: {e}")),
+				error_with(None),
+				"{suggestion}"
 			);
 		}
 	}
@@ -1570,12 +1648,14 @@ mod tests {
 				message: "stale destination in '/w': gone".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::Collision,
 				message: "target collision".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Repos(Codeless::new(RepoScan {
 				repos: vec![ScannedRepo {
@@ -1603,36 +1683,42 @@ mod tests {
 				message: "not a git repo".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::InvalidRevision,
 				message: "invalid rev".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::Timeout,
 				message: "timed out".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::Busy,
 				message: "busy".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::Cancelled,
 				message: "cancelled".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 			Response::Error {
 				code: ErrorCode::OutsideShare,
 				message: "outside share".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			},
 		];
 		for res in &responses {
@@ -1747,6 +1833,7 @@ mod tests {
 				freshness: DestinationFreshnessSnapshot {
 					roots: Default::default(),
 					target_files,
+					..Default::default()
 				},
 			},
 		};
@@ -1902,6 +1989,7 @@ mod tests {
 			freshness: DestinationFreshnessSnapshot {
 				roots: Default::default(),
 				target_files: Default::default(),
+				..Default::default()
 			},
 		};
 		let prepare = Request::PrepareReplay {

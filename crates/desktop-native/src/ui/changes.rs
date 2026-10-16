@@ -2,6 +2,7 @@
 //! directory tree) and the row renderers.
 
 use super::*;
+use crate::dirtree::{DirTree, TreePath, TreeSink};
 use crate::ChangesEmpty;
 
 /// One row of the Git Changes tool window (section header or file change).
@@ -285,28 +286,56 @@ pub(super) fn push_change_files<
 		);
 		return;
 	}
-	let tree = DirTree {
-		files,
+	let tree = DirTree { files };
+	let mut sink = ChangeSink {
+		rows,
 		slot,
 		group_id,
 		expanded: &layout.expanded,
 	};
-	tree.push(rows, &mut members, 0, depth);
+	tree.push(&mut sink, &mut members, 0, depth);
 }
 
-/// A file row the directory tree can place: its repository-relative path.
-pub(crate) trait TreePath {
-	fn tree_path(&self) -> &str;
+/// Turns the shared directory tree's rows into Changes rows.
+struct ChangeSink<'r, 'e, F> {
+	rows: &'r mut Vec<ChangeItemRow>,
+	slot: usize,
+	group_id: &'static str,
+	expanded: &'e F,
 }
 
-impl TreePath for crate::FileChangeItem {
+impl<F: Fn(usize, &str, &str) -> bool> TreeSink for ChangeSink<'_, '_, F> {
+	fn dir(
+		&mut self,
+		path: &str,
+		name: &str,
+		members: &[usize],
+		depth: usize,
+	) -> bool {
+		self.rows.push(ChangeItemRow::Dir {
+			slot: self.slot,
+			group_id: self.group_id,
+			path: path.to_string(),
+			name: name.to_string(),
+			count: members.len(),
+			depth,
+		});
+		(self.expanded)(self.slot, self.group_id, path)
+	}
+
+	fn file(&mut self, file_idx: usize, depth: usize) {
+		self.rows.push(ChangeItemRow::File { file_idx, depth });
+	}
+}
+
+impl crate::dirtree::TreePath for crate::FileChangeItem {
 	fn tree_path(&self) -> &str {
 		&self.path
 	}
 }
 
 /// A file of a commit (or of a log multi-selection).
-impl TreePath for (String, Option<ChangeType>) {
+impl crate::dirtree::TreePath for (String, Option<ChangeType>) {
 	fn tree_path(&self) -> &str {
 		&self.0
 	}
@@ -380,85 +409,6 @@ pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 		}
 	}
 	ai.count().cmp(&bi.count()).then_with(|| a.cmp(b))
-}
-
-/// Builds IntelliJ's "Group By > Directory" rows from the capped file rows
-/// alone: no Git reads, and only open directories' children get rows.
-pub(super) struct DirTree<'a, T, F> {
-	files: &'a [T],
-	slot: usize,
-	group_id: &'static str,
-	expanded: &'a F,
-}
-
-impl<T: TreePath, F: Fn(usize, &str, &str) -> bool> DirTree<'_, T, F> {
-	/// Path of file `i`. An untracked directory comes as `dir/` and is a
-	/// leaf named by its last component.
-	pub(super) fn path(&self, i: usize) -> &str {
-		self.files[i].tree_path().trim_end_matches('/')
-	}
-
-	/// First directory of file `i` from byte `start` on, `None` for a leaf.
-	pub(super) fn head(&self, i: usize, start: usize) -> Option<&str> {
-		self.path(i)[start..].split_once('/').map(|(d, _)| d)
-	}
-
-	/// Rows of `entries`, files whose paths share the same `start`-byte
-	/// prefix: directories first, then files, each by name ignoring case.
-	pub(super) fn push(
-		&self,
-		rows: &mut Vec<ChangeItemRow>,
-		entries: &mut [usize],
-		start: usize,
-		depth: usize,
-	) {
-		let key = |i: usize| match self.head(i, start) {
-			Some(dir) => (false, dir),
-			None => (true, &self.path(i)[start..]),
-		};
-		entries.sort_by(|&a, &b| {
-			let ((la, na), (lb, nb)) = (key(a), key(b));
-			la.cmp(&lb).then_with(|| natural_cmp(na, nb))
-		});
-		let mut k = 0;
-		while let Some(dir) = entries.get(k).and_then(|&i| self.head(i, start))
-		{
-			let end = k + entries[k..]
-				.iter()
-				.take_while(|&&i| self.head(i, start) == Some(dir))
-				.count();
-			let first = entries[k];
-			// A directory whose only child is a directory shows as one row.
-			let mut name_end = start + dir.len();
-			while let Some(sub) = self.head(first, name_end + 1) {
-				if !entries[k..end]
-					.iter()
-					.all(|&i| self.head(i, name_end + 1) == Some(sub))
-				{
-					break;
-				}
-				name_end += 1 + sub.len();
-			}
-			let path = &self.path(first)[..name_end];
-			rows.push(ChangeItemRow::Dir {
-				slot: self.slot,
-				group_id: self.group_id,
-				path: path.to_string(),
-				name: path[start..].to_string(),
-				count: end - k,
-				depth,
-			});
-			if (self.expanded)(self.slot, self.group_id, path) {
-				self.push(rows, &mut entries[k..end], name_end + 1, depth + 1);
-			}
-			k = end;
-		}
-		rows.extend(
-			entries[k..]
-				.iter()
-				.map(|&file_idx| ChangeItemRow::File { file_idx, depth }),
-		);
-	}
 }
 
 impl WorkbenchModel {

@@ -553,6 +553,17 @@ fn first_segments<'a>(multi: &[&'a str]) -> BTreeSet<&'a str> {
 		.collect()
 }
 
+/// Whether a `clipcode-root` value can name a folder: one path segment that
+/// is not `.`, `..` (a TS copy that resolved no root writes `..`), blank or
+/// inside `.git`; a separator rules out absolute paths and `..` segments. Anything else would become an `Add` prefix that
+/// the destination can never hold, or a probe of `<root>/..`, which is always
+/// a directory.
+fn is_folder_name(name: &str) -> bool {
+	!name.trim_matches(['.', ' ']).is_empty()
+		&& !name.contains(['/', '\\'])
+		&& !has_git_segment(name)
+}
+
 fn suggest_from_source_root(
 	primary_root: &str,
 	rels: &[&str],
@@ -601,11 +612,14 @@ fn suggest_from_source_root(
 		);
 	}
 
-	// Copied with the repo as root, and that folder exists here.
-	if probe.is_dir(&format!(
-		"{}/{source_root}",
-		primary_root.trim_end_matches('/')
-	)) {
+	// Copied with the repo as root, and that folder exists here. Only a
+	// real folder name may become a prefix; the strip above reads the paths
+	// alone, as TS does, so it stands whatever the root says.
+	if is_folder_name(source_root)
+		&& probe.is_dir(&format!(
+			"{}/{source_root}",
+			primary_root.trim_end_matches('/')
+		)) {
 		if already_anchored {
 			return None;
 		}
@@ -1380,6 +1394,77 @@ mod tests {
 			None
 		)
 		.is_none());
+	}
+
+	#[test]
+	fn restore_base_ignores_a_clipcode_root_that_is_not_a_folder_name() {
+		// `clipcode-root` should be a folder's basename. A TS copy that
+		// resolved no root writes `..`, and a hand-edited payload can carry
+		// anything: none of these names a folder the paths could belong to,
+		// yet every probe below says the joined path is a directory (as
+		// `/work/..` always is), so only the name itself can refuse them.
+		let degenerate = [
+			".",
+			"..",
+			" ",
+			"a/b",
+			"a\\b",
+			"../x",
+			"x/..",
+			"/abs",
+			"/",
+			"C:/x",
+			"C:\\x",
+			"\\\\server\\share",
+			".git",
+			"sub/.git",
+			".GIT.",
+		];
+		let paths = ["src/a.ts", "lib/b.ts"];
+		for root in degenerate {
+			let joined = format!("/work/{root}");
+			let p = probe(&[joined.as_str(), "/work"], &[root, "src"]);
+			assert!(
+				suggest("/work", &paths, &p, Some(root)).is_none(),
+				"clipcode-root {root:?} must not produce a suggestion"
+			);
+			assert!(
+				suggest("/work", &paths[..1], &p, Some(root)).is_none(),
+				"clipcode-root {root:?} must not produce a suggestion for one file"
+			);
+		}
+		// The strip reads the paths alone, as TS does: a degenerate root
+		// does not take it away.
+		let p = probe(&[], &[]);
+		assert_eq!(
+			suggest(
+				"/work/inv-svc-console",
+				&["inv-svc-console/src/a.ts", "inv-svc-console/lib/b.ts"],
+				&p,
+				Some(".."),
+			)
+			.unwrap()
+			.base,
+			RestoreBase::Strip {
+				segment: "inv-svc-console".into()
+			}
+		);
+		// An ordinary name still works next to them.
+		let p = probe(&["/work/inv-svc-console"], &[REPO]);
+		assert_eq!(
+			suggest("/work", &paths, &p, Some(REPO)).unwrap().base,
+			add(REPO)
+		);
+		// A name that merely contains dots or spaces is a real folder name.
+		for root in ["a.b", "my repo", "..x", "x..", "v1.2"] {
+			let joined = format!("/work/{root}");
+			let p = probe(&[joined.as_str()], &[root]);
+			assert_eq!(
+				suggest("/work", &paths, &p, Some(root)).unwrap().base,
+				add(root),
+				"{root:?} is a legal folder name"
+			);
+		}
 	}
 
 	#[test]

@@ -185,7 +185,7 @@ SNIP_CONFIG_DIR="$RUN/config" ./target/debug/snip-desktop-native \
 | Ctrl+A | 閱讀器全選。拖曳選取放開滑鼠時才印日誌，Ctrl+A 不印 | 拖曳：`SELECTION: from= to= chars=` |
 | `h` | Git log 有焦點：回到 HEAD，同 `btn-head` | `HEAD_LOCATED: row=` |
 | Tab／Shift+Tab、Ctrl+Tab／Ctrl+Shift+Tab | 焦點移到下一個／上一個 | `FOCUS: next`／`FOCUS: prev` |
-| Enter／Escape／Space／Up／Down | 預覽面板裡：套用／取消／切換目前列／移動選取 | `PASTE_APPLYING`、`PASTE_CANCELLED`、`PASTE_SEL_TOGGLED`、`PASTE_NAV` |
+| Enter／Escape／Space／Up／Down／Left／Right | 預覽面板裡：套用／取消／切換目前列（資料夾列是整個資料夾的勾選）／移動選取（會停在資料夾列和 root 列上）／收合或回到上一層／展開或進入第一個子列。Left／Right 只在面板本身有焦點時作用 | `PASTE_APPLYING`、`PASTE_CANCELLED`、`PASTE_SEL_TOGGLED`、`PASTE_DIR_SEL_TOGGLED`、`PASTE_NAV`、`PASTE_NAV_DIR`、`PASTE_DIR_TOGGLED` |
 
 Cmd+C、Cmd+V、Cmd+R、Cmd+Q、Cmd+Shift+O、Cmd+Shift+W 也綁了 Ctrl 版本；操作按 Cmd，並用日誌確認送到的是那個動作。Ctrl+F、Ctrl+G、Ctrl+A、Ctrl+Tab 只有 Ctrl 版本，Cmd+F、Cmd+G 沒有綁定。Mac 鍵盤的 F3、F7 可能要加 Fn。在這個 App 裡按 Cmd+C 是 App 自己的複製。
 
@@ -248,7 +248,7 @@ ID 以受測 binary 印出的 `CTRL_BOUNDS` 為準。下面是寫這份規程時
 | 篩選選單項目 | 使用者 `log-user:me`、`log-user:<名稱>`，選了印 `[APP:LOG_SEARCH: active=… author=true]`；分支選單打開時群組全收合，先點 `log-branch-group:<key>` 展開（本機分支是 `refs_local`，沒有日誌），再點 `log-branch:<完整 ref>`（如 `log-branch:refs/heads/side`），日誌 `[APP:REF_FILTER: <完整 ref>]`，清除後是 `[APP:REF_FILTER: all]` |
 | 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`btn-leave-tree`。檔案列右鍵「複製」複製該檔在這個 commit 的內容；資料夾列的「複製」是停用的 |
 | Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
-| 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items`、`paste-skip-reason:<ix>:<path>`（規劃略過原因） |
+| 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items`、`paste-skip-reason:<ix>:<path>`（規劃略過原因）。檔案模式的預覽是巢狀樹，資料夾列和 root 列另有 `paste-dir:<ord>:<rel>`（列本身，點擊選取）、`paste-dir-toggle:<ord>:<rel>`（箭頭，收合或展開）、`paste-dir-include:<ord>:<rel>`（三態勾選，部分選取點一下變全選）。`<ord>` 是 root 在畫面上的序號（從 0 起算，名稱可能重複或含 `:`），`<rel>` 是資料夾在 root 底下的完整路徑（單一子資料夾的鏈合成一列，`<rel>` 是整串），root 列本身的 `<rel>` 是空字串（`paste-dir:0:`）。超過 200 個檔案的預覽開啟時，每個 root 的第一層資料夾是收合的，底下的 `paste-row` 要先展開才畫得出來。commit 重播也是每個 commit 底下一棵樹，資料夾列用同樣的 id，`<ord>` 改成 commit 的索引（從 0 起算，和 `paste-commit:<c>` 的 `<c>` 相同），`<rel>` 是資料夾在該 commit 裡的路徑；點資料夾列或箭頭都是收合或展開，游標不會停在資料夾列上，勾選框鎖住（提示說明重播只能整段套用）。rename 的兩個列（`paste-row` 的 `<path>` 分別是舊路徑和新路徑）都在新路徑的資料夾底下 |
 | commit 預覽 | `paste-commit:<c>`（`c` 從 0 起算，是該 commit 的標頭，點擊收合或展開）、`paste-commit-count`、`paste-commit-whole`、`paste-commit-metadata`（詳情區的 message／作者／時間） |
 | 多 repo 對應 | `paste-mappings`、`paste-map:<prefix>`、`paste-map-target:<prefix>`、`paste-map-pick:<prefix>:<idx>`、`paste-map-keep:<prefix>` |
 | 閱讀器 | `reader`（內文）、`reader-truncated-notice`（截斷提示）、`editor-error`（讀不到或超過 1 MiB）、`find-bar`、`find-input`、`goto-input`、`btn-find-next`、`btn-find-prev`、`btn-diff-mode`（diff 的整合／並排切換，日誌 `[APP:DIFF_MODE: Inline\|SideBySide]`；貼上預覽開著時它在預覽的詳情區，兩處不會同時畫出） |
@@ -256,7 +256,7 @@ ID 以受測 binary 印出的 `CTRL_BOUNDS` 為準。下面是寫這份規程時
 
 Apply 被拒時，日誌一律是 `[APP:PASTE_STALE_DETECTED: <i18n key>]`，連不是 stale 的拒絕也用這個 tag。看 key 判斷是哪一種拒絕：`stale_modified`、`commit_subset_rejected`、`commit_overwrite_required`、`commit_replay_partial`（已建立部分 commit 後中途非版面衝突失敗）、`commit_replay_partial_refused`（已建立部分 commit 後因版面衝突被拒）、`commit_replay_refused`（沒有建立任何 commit 就被拒）等。
 
-其他會用到的日誌 tag：`PASTE_SEL_TOGGLED: idx= state=`（勾選是否納入）、`PASTE_TOGGLED: idx= state=`（允許覆寫）、`PASTE_COMMIT_TOGGLED: idx=<c>`、`PASTE_NAV: idx=`、`PASTE_PLAN_CLEARED`、`COPY_COMMITS_DONE: commits=N`、`TOAST: ok=`、`LOG_VIEW: hash`、`WORKSPACE: state=`、`APPLY_IGNORED:`。
+其他會用到的日誌 tag：`PASTE_SEL_TOGGLED: idx= state=`（勾選是否納入）、`PASTE_DIR_SEL_TOGGLED: dir=<ord>:<rel> state=`（資料夾的勾選，`state` 是之後整個資料夾是否納入）、`PASTE_DIR_TOGGLED: dir=<ord>:<rel> collapsed=`（資料夾收合或展開；只在收合狀態真的改變時才印，收合被預算拒絕時改印 `PASTE_DETAIL_REFUSED: reason=retained_budget`，收合狀態和游標都不變，不是 bug；commit 重播的資料夾 `<ord>` 是 commit 索引）、`PASTE_NAV_DIR: dir=<ord>:<rel>`（游標移到資料夾列；檔案列仍是 `PASTE_NAV: idx=`）、`PASTE_TOGGLED: idx= state=`（允許覆寫）、`PASTE_COMMIT_TOGGLED: idx=<c>`、`PASTE_NAV: idx=`、`PASTE_PLAN_CLEARED`、`COPY_COMMITS_DONE: commits=N`、`TOAST: ok=`、`LOG_VIEW: hash`、`WORKSPACE: state=`、`APPLY_IGNORED:`。
 
 第 6 節最後一張表另外用到：`PASTE_DIFF: idx= state=`（檔案模式可覆寫列與 commit 列的 diff；`state` 是 `diff`、`same` 或 `unavailable`）、`DIFF_MODE:`、`COPY_PREP: files=`、`COPY_DONE: copied=N`、`COPY_COMMITS_ERR:`、`RANGE: commits=N chain=`、`COMPARE: from= to=`、`E2E_CHANGES: files=N`（commit 或比較的變更檔案清單載入完成）、`COMMIT_SELECTED:`、`HEAD_LOCATED: row=`、`REF_FILTER:`、`LOG_MENU:`、`LOG_CHIPS:`、`LOG_SEARCH: active= author=`、`LOG_REGEX:`、`LOG_REFRESH`、`TREE_TOGGLED:`、`TREE_SELECTED:`、`SELECTION_COPIED: chars= fnv=`、`FIND_BAR: open`、`FIND: matches= first_line=`、`FIND_AT:`、`GOTO: line=`、`CHANGES_EMPTY: state=`、`LOG_EMPTY: state=`、`DISCOVERY_PROGRESS:`、`READY_REPOS:`。
 
