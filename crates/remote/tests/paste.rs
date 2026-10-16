@@ -3061,3 +3061,142 @@ fn a_worker_on_hfs_does_not_make_the_named_folder_through_an_ignored_character()
 	not_confirmed(err, 1);
 	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
 }
+
+/// How someone else changes `b.txt` on the worker after its Apply made it
+/// empty and before its row writes.
+#[derive(Clone, Copy)]
+enum Interloper {
+	/// Writes into the empty file itself (the same object).
+	WritesInto(&'static [u8]),
+	/// Renames another file over it (a new object at the name).
+	RenamesOver(&'static [u8]),
+}
+
+impl Interloper {
+	fn run(self, target: &Path) {
+		match self {
+			Self::WritesInto(bytes) => fs::write(target, bytes).unwrap(),
+			Self::RenamesOver(bytes) => {
+				let other = target.with_file_name("other.tmp");
+				fs::write(&other, bytes).unwrap();
+				fs::rename(&other, target).unwrap();
+			}
+		}
+	}
+
+	fn bytes(self) -> &'static [u8] {
+		match self {
+			Self::WritesInto(b) | Self::RenamesOver(b) => b,
+		}
+	}
+}
+
+/// Two new files through a worker, held after the first write
+/// (`SNIP_E2E_PASTE_HOLD`) while the interloper changes the second one's
+/// reservation. Returns the result and `b.txt`'s bytes.
+fn worker_apply_with_reservation_changed(
+	selection: RestoreSelection,
+	how: Interloper,
+) -> (RestoreExecutionResult, Vec<u8>) {
+	use std::time::{Duration, Instant};
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let hold = tmp.path().join("paste-hold");
+	let text = [entry("a.txt", "first"), entry("b.txt", "second")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+
+	fs::write(&hold, b"").unwrap();
+	std::env::set_var("SNIP_E2E_PASTE_HOLD", &hold);
+	let call = std::thread::spawn(move || {
+		client.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&selection,
+			&planned.expect(),
+			None,
+		)
+	});
+	let content = |name: &str| fs::read(ws.join(name)).unwrap_or_default();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while content("a.txt") != b"first" && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	let first = content("a.txt");
+	let reserved = ws.join("b.txt").is_file() && content("b.txt").is_empty();
+	if first == b"first" && reserved {
+		how.run(&ws.join("b.txt"));
+	}
+	fs::remove_file(&hold).unwrap();
+	let answer = call.join().expect("the call thread must end");
+	std::env::remove_var("SNIP_E2E_PASTE_HOLD");
+	assert_eq!(first, b"first", "the worker must commit its first write");
+	assert!(reserved, "b.txt is reserved, empty, when the hold starts");
+	let result = answer.unwrap();
+	assert_eq!(content("a.txt"), b"first");
+	assert!(!ws.join("other.tmp").exists());
+	(result, content("b.txt"))
+}
+
+fn assert_worker_reservation_kept(
+	result: &RestoreExecutionResult,
+	b: &[u8],
+	how: Interloper,
+) {
+	assert!(result.errors.is_empty(), "{result:?}");
+	assert_eq!(result.created_count, 1, "{result:?}");
+	assert_eq!(result.overwritten_count, 0, "{result:?}");
+	assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+	assert_eq!(b, how.bytes(), "what someone else put there is kept");
+}
+
+#[test]
+fn a_worker_keeps_a_reserved_file_someone_else_wrote() {
+	let _serial = serial();
+	let worker_default = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	for selection in [RestoreSelection::default(), worker_default] {
+		for how in [
+			Interloper::WritesInto(b"external\n"),
+			Interloper::RenamesOver(b"replaced\n"),
+		] {
+			let (result, b) =
+				worker_apply_with_reservation_changed(selection.clone(), how);
+			assert_worker_reservation_kept(&result, &b, how);
+		}
+	}
+}
+
+#[test]
+fn a_worker_overwrites_a_reserved_file_someone_else_wrote_only_when_allowed() {
+	let _serial = serial();
+	let selection = unchecked(&[]);
+	for how in [
+		Interloper::WritesInto(b"external\n"),
+		Interloper::RenamesOver(b"replaced\n"),
+	] {
+		let (result, b) =
+			worker_apply_with_reservation_changed(selection.clone(), how);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.overwritten_count, 1, "{result:?}");
+		assert_eq!(b, b"second");
+	}
+	for how in [
+		Interloper::WritesInto(&[0xff, 0xfe, 0x00, 0x41, 0x00, 0x0a]),
+		Interloper::RenamesOver(&[0xa4, 0xe9, 0xa5, 0xbb, 0x0a]),
+	] {
+		let (result, b) =
+			worker_apply_with_reservation_changed(selection.clone(), how);
+		assert_worker_reservation_kept(&result, &b, how);
+	}
+}

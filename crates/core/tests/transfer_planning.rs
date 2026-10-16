@@ -9640,3 +9640,158 @@ fn test_new_folders_without_the_workers_list_follow_the_paths() {
 		.destination_freshness()
 		.matches_preview(older.destination_freshness()));
 }
+
+// ---------------------------------------------------------------------------
+// A new file's empty reservation changed by someone else before its row wrote
+// ---------------------------------------------------------------------------
+
+/// How someone else changes `b.txt` after the Apply made it empty and
+/// before its row writes.
+#[derive(Clone, Copy)]
+enum Interloper {
+	/// Writes into the empty file itself (the same object).
+	WritesInto(&'static [u8]),
+	/// Renames another file over it (a new object at the name).
+	RenamesOver(&'static [u8]),
+}
+
+impl Interloper {
+	fn run(self, target: &Path) {
+		match self {
+			Self::WritesInto(bytes) => fs::write(target, bytes).unwrap(),
+			Self::RenamesOver(bytes) => {
+				let other = target.with_file_name("other.tmp");
+				fs::write(&other, bytes).unwrap();
+				fs::rename(&other, target).unwrap();
+			}
+		}
+	}
+
+	fn bytes(self) -> &'static [u8] {
+		match self {
+			Self::WritesInto(b) | Self::RenamesOver(b) => b,
+		}
+	}
+}
+
+/// Two new files; between the first row's write and the second's, the
+/// interloper changes the second one's reservation.
+fn apply_with_reservation_changed(
+	selection: RestoreSelection,
+	how: Interloper,
+) -> (restore::RestoreExecutionResult, TestRepo) {
+	let dst = TestRepo::new("dest-repo");
+	dst.write("keep.txt", "k");
+	dst.commit("base");
+	let text = "// file: a.txt\nfirst\n// file: b.txt\nsecond\n";
+	let plan = plan_import(
+		text,
+		"// file: $FILE_PATH",
+		&[dst.path().to_path_buf()],
+		&ImportMapping::with_primary(dst.canonical_id()),
+	)
+	.unwrap();
+	let b = dst.path().join("b.txt");
+	let mut writes = 0;
+	let result = plan
+		.apply_observed(&selection, &mut |op, _| {
+			writes += 1;
+			if writes == 1 {
+				assert_eq!(op.relative_path, "a.txt");
+				assert_eq!(fs::read(&b).unwrap(), b"", "b.txt is reserved");
+				how.run(&b);
+			}
+		})
+		.unwrap();
+	assert_eq!(writes, result.created_count + result.overwritten_count);
+	assert_eq!(dst.read("a.txt"), "first");
+	assert!(!dst.exists("other.tmp"));
+	(result, dst)
+}
+
+fn assert_reservation_kept(
+	result: &restore::RestoreExecutionResult,
+	dst: &TestRepo,
+	how: Interloper,
+) {
+	assert!(result.errors.is_empty(), "{result:?}");
+	assert_eq!(result.created_count, 1, "{result:?}");
+	assert_eq!(result.overwritten_count, 0, "{result:?}");
+	assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+	assert_eq!(
+		fs::read(dst.path().join("b.txt")).unwrap(),
+		how.bytes(),
+		"what someone else put there is kept"
+	);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_kept_without_overwrite() {
+	let how = Interloper::WritesInto(b"external\n");
+	let (result, dst) =
+		apply_with_reservation_changed(RestoreSelection::default(), how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_kept_with_skip_existing() {
+	let how = Interloper::WritesInto(b"external\n");
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	let (result, dst) = apply_with_reservation_changed(selection, how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_replaced_by_another_file_is_kept() {
+	let how = Interloper::RenamesOver(b"replaced\n");
+	let (result, dst) =
+		apply_with_reservation_changed(RestoreSelection::default(), how);
+	assert_reservation_kept(&result, &dst, how);
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	let (result, dst) = apply_with_reservation_changed(selection, how);
+	assert_reservation_kept(&result, &dst, how);
+}
+
+#[test]
+fn a_reserved_file_written_by_someone_else_is_overwritten_only_when_allowed() {
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for how in [
+		Interloper::WritesInto(b"external\n"),
+		Interloper::RenamesOver(b"replaced\n"),
+	] {
+		let (result, dst) =
+			apply_with_reservation_changed(selection.clone(), how);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.overwritten_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 0, "{result:?}");
+		assert_eq!(dst.read("b.txt"), "second");
+	}
+}
+
+#[test]
+fn a_reserved_file_given_binary_content_is_never_overwritten() {
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for how in [
+		Interloper::WritesInto(&[0xff, 0xfe, 0x00, 0x41, 0x00, 0x0a]),
+		Interloper::RenamesOver(&[0xa4, 0xe9, 0xa5, 0xbb, 0x0a]),
+	] {
+		let (result, dst) =
+			apply_with_reservation_changed(selection.clone(), how);
+		assert_reservation_kept(&result, &dst, how);
+	}
+}
