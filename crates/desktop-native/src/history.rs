@@ -1242,6 +1242,10 @@ impl WorkbenchModel {
 				return;
 			}
 			self.log_deferred = false;
+			#[cfg(test)]
+			{
+				self.history_replace_loads += 1;
+			}
 			let scope = self.log_scope();
 			self.log_scope_key = scope.iter().map(|(r, _)| r.clone()).collect();
 			self.log_feeds.clear();

@@ -1468,10 +1468,7 @@ impl WorkbenchModel {
 							if retries > 0 {
 								app_log!("[APP:REMOTE_SCAN_RECOVERED: retries={retries} repos={}]", e.repos.len());
 							}
-							if wipe {
-								model.begin_rescan();
-							}
-							model.merge_repo_entries(e.repos);
+							model.apply_scan_page(wipe, e.repos, cx);
 							for err in e.errors {
 								model.push_discovery_error(err);
 							}

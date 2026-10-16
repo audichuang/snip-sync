@@ -935,6 +935,10 @@ pub struct WorkbenchModel {
 	pub generation: u64,
 	pub preview_generation: u64,
 	pub history_generation: u64,
+	/// Replace loads of the log that got past the discovery wait: a test
+	/// counts how many one repo-set change costs.
+	#[cfg(test)]
+	pub(crate) history_replace_loads: u64,
 	pub tree_generation: u64,
 	pub mode: String,
 	pub focus_handle: FocusHandle,
@@ -1464,6 +1468,8 @@ impl WorkbenchModel {
 			generation: 0,
 			preview_generation: 0,
 			history_generation: 0,
+			#[cfg(test)]
+			history_replace_loads: 0,
 			tree_generation: 0,
 			mode,
 			focus_handle: cx.focus_handle(),
@@ -3188,6 +3194,20 @@ impl WorkbenchModel {
 				.await;
 			},
 		);
+	}
+
+	/// One page of a scan: the first of a rescan (`wipe`) first shrinks the
+	/// list to the manual repos plus the open one.
+	fn apply_scan_page(
+		&mut self,
+		wipe: bool,
+		page: Vec<RepoEntry>,
+		_cx: &mut Context<Self>,
+	) {
+		if wipe {
+			self.begin_rescan();
+		}
+		self.merge_repo_entries(page);
 	}
 
 	/// Replaces the list with the manual repos plus the open one, so the
@@ -5987,11 +6007,8 @@ async fn drive_discovery(
 			if model.discovery_generation != generation {
 				return true;
 			}
-			if wipe {
-				model.begin_rescan();
-				wipe = false;
-			}
-			model.merge_repo_entries(processed.0);
+			model.apply_scan_page(wipe, processed.0, cx);
+			wipe = false;
 			for err in processed.1 {
 				model.push_discovery_error(err);
 			}
@@ -15764,6 +15781,360 @@ mod tests {
 				for choice in &m.paste.plan().unwrap().prefix_choices {
 					assert!(choice.candidates.contains(&b));
 				}
+			});
+		}
+
+		/// A repo outside the workspace, in a directory of its own: the
+		/// workspace scan cannot find it, so only the user adding it brings
+		/// it into the set. Its root comes back canonical.
+		fn external_repo(name: &str) -> (tempfile::TempDir, PathBuf) {
+			let tmp = tempfile::tempdir().unwrap();
+			let root = repo(tmp.path(), name, &[]);
+			let root = dunce::canonicalize(root).unwrap();
+			(tmp, root)
+		}
+
+		/// Adds `path` the way a user does: the Project window's plus button,
+		/// the path field, Enter.
+		fn add_repo_by_gesture(cx: &mut VisualTestContext, path: &Path) {
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click(cx, "btn-add-repo");
+			click(cx, "input-add-repo");
+			cx.simulate_input(&path.display().to_string());
+			cx.simulate_keystrokes("enter");
+		}
+
+		/// The workspace's repos are all found and the scan is over.
+		fn repos_settled(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			n: usize,
+		) {
+			settle_until(cx, "the workspace's repos", |cx| {
+				model.read_with(cx, |m, _| !m.is_loading && m.repos.len() == n)
+			});
+		}
+
+		/// A repo added by hand while a paste preview is open joins every
+		/// prefix choice's candidates (#227): adding is a change of the
+		/// repo set like a scan page, not a scan's end.
+		#[gpui::test]
+		fn manually_added_repo_joins_an_open_paste_previews_candidates(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n// FILE: y/two.txt\n2\n");
+			let before = model.read_with(cx, |m, _| {
+				let choices = &m.paste.plan().unwrap().prefix_choices;
+				assert!(!choices.is_empty());
+				assert!(choices.iter().all(|c| !c.candidates.contains(&ext)));
+				choices
+					.iter()
+					.map(|c| c.candidates.clone())
+					.collect::<Vec<_>>()
+			});
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the added repo", |cx| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 2 && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("the preview stays open");
+				assert_eq!(plan.prefix_choices.len(), before.len());
+				for (choice, old) in plan.prefix_choices.iter().zip(&before) {
+					assert!(
+						choice.candidates.contains(&ext),
+						"{:?} lacks {ext:?}",
+						choice.candidates
+					);
+					assert_eq!(
+						choice.candidates[..old.len()],
+						old[..],
+						"existing candidates keep their index"
+					);
+				}
+			});
+		}
+
+		/// A scan page that lands while the scan is still running already
+		/// reaches the paste preview, and leaves Changes and Log to the
+		/// scan's end (#227): the first page of a Refresh must not drop the
+		/// rows of the repos it has not found again yet.
+		#[gpui::test]
+		fn scan_page_updates_paste_candidates_before_the_scan_ends(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			let b = repo(ws.path(), "b", &[]);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			let scope_before =
+				model.read_with(cx, |m, _| m.log_scope_key.clone());
+			let entry =
+				crate::resolve_added_repo(b, &CancelToken::new()).unwrap();
+			let b_root = entry.root.clone();
+			model.update_in(cx, |m, _, cx| {
+				m.is_loading = true;
+				m.apply_scan_page(false, vec![entry], cx);
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.repos.iter().any(|r| r.root == b_root));
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(
+						choice.candidates.contains(&b_root),
+						"a page of the running scan reaches the preview"
+					);
+				}
+				assert!(
+					!m.change_repos.iter().any(|s| s.root == b_root),
+					"Changes waits for the scan's end"
+				);
+				assert_eq!(m.log_scope_key, scope_before);
+			});
+			model.update_in(cx, |m, _, cx| {
+				m.is_loading = false;
+				m.finish_discovery(cx);
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.change_repos.iter().any(|s| s.root == b_root));
+			});
+		}
+
+		/// An Apply that fails stale returns the preview to idle: a repo
+		/// added while it was applying (the one moment candidates cannot be
+		/// extended) is in its candidates by then (#227).
+		#[gpui::test]
+		fn failed_apply_rebinds_candidates_to_repos_added_while_applying(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let entry =
+				crate::resolve_added_repo(ext.clone(), &CancelToken::new())
+					.unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			repos_settled(&model, cx, 1);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			model.update_in(cx, |m, _, cx| m.choose_paste_keep("x", cx));
+			settle_until(cx, "the mapping", |cx| {
+				model.read_with(cx, |m, _| !m.paste.is_loading())
+			});
+			// The target appears behind the preview's back: Apply goes stale.
+			fs::create_dir_all(dest.join("x")).unwrap();
+			fs::write(dest.join("x/one.txt"), "external").unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.apply_paste_restore(cx);
+				assert!(m.paste.is_applying());
+				m.install_added_repo(Ok(entry), cx);
+			});
+			settle_until(cx, "the apply to fail", |cx| {
+				model.read_with(cx, |m, _| !m.paste.is_applying())
+			});
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("the preview stays open");
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("stale_created")
+				);
+				assert!(!plan.prefix_choices.is_empty());
+				for choice in &plan.prefix_choices {
+					assert!(
+						choice.candidates.contains(&ext),
+						"{:?} lacks {ext:?}",
+						choice.candidates
+					);
+				}
+			});
+		}
+
+		/// A manually added namesake renames the repo it shares a name with:
+		/// the Changes nodes follow the rename and keep their order (#227).
+		#[gpui::test]
+		fn changes_nodes_follow_a_rename_from_a_manually_added_namesake(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			fs::create_dir(ws.path().join("nested")).unwrap();
+			let app = repo(&ws.path().join("nested"), "app", &[]);
+			repo(ws.path(), "zeta", &[]);
+			let (_ext_tmp, ext) = external_repo("app");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(app));
+			repos_settled(&model, cx, 2);
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the added namesake", |cx| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 3 && m.change_repos.len() == 3
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				for slot in &m.change_repos {
+					let name = m
+						.repos
+						.iter()
+						.find(|r| r.root == slot.root)
+						.map(|r| r.name.as_str());
+					assert_eq!(
+						Some(slot.name.as_str()),
+						name,
+						"the node of {:?} keeps its old name",
+						slot.root
+					);
+				}
+				let order: Vec<_> = m
+					.change_repos
+					.iter()
+					.map(|s| (s.name.clone(), s.root.clone()))
+					.collect();
+				let mut sorted = order.clone();
+				sorted.sort();
+				assert_eq!(order, sorted, "nodes are in (name, root) order");
+			});
+		}
+
+		/// A Refresh that finds a repo ahead of the one the repo selector's
+		/// cursor is on shifts the list: the cursor stays on its repo, so
+		/// Enter opens the repo it pointed at (#227).
+		#[gpui::test]
+		fn repo_selector_cursor_stays_on_its_repo_when_a_rescan_reorders_it(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "c", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			cx.simulate_keystrokes("alt-shift-r");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.popover, Some(crate::Popover::Repo));
+			});
+			cx.simulate_keystrokes("down");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos[m.popover_cursor].name, "c");
+			});
+			repo(ws.path(), "b", &[]);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			repos_settled(&model, cx, 3);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.popover, Some(crate::Popover::Repo));
+			});
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repo().map(|r| r.name.as_str()), Some("c"));
+			});
+		}
+
+		/// One Refresh that changes the repo set reloads the Log once: the
+		/// open repo's reload and the scope change are one reload (#227).
+		#[gpui::test]
+		fn refresh_that_changes_the_repo_set_reloads_the_log_once(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 2 && m.history_loaded
+				})
+			});
+			repo(ws.path(), "c", &[]);
+			let before = model.read_with(cx, |m, _| m.history_replace_loads);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			repos_settled(&model, cx, 3);
+			settle_until(cx, "the log of three repos", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 3 && m.history_loaded
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.history_replace_loads - before, 1);
+			});
+		}
+
+		/// A paste job already reading when a repo is added lands with it.
+		/// Guards the landing refresh the fan-out must not break (#227).
+		#[gpui::test]
+		fn paste_job_in_flight_lands_with_a_repo_added_meanwhile(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let entry =
+				crate::resolve_added_repo(ext.clone(), &CancelToken::new())
+					.unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			clip::write_text("// FILE: x/one.txt\n1\n").unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.trigger_paste_preview(cx);
+				assert!(m.paste.is_loading());
+				m.install_added_repo(Ok(entry), cx);
+			});
+			settle_until(cx, "the preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&ext));
+				}
+			});
+		}
+
+		/// A repo added by hand reloads the Log once, with the new repo in
+		/// its scope (#227).
+		#[gpui::test]
+		fn manual_add_reloads_the_log_once_with_the_new_repo(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "b", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 2 && m.history_loaded
+				})
+			});
+			let before = model.read_with(cx, |m, _| m.history_replace_loads);
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the log with the added repo", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.contains(&ext) && m.history_loaded
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.history_replace_loads - before, 1);
 			});
 		}
 
