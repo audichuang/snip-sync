@@ -968,7 +968,7 @@ pub struct WorkbenchModel {
 	pub discovery_depth_limited: Vec<PathBuf>,
 	pub discovery_error_overflow: usize,
 	pub discovery_depth_overflow: usize,
-	discovery_generation: u64,
+	discovery_generation: crate::gen::Gen<crate::gen::DiscoveryLane>,
 	pinned_repo: Option<(PathBuf, PathBuf)>,
 	/// The open repo kept across a rescan's wipe until the walk finds it
 	/// again; still set when a complete walk ends means it is gone.
@@ -977,7 +977,7 @@ pub struct WorkbenchModel {
 	refresh_reload: bool,
 	manual_repos: Vec<RepoEntry>,
 	tree_queue: VecDeque<TreeIo>,
-	tree_worker: u64,
+	tree_worker: crate::gen::Gen<crate::gen::TreeWorkerLane>,
 	tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
@@ -1080,7 +1080,7 @@ pub struct WorkbenchModel {
 	/// Status reads of the repos other than the open one.
 	pub changes_queue: ReadQueue<PathBuf>,
 	pub changes_cancel: Option<CancelToken>,
-	pub changes_generation: u64,
+	pub changes_generation: crate::gen::Gen<crate::gen::ChangesLane>,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
 	/// The current branch the branches pane drew its HEAD marker from this
@@ -1513,13 +1513,13 @@ impl WorkbenchModel {
 			discovery_depth_limited: Vec::new(),
 			discovery_error_overflow: 0,
 			discovery_depth_overflow: 0,
-			discovery_generation: 0,
+			discovery_generation: Default::default(),
 			pinned_repo: None,
 			carried_repo: None,
 			refresh_reload: false,
 			manual_repos: Vec::new(),
 			tree_queue: VecDeque::new(),
-			tree_worker: 0,
+			tree_worker: Default::default(),
 			tree_worker_alive: false,
 			restore_expanded: Vec::new(),
 			restore_ws_expanded: Vec::new(),
@@ -1592,7 +1592,7 @@ impl WorkbenchModel {
 			change_repos: Vec::new(),
 			changes_queue: ReadQueue::new(MAX_CHANGES_READS),
 			changes_cancel: None,
-			changes_generation: 0,
+			changes_generation: Default::default(),
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
 			last_branch_current: std::cell::Cell::new(None),
@@ -1917,7 +1917,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.changes_generation = self.changes_generation.wrapping_add(1);
+		self.changes_generation.invalidate();
 		let _ = arm_cancel(&mut self.changes_cancel);
 		self.changes_queue.clear_pending();
 		let open = self.repo_root();
@@ -1942,7 +1942,7 @@ impl WorkbenchModel {
 			return;
 		};
 		while let Some(root) = self.changes_queue.take() {
-			let generation = self.changes_generation;
+			let generation = self.changes_generation.current();
 			let known = self
 				.repos
 				.iter()
@@ -1967,7 +1967,7 @@ impl WorkbenchModel {
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
 					model.changes_queue.finish();
-					if model.changes_generation == generation {
+					if model.changes_generation.is_current(generation) {
 						model.land_queued_changes(&root, result);
 					}
 					model.pump_changes(cx);
@@ -2494,8 +2494,7 @@ impl WorkbenchModel {
 						token.cancel();
 					}
 				}
-				self.changes_generation =
-					self.changes_generation.wrapping_add(1);
+				self.changes_generation.invalidate();
 				self.changes_queue.clear_pending();
 				self.paste.invalidate_job();
 				let name = intent.name();
@@ -2567,7 +2566,7 @@ impl WorkbenchModel {
 		self.tree_cancel = None;
 		self.rev_tree_cancel = None;
 		self.tree_queue.clear();
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker.invalidate();
 		self.tree_worker_alive = false;
 		if let Some(tree) = self.file_tree.as_mut() {
 			tree.clear_loading();
@@ -2635,7 +2634,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.changes_cancel.take() {
 			token.cancel();
 		}
-		self.changes_generation = self.changes_generation.wrapping_add(1);
+		self.changes_generation.invalidate();
 		self.changes_queue.clear_pending();
 		self.preview_error_root = None;
 		self.paste.invalidate_job();
@@ -2681,7 +2680,7 @@ impl WorkbenchModel {
 		self.held_selection = None;
 		self.history_generation.invalidate();
 		self.tree_generation.invalidate();
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker.invalidate();
 		for slot in [
 			&mut self.history_cancel,
 			&mut self.preview_cancel,
@@ -3221,8 +3220,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.discovery_generation = self.discovery_generation.wrapping_add(1);
-		let generation = self.discovery_generation;
+		let generation = self.discovery_generation.bump();
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
@@ -3239,7 +3237,7 @@ impl WorkbenchModel {
 				Ok(disc) => disc,
 				Err(err) => {
 					let _ = this.update(&mut async_app, |model, cx| {
-						if model.discovery_generation != generation {
+						if !model.discovery_generation.is_current(generation) {
 							return;
 						}
 						model.discovery = None;
@@ -3274,8 +3272,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.discovery_generation = self.discovery_generation.wrapping_add(1);
-		let generation = self.discovery_generation;
+		let generation = self.discovery_generation.bump();
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
@@ -3699,8 +3696,7 @@ impl WorkbenchModel {
 			self.tree_queue.push_back(io);
 			return;
 		}
-		self.tree_worker = self.tree_worker.wrapping_add(1);
-		let worker = self.tree_worker;
+		let worker = self.tree_worker.bump();
 		self.tree_worker_alive = true;
 		let cancel = arm_cancel(&mut self.tree_cancel);
 		let ws_gen = self.lifecycle.generation();
@@ -3743,7 +3739,7 @@ impl WorkbenchModel {
 						// A close or reopen bumps the lifecycle generation;
 						// a repo switch bumps the worker id.
 						if model.lifecycle.generation() != ws_gen
-							|| model.tree_worker != worker
+							|| !model.tree_worker.is_current(worker)
 						{
 							if e2e_on() {
 								app_log!(
@@ -3768,7 +3764,7 @@ impl WorkbenchModel {
 			// Not gated on the generation: after a failed drain the
 			// workspace stays open and must be able to read again.
 			let _ = this.update(&mut async_app, |model, _| {
-				if model.tree_worker == worker {
+				if model.tree_worker.is_current(worker) {
 					model.tree_worker_alive = false;
 					model.tree_cancel = None;
 				}
@@ -4190,7 +4186,7 @@ impl WorkbenchModel {
 		self.keep_tree_selections();
 		let saved_files = self.kept_tree_selection(&repo_root);
 		self.tree_queue.clear();
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker.invalidate();
 		self.tree_worker_alive = false;
 		let _ = arm_cancel(&mut self.tree_cancel);
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
@@ -6371,14 +6367,14 @@ async fn drive_discovery(
 	this: gpui::WeakEntity<WorkbenchModel>,
 	cx: &mut gpui::AsyncApp,
 	mut disc: Discovery,
-	generation: u64,
+	generation: crate::gen::Stamp<crate::gen::DiscoveryLane>,
 	cancel: CancelToken,
 	mut wipe: bool,
 ) {
 	loop {
 		if cancel.is_cancelled() {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -6404,7 +6400,7 @@ async fn drive_discovery(
 		disc = returned;
 		let Some(page) = page else {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -6432,7 +6428,7 @@ async fn drive_discovery(
 			.await;
 		let stop = !matches!(status, ScanStatus::More);
 		let done = this.update(cx, |model, cx| {
-			if model.discovery_generation != generation {
+			if !model.discovery_generation.is_current(generation) {
 				return true;
 			}
 			model.apply_scan_page(wipe, processed.0, cx);
@@ -6457,7 +6453,7 @@ async fn drive_discovery(
 		});
 		if done.unwrap_or(true) {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -11083,11 +11079,11 @@ mod tests {
 					Some(snip_core::workspace::ScanStatus::TimedOut);
 				m.discovery_depth_limited.clear();
 				m.is_loading = false;
-				let gen_before = m.discovery_generation;
+				let gen_before = m.discovery_generation.current();
 				m.continue_discovery(cx);
 				assert_eq!(m.status.key, "remote_scan_incomplete");
 				assert!(!m.is_loading);
-				assert_eq!(m.discovery_generation, gen_before);
+				assert!(m.discovery_generation.is_current(gen_before));
 			});
 		}
 
@@ -24525,7 +24521,7 @@ mod tests {
 				let remote =
 					complete_remote_paste_in_background(&root, cx, &shared);
 				let before =
-					remote.read_with(cx, |m, _| m.discovery_generation);
+					remote.read_with(cx, |m, _| m.discovery_generation.raw_for_tests());
 				// Consecutive real key events, with GPUI's normal event-loop
 				// turn between them; no click or test-only redraw.
 				cx.simulate_keystrokes("cmd-3");
@@ -24538,7 +24534,7 @@ mod tests {
 				);
 				wait_scaled(cx, "Cmd+R refresh on the remote tab", |cx| {
 					remote.read_with(cx, |m, _| {
-						m.discovery_generation > before && !m.is_loading
+						m.discovery_generation.raw_for_tests() > before && !m.is_loading
 					})
 				});
 				assert_eq!(active(&root, cx), Some(2));
@@ -26301,7 +26297,7 @@ mod tests {
 				let models = initial_scan_failures(&root, cx);
 				let generations = models
 					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+					.map(|m| m.read_with(cx, |m, _| m.discovery_generation.raw_for_tests()));
 				cx.executor().advance_clock(Duration::from_secs(60));
 				cx.run_until_parked();
 				for (ix, model) in models.iter().enumerate() {
@@ -26312,7 +26308,7 @@ mod tests {
 						1
 					);
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation, generations[ix]);
+						assert_eq!(m.discovery_generation.raw_for_tests(), generations[ix]);
 						assert!(
 							m.remote.scan_error.is_some()
 								&& m.remote.scan_recovery.is_none()
@@ -26338,7 +26334,7 @@ mod tests {
 				let models = initial_scan_failures(&root, cx);
 				let generations = models
 					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+					.map(|m| m.read_with(cx, |m, _| m.discovery_generation.raw_for_tests()));
 				let connections =
 					fixture.worker.started_connections_for_tests();
 				cx.executor().advance_clock(Duration::from_secs(60));
@@ -26349,7 +26345,7 @@ mod tests {
 				);
 				for (ix, model) in models.iter().enumerate() {
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation, generations[ix]);
+						assert_eq!(m.discovery_generation.raw_for_tests(), generations[ix]);
 						assert_eq!(
 							m.remote.scan_error.as_ref().unwrap().key,
 							"remote_worker_too_old"

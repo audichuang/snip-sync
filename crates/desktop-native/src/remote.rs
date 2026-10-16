@@ -1423,8 +1423,7 @@ impl WorkbenchModel {
 		if wipe {
 			self.remote.scan_error = None;
 		}
-		self.discovery_generation = self.discovery_generation.wrapping_add(1);
-		let generation = self.discovery_generation;
+		let generation = self.discovery_generation.bump();
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.remote.scan_recovery = Some(ScanRecovery {
 			under: under.clone(),
@@ -1460,7 +1459,7 @@ impl WorkbenchModel {
 					.filter(|err| err.is_transient_read_failure())
 					.and_then(|_| scan_retry_delay(retries));
 				let landed = this.update(&mut async_app, |model, cx| {
-					if model.discovery_generation != generation
+					if !model.discovery_generation.is_current(generation)
 						|| model.lifecycle.generation() != lifecycle_generation
 					{
 						return false;
@@ -1583,7 +1582,7 @@ impl WorkbenchModel {
 				wait_cancelled(&mut async_app, delay, &cancel).await;
 				if cancel.is_cancelled() { return; }
 				let _ = this.update(&mut async_app, |model, cx| {
-					if model.discovery_generation == generation
+					if model.discovery_generation.is_current(generation)
 						&& model.lifecycle.generation() == lifecycle_generation
 						&& model.accepting_work()
 					{
