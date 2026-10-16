@@ -2946,3 +2946,118 @@ fn a_worker_does_not_write_one_file_twice_without_the_key() {
 	}
 	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
 }
+
+/// A fresh HFS+ volume (`hdiutil`), detached when dropped: HFS+ ignores
+/// some characters (U+200C among them), which no name key of ours knows.
+#[cfg(target_os = "macos")]
+struct Hfs {
+	mount: PathBuf,
+	_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "macos")]
+impl Hfs {
+	fn new() -> Option<Self> {
+		use std::process::Command;
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		let image = path.join("vol.dmg");
+		let mount = path.join("mnt");
+		fs::create_dir(&mount).unwrap();
+		let made = Command::new("hdiutil")
+			.args(["create", "-quiet", "-size", "8m", "-fs", "HFS+"])
+			.args(["-volname", "snip241"])
+			.arg(&image)
+			.status()
+			.is_ok_and(|s| s.success())
+			&& Command::new("hdiutil")
+				.args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+				.arg(&mount)
+				.arg(&image)
+				.status()
+				.is_ok_and(|s| s.success());
+		if !made {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"hdiutil could not make an HFS+ volume"
+			);
+			eprintln!("skipped: hdiutil could not make an HFS+ volume");
+			return None;
+		}
+		Some(Self { mount, _dir: dir })
+	}
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Hfs {
+	fn drop(&mut self) {
+		let _ = std::process::Command::new("hdiutil")
+			.args(["detach", "-quiet", "-force"])
+			.arg(&self.mount)
+			.status();
+	}
+}
+
+/// On a worker's HFS+ workspace, `A/a.txt` and `A<U+200C>/a.txt` are one
+/// file the preview shows as two; the worker's Apply meets the second at
+/// `create_new` and writes neither.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_on_hfs_does_not_write_one_file_twice_through_an_ignored_character()
+{
+	let _serial = serial();
+	let Some(hfs) = Hfs::new() else { return };
+	let ws = hfs.mount.join("ws");
+	fs::create_dir(&ws).unwrap();
+	let text = [
+		entry("A/a.txt", "FIRST"),
+		entry("A\u{200C}/a.txt", "SECOND"),
+	]
+	.concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "");
+	let route = new_dirs_route(&[]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	assert_eq!(plan.restore_plan().create_operations.len(), 2);
+	let sel = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	match target.apply_files(&text, &route, &plan, &sel) {
+		Err(PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Collision,
+			..
+		})) => {}
+		other => panic!("expected a collision, got {other:?}"),
+	}
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// On a worker's HFS+ workspace, the destination `A` (not made yet)
+/// reached as `q/A<U+200C>` through `q` (the workspace itself): nothing is
+/// made without consent.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_on_hfs_does_not_make_the_named_folder_through_an_ignored_character()
+{
+	let _serial = serial();
+	let Some(hfs) = Hfs::new() else { return };
+	let ws = hfs.mount.join("ws");
+	fs::create_dir(&ws).unwrap();
+	let text = entry("q/A\u{200C}/a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "A");
+	let route = new_dirs_route(&[("q", "")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let err = target
+		.apply_files(&text, &route, &plan, &RestoreSelection::default())
+		.unwrap_err();
+	not_confirmed(err, 1);
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
