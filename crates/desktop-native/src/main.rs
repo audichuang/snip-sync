@@ -27728,26 +27728,32 @@ mod tests {
 				assert_focus_not_in_closed_layer(cx, model);
 			}
 
-			/// A layer is open exactly when its panel is drawn. The add-repo
-			/// field belongs to the Project pane: drawn only while the pane
-			/// is (its tab in use, the tool window not hidden).
+			/// A layer is open exactly when its panel is drawn. An inline layer
+			/// belongs to its pane and is drawn only while the pane is: the
+			/// add-repo field to the Project pane (its tab in use, the tool
+			/// window not hidden), the find bar to the reader (not replaced by
+			/// the paste preview), the destination field to the paste panel.
+			/// A hidden pane keeps its layer open and brings it back as it was.
 			pub(crate) fn assert_overlay_panels_match(
 				cx: &mut VisualTestContext,
 				model: &Entity<WorkbenchModel>,
 			) {
 				use crate::overlay::OverlayKind;
-				let (open, project) = model.read_with(cx, |m, _| {
-					(
-						OverlayKind::ALL
-							.into_iter()
-							.filter(|k| m.overlays.is_open(*k))
-							.collect::<Vec<_>>(),
-						// The Project pane is drawn while its tab is the one
-						// in use and the left tool window is not hidden.
-						m.active_tab == crate::WorkbenchTab::FileExplorer
-							&& m.left_visible,
-					)
-				});
+				let (open, project, reader, paste) =
+					model.read_with(cx, |m, _| {
+						(
+							OverlayKind::ALL
+								.into_iter()
+								.filter(|k| m.overlays.is_open(*k))
+								.collect::<Vec<_>>(),
+							m.active_tab == crate::WorkbenchTab::FileExplorer
+								&& m.left_visible,
+							m.workspace_open
+								&& m.paste.plan().is_none()
+								&& !m.paste.is_loading(),
+							m.paste.plan().is_some(),
+						)
+					});
 				let mut selectors: Vec<&'static str> = OverlayKind::ALL
 					.iter()
 					.map(|k| k.panel_selector())
@@ -27756,9 +27762,14 @@ mod tests {
 				selectors.sort_unstable();
 				selectors.dedup();
 				for sel in selectors {
-					if sel == OverlayKind::AddRepoField.panel_selector()
-						&& !project
-					{
+					let pane_hidden = (sel
+						== OverlayKind::AddRepoField.panel_selector()
+						&& !project) || (sel
+						== OverlayKind::FindBar.panel_selector()
+						&& !reader) || (sel
+						== OverlayKind::PasteDestField.panel_selector()
+						&& !paste);
+					if pane_hidden {
 						continue;
 					}
 					let want = open.iter().any(|k| k.panel_selector() == sel);
