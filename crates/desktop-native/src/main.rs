@@ -27712,7 +27712,8 @@ mod tests {
 			}
 
 			/// A layer is open exactly when its panel is drawn. The add-repo
-			/// field belongs to the Project pane: drawn only while it shows.
+			/// field belongs to the Project pane: drawn only while the pane
+			/// is (its tab in use, the tool window not hidden).
 			pub(crate) fn assert_overlay_panels_match(
 				cx: &mut VisualTestContext,
 				model: &Entity<WorkbenchModel>,
@@ -27724,7 +27725,10 @@ mod tests {
 							.into_iter()
 							.filter(|k| m.overlays.is_open(*k))
 							.collect::<Vec<_>>(),
-						m.active_tab == crate::WorkbenchTab::FileExplorer,
+						// The Project pane is drawn while its tab is the one
+						// in use and the left tool window is not hidden.
+						m.active_tab == crate::WorkbenchTab::FileExplorer
+							&& m.left_visible,
 					)
 				});
 				let mut selectors: Vec<&'static str> = OverlayKind::ALL
