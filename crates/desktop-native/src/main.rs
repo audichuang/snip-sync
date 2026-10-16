@@ -997,6 +997,12 @@ pub struct WorkbenchModel {
 	pub reader_active: bool,
 	pub log_focus: FocusHandle,
 	pub paste_focus: FocusHandle,
+	/// The open floating layer's panel (one is open at a time): a control
+	/// pressed inside it holds the keyboard under this handle, so the
+	/// layer still knows it as its own once it closes (`OverlayStack`).
+	pub panel_focus: FocusHandle,
+	/// The find bar's container, for the same reason and for Escape.
+	pub find_bar_focus: FocusHandle,
 	// Tool window layout; stored sizes survive collapse/restore.
 	pub left_w: f32,
 	pub bottom_h: f32,
@@ -1488,6 +1494,8 @@ impl WorkbenchModel {
 			reader_active: false,
 			log_focus: cx.focus_handle().tab_index(46).tab_stop(true),
 			paste_focus: cx.focus_handle(),
+			panel_focus: cx.focus_handle(),
+			find_bar_focus: cx.focus_handle(),
 			left_w: theme::LEFT_W_DEFAULT,
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
@@ -24483,15 +24491,17 @@ mod tests {
 					None,
 					"the folded chip keeps no place from the wide frame"
 				);
-				let open = floating_now(&model, cx);
-				if open == ["log-menu:Branch"] {
-					cx.simulate_click(at, Modifiers::none());
-					settle_checked(cx, &model);
-					assert!(
-						floating_now(&model, cx).is_empty(),
-						"a press where the chip used to be is an outside press"
-					);
-				}
+				assert_eq!(
+					floating_now(&model, cx),
+					["log-menu:Branch"],
+					"the menu survives the resize, so the press below tests it"
+				);
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(
+					floating_now(&model, cx).is_empty(),
+					"a press where the chip used to be is an outside press"
+				);
 			}
 
 			/// A layer closed by a focusable control inside its own panel
@@ -24543,6 +24553,35 @@ mod tests {
 					focus_name(&model, cx),
 					"log",
 					"the Log keeps the keyboard after Apply"
+				);
+			}
+
+			/// The panel tracks the keyboard for its controls, but a press on
+			/// its blank part does not take it from the field typed in.
+			#[gpui::test]
+			fn a_press_on_a_panels_blank_part_keeps_the_field_focused(
+				cx: &mut TestAppContext,
+			) {
+				use crate::{overlay::OverlayKind, ui::LogMenu};
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-date", "log-menu:Date")
+					.fire(&model, cx);
+				let since = model
+					.read_with(cx, |m, cx| m.log_since_input.read(cx).handle());
+				cx.update(|window, _| window.focus(&since));
+				settle_checked(cx, &model);
+				let panel = cx
+					.debug_bounds(
+						OverlayKind::LogMenu(LogMenu::Date).panel_selector(),
+					)
+					.expect("the date menu is drawn");
+				let at = panel.origin + gpui::point(gpui::px(2.), gpui::px(2.));
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Date"]);
+				assert!(
+					cx.update(|window, _| since.is_focused(window)),
+					"the field keeps the keyboard"
 				);
 			}
 

@@ -294,6 +294,7 @@ impl WorkbenchModel {
 			);
 		div()
 			.id("find-bar")
+			.track_focus(&self.find_bar_focus)
 			.debug_selector(|| OverlayKind::FindBar.panel_selector().into())
 			.relative()
 			.flex()

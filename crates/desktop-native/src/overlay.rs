@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use gpui::{
 	canvas, div, prelude::*, App, Bounds, Context, Div, Entity, FocusHandle,
-	Global, MouseDownEvent, Pixels, Stateful, Window, WindowId,
+	Global, MouseButton, MouseDownEvent, Pixels, Stateful, Window, WindowId,
 };
 
 use crate::menu::{ContextMenu, MenuOrigin};
@@ -574,6 +574,13 @@ impl OverlayStack {
 				let ok = if n == 0 { cursor == 0 } else { cursor < n };
 				(!ok).then(|| format!("cursor {cursor} over {n} candidates"))
 			}
+			// O5 and O6 are about the frame the window draws: a tab in the
+			// background draws none, its last frame says nothing now.
+			OverlayInvariant::O5 | OverlayInvariant::O6
+				if !crate::tabs::is_shown(m.ws_tab) =>
+			{
+				None
+			}
 			OverlayInvariant::O5 => o.has_pending_return().then(|| {
 				"a return of the keyboard is still waiting".to_string()
 			}),
@@ -754,6 +761,11 @@ impl WorkbenchModel {
 				return FocusTarget::Field(id);
 			}
 		}
+		// Anything focused inside the find bar (a toggle, a step button)
+		// is the bar's: Escape closes it as it does from its fields.
+		if self.find_bar_focus.contains(&f, window) {
+			return FocusTarget::Field(FieldId::Find);
+		}
 		let panes = [
 			(&self.chrome.menu_focus, FocusTarget::Menu),
 			(&self.paste_focus, FocusTarget::PastePanel),
@@ -788,27 +800,35 @@ impl WorkbenchModel {
 		cx: &App,
 	) -> Vec<FocusHandle> {
 		let h = |i: &Entity<TextInput>| i.read(cx).handle();
+		// A floating layer's panel is the keyboard's too: a button pressed
+		// inside it takes the focus, and closing the layer by that press is
+		// the layer's own doing.
+		let panel = self.panel_focus.clone();
 		match kind {
-			OverlayKind::WorkspaceMenu => {
-				vec![h(&self.workspace_path_input), h(&self.remote_path_input)]
-			}
+			OverlayKind::WorkspaceMenu => vec![
+				h(&self.workspace_path_input),
+				h(&self.remote_path_input),
+				panel,
+			],
 			OverlayKind::LogMenu(LogMenu::Repo) => {
-				vec![h(&self.log_path_input)]
+				vec![h(&self.log_path_input), panel]
 			}
 			OverlayKind::LogMenu(LogMenu::Branch) => {
-				vec![h(&self.log_branch_menu_input)]
+				vec![h(&self.log_branch_menu_input), panel]
 			}
 			OverlayKind::LogMenu(LogMenu::Date) => {
-				vec![h(&self.log_since_input), h(&self.log_until_input)]
+				vec![h(&self.log_since_input), h(&self.log_until_input), panel]
 			}
 			OverlayKind::LogMenu(
 				LogMenu::User | LogMenu::More | LogMenu::FilterMore,
-			) => Vec::new(),
-			OverlayKind::Selector(_) => vec![h(&self.selector_input)],
+			) => vec![panel],
+			OverlayKind::Selector(_) => vec![h(&self.selector_input), panel],
 			OverlayKind::ContextMenu => vec![self.chrome.menu_focus.clone()],
-			OverlayKind::FindBar => {
-				vec![h(&self.find_input), h(&self.goto_input)]
-			}
+			OverlayKind::FindBar => vec![
+				h(&self.find_input),
+				h(&self.goto_input),
+				self.find_bar_focus.clone(),
+			],
 			OverlayKind::AddRepoField => vec![h(&self.add_repo_input)],
 		}
 	}
@@ -1217,6 +1237,16 @@ impl WorkbenchModel {
 			.id(selector)
 			.debug_selector(move || selector.into())
 			.occlude()
+			// The panel tracks the keyboard so a press on a control in it
+			// is the layer's (the context menu tracks its own handle). A
+			// press on the panel's blank part leaves the keyboard where it
+			// was: this runs before the panel's own focus-on-press.
+			.when(kind != OverlayKind::ContextMenu, |d| {
+				d.track_focus(&self.panel_focus)
+					.on_mouse_down(MouseButton::Left, |_, window, _| {
+						window.prevent_default()
+					})
+			})
 			.on_mouse_down_out(cx.listener(
 				move |this, ev: &MouseDownEvent, _, cx| {
 					if !this.overlays.on_trigger(kind, ev.position) {
