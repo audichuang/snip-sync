@@ -22976,6 +22976,172 @@ mod tests {
 			});
 		}
 
+		/// Two repos: alpha (open) with a small file, beta with a 40-line
+		/// file whose second commit changes line 20, so its diff has folds.
+		/// The beta commit's diff is shown from the merged Log.
+		fn open_with_beta_commit_shown(
+			cx: &mut TestAppContext,
+		) -> (
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			tempfile::TempDir,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let body: String =
+				(1..=40).map(|n| format!("line {n}\n")).collect();
+			fs::write(beta.join("f.txt"), &body).unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta add"]);
+			fs::write(beta.join("f.txt"), body.replace("line 20", "LINE 20"))
+				.unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta edit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta edit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta edit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.repo_root().is_some_and(|r| r.ends_with("alpha")),
+					"alpha is the open repo: {:?}",
+					m.repo_root()
+				);
+				assert!(
+					m.preview_root().is_some_and(|r| r.ends_with("beta")),
+					"the commit's repo: {:?}",
+					m.preview_root()
+				);
+			});
+			(model, cx, ws)
+		}
+
+		/// A Project file of the open repo is clicked while the beta commit's
+		/// diff is still on screen: the diff keeps naming its own repository
+		/// in the breadcrumb, and Expand All reads from it, until the new
+		/// read lands (#228 #229).
+		#[gpui::test]
+		fn a_diff_still_shown_while_a_file_loads_keeps_its_repository(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_with_beta_commit_shown(cx);
+			open_project_tool(&model, cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			click_probed(&model, cx, "tree-row:a.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.preview_loading, "the read is held back");
+				assert!(commit_preview_shown(m), "the beta diff stays");
+				let root = m.preview_root().expect("a preview root");
+				assert!(
+					root.ends_with("beta"),
+					"the shown diff's repo: {root:?}"
+				);
+				let crumbs = m.source_labels().1;
+				assert!(
+					crumbs.contains("beta") && !crumbs.contains("alpha"),
+					"the breadcrumb names the open repo: {crumbs}"
+				);
+			});
+			let _ = crate::test_log::take();
+			click_probed(&model, cx, "btn-expand-folds");
+			settle(cx);
+			let lines = crate::test_log::take();
+			assert!(
+				lines.iter().any(|l| l.starts_with("[APP:FOLD_EXPANDED: ")),
+				"Expand All read from the wrong repository: {lines:#?}"
+			);
+			assert!(
+				!lines.iter().any(|l| l.starts_with("[APP:FOLD_REFUSED: ")),
+				"{lines:#?}"
+			);
+		}
+
+		/// A diff keeps its repository through Expand All, which rebuilds
+		/// the preview: a Changes row of a repo that is not the open one
+		/// (#228 #229).
+		#[gpui::test]
+		fn a_diff_keeps_its_repository_after_expand_all(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let body: String =
+				(1..=40).map(|n| format!("line {n}\n")).collect();
+			fs::write(beta.join("f.txt"), &body).unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta add"]);
+			fs::write(beta.join("f.txt"), body.replace("line 20", "LINE 20"))
+				.unwrap();
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "beta's change", |cx| {
+				model.read_with(cx, |m, _| {
+					m.files.iter().any(|f| f.path == "f.txt")
+				})
+			});
+			click_probed(&model, cx, "change-repo-toggle:unstaged:beta");
+			settle(cx);
+			click_probed(&model, cx, "change-row@beta:unstaged:f.txt");
+			settle_until(cx, "beta's diff", |cx| {
+				model.read_with(cx, |m, _| {
+					m.preview.is_some() && !m.preview_loading
+				})
+			});
+			let beta_root = model.read_with(cx, |m, _| {
+				let root = m.preview_root().expect("a preview root");
+				assert!(root.ends_with("beta"), "{root:?}");
+				assert!(
+					m.repo_root().is_some_and(|r| r.ends_with("alpha")),
+					"alpha is the open repo"
+				);
+				root
+			});
+			click_probed(&model, cx, "btn-expand-folds");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.preview.as_ref().is_some_and(|p| p.lines.len() > 40),
+					"the folds were expanded"
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(beta_root.as_path()),
+					"the rebuilt preview forgot its repository"
+				);
+			});
+		}
+
 		/// Opens the Project tool window with the rail button, as a user does.
 		fn open_project_tool(
 			model: &Entity<WorkbenchModel>,
