@@ -7741,6 +7741,62 @@ fn test_a_symlink_where_a_new_folder_was_planned_is_stale() {
 	assert!(!dst.exists("other/a.txt"));
 }
 
+#[cfg(unix)]
+#[test]
+fn test_an_existing_folder_replaced_by_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+	fs::create_dir(dst.path().join("other")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert!(!dst.exists("other/a.txt"));
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_folder_that_was_already_a_symlink_at_preview_still_applies() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real")).unwrap();
+	std::os::unix::fs::symlink("real", dst.path().join("link")).unwrap();
+
+	// The symlink is the nearest existing folder.
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/new/a.txt"), "a");
+
+	// The symlink lies higher on the chain than the nearest existing folder.
+	let plan = plan_one(dst.path(), "// file: link/new/deep/b.txt\nb\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/new/deep/b.txt"), "b");
+
+	// An existing folder below the symlink is removed after the preview: the
+	// symlink above it was already one, so the write still goes through it.
+	fs::create_dir(dst.path().join("real/sub")).unwrap();
+	let plan = plan_one(dst.path(), "// file: link/sub/c.txt\nc\n");
+	fs::remove_dir(dst.path().join("real/sub")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/sub/c.txt"), "c");
+}
+
 #[test]
 fn test_a_file_on_the_folder_path_is_refused_at_preview_on_every_platform() {
 	let dst = TestRepo::new("dst");
@@ -7816,6 +7872,7 @@ fn test_a_snapshot_without_the_new_fields_still_revalidates_and_matches() {
 	let object = json.as_object_mut().unwrap();
 	object.remove("repos");
 	object.remove("missing_dirs");
+	object.remove("symlinked_dirs");
 	let old: DestinationFreshnessSnapshot =
 		serde_json::from_value(json).unwrap();
 	assert_eq!((&old.repos, &old.missing_dirs), (&None, &None));
