@@ -1110,6 +1110,25 @@ mod tests {
 		assert_eq!(FitRole::Hash.font(), (CODE_FONT, SMALL_TEXT));
 		assert_eq!(FitRole::BranchLabel.chrome(), 17.);
 		assert_eq!(FitRole::ChipUser.chrome(), 27.);
+		// The More chip's padding (4 + 4), the gap and the 10px icon.
+		assert_eq!(FitRole::ChipMore.chrome(), 21.);
+	}
+
+	/// The More chip's box holds its padding and icon around the text, so
+	/// the graphemes shown and the cut are counted against the text's part
+	/// of a clipped box, not the whole of it.
+	#[test]
+	fn the_more_chip_counts_its_text_without_the_chrome() {
+		let m = noop(10.);
+		let role = FitRole::ChipMore;
+		let text = "More";
+		let natural = natural_px(role, text, &m);
+		assert_eq!(natural, 21. + m(text) + FIT_MARGIN);
+		assert_eq!(shown_graphemes(role, text, natural, &m), (4, 4));
+		// 8px short of the box leaves no room for the whole word.
+		let (shown, total) = shown_graphemes(role, text, natural - 8., &m);
+		assert_eq!(total, 4);
+		assert!(shown < 4, "{shown}");
 	}
 
 	#[test]
