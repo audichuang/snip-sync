@@ -11,7 +11,8 @@
 //! them. The object is read with a stat, which needs no right to read the
 //! folder and holds nothing open. Only the names below the
 //! anchor, which the filesystem has not seen yet, fold case, and only when
-//! the anchor's filesystem does. Two folders under two existing folders are
+//! the anchor's filesystem does; they are Unicode-normalized everywhere
+//! ([`name_key`], the one rule for which names are one). Two folders under two existing folders are
 //! two folders however alike the paths read: `Α/new` and `α/new` are one
 //! folder only if `Α` and `α` are (the same object).
 //!
@@ -115,11 +116,42 @@ impl FolderId {
 /// one key are one folder or file. `folds` is whether that folder's
 /// filesystem folds case. Every identity in this module (and so every
 /// [`FolderId`] and [`TargetId`]) takes its names from here only.
+///
+/// The key errs towards merging: two names merged that the filesystem keeps
+/// apart cost one more question or one more refused pair, while two kept
+/// apart that it merges let a named folder be made without consent, or one
+/// file be written twice (the preview showing two new files, Apply
+/// overwriting the first with the second).
+///
+/// - Unicode normalization, on every filesystem: `é` composed and `e` with
+///   a combining accent are one name. macOS (APFS, HFS+) looks either up as
+///   the same entry; Linux and NTFS keep them apart, where merging them is
+///   the safe side above.
+/// - Case, only where the filesystem folds it: full Unicode case folding
+///   (`unicase`), not `to_lowercase`. Folding merges what lowercasing keeps
+///   apart, such as the final sigma `ς` and `σ` (one name to APFS) and `ß`
+///   and `ss` (full folding; more than some filesystems merge).
+///
+/// The canonical caseless form (decompose, fold, decompose again), so a
+/// decomposed capital meets the composed small letter. ASCII is its own
+/// key, or its lowercase where case folds.
 pub(crate) fn name_key(name: &str, folds: bool) -> String {
+	use unicode_normalization::UnicodeNormalization;
+	if name.is_ascii() {
+		return if folds {
+			name.to_ascii_lowercase()
+		} else {
+			name.to_string()
+		};
+	}
+	let decomposed: String = name.nfd().collect();
 	if folds {
-		name.to_lowercase()
+		unicase::UniCase::new(decomposed.as_str())
+			.to_folded_case()
+			.nfd()
+			.collect()
 	} else {
-		name.to_string()
+		decomposed
 	}
 }
 

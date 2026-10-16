@@ -14,6 +14,10 @@ arboard = "3"
 thiserror = "2"
 tempfile = "3"
 similar = "2.7"
+# Which new names are one folder (foldernames.rs `name_key`): Unicode
+# normalization and full case folding.
+unicode-normalization = "0.1"
+unicase = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
