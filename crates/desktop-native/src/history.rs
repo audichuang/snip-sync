@@ -943,9 +943,9 @@ fn clip_tree_error(mut msg: Msg) -> Msg {
 	msg.inner = msg
 		.inner
 		.map(|boxed| Box::new((boxed.0, clip_tree_error(boxed.1))));
-	msg.tail = msg
-		.tail
-		.map(|boxed| Box::new((boxed.0, clip_tree_error(boxed.1))));
+	msg.list = msg.list.map(|boxed| {
+		Box::new((boxed.0, boxed.1.into_iter().map(clip_tree_error).collect()))
+	});
 	msg
 }
 
@@ -964,7 +964,9 @@ fn clip_msg(mut msg: Msg) -> Msg {
 	msg.inner = msg
 		.inner
 		.map(|boxed| Box::new((boxed.0, clip_msg(boxed.1))));
-	msg.tail = msg.tail.map(|boxed| Box::new((boxed.0, clip_msg(boxed.1))));
+	msg.list = msg.list.map(|boxed| {
+		Box::new((boxed.0, boxed.1.into_iter().map(clip_msg).collect()))
+	});
 	msg
 }
 

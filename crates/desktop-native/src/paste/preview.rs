@@ -1003,7 +1003,7 @@ mod tests {
 				args: vec!["x".repeat(40)],
 				key_args: Vec::new(),
 				inner: None,
-				tail: None,
+				list: None,
 			},
 			Some(&o),
 		);

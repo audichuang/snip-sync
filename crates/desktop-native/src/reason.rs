@@ -132,17 +132,31 @@ pub fn apply_log_token(msg: &Msg) -> &'static str {
 	match msg.key {
 		"stale_created" => "stale_created",
 		"stale_deleted" => "stale_deleted",
-		"paste_repo_busy"
-		| "paste_outcome_unknown"
-		| "paste_err_destination"
-		| "paste_err_destination_not_dir"
-		| "paste_err_plan"
-		| "error_open_repo"
-		| "commit_replay_refused"
-		| "commit_replay_partial" => msg.key,
-		_ => "stale_modified",
+		key => APP_APPLY_KEYS
+			.iter()
+			.copied()
+			.find(|app| *app == key)
+			.unwrap_or("stale_modified"),
 	}
 }
+
+/// Every message the app builds itself on the Apply path
+/// (`PasteApplyPlan::execute` and `execute_commit`). They keep their own
+/// names on `PASTE_STALE_DETECTED`; anything else is worded from a reason.
+pub const APP_APPLY_KEYS: [&str; 12] = [
+	"paste_repo_busy",
+	"paste_outcome_unknown",
+	"paste_err_destination",
+	"paste_err_destination_not_dir",
+	"paste_err_plan",
+	"error_open_repo",
+	"commit_replay_refused",
+	"commit_replay_partial",
+	"commit_replay_partial_refused",
+	"commit_subset_rejected",
+	"commit_overwrite_required",
+	"mapping_required",
+];
 
 /// A failure's wording, headline and trailing datum.
 fn headed(key: &'static str, datum: &str) -> Msg {
@@ -365,11 +379,7 @@ mod log_token_tests {
 
 	#[test]
 	fn other_apply_failures_print_stable_tokens() {
-		for key in [
-			"paste_repo_busy",
-			"paste_outcome_unknown",
-			"paste_err_destination",
-		] {
+		for key in APP_APPLY_KEYS {
 			assert_eq!(apply_log_token(&Msg::new(key, [])), key);
 		}
 		for msg in [

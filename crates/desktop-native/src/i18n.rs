@@ -34,9 +34,11 @@ pub struct Msg {
 	/// An argument that is itself a message, worded with the message.
 	/// Boxed: `Msg` sits in many enums that must stay small.
 	pub inner: Option<Box<(usize, Msg)>>,
-	/// A second argument that is itself a message (a list's rest). Only a
-	/// list of failures sets it, and it is a toast, not a retained error.
-	pub tail: Option<Box<(usize, Msg)>>,
+	/// An argument that is a flat list of messages (a list's rest), worded
+	/// one by one and joined by the dictionary's separator. Flat, so a long
+	/// list never nests: rendering, cloning and dropping do not recurse
+	/// once per item.
+	pub list: Option<Box<(usize, Vec<Msg>)>>,
 }
 
 impl Msg {
@@ -46,7 +48,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: None,
-			tail: None,
+			list: None,
 		}
 	}
 
@@ -92,9 +94,9 @@ impl Msg {
 		self
 	}
 
-	/// Argument `index` is a second nested message, beside the first.
-	pub fn and_msg_arg(mut self, index: usize, tail: Msg) -> Msg {
-		self.tail = Some(Box::new((index, tail)));
+	/// Argument `index` is a list of messages, joined when drawn.
+	pub fn and_list_arg(mut self, index: usize, list: Vec<Msg>) -> Msg {
+		self.list = Some(Box::new((index, list)));
 		self
 	}
 
@@ -111,7 +113,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: Some(Box::new((index, inner))),
-			tail: None,
+			list: None,
 		}
 	}
 
@@ -125,7 +127,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: vec![index],
 			inner: None,
-			tail: None,
+			list: None,
 		}
 	}
 
@@ -139,7 +141,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: indices.into_iter().collect(),
 			inner: None,
-			tail: None,
+			list: None,
 		}
 	}
 
@@ -150,8 +152,17 @@ impl Msg {
 			.iter()
 			// The String headers are in the args Vec's capacity below.
 			.map(|arg| arg.capacity())
-			.chain(self.inner.iter().chain(self.tail.iter()).map(|boxed| {
+			.chain(self.inner.iter().map(|boxed| {
 				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
+			}))
+			.chain(self.list.iter().map(|boxed| {
+				std::mem::size_of::<(usize, Vec<Msg>)>()
+					+ boxed.1.capacity() * std::mem::size_of::<Msg>()
+					+ boxed
+						.1
+						.iter()
+						.map(Msg::heap_bytes)
+						.fold(0usize, usize::saturating_add)
 			}))
 			.chain([
 				self.key_args.capacity() * std::mem::size_of::<usize>(),
@@ -170,10 +181,19 @@ impl Msg {
 					self.inner.as_deref().filter(|(at, _)| *at == i)
 				{
 					inner.render(loc)
-				} else if let Some((_, tail)) =
-					self.tail.as_deref().filter(|(at, _)| *at == i)
+				} else if let Some((_, list)) =
+					self.list.as_deref().filter(|(at, _)| *at == i)
 				{
-					tail.render(loc)
+					let sep = tf("restore_err_join", loc, &["\u{1}", "\u{2}"]);
+					let sep = sep
+						.split_once('\u{1}')
+						.and_then(|(_, rest)| rest.split_once('\u{2}'))
+						.map_or("; ", |(sep, _)| sep)
+						.to_string();
+					list.iter()
+						.map(|m| m.render(loc))
+						.collect::<Vec<_>>()
+						.join(&sep)
 				} else if self.key_args.contains(&i) {
 					let translated = t(s, loc);
 					if !translated.is_empty() {

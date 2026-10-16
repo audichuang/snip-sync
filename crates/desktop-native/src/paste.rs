@@ -786,22 +786,9 @@ impl PasteApplyResult {
 		// The first is the headline's own argument; every other failure
 		// follows it, path and cause, worded when drawn.
 		args.push(String::new());
-		let rest = failures[1..]
-			.iter()
-			.rev()
-			.map(restore_failure_msg)
-			.reduce(|tail, f| {
-				Msg::with_msg_arg(
-					"restore_err_join",
-					[String::new(), String::new()],
-					0,
-					f,
-				)
-				.and_msg_arg(1, tail)
-			})
-			.expect("two or more failures");
+		let rest = failures[1..].iter().map(restore_failure_msg).collect();
 		Msg::with_msg_arg("status_paste_partial_more", args, 5, first)
-			.and_msg_arg(6, rest)
+			.and_list_arg(6, rest)
 	}
 
 	/// The failures as data. A worker that predates typed failures sent
@@ -2809,6 +2796,44 @@ pub(crate) mod tests {
 		let zh = status.render(crate::i18n::Locale::ZhTw);
 		let en = status.render(crate::i18n::Locale::En);
 		assert_ne!(zh, en);
+	}
+
+	#[test]
+	fn apply_status_of_thousands_of_failures_does_not_recurse() {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		const N: usize = 20_000;
+		let failures: Vec<RestoreFailure> = (0..N)
+			.map(|i| RestoreFailure {
+				path: format!("f{i}.txt"),
+				reason: Some(Reason::Io {
+					detail: "No space left on device".into(),
+				}),
+			})
+			.collect();
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: failures.iter().map(|f| f.path.clone()).collect(),
+				failures,
+			},
+			created_commits: Vec::new(),
+		};
+		// Default test thread: any per-failure recursion overflows it.
+		let status = result.status();
+		let copy = status.clone();
+		assert!(copy.heap_bytes() > 0);
+		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = status.render(loc);
+			assert!(text.contains("f0.txt"), "{loc:?}");
+			assert!(text.contains(&format!("f{}.txt", N - 1)), "{loc:?}");
+		}
+		drop(copy);
+		drop(status);
 	}
 
 	#[test]
