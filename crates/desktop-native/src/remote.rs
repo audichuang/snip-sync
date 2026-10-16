@@ -79,6 +79,15 @@ pub fn load_hosts() -> Vec<RemoteHost> {
 		.collect()
 }
 
+/// The `REMOTE_HOST_FAILED` e2e line. Drivers read it as developers did:
+/// the English wording, never a dictionary key a rename could change.
+fn host_failed_line(name: &str, err: &Msg) -> String {
+	format!(
+		"[APP:REMOTE_HOST_FAILED: host={name} {}]",
+		err.render(crate::i18n::Locale::En)
+	)
+}
+
 #[cfg(test)]
 thread_local! {
 	static TEST_HOSTS: std::cell::RefCell<Option<Vec<RemoteHost>>> = const { std::cell::RefCell::new(None) };
@@ -894,7 +903,7 @@ impl WorkbenchModel {
 				}
 			}
 			Err(err) => {
-				app_log!("[APP:REMOTE_HOST_FAILED: host={name} {}]", err.key);
+				app_log!("{}", host_failed_line(&name, err));
 				browse.client = None;
 			}
 		}
@@ -1611,6 +1620,22 @@ async fn hold_open(
 mod tests {
 	use super::*;
 	use crate::i18n::Locale;
+
+	#[test]
+	fn host_failed_line_is_english_wording_not_a_key() {
+		let err =
+			crate::reason::reason_msg(&snip_core::reason::Reason::Cancelled);
+		let line = host_failed_line("box", &err);
+		assert_eq!(
+			line,
+			format!(
+				"[APP:REMOTE_HOST_FAILED: host=box {}]",
+				err.render(Locale::En)
+			)
+		);
+		assert!(!line.contains(err.key), "{line}");
+	}
+
 	use crate::reason::refusal_key;
 	use snip_core::gitsrc::StartReason;
 	use snip_remote::ConnectFailureKind;

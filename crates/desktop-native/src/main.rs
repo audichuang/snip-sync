@@ -5749,7 +5749,10 @@ impl WorkbenchModel {
 							model.show_toast(ok, result.status(), cx);
 						}
 						Err(err) => {
-							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
+							app_log!(
+								"[APP:PASTE_STALE_DETECTED: {}]",
+								crate::reason::apply_log_token(&err)
+							);
 							model.status = err.clone();
 							model.paste.apply_failed(err, model.preview.as_ref());
 						}

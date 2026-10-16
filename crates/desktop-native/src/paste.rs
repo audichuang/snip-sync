@@ -369,6 +369,9 @@ impl PastePending {
 	}
 }
 
+// One input is held per worker and moved, never copied; its size is counted
+// by `bytes`, so a boxed variant would only move the same bytes.
+#[allow(clippy::large_enum_variant)]
 enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
@@ -780,21 +783,25 @@ impl PasteApplyResult {
 		if failures.len() == 1 {
 			return Msg::with_msg_arg("status_paste_partial", args, 5, first);
 		}
-		// The first is worded in full; the others are named, so every path
-		// that did not land is on screen.
-		// A worker that sent only `errors` has no paths: the other lines'
-		// own text stays on screen instead.
-		let rest = if f.failures.len() == f.errors.len() {
-			failures[1..]
-				.iter()
-				.map(|f| f.path.as_str())
-				.collect::<Vec<_>>()
-				.join(", ")
-		} else {
-			f.errors[1..].join("; ")
-		};
-		args.push(rest);
+		// The first is the headline's own argument; every other failure
+		// follows it, path and cause, worded when drawn.
+		args.push(String::new());
+		let rest = failures[1..]
+			.iter()
+			.rev()
+			.map(restore_failure_msg)
+			.reduce(|tail, f| {
+				Msg::with_msg_arg(
+					"restore_err_join",
+					[String::new(), String::new()],
+					0,
+					f,
+				)
+				.and_msg_arg(1, tail)
+			})
+			.expect("two or more failures");
 		Msg::with_msg_arg("status_paste_partial_more", args, 5, first)
+			.and_msg_arg(6, rest)
 	}
 
 	/// The failures as data. A worker that predates typed failures sent
@@ -2750,6 +2757,58 @@ pub(crate) mod tests {
 		.status();
 		assert_eq!(one.key, "status_paste_partial");
 		assert!(one.render(crate::i18n::Locale::ZhTw).contains("a/x.txt"));
+	}
+
+	#[test]
+	fn apply_status_keeps_path_and_cause_of_every_failure() {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		let failures = vec![
+			RestoreFailure {
+				path: "a.txt".into(),
+				reason: Some(Reason::PermissionDenied {
+					path: "a.txt".into(),
+				}),
+			},
+			RestoreFailure {
+				path: "b.txt".into(),
+				reason: Some(Reason::Io {
+					detail: "No space left on device".into(),
+				}),
+			},
+			RestoreFailure {
+				path: "c.txt".into(),
+				reason: Some(Reason::UnsafePath {
+					path: "c.txt".into(),
+				}),
+			},
+		];
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: failures.iter().map(|f| f.path.clone()).collect(),
+				failures: failures.clone(),
+			},
+			created_commits: Vec::new(),
+		};
+		let status = result.status();
+		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = status.render(loc);
+			for f in &failures {
+				let line = restore_failure_msg(f).render(loc);
+				assert!(text.contains(&line), "{line} missing: {text}");
+				assert!(text.contains(&f.path), "{text}");
+			}
+			assert!(text.contains("No space left on device"), "{text}");
+			assert!(!text.contains("{}"), "{text}");
+		}
+		let zh = status.render(crate::i18n::Locale::ZhTw);
+		let en = status.render(crate::i18n::Locale::En);
+		assert_ne!(zh, en);
 	}
 
 	#[test]

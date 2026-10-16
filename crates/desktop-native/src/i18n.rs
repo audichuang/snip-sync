@@ -34,6 +34,9 @@ pub struct Msg {
 	/// An argument that is itself a message, worded with the message.
 	/// Boxed: `Msg` sits in many enums that must stay small.
 	pub inner: Option<Box<(usize, Msg)>>,
+	/// A second argument that is itself a message (a list's rest). Only a
+	/// list of failures sets it, and it is a toast, not a retained error.
+	pub tail: Option<Box<(usize, Msg)>>,
 }
 
 impl Msg {
@@ -43,6 +46,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: None,
+			tail: None,
 		}
 	}
 
@@ -88,6 +92,12 @@ impl Msg {
 		self
 	}
 
+	/// Argument `index` is a second nested message, beside the first.
+	pub fn and_msg_arg(mut self, index: usize, tail: Msg) -> Msg {
+		self.tail = Some(Box::new((index, tail)));
+		self
+	}
+
 	/// Argument `index` is a message: it is worded in the language the
 	/// outer message is drawn in.
 	pub fn with_msg_arg(
@@ -101,6 +111,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: Some(Box::new((index, inner))),
+			tail: None,
 		}
 	}
 
@@ -114,6 +125,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: vec![index],
 			inner: None,
+			tail: None,
 		}
 	}
 
@@ -127,6 +139,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: indices.into_iter().collect(),
 			inner: None,
+			tail: None,
 		}
 	}
 
@@ -137,7 +150,7 @@ impl Msg {
 			.iter()
 			// The String headers are in the args Vec's capacity below.
 			.map(|arg| arg.capacity())
-			.chain(self.inner.iter().map(|boxed| {
+			.chain(self.inner.iter().chain(self.tail.iter()).map(|boxed| {
 				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
 			}))
 			.chain([
@@ -157,6 +170,10 @@ impl Msg {
 					self.inner.as_deref().filter(|(at, _)| *at == i)
 				{
 					inner.render(loc)
+				} else if let Some((_, tail)) =
+					self.tail.as_deref().filter(|(at, _)| *at == i)
+				{
+					tail.render(loc)
 				} else if self.key_args.contains(&i) {
 					let translated = t(s, loc);
 					if !translated.is_empty() {
@@ -614,6 +631,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_partial" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}，{} 個檔案失敗：{}",
 			"status_paste_partial_more" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}，{} 個檔案失敗：{}；另有：{}",
 			"restore_err_file" => "「{}」：{}",
+			"restore_err_join" => "{}；{}",
 			"restore_err_unknown" => "原因不明",
 			"scan_errors_count" => "{} 個掃描錯誤",
 			"submodule" => "子模組",
@@ -1121,6 +1139,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_partial" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}; {} files failed: {}",
 			"status_paste_partial_more" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}; {} files failed: {}; also: {}",
 			"restore_err_file" => "\"{}\": {}",
+			"restore_err_join" => "{}; {}",
 			"restore_err_unknown" => "unknown reason",
 			"scan_errors_count" => "{} scan error(s)",
 			"submodule" => "Submodule",
@@ -1364,6 +1383,7 @@ mod tests {
 			"status_paste_partial",
 			"status_paste_partial_more",
 			"restore_err_file",
+			"restore_err_join",
 			"restore_err_unknown",
 			"scan_errors_count",
 			"paste_diff_same",

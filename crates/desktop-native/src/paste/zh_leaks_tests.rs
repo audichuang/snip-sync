@@ -431,7 +431,7 @@ fn keys_of(msg: &Msg, out: &mut Vec<String>) {
 			out.push(arg.clone());
 		}
 	}
-	if let Some(inner) = msg.inner.as_deref() {
+	for inner in msg.inner.iter().chain(msg.tail.iter()) {
 		keys_of(&inner.1, out);
 	}
 }
