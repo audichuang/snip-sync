@@ -10,7 +10,7 @@ use crate::browser::{
 };
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, GitPool, RunOptions};
-use crate::gitsrc::{self, ChangedPaths, Git, GitError, GitSource};
+use crate::gitsrc::{self, ChangedPaths, Condition, Git, GitError, GitSource};
 pub use crate::reason::Failure;
 use crate::reason::Reason;
 use crate::workspace::{
@@ -549,9 +549,7 @@ pub(crate) fn check_repo_boundary(
 		.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?;
 	let lines: Vec<&str> = stdout.lines().collect();
 	if lines.len() != 10 {
-		return Err(GitError::Diagnostic(
-			"rev-parse --git-path output must be exactly 10 lines",
-		));
+		return Err(GitError::Condition(Condition::GitPathOutput));
 	}
 
 	const PATH_WHATS: [&str; 10] = [
@@ -2428,7 +2426,7 @@ mod tests {
 		let head = git.resolve_commit_with("HEAD", &opts).unwrap();
 
 		// For Working and Staged, passing listed = Some(...) for unmodified file
-		// must return GitError::Diagnostic("Path is not in this Git source")
+		// must return GitError::Condition(Condition::PathNotInSource)
 		let err_work = repo
 			.preview(
 				&GitSource::Working,
@@ -2440,7 +2438,7 @@ mod tests {
 		assert!(
 			matches!(
 				&err_work,
-				GitError::Diagnostic("Path is not in this Git source")
+				GitError::Condition(Condition::PathNotInSource)
 			),
 			"expected Malformed, got {err_work:?}"
 		);
@@ -2456,7 +2454,7 @@ mod tests {
 		assert!(
 			matches!(
 				&err_stage,
-				GitError::Diagnostic("Path is not in this Git source")
+				GitError::Condition(Condition::PathNotInSource)
 			),
 			"expected Malformed, got {err_stage:?}"
 		);

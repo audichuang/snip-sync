@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
-use crate::gitsrc::{self, Git, GitError, GitSource};
+use crate::gitsrc::{self, Condition, Git, GitError, GitSource};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
@@ -619,9 +619,7 @@ pub fn commit_directory_with(
 			return Err(GitError::Diagnostic("ls-tree record has empty path"));
 		}
 		let Ok(path_str) = std::str::from_utf8(path_bytes) else {
-			return Err(GitError::Diagnostic(
-				"unsupported non-UTF-8 path in commit directory",
-			));
+			return Err(GitError::Condition(Condition::CommitPathNotUtf8));
 		};
 		let path = path_str.to_string();
 		let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -788,7 +786,7 @@ pub fn git_preview_with(
 		opts.max_stdout as u64,
 		opts,
 	)?
-	.ok_or(GitError::Diagnostic("Path is not in this Git source"))?;
+	.ok_or(GitError::Condition(Condition::PathNotInSource))?;
 	let revs = diff_revs(git, source, None, opts)?;
 	finish_preview(git, revs, path, file.content, file.change_type, opts)
 }
@@ -1697,12 +1695,7 @@ mod tests {
 		let g = Git::open(root).unwrap();
 		let err = commit_directory(&g, "HEAD", "", 2000).unwrap_err();
 		assert!(
-			matches!(
-				err,
-				GitError::Diagnostic(
-					"unsupported non-UTF-8 path in commit directory"
-				)
-			),
+			matches!(err, GitError::Condition(Condition::CommitPathNotUtf8)),
 			"{err:?}"
 		);
 	}

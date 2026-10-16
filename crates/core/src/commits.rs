@@ -2461,6 +2461,7 @@ fn replay_commit(
 			// Never shown: a layout conflict is worded by its own key.
 			reason: Box::new(Reason::Internal {
 				detail: String::new(),
+				condition: None,
 			}),
 			layout_conflict: Some(conflict),
 			conflict_path: Some(plan.files[i].path.clone()),

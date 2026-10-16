@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
-use crate::gitsrc::{Git, GitError};
+use crate::gitsrc::{Condition, Git, GitError};
 use crate::reason::Failure;
 use crate::transfer::SourceKind;
 
@@ -582,7 +582,7 @@ pub fn declared_submodules(
 		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
 		Err(e) => return Err(e.into()),
 		Ok(m) if !m.is_file() => {
-			return Err(GitError::Diagnostic(".gitmodules is not a file"))
+			return Err(GitError::Condition(Condition::GitmodulesNotFile))
 		}
 		Ok(_) => {}
 	}
@@ -1002,6 +1002,7 @@ fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::reason::Reason;
 	use std::path::PathBuf;
 	use std::process::Command;
 	use std::time::{Duration, Instant};
@@ -1537,6 +1538,36 @@ mod tests {
 		paths.sort();
 		assert_eq!(paths.len(), 15, "{paths:?}");
 		assert!(started.elapsed().as_secs() < 180, "walk took too long");
+	}
+
+	/// A `.gitmodules` that is a folder is the user's doing: a typed
+	/// condition, with the CLI's text unchanged.
+	#[test]
+	fn a_gitmodules_folder_is_a_typed_condition() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		init(&root);
+		commit_file(&root, "a.txt", "a\n");
+		fs::create_dir(root.join(".gitmodules")).unwrap();
+		let git_root = Git::open(&root).unwrap();
+		let err =
+			declared_submodules(&git_root, &RunOptions::interactive(None))
+				.unwrap_err();
+		assert!(
+			matches!(err, GitError::Condition(Condition::GitmodulesNotFile)),
+			"{err:?}"
+		);
+		assert_eq!(
+			err.to_string(),
+			"unexpected git output: .gitmodules is not a file"
+		);
+		assert_eq!(
+			err.reason(),
+			Reason::Internal {
+				detail: String::new(),
+				condition: Some(Condition::GitmodulesNotFile),
+			}
+		);
 	}
 
 	#[test]

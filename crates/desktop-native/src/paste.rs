@@ -2474,6 +2474,7 @@ impl PastePreviewPlan {
 				0,
 				reason_msg(&snip_core::reason::Reason::Internal {
 					detail: String::new(),
+					condition: None,
 				}),
 			));
 		};

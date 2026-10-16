@@ -5041,6 +5041,7 @@ impl WorkbenchModel {
 					0,
 					crate::reason::reason_msg(&Reason::Internal {
 						detail: String::new(),
+						condition: None,
 					}),
 				));
 				cx.notify();

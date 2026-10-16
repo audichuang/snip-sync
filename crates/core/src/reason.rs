@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::gitsrc::StartReason;
+use crate::gitsrc::{Condition, StartReason};
 
 /// The worker's coarse error classification on the wire. Closed: it is never
 /// extended again, because an old peer would not know a new code.
@@ -147,9 +147,14 @@ pub enum Reason {
 		sha: String,
 	},
 	OutsideShare,
-	/// An invariant break the user cannot cause.
+	/// An invariant break the user cannot cause (a bug-report label in
+	/// `detail`), or, with `condition`, a fixed condition the user can cause
+	/// that a front end words itself (`detail` is then empty). `condition`
+	/// is additive on the wire: an old peer sends and reads none.
 	Internal {
 		detail: String,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		condition: Option<Condition>,
 	},
 	// filesystem
 	Io {
@@ -432,8 +437,9 @@ impl Reason {
 			Self::GitFailed { .. } => Self::GitFailed {
 				stderr: String::new(),
 			},
-			Self::Internal { .. } => Self::Internal {
+			Self::Internal { condition, .. } => Self::Internal {
 				detail: String::new(),
+				condition,
 			},
 			Self::Io { .. } => Self::Io {
 				detail: String::new(),
@@ -610,7 +616,10 @@ mod tests {
 			Reason::InvalidRevision { rev: ok() },
 			Reason::Shallow { sha: ok() },
 			Reason::OutsideShare,
-			Reason::Internal { detail: s() },
+			Reason::Internal {
+				detail: s(),
+				condition: None,
+			},
 			Reason::Io { detail: s() },
 			Reason::NotFound { path: s() },
 			Reason::PermissionDenied { path: s() },
@@ -668,6 +677,10 @@ mod tests {
 			start: None,
 			detail: String::new(),
 		});
+		v.push(Reason::Internal {
+			detail: String::new(),
+			condition: Some(Condition::GitmodulesNotFile),
+		});
 		for path in [Some(s()), Some(r"C:\abs\secret".to_string()), None] {
 			v.push(Reason::PayloadTooLarge {
 				limit: 1,
@@ -712,6 +725,8 @@ mod tests {
 			StartReason::KeyLogin,
 			StartReason::NoAnswer,
 			StartReason::Closed,
+			StartReason::NoCommand,
+			StartReason::CannotRun,
 		] {
 			let r = Reason::Start {
 				start: Some(start),
@@ -722,6 +737,46 @@ mod tests {
 					.unwrap();
 			assert_eq!(back, r);
 		}
+	}
+
+	/// `condition` is additive: a frame from an old peer has none, and a
+	/// reason without one sends none.
+	#[test]
+	fn the_condition_field_is_additive_on_the_wire() {
+		let old: Reason =
+			serde_json::from_str(r#"{"r":"internal","detail":"x"}"#).unwrap();
+		assert_eq!(
+			old,
+			Reason::Internal {
+				detail: "x".into(),
+				condition: None
+			}
+		);
+		assert_eq!(
+			serde_json::to_string(&old).unwrap(),
+			r#"{"r":"internal","detail":"x"}"#
+		);
+		let typed = Reason::Internal {
+			detail: String::new(),
+			condition: Some(Condition::PathNotInSource),
+		};
+		assert_eq!(
+			serde_json::to_string(&typed).unwrap(),
+			r#"{"r":"internal","detail":"","condition":"path_not_in_source"}"#
+		);
+		// A worker's scrub keeps the fixed condition, drops the detail.
+		let scrubbed = Reason::Internal {
+			detail: "/abs/secret".into(),
+			condition: Some(Condition::PathNotInSource),
+		}
+		.scrubbed();
+		assert_eq!(
+			scrubbed,
+			Reason::Internal {
+				detail: String::new(),
+				condition: Some(Condition::PathNotInSource)
+			}
+		);
 	}
 
 	#[test]

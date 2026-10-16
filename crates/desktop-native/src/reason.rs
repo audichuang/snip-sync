@@ -9,7 +9,7 @@
 //! fallback. All matches are exhaustive: a new variant of any enum below does
 //! not compile until it has a wording.
 
-use snip_core::gitsrc::StartReason;
+use snip_core::gitsrc::{Condition, StartReason};
 use snip_core::reason::{
 	ErrorCode, Failure, PayloadErrorKind, Reason, StaleChange,
 };
@@ -48,6 +48,19 @@ pub fn start_reason_key(reason: StartReason) -> &'static str {
 		StartReason::KeyLogin => "remote_start_key_login",
 		StartReason::NoAnswer => "remote_start_no_answer",
 		StartReason::Closed => "remote_start_closed",
+		StartReason::NoCommand => "remote_start_no_command",
+		StartReason::CannotRun => "remote_start_cannot_run",
+	}
+}
+
+/// The dictionary key of a user-caused condition's wording.
+pub fn condition_key(condition: Condition) -> &'static str {
+	match condition {
+		Condition::GitmodulesNotFile => "cond_gitmodules_not_file",
+		Condition::PathNotInSource => "cond_path_not_in_source",
+		Condition::PathNotUtf8 => "cond_path_not_utf8",
+		Condition::CommitPathNotUtf8 => "cond_commit_path_not_utf8",
+		Condition::GitPathOutput => "cond_git_path_output",
 	}
 }
 
@@ -57,10 +70,14 @@ pub fn start_reason_key(reason: StartReason) -> &'static str {
 pub fn start_msg(reason: StartReason, detail: &str) -> Msg {
 	let headline = Msg::new(start_reason_key(reason), []);
 	match reason {
-		StartReason::KeyLogin => Msg::detail(headline, detail),
-		StartReason::NoWorker | StartReason::NoAnswer | StartReason::Closed => {
-			headline
+		// The OS's own words (the program and why it failed) trail it.
+		StartReason::KeyLogin | StartReason::CannotRun => {
+			Msg::detail(headline, detail)
 		}
+		StartReason::NoWorker
+		| StartReason::NoAnswer
+		| StartReason::Closed
+		| StartReason::NoCommand => headline,
 	}
 }
 
@@ -147,9 +164,15 @@ fn invalid_payload(
 // name for a bug report under the localized "internal error" headline, or
 // git's own output; never a sentence of ours).
 // Classified (ii), now typed: InvalidPayload (`serde_json`'s message became
-// kind + line + column). The zh leak test pins this list
-// (`string_fields_are_classified`): a new String field fails it until it
-// is classified here.
+// kind + line + column); the product sentences of Internal ("`.gitmodules`
+// is not a file", "path is not in this Git source") became `Condition`, and
+// those of Start ("no command to start the worker", "cannot run ...")
+// became `StartReason::NoCommand` / `CannotRun` (the OS's words stay data).
+// A producer that can say a sentence of ours to a user types it; only a
+// bug-report label may stay in `Internal.detail` (`GitError::Diagnostic`).
+// The zh leak test pins this list (`string_fields_are_classified`) and
+// feeds each producer of product text (`product_text_never_reaches_a_data_field`):
+// a new String field fails it until it is classified here.
 
 /// The message for a reason. Exhaustive: no `_` arm.
 pub fn reason_msg(r: &Reason) -> Msg {
@@ -189,7 +212,14 @@ pub fn reason_msg(r: &Reason) -> Msg {
 			sha,
 		),
 		Reason::OutsideShare => Msg::new("remote_refused_outside_share", []),
-		Reason::Internal { detail } => headed("err_internal", detail),
+		Reason::Internal {
+			condition: Some(condition),
+			..
+		} => Msg::new(condition_key(*condition), []),
+		Reason::Internal {
+			detail,
+			condition: None,
+		} => headed("err_internal", detail),
 		Reason::Io { detail } => headed("err_io", detail),
 		Reason::NotFound { path } => headed("err_not_found", path),
 		Reason::PermissionDenied { path } => {

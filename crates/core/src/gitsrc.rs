@@ -54,6 +54,51 @@ pub enum StartReason {
 	NoAnswer,
 	/// The far end closed before snip started.
 	Closed,
+	/// There was no command to run (an empty ssh command line).
+	NoCommand,
+	/// The command could not be run at all (missing program, no permission);
+	/// the OS's words trail it as data.
+	CannotRun,
+}
+
+/// A condition the user can cause that surfaces as unexpected git output:
+/// fixed, never git's or the OS's words, so a front end words it in its own
+/// language. `Display` is the English text the CLI prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Condition {
+	/// `.gitmodules` exists but is a folder or a link, not a file.
+	GitmodulesNotFile,
+	/// The path is in no revision or working tree of this Git source.
+	PathNotInSource,
+	/// A path git printed is not UTF-8 (a platform that needs it).
+	PathNotUtf8,
+	/// A path in a commit's folder is not UTF-8.
+	CommitPathNotUtf8,
+	/// `rev-parse --git-path` did not print the ten lines asked for.
+	GitPathOutput,
+}
+
+impl Condition {
+	pub fn text(self) -> &'static str {
+		match self {
+			Self::GitmodulesNotFile => ".gitmodules is not a file",
+			Self::PathNotInSource => "Path is not in this Git source",
+			Self::PathNotUtf8 => "path is not UTF-8",
+			Self::CommitPathNotUtf8 => {
+				"unsupported non-UTF-8 path in commit directory"
+			}
+			Self::GitPathOutput => {
+				"rev-parse --git-path output must be exactly 10 lines"
+			}
+		}
+	}
+}
+
+impl std::fmt::Display for Condition {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.text())
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +169,10 @@ pub enum GitError {
 	/// verbatim: it holds nothing git or the OS said.
 	#[error("unexpected git output: {0}")]
 	Diagnostic(&'static str),
+	/// The same `Display` bytes for a condition the user can cause: typed,
+	/// so a front end words it instead of printing the English.
+	#[error("unexpected git output: {0}")]
+	Condition(Condition),
 	#[error("outside the shared folder: {what}")]
 	OutsideBoundary { what: &'static str },
 	#[error("repository too large to verify: {what}")]
@@ -172,6 +221,7 @@ impl GitError {
 			// Nothing in these carries stderr or OS text: Display as is.
 			Self::NotFound
 			| Self::Diagnostic(_)
+			| Self::Condition(_)
 			| Self::Timeout { .. }
 			| Self::Cancelled { .. }
 			| Self::QueueTimeout { .. }
@@ -212,16 +262,24 @@ impl GitError {
 			Self::OutputHeldOpen { args } | Self::NestedProcess { args } => {
 				Reason::Internal {
 					detail: args.clone(),
+					condition: None,
 				}
 			}
 			Self::Cleanup { args, message } => Reason::Internal {
 				detail: format!("{args}: {message}"),
+				condition: None,
 			},
 			Self::Malformed(output) => Reason::Internal {
 				detail: output.clone(),
+				condition: None,
 			},
 			Self::Diagnostic(text) => Reason::Internal {
 				detail: (*text).to_string(),
+				condition: None,
+			},
+			Self::Condition(condition) => Reason::Internal {
+				detail: String::new(),
+				condition: Some(*condition),
 			},
 			Self::NotARepository(p) => Reason::NotARepository {
 				path: p.display().to_string(),
@@ -277,7 +335,7 @@ pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, GitError> {
 	{
 		std::str::from_utf8(bytes)
 			.map(PathBuf::from)
-			.map_err(|_| GitError::Diagnostic("path is not UTF-8"))
+			.map_err(|_| GitError::Condition(Condition::PathNotUtf8))
 	}
 }
 

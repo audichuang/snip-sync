@@ -823,6 +823,10 @@ pub(crate) fn start_message(
 		(Some(StartReason::Closed), _) => {
 			"the remote end closed the connection before snip started".into()
 		}
+		// Built by `spawn` with its own message, never classified here.
+		(Some(StartReason::NoCommand | StartReason::CannotRun), _) => {
+			stderr.to_string()
+		}
 		// The stream's own message: a banner, an out-of-step frame.
 		(None, StartCause::BadData(message)) => message,
 		// Whatever the transport said outranks the bare timeout.
@@ -890,7 +894,13 @@ type Started = (
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let (program, args) = argv.split_first().ok_or_else(|| {
-		RemoteError::Connect("no command to start the worker".into())
+		// The same text the CLI always printed, typed for a front end.
+		RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(StartReason::NoCommand),
+			detail: String::new(),
+			message: "no command to start the worker".into(),
+		}
 	})?;
 	let mut child = Command::new(program)
 		.args(args)
@@ -899,10 +909,14 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 		.stderr(Stdio::piped())
 		.spawn()
 		.map_err(|err| {
-			RemoteError::Connect(format!(
-				"cannot run {}: {err}",
-				program.to_string_lossy()
-			))
+			let program = program.to_string_lossy();
+			RemoteError::Start {
+				kind: ConnectFailureKind::WorkerUnavailable,
+				reason: Some(StartReason::CannotRun),
+				// Data only: the program and what the OS said.
+				detail: format!("{program}: {err}"),
+				message: format!("cannot run {program}: {err}"),
+			}
 		})?;
 	let stdin: ChildStdin = child.stdin.take().expect("piped stdin");
 	let stdout = child.stdout.take().expect("piped stdout");
@@ -2987,6 +3001,40 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 	use crate::proto::write_frame;
+
+	/// A worker that cannot be started for a reason of ours is typed, with
+	/// the CLI's text unchanged and the OS's words as data only.
+	#[test]
+	fn a_command_that_cannot_start_is_typed() {
+		let Err(error) = spawn(&[]) else {
+			panic!("an empty command started")
+		};
+		assert_eq!(error.to_string(), "no command to start the worker");
+		assert_eq!(
+			error.reason(),
+			Reason::Start {
+				start: Some(StartReason::NoCommand),
+				detail: String::new(),
+			}
+		);
+		let missing = std::env::temp_dir().join("snip-no-such-program-225");
+		let Err(error) = spawn(&[missing.clone().into_os_string()]) else {
+			panic!("a missing program started")
+		};
+		let program = missing.to_string_lossy();
+		assert!(
+			error
+				.to_string()
+				.starts_with(&format!("cannot run {program}: ")),
+			"{error}"
+		);
+		let Reason::Start { start, detail } = error.reason() else {
+			panic!("{error:?}")
+		};
+		assert_eq!(start, Some(StartReason::CannotRun));
+		assert!(detail.starts_with(&format!("{program}: ")), "{detail}");
+		assert!(!error.is_restore_retryable());
+	}
 
 	struct PreparedWrites(Arc<Mutex<Vec<u8>>>);
 	impl IoWrite for PreparedWrites {

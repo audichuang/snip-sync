@@ -14,7 +14,7 @@ use crate::i18n::Locale;
 use crate::reason::reason_msg;
 use crate::PreviewErr;
 use snip_core::commits::CommitError;
-use snip_core::gitsrc::{GitError, StartReason};
+use snip_core::gitsrc::{Condition, GitError, StartReason};
 use snip_core::reason::{Reason, StaleChange};
 use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError};
 use std::collections::BTreeSet;
@@ -56,11 +56,20 @@ const ALL_CODES: [ErrorCode; 15] = [
 	ErrorCode::Stale,
 	ErrorCode::Collision,
 ];
-const ALL_REASONS: [StartReason; 4] = [
+const ALL_REASONS: [StartReason; 6] = [
 	StartReason::NoWorker,
 	StartReason::KeyLogin,
 	StartReason::NoAnswer,
 	StartReason::Closed,
+	StartReason::NoCommand,
+	StartReason::CannotRun,
+];
+const ALL_CONDITIONS: [Condition; 5] = [
+	Condition::GitmodulesNotFile,
+	Condition::PathNotInSource,
+	Condition::PathNotUtf8,
+	Condition::CommitPathNotUtf8,
+	Condition::GitPathOutput,
 ];
 
 fn code_index(code: ErrorCode) -> usize {
@@ -89,6 +98,8 @@ fn reason_index(reason: StartReason) -> usize {
 		StartReason::KeyLogin => 1,
 		StartReason::NoAnswer => 2,
 		StartReason::Closed => 3,
+		StartReason::NoCommand => 4,
+		StartReason::CannotRun => 5,
 	}
 }
 
@@ -134,9 +145,10 @@ fn git_variant(e: &GitError) -> usize {
 		GitError::Remote { .. } => 19,
 		GitError::Io(_) => 20,
 		GitError::Diagnostic(_) => 21,
+		GitError::Condition(_) => 22,
 	}
 }
-const GIT_VARIANTS: usize = 22;
+const GIT_VARIANTS: usize = 23;
 
 fn preview_variant(e: &PreviewErr) -> usize {
 	match e {
@@ -289,6 +301,12 @@ fn git_samples() -> Vec<(String, GitError)> {
 		("Host".into(), GitError::remote(Reason::Protocol, a())),
 		("Io".into(), GitError::Io(std::io::Error::other(D))),
 	];
+	for condition in ALL_CONDITIONS {
+		v.push((
+			format!("Condition#{condition:?}"),
+			GitError::Condition(condition),
+		));
+	}
 	for reason in ALL_REASONS {
 		v.push((
 			format!("HostStart#{}", reason_index(reason)),
@@ -513,7 +531,13 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		),
 		("Shallow".into(), Reason::Shallow { sha: d() }),
 		("OutsideShare".into(), Reason::OutsideShare),
-		("Internal".into(), Reason::Internal { detail: d() }),
+		(
+			"Internal".into(),
+			Reason::Internal {
+				detail: d(),
+				condition: None,
+			},
+		),
 		("Io".into(), Reason::Io { detail: d() }),
 		("NotFound".into(), Reason::NotFound { path: d() }),
 		(
@@ -613,6 +637,15 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 			Reason::DepthLimitedOmitted { count: 3 },
 		),
 	];
+	for condition in ALL_CONDITIONS {
+		v.push((
+			format!("Internal({condition:?})"),
+			Reason::Internal {
+				detail: String::new(),
+				condition: Some(condition),
+			},
+		));
+	}
 	for code in ALL_CODES {
 		v.push((
 			format!("Refused#{}", code_index(code)),
@@ -1201,9 +1234,12 @@ fn string_fields() -> BTreeSet<String> {
 			}
 			serde_json::Value::Object(map) => {
 				for (k, v) in map {
-					// The serde tag names a variant, and `kind`, `code` and
-					// `start` are closed enums: neither is free text.
-					if !matches!(k.as_str(), "r" | "kind" | "code" | "start") {
+					// The serde tag names a variant, and `kind`, `code`,
+					// `start` and `condition` are closed enums: neither is free text.
+					if !matches!(
+						k.as_str(),
+						"r" | "kind" | "code" | "start" | "condition"
+					) {
 						walk(&format!("{prefix}.{k}"), v, out);
 					}
 				}
@@ -1302,4 +1338,118 @@ fn an_invalid_payload_is_worded_without_the_librarys_text() {
 		kinds.len() >= 2,
 		"the probes cover several kinds: {kinds:?}"
 	);
+}
+
+/// An English sentence of ours, as a producer once put it into a data field.
+const PRODUCT_SENTENCE: &str = "the folder is not a regular file";
+
+/// The String fields classified as data whose producer is, or once was,
+/// able to carry a sentence of our own (not a path, a name or git's or the
+/// OS's words). Each one must have its sentences typed at the producer.
+const PRODUCT_TEXT_FIELDS: &[&str] = &["internal.detail", "start.detail"];
+
+/// `sample` with the String at `field` (`variant.field`) replaced.
+fn with_field(sample: &Reason, field: &str, text: &str) -> Option<Reason> {
+	let mut json = serde_json::to_value(sample).ok()?;
+	let (variant, key) = field.split_once('.')?;
+	if json["r"].as_str()? != variant {
+		return None;
+	}
+	json[key] = serde_json::Value::String(text.into());
+	serde_json::from_value(json).ok()
+}
+
+/// A data field echoes what it is given, so the only guard is at the
+/// producer: a sentence of ours must be typed, never stored as data. This
+/// pins both halves. (1) The leak detector does see such a sentence in each
+/// field that could carry one, so a producer that regresses to a string
+/// fails the zh-TW sweep. (2) Every producer known to have said such a
+/// sentence now words it from a type: nothing of its English text reaches
+/// zh-TW or the data slot.
+#[test]
+fn product_text_never_reaches_a_data_field() {
+	let samples = reason_samples();
+	for field in PRODUCT_TEXT_FIELDS {
+		let mut tried = 0;
+		for (label, sample) in &samples {
+			let Some(reason) = with_field(sample, field, PRODUCT_SENTENCE)
+			else {
+				continue;
+			};
+			// A sample whose wording does not show the field is no test.
+			let other = with_field(sample, field, "x").unwrap();
+			if zh(&reason_msg(&other)) == zh(&reason_msg(&reason)) {
+				continue;
+			}
+			tried += 1;
+			let mut found = Found::default();
+			check(
+				format!("{field} <- {label}"),
+				&zh(&reason_msg(&reason)),
+				&mut found,
+			);
+			assert!(
+				!found.leaks.is_empty(),
+				"{field} <- {label}: an English sentence in the field went \
+				 unnoticed"
+			);
+		}
+		assert!(tried > 0, "{field}: no sample to test");
+	}
+
+	// Every classified product-text field is in the data list: the list
+	// above cannot name a field `string_fields_are_classified` does not know.
+	let known = string_fields();
+	for field in PRODUCT_TEXT_FIELDS {
+		assert!(known.contains(*field), "{field} is not a Reason field");
+	}
+
+	// (2) The producers, one by one.
+	for condition in ALL_CONDITIONS {
+		let error = GitError::Condition(condition);
+		// The CLI's bytes are unchanged.
+		assert_eq!(
+			error.to_string(),
+			format!("unexpected git output: {}", condition.text())
+		);
+		let reason = error.reason();
+		let Reason::Internal {
+			detail,
+			condition: Some(typed),
+		} = &reason
+		else {
+			panic!("{condition:?}: not typed: {reason:?}");
+		};
+		assert!(detail.is_empty() && *typed == condition, "{reason:?}");
+		for r in [Some(reason.clone()), reason.clone().beside_code()]
+			.into_iter()
+			.flatten()
+		{
+			let msg = reason_msg(&r);
+			let mut found = Found::default();
+			check(format!("{condition:?}"), &zh(&msg), &mut found);
+			assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+			assert!(found.no_wording.is_empty(), "no Chinese: {condition:?}");
+			for loc in [Locale::ZhTw, Locale::En] {
+				assert!(
+					!msg.render(loc).contains(condition.text()),
+					"{condition:?} shows the CLI's English in {loc:?}"
+				);
+			}
+		}
+	}
+	for start in [StartReason::NoCommand, StartReason::CannotRun] {
+		let error = RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(start),
+			detail: D.into(),
+			message: "cannot run ssh: the sentence of the CLI".into(),
+		};
+		let msg = crate::remote::describe_msg(error);
+		let mut found = Found::default();
+		check(format!("{start:?}"), &zh(&msg), &mut found);
+		assert!(found.leaks.is_empty(), "{:#?}", found.leaks);
+		assert!(found.no_wording.is_empty(), "no Chinese: {start:?}");
+		assert!(!zh(&msg).contains("the sentence of the CLI"));
+	}
 }

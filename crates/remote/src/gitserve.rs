@@ -1123,6 +1123,27 @@ mod tests {
 		let fixed = Failure::git("", &GitError::Diagnostic("raw diff record"));
 		assert_eq!(gone(&fixed).0, "unexpected git output: raw diff record");
 		assert_eq!(fixed.message, "unexpected git output: raw diff record");
+		// A condition the user causes is typed: the same verbatim text, and
+		// the reason keeps the condition after the scrub.
+		let typed = Failure::git(
+			"",
+			&GitError::Condition(
+				snip_core::gitsrc::Condition::GitmodulesNotFile,
+			),
+		);
+		assert_eq!(
+			gone(&typed).0,
+			"unexpected git output: .gitmodules is not a file"
+		);
+		assert_eq!(
+			typed.reason.clone().scrubbed(),
+			Reason::Internal {
+				detail: String::new(),
+				condition: Some(
+					snip_core::gitsrc::Condition::GitmodulesNotFile
+				),
+			}
+		);
 		// A row built without the producer's text never sends its message.
 		let bare = Failure::new(
 			secret,
@@ -1135,6 +1156,7 @@ mod tests {
 			secret,
 			Reason::Internal {
 				detail: secret.into(),
+				condition: None,
 			},
 		);
 		assert_eq!(gone(&bare).0, "unexpected git failure (details withheld)");
@@ -1523,6 +1545,7 @@ mod tests {
 				GitError::Malformed(format!("{secret} odd")),
 				Some(Reason::Internal {
 					detail: String::new(),
+					condition: None,
 				}),
 			),
 			(
@@ -1532,6 +1555,7 @@ mod tests {
 				},
 				Some(Reason::Internal {
 					detail: String::new(),
+					condition: None,
 				}),
 			),
 			(
