@@ -2657,6 +2657,9 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.compare = Some((older.clone(), newer.clone()));
 		self.details_generation = self.details_generation.wrapping_add(1);
+		// Compare shows only its own header, so the whole view and the
+		// multi-selection's list state restart together: an expanded flag
+		// must not stay true over an emptied `selection_details`.
 		self.reset_commit_view();
 		self.reset_selection_details();
 		self.clear_preview();

@@ -4405,11 +4405,12 @@ impl WorkbenchModel {
 			self.selected_file_source.replace(source.clone()),
 			self.selected_file_root.clone(),
 			self.selected_commit.take(),
+			// Taking the view resets it; it goes back with the selection.
+			std::mem::take(&mut self.commit_view),
 		);
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.reset_commit_view();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
@@ -4504,6 +4505,7 @@ impl WorkbenchModel {
 						model.selected_file_source,
 						model.selected_file_root,
 						model.selected_commit,
+						model.commit_view,
 					) = shown_selection;
 				} else {
 					model.preview_error_root = Some(shown_root);

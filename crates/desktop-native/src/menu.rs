@@ -635,6 +635,11 @@ impl WorkbenchModel {
 	) {
 		let in_selection = self.log_is_selected(sha);
 		if !in_selection {
+			// A tab that drains ignores the select, and its menu would then
+			// act on the old selection, not on this row.
+			if !self.accepting_work() {
+				return;
+			}
 			self.select_commit(sha, cx);
 		}
 		let entries = self.log_row_menu(sha);
