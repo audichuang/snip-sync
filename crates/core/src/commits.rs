@@ -5,6 +5,7 @@
 //! replay writes the files then commits ONLY those paths, so anything the
 //! user had staged stays out of the new commits.
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -887,6 +888,42 @@ struct TestHookState {
 thread_local! {
 	static TEST_HOOK: std::cell::RefCell<TestHookState> = std::cell::RefCell::new(TestHookState::default());
 	static TEST_SERDE_BYTES_COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+	static FOLD_CASE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+	static LISTING_METER: std::cell::RefCell<ListingMeter> = std::cell::RefCell::new(ListingMeter::default());
+}
+
+/// What planning read from the disk, for the tests that pin the cost of the
+/// per-file rules (#146): `reads` counts directory reads by
+/// `PlannedLayout::key` of the directory, `visited` the entries a caller
+/// walked through `DirEntries::iter`.
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct ListingMeter {
+	reads: std::collections::HashMap<PathBuf, usize>,
+	visited: usize,
+}
+
+#[cfg(test)]
+fn take_listing_meter() -> ListingMeter {
+	LISTING_METER.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
+/// Makes `PlannedLayout` fold case whatever the filesystem does, until the
+/// guard drops, so the case-alias rules run on every OS.
+#[cfg(test)]
+struct FoldCaseGuard;
+
+#[cfg(test)]
+impl Drop for FoldCaseGuard {
+	fn drop(&mut self) {
+		FOLD_CASE_OVERRIDE.with(|c| c.set(None));
+	}
+}
+
+#[cfg(test)]
+fn force_fold_case(on: bool) -> FoldCaseGuard {
+	FOLD_CASE_OVERRIDE.with(|c| c.set(Some(on)));
+	FoldCaseGuard
 }
 
 #[cfg(test)]
@@ -1626,6 +1663,37 @@ enum Node {
 	Absent,
 }
 
+/// One directory's entries as the layout sees them (disk minus entries
+/// overridden as absent, plus overlay entries), keyed by `PlannedLayout::key`
+/// of the entry's path. Planning reads a directory only through this; a
+/// per-file question is a lookup, never a scan (#146).
+///
+/// Values keep the entry's name only, not its path: a listing is shared by
+/// every spelling of its directory, so comparing whole paths would call a
+/// spelling of the directory itself an alias.
+#[derive(Debug, Default)]
+struct DirEntries(std::collections::HashMap<PathBuf, (OsString, Node)>);
+
+impl DirEntries {
+	/// The entry's name as spelled on disk or by the overlay.
+	fn name(&self, key: &Path) -> Option<&OsStr> {
+		self.0.get(key).map(|(name, _)| name.as_os_str())
+	}
+
+	/// Every entry. A scan: per-file rules must use [`Self::name`].
+	fn iter(&self) -> impl Iterator<Item = (&OsStr, Node)> + '_ {
+		self.0.values().map(|(name, node)| {
+			#[cfg(test)]
+			LISTING_METER.with(|m| m.borrow_mut().visited += 1);
+			(name.as_os_str(), *node)
+		})
+	}
+
+	fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+}
+
 /// The on-disk tree seen through the effects of the commits planned so far:
 /// a path answers from `overrides` first and from `fs::symlink_metadata`
 /// otherwise. Empty, it is the plain disk (what `replay_commit` plans against).
@@ -1667,7 +1735,7 @@ struct PlannedLayout {
 impl PlannedLayout {
 	/// A layout for planning or replaying in `git`'s worktree.
 	fn new(git: &Git, opts: &RunOptions) -> Result<Self, GitError> {
-		let fold_case = crate::transfer::fs_is_case_insensitive(git.root());
+		let fold_case = Self::fold_case_for(git.root());
 		Ok(Self {
 			fold_case,
 			tracked: if fold_case {
@@ -1677,6 +1745,15 @@ impl PlannedLayout {
 			},
 			..Self::default()
 		})
+	}
+
+	/// Whether keys fold case at `root`: as the filesystem there does.
+	fn fold_case_for(root: &Path) -> bool {
+		#[cfg(test)]
+		if let Some(forced) = FOLD_CASE_OVERRIDE.with(|c| c.get()) {
+			return forced;
+		}
+		crate::transfer::fs_is_case_insensitive(root)
 	}
 
 	fn key(&self, path: &Path) -> PathBuf {
@@ -1805,9 +1882,14 @@ impl PlannedLayout {
 	}
 
 	/// The entries of `dir`: disk entries minus those overridden as absent,
-	/// plus overridden entries directly inside it.
-	fn children(&self, dir: &Path) -> Vec<(PathBuf, Node)> {
-		let mut out: std::collections::HashMap<PathBuf, (PathBuf, Node)> =
+	/// plus overridden entries directly inside it. Planning reaches this only
+	/// through [`Listings::get`].
+	fn read_entries(&self, dir: &Path) -> DirEntries {
+		#[cfg(test)]
+		LISTING_METER.with(|m| {
+			*m.borrow_mut().reads.entry(self.key(dir)).or_default() += 1;
+		});
+		let mut out: std::collections::HashMap<PathBuf, (OsString, Node)> =
 			std::collections::HashMap::new();
 		let entries = self.disk_children_live(dir).then(|| fs::read_dir(dir));
 		if let Some(Ok(entries)) = entries {
@@ -1815,23 +1897,24 @@ impl PlannedLayout {
 				let Ok(entry) = entry else {
 					// An unreadable entry counts as a live file nobody deletes,
 					// so `dir` is never taken for empty.
-					let path = dir.join("<unreadable entry>");
-					out.insert(self.key(&path), (path, Node::File));
+					let name = OsString::from("<unreadable entry>");
+					out.insert(self.key(&dir.join(&name)), (name, Node::File));
 					continue;
 				};
 				let node = match entry.file_type() {
 					Ok(t) if t.is_dir() => Node::Dir,
 					_ => Node::File,
 				};
-				out.insert(self.key(&entry.path()), (entry.path(), node));
+				out.insert(self.key(&entry.path()), (entry.file_name(), node));
 			}
 		}
 		out.retain(|key, _| self.overrides.get(key) != Some(&Node::Absent));
 		for (key, path) in self.added.get(&self.key(dir)).into_iter().flatten()
 		{
-			out.insert(key.clone(), (path.clone(), self.overrides[key]));
+			let name = path.file_name().unwrap_or_default().to_os_string();
+			out.insert(key.clone(), (name, self.overrides[key]));
 		}
-		out.into_values().collect()
+		DirEntries(out)
 	}
 
 	/// Whether `dir` still holds an entry. Stops at the first live one.
@@ -2017,7 +2100,7 @@ fn case_alias(
 	abs: &Path,
 	rel: &str,
 	layout: &PlannedLayout,
-	children: &mut std::collections::HashMap<PathBuf, Vec<(PathBuf, Node)>>,
+	children: &mut std::collections::HashMap<PathBuf, DirEntries>,
 ) -> bool {
 	let on_disk = abs
 		.ancestors()
@@ -2028,11 +2111,13 @@ fn case_alias(
 				return false;
 			};
 			let entries = children
-				.entry(parent.to_path_buf())
-				.or_insert_with(|| layout.children(parent));
+				.entry(layout.key(parent))
+				.or_insert_with(|| layout.read_entries(parent));
 			let key = layout.key(a);
-			!entries.iter().any(|(p, _)| p == a)
-				&& entries.iter().any(|(p, _)| layout.key(p) == key)
+			!entries.iter().any(|(n, _)| Some(n) == a.file_name())
+				&& entries
+					.iter()
+					.any(|(n, _)| layout.key(&parent.join(n)) == key)
 		});
 	on_disk || layout.tracked.aliases(rel)
 }
@@ -2063,11 +2148,14 @@ fn layout_conflicts(
 		deleted: &std::collections::HashSet<&Path>,
 		layout: &PlannedLayout,
 	) -> bool {
-		let children = layout.children(dir);
+		let children = layout.read_entries(dir);
 		!children.is_empty()
-			&& children.iter().all(|(path, node)| match node {
-				Node::Dir => emptied(path, deleted, layout),
-				_ => deleted.contains(path.as_path()),
+			&& children.iter().all(|(name, node)| {
+				let path = dir.join(name);
+				match node {
+					Node::Dir => emptied(&path, deleted, layout),
+					_ => deleted.contains(path.as_path()),
+				}
 			})
 	}
 	let mut children = std::collections::HashMap::new();
@@ -4044,6 +4132,483 @@ mod tests {
 			"planning took {:?}",
 			started.elapsed()
 		);
+	}
+
+	// Issue #146: a per-file rule asks a directory's listing a question; it
+	// never scans it. `ListingMeter` counts both what planning read from the
+	// disk and what a caller walked, so the test pins counts, not seconds,
+	// and holds on a slow CI VM. `force_fold_case` runs the rules on every OS.
+	fn alias_free(plan: &CommitReplayPlan) -> bool {
+		plan.commits
+			.iter()
+			.flat_map(|c| &c.files)
+			.all(|f| f.layout_conflict != Some(LayoutConflict::CaseAlias))
+	}
+
+	#[test]
+	fn case_alias_planning_is_linear_in_every_shape() {
+		let _fold = force_fold_case(true);
+		let n = 2000;
+		let base = || {
+			let dst = Repo::new("main");
+			dst.write("keep.txt", b"keep\n");
+			dst.commit("base", "2019-01-01T00:00:00+00:00");
+			dst
+		};
+		let each = |f: &dyn Fn(usize) -> CommitFile| -> Vec<CommitFile> {
+			(0..n).map(f).collect()
+		};
+		let mut shapes: Vec<(&str, Repo, CommitsPayload, bool)> = Vec::new();
+		// Q1-Q3: the existing file itself, modified, deleted, renamed away.
+		let big_files = || {
+			let dst = base();
+			for i in 0..n {
+				dst.write(&format!("big/f{i}.txt"), b"old\n");
+			}
+			dst
+		};
+		shapes.push((
+			"Q1 modify existing files",
+			big_files(),
+			bob(
+				"edit\n",
+				each(&|i| {
+					change(
+						&format!("big/f{i}.txt"),
+						FileChange::Modified,
+						Some("new\n"),
+					)
+				}),
+			),
+			false,
+		));
+		shapes.push((
+			"Q2 delete existing files",
+			big_files(),
+			bob(
+				"delete\n",
+				each(&|i| {
+					change(&format!("big/f{i}.txt"), FileChange::Deleted, None)
+				}),
+			),
+			false,
+		));
+		shapes.push((
+			"Q3 rename existing files",
+			big_files(),
+			bob(
+				"rename\n",
+				each(&|i| {
+					let mut f = change(
+						&format!("moved/f{i}.txt"),
+						FileChange::Renamed,
+						Some("old\n"),
+					);
+					f.old_path = Some(format!("big/f{i}.txt"));
+					f
+				}),
+			),
+			false,
+		));
+		// Q4: the existing middle directory of every new path.
+		let dst = base();
+		for i in 0..n {
+			dst.write(&format!("big/d{i}/k.txt"), b"k\n");
+		}
+		shapes.push((
+			"Q4 new files in existing directories",
+			dst,
+			bob(
+				"add\n",
+				each(&|i| {
+					change(
+						&format!("big/d{i}/new.txt"),
+						FileChange::Added,
+						Some("new\n"),
+					)
+				}),
+			),
+			false,
+		));
+		// Q5: entries only an earlier commit of the batch created.
+		shapes.push((
+			"Q5 overlay-only files",
+			big_files(),
+			CommitsPayload {
+				commits: vec![
+					batch_commit(
+						"add",
+						each(&|i| {
+							change(
+								&format!("big/g{i}.txt"),
+								FileChange::Added,
+								Some("a\n"),
+							)
+						}),
+					),
+					batch_commit(
+						"edit",
+						each(&|i| {
+							change(
+								&format!("big/g{i}.txt"),
+								FileChange::Modified,
+								Some("b\n"),
+							)
+						}),
+					),
+				],
+			},
+			false,
+		));
+		// Q6: every path is an alias, so every lookup misses.
+		shapes.push((
+			"Q6 every path an alias",
+			big_files(),
+			bob(
+				"edit\n",
+				each(&|i| {
+					change(
+						&format!("big/F{i}.txt"),
+						FileChange::Modified,
+						Some("new\n"),
+					)
+				}),
+			),
+			true,
+		));
+		// Every shape is measured, so one failure names them all.
+		let mut problems = Vec::new();
+		for (name, dst, payload, aliases) in shapes {
+			let g = dst.open();
+			let _ = take_listing_meter();
+			let plan = plan_commit_replay(&g, &payload);
+			let meter = take_listing_meter();
+			let most = meter.reads.values().copied().max().unwrap_or(0);
+			if meter.visited != 0 {
+				problems.push(format!(
+					"{name}: a per-file rule walked {} listing entries",
+					meter.visited
+				));
+			}
+			if most > payload.commits.len() {
+				problems.push(format!(
+					"{name}: a directory was read {most} times for {} commits",
+					payload.commits.len()
+				));
+			}
+			let last = plan.commits.last().unwrap();
+			let all_alias = last
+				.files
+				.iter()
+				.all(|f| f.layout_conflict == Some(LayoutConflict::CaseAlias));
+			if aliases && !all_alias {
+				problems.push(format!("{name}: a row is not a case alias"));
+			}
+			if !aliases && !alias_free(&plan) {
+				problems.push(format!("{name}: a row is a case alias"));
+			}
+		}
+		assert!(problems.is_empty(), "{problems:#?}");
+	}
+
+	// Issue #146: `skip_layout_conflicts` loops until no new conflict, and
+	// `emptied` asks a directory what it holds; one listing per directory
+	// serves every round, every row and every spelling.
+	#[test]
+	fn skip_layout_conflicts_lists_each_directory_once() {
+		let _fold = force_fold_case(true);
+		let dst = Repo::new("main");
+		dst.write("d/a.txt", b"a\n");
+		dst.write("e/k.txt", b"k\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let mut rename = change("e", FileChange::Renamed, Some("a\n"));
+		rename.old_path = Some("d/a.txt".into());
+		// Round 1: row 1 passes, as row 0 deletes what fills `d`. Skipping
+		// row 0 refills `d`, so round 2 refuses row 1 too.
+		let payload = bob(
+			"swap\n",
+			vec![rename, change("d", FileChange::Added, Some("d\n"))],
+		);
+		let g = dst.open();
+		let head = dst.git(&["rev-parse", "HEAD"]);
+		let status = dst.git(&["status", "--porcelain"]);
+		let ok = |m: &ListingMeter, what: &str| {
+			for (dir, reads) in &m.reads {
+				assert!(*reads <= 1, "{what}: {dir:?} was read {reads} times");
+			}
+		};
+		let _ = take_listing_meter();
+		let plan = plan_commit_replay(&g, &payload);
+		let planned = take_listing_meter();
+		let files = &plan.commits[0].files;
+		for f in files {
+			assert_eq!(
+				f.layout_conflict,
+				Some(LayoutConflict::DirectoryInTheWay),
+				"{plan:?}"
+			);
+		}
+		assert_eq!(
+			plan.commits[0].refused_by(),
+			Some(LayoutConflict::DirectoryInTheWay)
+		);
+		ok(&planned, "preview");
+		let result = replay(&g, &payload);
+		let replayed = take_listing_meter();
+		let failure = result.failure.expect("refused");
+		assert_eq!(failure.layout_conflict, plan.commits[0].refused_by());
+		assert!(result.created.is_empty());
+		assert_eq!(dst.git(&["rev-parse", "HEAD"]), head);
+		assert_eq!(dst.git(&["status", "--porcelain"]), status);
+		ok(&replayed, "replay");
+	}
+
+	/// Every entry under `root` outside `.git`, with its bytes (`None` for a
+	/// directory), as the disk spells it.
+	fn disk_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+		fn walk(
+			root: &Path,
+			dir: &Path,
+			out: &mut Vec<(String, Option<Vec<u8>>)>,
+		) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let entry = entry.unwrap();
+				let path = entry.path();
+				if path.file_name().is_some_and(|n| n == ".git") {
+					continue;
+				}
+				let rel = path
+					.strip_prefix(root)
+					.unwrap()
+					.to_string_lossy()
+					.replace('\\', "/");
+				if entry.file_type().unwrap().is_dir() {
+					out.push((rel, None));
+					walk(root, &path, out);
+				} else {
+					out.push((rel, Some(fs::read(&path).unwrap())));
+				}
+			}
+		}
+		let mut out = Vec::new();
+		walk(root, root, &mut out);
+		out.sort();
+		out
+	}
+
+	// Issue #146 point 5: a spelling only the disk has (untracked, ignored
+	// or an empty directory) is refused like a tracked one. Whether git then
+	// commits depends on the common prefix of the commit's paths (see
+	// `git_commit_only_fails_through_a_disk_only_case_alias`), so this is a
+	// rule, not a prediction.
+	#[test]
+	fn case_alias_refuses_every_disk_only_spelling() {
+		let _fold = force_fold_case(true);
+		let added = |p: &str| change(p, FileChange::Added, Some("n\n"));
+		let modified = |p: &str| change(p, FileChange::Modified, Some("n\n"));
+		type Setup = fn(&Repo);
+		let cases: Vec<(&str, Setup, Vec<CommitFile>)> = vec![
+			(
+				"P1 untracked directory, one path",
+				|r| r.write("Build/x.txt", b"x\n"),
+				vec![added("build/out.txt")],
+			),
+			(
+				"P2 untracked directory, two paths",
+				|r| r.write("Build/x.txt", b"x\n"),
+				vec![added("build/out.txt"), added("other.txt")],
+			),
+			(
+				"P3 ignored directory",
+				|r| {
+					r.write(".gitignore", b"Build/\n");
+					r.commit("ignore", "2019-01-02T00:00:00+00:00");
+					r.write("Build/x.txt", b"x\n");
+				},
+				vec![added("build/out.txt"), added("other.txt")],
+			),
+			(
+				"P4 directory ignored by its other spelling",
+				|r| {
+					r.write(".gitignore", b"build/\n");
+					r.commit("ignore", "2019-01-02T00:00:00+00:00");
+					r.write("Build/x.txt", b"x\n");
+				},
+				vec![added("build/out.txt"), added("other.txt")],
+			),
+			(
+				"P5 empty directory",
+				|r| fs::create_dir(r.path().join("Build")).unwrap(),
+				vec![added("build/out.txt"), added("other.txt")],
+			),
+			(
+				"P6 untracked file, added",
+				|r| r.write("Foo.txt", b"old\n"),
+				vec![added("foo.txt")],
+			),
+			(
+				"P7 untracked file, modified",
+				|r| r.write("Foo.txt", b"old\n"),
+				vec![modified("foo.txt")],
+			),
+			(
+				"P8 ignored file, added",
+				|r| {
+					r.write(".gitignore", b"Foo.txt\n");
+					r.commit("ignore", "2019-01-02T00:00:00+00:00");
+					r.write("Foo.txt", b"old\n");
+				},
+				vec![added("foo.txt")],
+			),
+			(
+				"P9 file and directory both aliases",
+				|r| r.write("Build/Out.txt", b"old\n"),
+				vec![modified("build/out.txt")],
+			),
+			(
+				"P10 nested untracked directory",
+				|r| {
+					r.write("src/a.txt", b"a\n");
+					r.commit("src", "2019-01-02T00:00:00+00:00");
+					r.write("src/Gen/x.txt", b"x\n");
+				},
+				vec![added("src/gen/y.txt"), added("src/z.txt")],
+			),
+			(
+				"P11 two levels deep",
+				|r| r.write("Build/Sub/x.txt", b"x\n"),
+				vec![added("build/sub/y.txt"), added("keep2.txt")],
+			),
+			(
+				"P12 delete through an untracked file",
+				|r| r.write("Foo.txt", b"old\n"),
+				vec![change("foo.txt", FileChange::Deleted, None)],
+			),
+			(
+				"P13 rename from an untracked file",
+				|r| r.write("Foo.txt", b"old\n"),
+				vec![{
+					let mut f =
+						change("bar.txt", FileChange::Renamed, Some("old\n"));
+					f.old_path = Some("foo.txt".into());
+					f
+				}],
+			),
+		];
+		for (name, setup, files) in cases {
+			let dst = Repo::new("main");
+			dst.write("keep.txt", b"keep\n");
+			dst.commit("base", "2019-01-01T00:00:00+00:00");
+			setup(&dst);
+			let payload = bob("alias\n", files);
+			let g = dst.open();
+			let head = dst.git(&["rev-parse", "HEAD"]);
+			let status = dst.git(&["status", "--porcelain", "--ignored"]);
+			let disk = disk_snapshot(&dst.path());
+			let plan = plan_commit_replay(&g, &payload);
+			assert_eq!(
+				plan.commits.last().unwrap().refused_by(),
+				Some(LayoutConflict::CaseAlias),
+				"{name}: {plan:?}"
+			);
+			let result = replay(&g, &payload);
+			let failure = result.failure.clone().unwrap_or_else(|| {
+				panic!("{name}: replay was not refused: {result:?}")
+			});
+			assert_eq!(
+				failure.layout_conflict,
+				Some(LayoutConflict::CaseAlias),
+				"{name}: {failure:?}"
+			);
+			assert!(result.created.is_empty(), "{name}: {result:?}");
+			assert_eq!(dst.git(&["rev-parse", "HEAD"]), head, "{name}");
+			assert_eq!(
+				dst.git(&["status", "--porcelain", "--ignored"]),
+				status,
+				"{name}"
+			);
+			assert_eq!(disk_snapshot(&dst.path()), disk, "{name}");
+		}
+	}
+
+	// Issue #146 point 5, the premise: what git itself does when asked for a
+	// spelling only the disk has. Not a test of snip, but of why
+	// `case_alias` refuses those: git commits one path through the other
+	// spelling of an untracked folder, and fails (after staging the other
+	// paths) once a second path widens the pathspec. The filesystem is
+	// probed, not forced.
+	#[test]
+	fn git_commit_only_fails_through_a_disk_only_case_alias() {
+		const PREMISE: &str =
+			"premise of #146 changed: revisit commits::case_alias";
+		use std::io::Write as _;
+		use std::process::Stdio;
+		// Writes `paths` as replay does, then stages and commits only them.
+		// `None` when the commit succeeded.
+		fn replay_like(dst: &Repo, paths: &[&str]) -> Option<String> {
+			for p in paths {
+				crate::fsutil::write_text_file(&dst.path().join(p), "new\n")
+					.unwrap();
+			}
+			let mut add = vec!["--literal-pathspecs", "add", "-A", "-f", "--"];
+			add.extend(paths);
+			let _ = dst.cmd(&add).output().unwrap();
+			let mut commit = vec![
+				"--literal-pathspecs",
+				"commit",
+				"--quiet",
+				"--only",
+				"--no-verify",
+				"--allow-empty",
+				"--cleanup=verbatim",
+				"-F",
+				"-",
+				"--",
+			];
+			commit.extend(paths);
+			let mut child = dst
+				.cmd(&commit)
+				.stdin(Stdio::piped())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped())
+				.spawn()
+				.unwrap();
+			child.stdin.take().unwrap().write_all(b"alias\n").unwrap();
+			let out = child.wait_with_output().unwrap();
+			(!out.status.success())
+				.then(|| String::from_utf8_lossy(&out.stderr).into_owned())
+		}
+		let case = |untracked: &str, paths: &[&str]| {
+			let dst = Repo::new("main");
+			dst.write("keep.txt", b"keep\n");
+			dst.commit("base", "2019-01-01T00:00:00+00:00");
+			dst.write(untracked, b"old\n");
+			let failed = replay_like(&dst, paths);
+			let staged = dst.git(&["diff", "--cached", "--name-only"]);
+			(dst, failed, staged)
+		};
+		let insensitive = {
+			let probe = Repo::new("main");
+			crate::transfer::fs_is_case_insensitive(&probe.path())
+		};
+		let (_a, a, _) = case("Build/x.txt", &["build/out.txt"]);
+		let (_b, b, b_staged) =
+			case("Build/x.txt", &["build/out.txt", "other.txt"]);
+		let (_c, c, _) = case("Foo.txt", &["foo.txt"]);
+		if insensitive {
+			assert!(a.is_none(), "{PREMISE}: {a:?}");
+			assert!(b.is_some(), "{PREMISE}");
+			assert!(b_staged.contains("other.txt"), "{PREMISE}: {b_staged}");
+			// Keeping the old spelling on `rename(2)` is APFS's doing; NTFS's
+			// `MoveFileEx` may take the new name, and that is not checked here.
+			#[cfg(target_os = "macos")]
+			assert!(c.is_some(), "{PREMISE}");
+			let _ = &c;
+		} else {
+			assert!(a.is_none(), "{PREMISE}: {a:?}");
+			assert!(b.is_none(), "{PREMISE}: {b:?}");
+			assert!(c.is_none(), "{PREMISE}: {c:?}");
+		}
 	}
 
 	#[test]
