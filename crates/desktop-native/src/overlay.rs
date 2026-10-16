@@ -70,6 +70,21 @@ impl OverlayKind {
 		}
 	}
 
+	/// The layer gives the keyboard back to where it was opened from, so a
+	/// layer opened over another one's keyboard inherits where that one
+	/// would have sent it. The others have a fixed place: a Log dropdown
+	/// the Log, a context menu its pane, the find bar the reader.
+	pub(crate) const fn returns_to_opener(self) -> bool {
+		match self {
+			OverlayKind::WorkspaceMenu
+			| OverlayKind::Selector(_)
+			| OverlayKind::AddRepoField => true,
+			OverlayKind::LogMenu(_)
+			| OverlayKind::ContextMenu
+			| OverlayKind::FindBar => false,
+		}
+	}
+
 	/// A tooltip would land on this layer's panel or on the controls under
 	/// it, so none shows while it is open. An inline layer is part of its
 	/// pane and takes none of that away.
@@ -813,9 +828,10 @@ impl WorkbenchModel {
 	}
 
 	/// Opens a layer; the one door in. A floating layer replaces the open
-	/// one, and an inline layer closes it: the keyboard is a floating
-	/// layer's to give back, so the newer layer inherits where the older
-	/// one would have sent it.
+	/// one, and an inline layer closes it. A layer that gives the keyboard
+	/// back to where it was opened from (`returns_to_opener`) and finds it
+	/// in the older layer inherits where the older one would have sent it;
+	/// the others have a fixed place.
 	pub(crate) fn open_layer(
 		&mut self,
 		kind: OverlayKind,
@@ -835,7 +851,8 @@ impl WorkbenchModel {
 			return;
 		}
 		let mut ret = ret;
-		if let Some(w) = window.as_deref() {
+		if let Some(w) = window.as_deref().filter(|_| kind.returns_to_opener())
+		{
 			if let Some(f) = w.focused(cx) {
 				let in_layer = |owned: &[FocusHandle]| {
 					owned.iter().any(|o| o.contains(&f, w))

@@ -24371,14 +24371,15 @@ mod tests {
 					focus_name(&model, cx),
 					"reader",
 				);
-				// 8: the same for a Log dropdown opened over a selector.
+				// 8: a Log dropdown that takes the keyboard (its filter field)
+				// opened after a selector gives it back to the Log.
 				cx.simulate_keystrokes("alt-1");
 				settle_checked(cx, &model);
 				cx.simulate_keystrokes("alt-shift-r");
 				settle_checked(cx, &model);
-				Opener::Click("log-filter-user", "log-menu:User")
+				Opener::Click("log-filter-branch", "log-menu:Branch")
 					.fire(&model, cx);
-				assert_eq!(floating_now(&model, cx), ["log-menu:User"]);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Branch"]);
 				cx.simulate_keystrokes("escape");
 				settle_checked(cx, &model);
 				check(
