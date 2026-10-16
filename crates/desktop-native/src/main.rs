@@ -225,6 +225,7 @@ fn ready_marker(name: &str) {
 	let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+mod dirtree;
 mod githost;
 pub mod graph_view;
 mod history;
