@@ -1867,4 +1867,174 @@ mod render_tests {
 			.style_drift_line("text-fit:t:author")
 			.starts_with("[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:t:author"));
 	}
+
+	// ── the cut: what the floor and the probe say is what gpui draws ──
+
+	/// A real text system with the embedded fonts, or `false` where the OS
+	/// has none (only a CI that requires every test may not skip).
+	fn real_fonts(cx: &mut TestAppContext) -> bool {
+		if !cx.use_real_text_system() {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+					|| cfg!(windows),
+				"no real text system on this OS"
+			);
+			return false;
+		}
+		cx.update(|cx| crate::theme::register_fonts(cx));
+		true
+	}
+
+	/// How many whole graphemes of `text` gpui's own ellipsis keeps in a
+	/// text node `avail` wide, from `LineWrapper::truncate_line` itself: the
+	/// call `text_ellipsis` makes when it lays the text out.
+	fn gpui_kept(
+		window: &Window,
+		style: FitStyle,
+		text: &str,
+		avail: f32,
+	) -> usize {
+		let mut font = gpui::font(style.family);
+		font.weight = style.weight;
+		let mut runs = vec![gpui::TextRun {
+			len: text.len(),
+			font: font.clone(),
+			color: gpui::black(),
+			background_color: None,
+			underline: None,
+			strikethrough: None,
+		}];
+		let mut wrapper =
+			window.text_system().line_wrapper(font, px(style.size));
+		let cut = wrapper.truncate_line(
+			text.to_string().into(),
+			px(avail),
+			ELLIPSIS,
+			&mut runs,
+		);
+		match cut.strip_suffix(ELLIPSIS).filter(|_| cut.as_ref() != text) {
+			Some(kept) => grapheme_count(kept),
+			None => grapheme_count(text),
+		}
+	}
+
+	struct Blank;
+
+	impl Render for Blank {
+		fn render(
+			&mut self,
+			_: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			div().size_full()
+		}
+	}
+
+	/// Names whose letters kern: gpui adds a cut text up one character at a
+	/// time, so the width of its prefix is not the shaped width of that
+	/// prefix. (role, the viewer's own, text)
+	const KERNED: [(FitRole, bool, &str); 6] = [
+		(FitRole::Author, true, "Taylor Smith"),
+		(FitRole::Author, false, "Taylor Smith"),
+		(FitRole::Author, true, "AVAVAV Tomas"),
+		(FitRole::Author, false, "AVAVAV Tomas"),
+		(FitRole::Subject, false, "AVAVAVAV To Ty Te Wa long subject"),
+		(FitRole::PaneRefName, false, "Taylor/AVAVAV-WAVE-branch"),
+	];
+
+	/// At its floor the text keeps what its rule asks of it in what gpui
+	/// really draws, not in what the whole shaped line would let it keep.
+	#[gpui::test]
+	fn a_kerned_text_keeps_its_rule_at_the_floor_in_what_gpui_cuts(
+		cx: &mut TestAppContext,
+	) {
+		if !real_fonts(cx) {
+			return;
+		}
+		let (_, cx) = cx.add_window_view(|_, _| Blank);
+		cx.update(|window, _| {
+			for (role, own, text) in KERNED {
+				let style = role.style_for(own);
+				let m = role_measure_for(window, role, own);
+				let floor = floor_px(role, text, 0, &m);
+				let want = match role.rule() {
+					FitRule::Readable(n) => n,
+					rule => panic!("{rule:?} is no readable floor"),
+				};
+				let kept =
+					gpui_kept(window, style, text, floor - role.chrome());
+				assert!(
+					kept >= want,
+					"{role:?} own={own} {text:?}: gpui keeps {kept} of {want} \
+					 at the floor {floor:.2}"
+				);
+			}
+		});
+	}
+
+	/// The probe counts what gpui keeps, at every width a box can have.
+	#[gpui::test]
+	fn the_probe_counts_what_gpui_keeps_at_every_width(
+		cx: &mut TestAppContext,
+	) {
+		if !real_fonts(cx) {
+			return;
+		}
+		let (_, cx) = cx.add_window_view(|_, _| Blank);
+		cx.update(|window, _| {
+			let mut bad = Vec::new();
+			for (role, own, text) in KERNED {
+				let style = role.style_for(own);
+				let m = role_measure_for(window, role, own);
+				let natural = natural_px(role, text, &m);
+				let mut visible = role.chrome();
+				while visible < natural + 4. {
+					let (shown, total) =
+						shown_graphemes(role, text, visible, &m);
+					let kept = gpui_kept(
+						window,
+						style,
+						text,
+						visible - role.chrome(),
+					);
+					if shown != kept || total != grapheme_count(text) {
+						bad.push(format!(
+							"{role:?} own={own} {text:?} at {visible:.2}: probe {shown}/{total}, gpui keeps {kept}"
+						));
+					}
+					visible += 0.37;
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} widths disagree:\n{}",
+				bad.len(),
+				bad[..bad.len().min(12)].join("\n")
+			);
+		});
+	}
+
+	/// A whole-or-nothing text is whole in the box its natural width gives
+	/// it: the box also holds the sum gpui adds up character by character.
+	#[gpui::test]
+	fn a_kerned_text_is_whole_in_its_natural_box(cx: &mut TestAppContext) {
+		if !real_fonts(cx) {
+			return;
+		}
+		let (_, cx) = cx.add_window_view(|_, _| Blank);
+		cx.update(|window, _| {
+			for (role, own, text) in KERNED {
+				let style = role.style_for(own);
+				let m = role_measure_for(window, role, own);
+				let natural = natural_px(role, text, &m);
+				let kept =
+					gpui_kept(window, style, text, natural - role.chrome());
+				assert_eq!(
+					kept,
+					grapheme_count(text),
+					"{role:?} own={own} {text:?} is cut in its natural box {natural:.2}"
+				);
+			}
+		});
+	}
 }
