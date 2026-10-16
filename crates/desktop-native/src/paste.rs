@@ -2197,6 +2197,13 @@ impl PastePreviewPlan {
 			limit,
 			remote,
 		)?;
+		// A refusal that carries the engine's suggestion lands as the panel
+		// it was opened on, like a retarget's (`retarget_with`): not
+		// executable, with the error, and [Adjust paths] recovers it. One
+		// without a suggestion leaves nothing to keep.
+		if plan.restore_hint().is_some() {
+			return Ok(plan);
+		}
 		if let Some(err) = failed {
 			return Err(err);
 		}

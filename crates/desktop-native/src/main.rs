@@ -18696,14 +18696,16 @@ mod tests {
 			});
 		}
 
-		/// The same path twice: the engine refuses the plan as it stands,
-		/// before any adjustment is chosen.
+		/// The same path twice at the root: the engine refuses the plan as
+		/// it stands, before any adjustment is chosen, and has nothing to
+		/// suggest (no folder to strip).
 		const RESTORE_BASE_REFUSED_PAYLOAD: &str =
-			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/a.ts\ny\n";
+			"// clipcode-root: mono\n// FILE: a.ts\nx\n// FILE: a.ts\ny\n";
 
-		/// A first plan the engine refuses opens no preview, so there is no
-		/// hint row to leave behind (#240): the panel needs a plan to hang
-		/// the hint on, and it says why on the status line.
+		/// A first plan the engine refuses without a suggestion opens no
+		/// preview, so there is no hint row to leave behind (#240): it says
+		/// why on the status line. One that carries a suggestion lands as a
+		/// panel instead (`a_new_paste_into_a_refused_folder_...`).
 		fn assert_first_plan_refused_without_a_panel(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
