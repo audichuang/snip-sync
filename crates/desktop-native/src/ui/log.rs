@@ -1166,7 +1166,7 @@ impl WorkbenchModel {
 		});
 		let more = natural_px(
 			FitRole::ChipMore,
-			&t("log_chip_more", loc),
+			t("log_chip_more", loc),
 			&role_measure(window, FitRole::ChipMore),
 		);
 		let more_dot = more + MORE_DOT_W + MORE_BORDER_W;
@@ -3500,9 +3500,11 @@ mod row_fit_tests {
 				let s = log_date_in(
 					iso,
 					loc,
-					chrono::DateTime::parse_from_rfc3339("2027-06-01T00:00:00Z")
-						.unwrap()
-						.with_timezone(&chrono::Utc),
+					chrono::DateTime::parse_from_rfc3339(
+						"2027-06-01T00:00:00Z",
+					)
+					.unwrap()
+					.with_timezone(&chrono::Utc),
 					&chrono::Utc,
 				);
 				assert!(m(&s) <= need, "{loc:?} {s:?}");
