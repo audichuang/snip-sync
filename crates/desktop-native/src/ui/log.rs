@@ -2,8 +2,8 @@
 
 use super::fit::{
 	fit_row, floor_px, natural_px, record_dropped, role_measure, Claim,
-	FitCell, FitId, FitRole, FitStyle, Part, RowFit, CHIP_CHROME_W, FIT_MARGIN,
-	MORE_ICON_W,
+	FitCell, FitId, FitRole, FitStyle, Measure, Part, RowFit, CHIP_CHROME_W,
+	FIT_MARGIN, MORE_ICON_W,
 };
 use super::*;
 
@@ -879,10 +879,12 @@ pub(super) fn fit_log_row(
 /// have: every digit position of the longest forms (a double-digit month and
 /// day, the latest time, and the today and yesterday forms) takes the widest
 /// digit `measure` knows, which no date can exceed.
-pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
+pub(super) fn date_need_w(loc: Locale, measure: &dyn Measure) -> f32 {
 	let widest = ('0'..='9')
 		.max_by(|a, b| {
-			measure(&a.to_string()).total_cmp(&measure(&b.to_string()))
+			measure
+				.width(&a.to_string())
+				.total_cmp(&measure.width(&b.to_string()))
 		})
 		.unwrap_or('0');
 	let time = "23:59";
@@ -904,7 +906,7 @@ pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
 			.chars()
 			.map(|c| if c.is_ascii_digit() { widest } else { c })
 			.collect();
-		measure(&wide)
+		measure.drawn(&wide)
 	})
 	.fold(0., f32::max)
 }
@@ -1151,8 +1153,9 @@ impl WorkbenchModel {
 			let role = chip_role(menu);
 			let m = role_measure(window, role);
 			let (text, key_end) = Self::log_chip_text(&label, &value);
-			let natural =
-				CHIP_CHROME_W + m(&text).min(CHIP_TEXT_MAX_W) + FIT_MARGIN;
+			let natural = CHIP_CHROME_W
+				+ m.drawn(&text).min(CHIP_TEXT_MAX_W)
+				+ FIT_MARGIN;
 			let valued = value.is_some();
 			ChipInput {
 				natural,

@@ -16061,6 +16061,10 @@ mod tests {
 			/// in than in the regular one (#229 review).
 			const OWN_AUTHOR: &str = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW <me@x>";
 
+			/// A name whose letters kern (T-a, a-y): gpui cuts it by the sum of
+			/// its characters, which the shaped line is narrower than.
+			const KERNED_AUTHOR: &str = "Taylor Smith <ts@x>";
+
 			fn fit_fixture(dir: &Path) -> FitFixture {
 				let r = dir.join("solo");
 				fs::create_dir(&r).unwrap();
@@ -16082,7 +16086,12 @@ mod tests {
 				};
 				commit("init.txt", "init", None, "2025-10-01T10:00:00Z");
 				git(&r, &["checkout", "-q", "-b", "side"]);
-				commit("side.txt", "side work", None, "2025-10-02T10:00:00Z");
+				commit(
+					"side.txt",
+					"side work",
+					Some("AVAVAV Tomas <av@x>"),
+					"2025-10-02T10:00:00Z",
+				);
 				git(&r, &["checkout", "-q", "main"]);
 				git_dated(
 					&r,
@@ -16127,7 +16136,7 @@ mod tests {
 				commit(
 					"bump.txt",
 					"bump dependencies and regenerate the lockfile for the release",
-					None,
+					Some(KERNED_AUTHOR),
 					"2025-12-20T15:30:00Z",
 				);
 				for t in ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"] {

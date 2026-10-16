@@ -108,3 +108,14 @@ after it: without the embedded fonts "Inter" falls back to a system font and
 the same string measures 249.6 instead of 232.0 (7% off). `open_real_text` in
 `crates/desktop-native/src/main.rs` does both and asserts the families
 resolve (#228).
+
+`src/text_system/line_wrapper.rs`, `LineWrapper::truncate_line`: the cut
+decision moved into the free function `truncation_ix`, which `truncate_line`
+calls with the wrapper's own character widths, and `LineWrapper::char_advance`
+is public. The behaviour of `truncate_line` is unchanged. The Log's text fit
+(`crates/desktop-native/src/ui/fit.rs`) calls the same two to decide the
+floor of a text, the width a box must have, and how much of a text is in
+sight: a second copy of the algorithm drifted from gpui's (it sums the
+characters one by one, so a kerned name such as "Taylor Smith" is cut earlier
+than its shaped width says). The unit tests in `fit.rs` compare it with
+`truncate_line` on real fonts.

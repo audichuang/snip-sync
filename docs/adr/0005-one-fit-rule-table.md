@@ -23,8 +23,9 @@ Log 工具視窗裡一段文字和別的文字搶寬度時（commit 列的 subje
 | `PaneGroup`、`PaneRefName`、`MenuRefName` | `Readable(6)` | 一定有 |
 | `PaneRepo`、`MenuRepo`（repo 後綴） | `Whole` | 整段或沒有 |
 
-- `Readable(n)` 的下限寬是 chrome（標籤的圖示與間隔、chip 的內距與圖示）加「前 n 個 grapheme 加 `…`」的量測寬再加 1px；文字不超過 n 個 grapheme 時，下限就是整段。`KeyValue(n)` 的鍵一定完整，值至少 n 個 grapheme。`Whole` 的下限等於自然寬。
-- 那 1px（`FIT_MARGIN`）對齊 gpui 的省略號：它逐字元加總寬度，加總後捨去小數仍大於盒寬才截（`LineWrapper::truncate_line`），所以量出的整形寬度剛好放進去的盒子，仍可能被截。每個自然寬與下限寬都含這 1px。
+- `Readable(n)` 的下限寬是 chrome（標籤的圖示與間隔、chip 的內距與圖示）加「前 n 個 grapheme 加 `…`」的寬再加 1px；文字不超過 n 個 grapheme 時，下限就是整段。`KeyValue(n)` 的鍵一定完整，值至少 n 個 grapheme。`Whole` 的下限等於自然寬。
+- 「寬」指 gpui 截斷時算的寬度：它逐字元加總（`LineWrapper::truncate_line`），不是整段文字整形後的寬度；有字偶距的名字（`Taylor Smith`、`AVAVAV`）加總比整形寬好幾 px，整形寬量出的下限會只留「Ta…」。所以下限、自然寬（取整形寬與加總的較大者）與 `TEXT_FIT` 的 `shown` 都經過同一個 `Measure`，截在哪裡由 vendored gpui 的 `truncation_ix`（`truncate_line` 自己呼叫的函式）決定，探針與繪製不可能有兩套算法。
+- 那 1px（`FIT_MARGIN`）涵蓋實體像素對齊讓盒子少半 px：gpui 在加總捨去小數仍大於盒寬時才截，且保留的前綴加省略號要嚴格小於盒寬。每個自然寬與下限寬都含這 1px。
 
 ## 全序
 

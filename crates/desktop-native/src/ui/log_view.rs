@@ -2,7 +2,7 @@
 
 use super::fit::{
 	floor_px, natural_px, record_dropped, role_measure, role_measure_for,
-	FitCell, FitId, FitRole, ELLIPSIS, FIT_MARGIN,
+	FitCell, FitId, FitRole, Measure, ELLIPSIS, FIT_MARGIN,
 };
 use super::log::row_policy::*;
 use super::*;
@@ -685,7 +685,7 @@ impl WorkbenchModel {
 		let subject = ui(FitRole::Subject);
 		let bound = ["\u{6f22}", "W"]
 			.iter()
-			.map(|c| subject(&format!("{}{ELLIPSIS}", c.repeat(6))))
+			.map(|c| subject.drawn(&format!("{}{ELLIPSIS}", c.repeat(6))))
 			.fold(0., f32::max)
 			+ FIT_MARGIN;
 		let mut seen = HashSet::new();

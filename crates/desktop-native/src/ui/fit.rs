@@ -3,9 +3,12 @@
 //! shares a row's width ([`fit_row`]) and the `TEXT_FIT` probe that checks
 //! what was drawn against it.
 //!
-//! The first half is pure: it needs no GPUI, only a `measure` function from
-//! text to width. The second draws a text in its box ([`FitCell`]) and
-//! reports it to the probe.
+//! The first half is pure: it needs no window, only a [`Measure`] of a text.
+//! The second draws a text in its box ([`FitCell`]) and reports it to the
+//! probe. What a cut shows is decided in one place, gpui's `truncation_ix`
+//! (the function behind its `text_ellipsis`): the floors, the boxes and the
+//! probe call it with the widths the text system gives, so none of them can
+//! disagree with the cut that is drawn.
 
 use std::fmt;
 
@@ -113,11 +116,10 @@ pub(crate) const CHIP_CHROME_W: f32 = 27.;
 /// front of the icon, which is not part of [`FitRole::chrome`].
 pub(crate) const MORE_PAD_W: f32 = 8.;
 pub(crate) const MORE_ICON_W: f32 = 10.;
-/// What gpui's ellipsis needs beyond the shaped width: it adds up the
-/// characters one by one, which can come out a hair wider than the shaped
-/// line, and cuts the line when that sum, rounded down, exceeds the box
-/// (`LineWrapper::truncate_line`). Every width the rule table gives
-/// includes it.
+/// What a box keeps beyond the width gpui's ellipsis adds up: a box snapped to
+/// a physical pixel can come out up to half a pixel under it, and gpui cuts a
+/// line when its sum, rounded down, exceeds the box (`truncation_ix`). Every
+/// width the rule table gives includes it.
 pub(crate) const FIT_MARGIN: f32 = 1.;
 
 pub(crate) const ELLIPSIS: &str = "\u{2026}";
@@ -330,24 +332,71 @@ fn prefix_graphemes(s: &str, n: usize) -> &str {
 	}
 }
 
+/// What the text system says of a text in one style.
+pub(crate) trait Measure {
+	/// The width of `s` shaped as one line: what is drawn.
+	fn width(&self, s: &str) -> f32;
+
+	/// A function from a character to its width laid out alone. gpui adds a
+	/// line up from these when it cuts it, so the sum is not the shaped
+	/// width: a kerned pair is narrower shaped than as two characters.
+	fn char_widths(&self) -> Box<dyn FnMut(char) -> f32 + '_>;
+
+	/// The width gpui's ellipsis counts `s` as: its characters added up.
+	fn advance(&self, s: &str) -> f32 {
+		let mut width = self.char_widths();
+		s.chars().map(&mut *width).sum()
+	}
+
+	/// The room `s` needs to be drawn whole: the shaped line, and the sum
+	/// gpui adds up to decide it is not cut, whichever is wider.
+	fn drawn(&self, s: &str) -> f32 {
+		self.width(s).max(self.advance(s))
+	}
+
+	/// Where gpui cuts `s` when its text node is `avail` wide: the byte
+	/// index the kept text ends at, or `None` when all of it is kept. This
+	/// is gpui's own decision (`gpui::truncation_ix`).
+	fn cut(&self, s: &str, avail: f32) -> Option<usize> {
+		let mut width = self.char_widths();
+		let suffix = ELLIPSIS.chars().map(&mut *width).sum::<f32>();
+		gpui::truncation_ix(s, px(avail), px(suffix), |c| px(width(c)))
+	}
+}
+
+/// A text system that measures every character the same, as the tests'
+/// closures do: `s`'s width is the sum of its characters'.
+impl<F: Fn(&str) -> f32> Measure for F {
+	fn width(&self, s: &str) -> f32 {
+		self(s)
+	}
+
+	fn char_widths(&self) -> Box<dyn FnMut(char) -> f32 + '_> {
+		Box::new(move |c| self(c.encode_utf8(&mut [0; 4])))
+	}
+}
+
 /// The width of the whole text in its role's box: its chrome, the text, and
-/// [`FIT_MARGIN`].
+/// [`FIT_MARGIN`]. A text is whole only where gpui's character-by-character
+/// sum fits, so the box holds that when it is wider than the shaped line.
 pub(crate) fn natural_px(
 	role: FitRole,
 	text: &str,
-	measure: &dyn Fn(&str) -> f32,
+	measure: &dyn Measure,
 ) -> f32 {
-	role.chrome() + measure(text) + FIT_MARGIN
+	role.chrome() + measure.width(text).max(measure.advance(text)) + FIT_MARGIN
 }
 
 /// The narrowest the role's rule allows `text`'s box (see [`FitRule`]); never
 /// more than [`natural_px`]. `key_end` is where a `KeyValue` text's key ends
-/// (a byte index; the key is what comes before, `": "` included).
+/// (a byte index; the key is what comes before, `": "` included). The box
+/// keeps the rule's graphemes where gpui cuts, so the prefix and the ellipsis
+/// are measured as gpui adds them up.
 pub(crate) fn floor_px(
 	role: FitRole,
 	text: &str,
 	key_end: usize,
-	measure: &dyn Fn(&str) -> f32,
+	measure: &dyn Measure,
 ) -> f32 {
 	let natural = natural_px(role, text, measure);
 	let kept = match role.rule() {
@@ -356,7 +405,7 @@ pub(crate) fn floor_px(
 			if grapheme_count(text) <= n {
 				return natural;
 			}
-			format!("{}{ELLIPSIS}", prefix_graphemes(text, n))
+			prefix_graphemes(text, n)
 		}
 		FitRule::KeyValue(n) => {
 			let key_end = key_end.min(text.len());
@@ -364,43 +413,32 @@ pub(crate) fn floor_px(
 			if grapheme_count(value) <= n {
 				return natural;
 			}
-			format!("{key}{}{ELLIPSIS}", prefix_graphemes(value, n))
+			&text[..key.len() + prefix_graphemes(value, n).len()]
 		}
 	};
-	(role.chrome() + measure(&kept) + FIT_MARGIN).min(natural)
+	let cut = format!("{kept}{ELLIPSIS}");
+	(role.chrome() + measure.drawn(&cut) + FIT_MARGIN).min(natural)
 }
 
 /// How many graphemes of `text` a box `visible` wide shows, of how many it
-/// has: all of them when the whole text fits, else the most whose prefix and
-/// the ellipsis fit (the way gpui cuts).
+/// has: all of them when gpui keeps the whole text, else the whole graphemes
+/// before the byte where gpui cuts it.
 pub(crate) fn shown_graphemes(
 	role: FitRole,
 	text: &str,
 	visible: f32,
-	measure: &dyn Fn(&str) -> f32,
+	measure: &dyn Measure,
 ) -> (usize, usize) {
 	let total = grapheme_count(text);
-	if role.chrome() + measure(text) <= visible + 0.5 {
-		return (total, total);
+	match measure.cut(text, visible - role.chrome()) {
+		None => (total, total),
+		Some(kept) => (
+			text.grapheme_indices(true)
+				.take_while(|(i, g)| i + g.len() <= kept)
+				.count(),
+			total,
+		),
 	}
-	// gpui's ellipsis keeps the prefix whose width and the ellipsis's stay
-	// under the box; the margin is the floor's, it is not asked of what is
-	// seen (a box snapped to a physical pixel can be 0.5px under it).
-	let fits = |k: usize| {
-		let kept = format!("{}{ELLIPSIS}", prefix_graphemes(text, k));
-		role.chrome() + measure(&kept) <= visible + 0.01
-	};
-	// The most graphemes that fit; a longer prefix is never narrower.
-	let (mut lo, mut hi) = (0, total);
-	while lo < hi {
-		let mid = (lo + hi).div_ceil(2);
-		if fits(mid) {
-			lo = mid;
-		} else {
-			hi = mid - 1;
-		}
-	}
-	(lo, total)
 }
 
 /// Whether `shown` of `total` graphemes satisfies `rule`; `key_graphemes` is a
@@ -662,11 +700,42 @@ pub(crate) fn text_width_in(
 	)
 }
 
+/// A style's measure of the text system: the shaped width of a text and the
+/// widths gpui's own line wrapper gives its characters.
+pub(crate) struct TextMeasure<'a> {
+	window: &'a Window,
+	family: &'a str,
+	size: f32,
+	weight: FontWeight,
+}
+
+impl<'a> TextMeasure<'a> {
+	fn font(&self) -> gpui::Font {
+		let mut font = gpui::font(self.family.to_string());
+		font.weight = self.weight;
+		font
+	}
+}
+
+impl Measure for TextMeasure<'_> {
+	fn width(&self, s: &str) -> f32 {
+		text_width_in(self.window, self.family, self.size, self.weight, s)
+	}
+
+	fn char_widths(&self) -> Box<dyn FnMut(char) -> f32 + '_> {
+		let mut wrapper = self
+			.window
+			.text_system()
+			.line_wrapper(self.font(), px(self.size));
+		Box::new(move |c| f32::from(wrapper.char_advance(c)))
+	}
+}
+
 /// `measure` for a role: its style from the text system.
 pub(crate) fn role_measure<'a>(
 	window: &'a Window,
 	role: FitRole,
-) -> impl Fn(&str) -> f32 + 'a {
+) -> TextMeasure<'a> {
 	style_measure(window, role.style())
 }
 
@@ -676,7 +745,7 @@ pub(crate) fn role_measure_for<'a>(
 	window: &'a Window,
 	role: FitRole,
 	own: bool,
-) -> impl Fn(&str) -> f32 + 'a {
+) -> TextMeasure<'a> {
 	style_measure(window, role.style_for(own))
 }
 
@@ -684,8 +753,13 @@ pub(crate) fn role_measure_for<'a>(
 pub(crate) fn style_measure<'a>(
 	window: &'a Window,
 	style: FitStyle,
-) -> impl Fn(&str) -> f32 + 'a {
-	move |s: &str| style.width(window, s)
+) -> TextMeasure<'a> {
+	TextMeasure {
+		window,
+		family: style.family,
+		size: style.size,
+		weight: style.weight,
+	}
 }
 
 /// Where a `TEXT_FIT` belongs: the scope is the id of the probe of the thing
@@ -1064,14 +1138,11 @@ impl FitCell {
 							_ => {
 								// Counted in what is on screen, so a drift
 								// cannot hide behind a kind measure.
-								let measure = |s: &str| {
-									text_width_in(
-										window,
-										painted.font_family.as_ref(),
-										painted_size,
-										painted.font_weight,
-										s,
-									)
+								let measure = TextMeasure {
+									window,
+									family: painted.font_family.as_ref(),
+									size: painted_size,
+									weight: painted.font_weight,
 								};
 								shown_graphemes(
 									role, &text, visible_w, &measure,
@@ -1156,6 +1227,70 @@ mod tests {
 	/// 0.6em per char, as the test text system measures (12px: 7.2).
 	fn noop(size: f32) -> impl Fn(&str) -> f32 {
 		move |s: &str| s.chars().count() as f32 * 0.6 * size
+	}
+
+	/// A text system with kerning: every character is 6px alone, a pair
+	/// listed in `PAIRS` is 2px narrower shaped.
+	struct Kerned;
+
+	impl Kerned {
+		const PAIRS: [&'static str; 4] = ["AV", "Ta", "To", "VA"];
+	}
+
+	impl Measure for Kerned {
+		fn width(&self, s: &str) -> f32 {
+			let chars: Vec<char> = s.chars().collect();
+			let pairs = chars
+				.windows(2)
+				.filter(|w| {
+					Self::PAIRS.contains(&w.iter().collect::<String>().as_str())
+				})
+				.count();
+			chars.len() as f32 * 6. - pairs as f32 * 2.
+		}
+
+		fn char_widths(&self) -> Box<dyn FnMut(char) -> f32 + '_> {
+			Box::new(|_| 6.)
+		}
+	}
+
+	/// The floor is where gpui's cut keeps the rule's graphemes, and gpui
+	/// adds characters up one by one: "AVAVAV" shapes 8px narrower than it
+	/// sums, so a floor taken from the shaped line is a pair of letters short.
+	#[test]
+	fn a_kerned_floor_is_where_the_cut_keeps_the_graphemes() {
+		let role = FitRole::Author; // Readable(3)
+		for text in ["AVAVAV Tomas", "Taylor Smith", "ToToTo ToTo"] {
+			let floor = floor_px(role, text, 0, &Kerned);
+			let (shown, total) = shown_graphemes(role, text, floor, &Kerned);
+			assert!(shown >= 3, "{text}: {shown}/{total} at the floor {floor}");
+			// The cut and the shown count are one function: a hair under the
+			// floor's margin the third grapheme is still kept, a pixel
+			// further in it is not.
+			let (a, _) = shown_graphemes(role, text, floor - 0.5, &Kerned);
+			let (b, _) = shown_graphemes(role, text, floor - 1.5, &Kerned);
+			assert_eq!((a, b), (3, 2), "{text}");
+			// What a shaped floor would have said: too narrow.
+			let shaped = role.chrome()
+				+ Kerned
+					.width(&format!("{}{ELLIPSIS}", prefix_graphemes(text, 3)))
+				+ FIT_MARGIN;
+			let (kept, _) = shown_graphemes(role, text, shaped, &Kerned);
+			assert!(kept < 3, "{text}: the shaped floor {shaped} keeps {kept}");
+		}
+	}
+
+	/// A text is whole only in a box that holds gpui's sum of its
+	/// characters, which kerning makes wider than the shaped line.
+	#[test]
+	fn a_kerned_text_is_whole_in_its_natural_box_pure() {
+		let role = FitRole::Subject;
+		let text = "AVAVAVAVAV";
+		let natural = natural_px(role, text, &Kerned);
+		assert_eq!(natural, role.chrome() + 60. + FIT_MARGIN);
+		assert_eq!(shown_graphemes(role, text, natural, &Kerned), (10, 10));
+		// 12px under, and a shaped natural width would have been: cut.
+		assert!(shown_graphemes(role, text, natural - 12., &Kerned).0 < 10);
 	}
 
 	// ── R1, R2: the rule table ──
@@ -1393,8 +1528,9 @@ mod tests {
 		assert_eq!(shown_graphemes(role, text, floor, &m), (6, 26));
 		assert!(rule_holds(role.rule(), 6, 26, 0));
 		assert!(!rule_holds(role.rule(), 5, 26, 0));
-		// A hair under the floor's margin: still six; a char less: five.
-		assert_eq!(shown_graphemes(role, text, floor - 1., &m), (6, 26));
+		// A box a physical pixel's half under the floor (the margin is 1px)
+		// still keeps six; a char less keeps five.
+		assert_eq!(shown_graphemes(role, text, floor - 0.5, &m), (6, 26));
 		assert_eq!(shown_graphemes(role, text, floor - 1.5, &m), (5, 26));
 		// Nothing fits.
 		assert_eq!(shown_graphemes(role, text, 1., &m), (0, 26));
@@ -2036,5 +2172,82 @@ mod render_tests {
 				);
 			}
 		});
+	}
+
+	/// A cell holding a kerned name in a box of a given width.
+	struct KernedCell {
+		probes: Option<Probes>,
+		text: &'static str,
+		own: bool,
+		width: Option<f32>,
+	}
+
+	impl Render for KernedCell {
+		fn render(
+			&mut self,
+			window: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			let role = FitRole::Author;
+			let width = self.width.unwrap_or_else(|| {
+				floor_px(
+					role,
+					self.text,
+					0,
+					&role_measure_for(window, role, self.own),
+				)
+			});
+			div()
+				.size_full()
+				.child(
+					div().w(px(300.)).child(
+						FitCell::new(FitId::new("t", role), self.text)
+							.own(self.own)
+							.fixed_width(width)
+							.render(&self.probes, window),
+					),
+				)
+				.children(probe_frame_end(&self.probes))
+		}
+	}
+
+	/// The cell drawn at its floor: the probe's `shown` is what gpui kept
+	/// of the text in the box it drew, and it satisfies the rule.
+	#[gpui::test]
+	fn a_cell_at_its_floor_shows_what_gpui_kept_and_the_probe_says_so(
+		cx: &mut TestAppContext,
+	) {
+		if !real_fonts(cx) {
+			return;
+		}
+		for (text, own) in [
+			("Taylor Smith", true),
+			("Taylor Smith", false),
+			("AVAVAV Tomas", true),
+		] {
+			let probes = Probes::for_test();
+			let shared = probes.clone();
+			let (_, cx) = cx.add_window_view(|_, _| KernedCell {
+				probes: Some(probes),
+				text,
+				own,
+				width: None,
+			});
+			cx.run_until_parked();
+			let f = shared
+				.text_fit("text-fit:t:author")
+				.expect("the text was recorded");
+			let kept = cx.update(|window, _| {
+				gpui_kept(
+					window,
+					f.style,
+					text,
+					f.visible - FitRole::Author.chrome(),
+				)
+			});
+			assert_eq!(f.shown, kept, "{f:?}");
+			assert!(f.shown >= 3, "{text} own={own}: {f:?}");
+			assert!(rule_holds(FitRole::Author.rule(), f.shown, f.total, 0));
+		}
 	}
 }
