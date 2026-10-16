@@ -48,10 +48,12 @@ REQUIRED_TOOLS = (
     "xclip",
     "git",
 )
-BOUNDS_RE = re.compile(
-    r"\[APP:CTRL_BOUNDS: id=(?P<id>.+?) x=(?P<x>-?\d+) y=(?P<y>-?\d+) "
-    r"w=(?P<w>\d+) h=(?P<h>\d+)\]"
-)
+# The id of a CTRL_* line can hold any character; it is read from the end of the line, by the
+# same patterns as every other harness (see bench_native_memory.py).
+try:
+    from bench_native_memory import BOUNDS_RE, CTRL_GONE_RE
+except ImportError:  # imported as scripts.check_native_ime
+    from scripts.bench_native_memory import BOUNDS_RE, CTRL_GONE_RE
 
 
 class ImeCheckError(Exception):
@@ -89,9 +91,9 @@ def parse_bounds(lines: list[str]) -> dict[str, tuple[int, int, int, int]]:
                 int(match["h"]),
             )
             continue
-        gone = re.search(r"\[APP:CTRL_GONE: id=(.+?)\]", line)
+        gone = CTRL_GONE_RE.search(line)
         if gone:
-            out.pop(gone[1], None)
+            out.pop(gone["id"], None)
     return out
 
 

@@ -516,7 +516,28 @@ THREE_TABS = 3
 # Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
 APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
-BOUNDS_RE = re.compile(r"\[APP:CTRL_BOUNDS: id=(?P<id>.+?) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+)\]")
+# The `[APP:...: id=<id> ...]` lines carry an id that can hold any character a repository, branch or
+# file name can: spaces, `=`, `:`, `]`, even a field's own name (`x=`, `rule=`). So no reader cuts an
+# id at its first space or `=`. The id is everything between `id=` and the fixed fields at the end of
+# the line (`x= y= w= h=`, `rule= ... shown=`, `fit= drawn=`), so these patterns are anchored at the
+# end and take the id greedily. A background tab's TEXT_FIT lines end in ` ws_tab=<n>` before the `]`
+# (the controls of a tab that is not shown are not read: CTRL_* lines of one carry no tab tag here).
+# `crates/native-e2e/src/lib.rs` reads the same lines by the same rule; scripts/real_ui_round.py and
+# scripts/check_native_ime.py use these patterns instead of their own.
+APP_TAB = r"(?: ws_tab=\d+)?"
+BOUNDS_RE = re.compile(r"\[APP:CTRL_BOUNDS: id=(?P<id>.+) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+)\]\s*$")
+CTRL_GONE_RE = re.compile(r"\[APP:CTRL_GONE: id=(?P<id>.+)\]\s*$")
+TEXT_FIT_RE = re.compile(
+    r"\[APP:TEXT_FIT: id=(?P<id>.+) rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
+    r"fit=(?P<fit>-|-?\d+) drawn=(?P<drawn>-?\d+) visible=(?P<visible>-?\d+) clipped=(?P<clipped>[01]) "
+    rf"cut=(?P<cut>[01]) shown=(?P<shown>\d+)/(?P<total>\d+){APP_TAB}\]\s*$"
+)
+TEXT_FIT_DRIFT_RE = re.compile(rf"\[APP:TEXT_FIT_DRIFT: id=(?P<id>.+) fit=(?P<fit>-?\d+) drawn=(?P<drawn>-?\d+){APP_TAB}\]\s*$")
+# A family can have spaces ("JetBrains Mono/13/400"), so the styles run to the next field.
+TEXT_FIT_STYLE_DRIFT_RE = re.compile(
+    rf"\[APP:TEXT_FIT_STYLE_DRIFT: id=(?P<id>.+) measured=(?P<measured>.+) drawn=(?P<drawn>.+?){APP_TAB}\]\s*$"
+)
+TEXT_FIT_GONE_RE = re.compile(rf"\[APP:TEXT_FIT_GONE: id=(?P<id>.+?){APP_TAB}\]\s*$")
 REPO_SELECT_RE = re.compile(r"\[APP:REPO_SELECTING: (?P<idx>\d+) \((?P<name>[^)]+)\)")
 FILE_HEADER_RE = re.compile(
     rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*([^\r\n]+)\r?\n"
@@ -569,9 +590,9 @@ def parse_bounds(lines: list[str]) -> dict[str, tuple[int, int, int, int]]:
         if m:
             out[m["id"]] = (int(m["x"]), int(m["y"]), int(m["w"]), int(m["h"]))
             continue
-        gone = re.search(r"\[APP:CTRL_GONE: id=(.+?)\]", line)
+        gone = CTRL_GONE_RE.search(line)
         if gone:
-            out.pop(gone[1], None)
+            out.pop(gone["id"], None)
     return out
 
 

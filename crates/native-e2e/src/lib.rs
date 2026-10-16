@@ -102,12 +102,40 @@ pub fn lookup_bounds(
 	bounds.get(first).copied()
 }
 
+// The `[APP:…: id=<id> …]` lines carry an id that can hold any character a
+// repository, branch or file name can: spaces, `=`, `:`, `]`, even a field's
+// own name. So no parser cuts an id at the first space or `=`. The text after
+// `id=` is read from its end, where the line's fixed fields are (`x= y= w= h=`,
+// `rule= … shown=`, `fit= drawn=`, `by=`), after the closing `]` and a
+// background tab's ` ws_tab=<n>` are taken off. `scripts/bench_native_memory.py`
+// reads the same lines by the same rule.
+
+/// What follows `[APP:<kind>: id=` in `line`, without the closing `]` and
+/// the tab tag.
+fn id_body<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
+	let marker = format!("[APP:{kind}: id=");
+	let rest = &line[line.find(&marker)? + marker.len()..];
+	Some(strip_tab_tag(rest.trim_end().strip_suffix(']')?))
+}
+
+/// `s` without a trailing ` ws_tab=<digits>`.
+fn strip_tab_tag(s: &str) -> &str {
+	match s.rfind(" ws_tab=") {
+		Some(i)
+			if !s[i + 8..].is_empty()
+				&& s[i + 8..].bytes().all(|b| b.is_ascii_digit()) =>
+		{
+			&s[..i]
+		}
+		_ => s,
+	}
+}
+
 /// Parses a `[APP:CTRL_BOUNDS: id=<id> x=<n> y=<n> w=<n> h=<n>]` line into
 /// the control id and its `[x, y, w, h]`.
 pub fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
-	let rest = line.split("[APP:CTRL_BOUNDS: id=").nth(1)?;
-	let (id, nums) = rest.rsplit_once(" x=")?;
-	let mut vals = nums.trim_end_matches(']').split(' ');
+	let (id, nums) = id_body(line, "CTRL_BOUNDS")?.rsplit_once(" x=")?;
+	let mut vals = nums.split(' ');
 	let x = vals.next()?.parse().ok()?;
 	let mut v = [x, 0, 0, 0];
 	for slot in &mut v[1..] {
@@ -118,32 +146,26 @@ pub fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
 
 /// Parses a `[APP:CTRL_GONE: id=<id>]` line.
 pub fn parse_gone(line: &str) -> Option<String> {
-	let rest = line.split("[APP:CTRL_GONE: id=").nth(1)?;
-	Some(rest.strip_suffix(']')?.to_string())
+	Some(id_body(line, "CTRL_GONE")?.to_string())
 }
 
-/// Parses a duplicate probe line `[APP:CTRL_DUPLICATE: id=...]`.
+/// Parses a duplicate probe line `[APP:CTRL_DUPLICATE: id=<id>]`.
 pub fn parse_duplicate(line: &str) -> Option<String> {
-	let rest = line.split("[APP:CTRL_DUPLICATE: id=").nth(1)?;
-	Some(rest.trim_end().strip_suffix(']')?.to_string())
+	Some(id_body(line, "CTRL_DUPLICATE")?.to_string())
 }
 
-/// Parses a covered control audit line `[APP:CTRL_COVERED: id=... by=...]`.
+/// Parses a covered control audit line `[APP:CTRL_COVERED: id=<id> by=<id>]`;
+/// the two ids are told apart at the last ` by=`.
 pub fn parse_covered(line: &str) -> Option<(String, String)> {
-	let rest = line.split("[APP:CTRL_COVERED: id=").nth(1)?;
-	let (id_a, rest_b) = rest.split_once(" by=")?;
-	Some((
-		id_a.to_string(),
-		rest_b.trim_end().strip_suffix(']')?.to_string(),
-	))
+	let (id, by) = id_body(line, "CTRL_COVERED")?.rsplit_once(" by=")?;
+	Some((id.to_string(), by.to_string()))
 }
 
-/// Parses a `TEXT_FIT` line `[APP:TEXT_FIT: id=<id> ... clipped=<0|1> ...]`:
+/// Parses a `TEXT_FIT` line `[APP:TEXT_FIT: id=<id> rule=… clipped=<0|1> …]`:
 /// the id of the text and whether an ancestor clips it.
 pub fn parse_text_fit(line: &str) -> Option<(String, bool)> {
-	let rest = line.split("[APP:TEXT_FIT: id=").nth(1)?;
-	let (id, rest) = rest.split_once(' ')?;
-	let clipped = rest.split(" clipped=").nth(1)?.starts_with('1');
+	let (id, fields) = id_body(line, "TEXT_FIT")?.rsplit_once(" rule=")?;
+	let clipped = fields.split(" clipped=").nth(1)?.starts_with('1');
 	Some((id.to_string(), clipped))
 }
 
@@ -158,21 +180,20 @@ pub fn parse_text_fit_clipped(line: &str) -> Option<String> {
 /// drawn is not the width the solver gave. A
 /// `[APP:TEXT_FIT_STYLE_DRIFT: id=<id> measured=<style> drawn=<style>]` line
 /// counts as well: the box is drawn in another family, size or weight than
-/// the one its floor and counts were measured in.
+/// the one its floor and counts were measured in (a family may have spaces).
 pub fn parse_text_fit_drift(line: &str) -> Option<String> {
-	let rest = line
-		.split("[APP:TEXT_FIT_DRIFT: id=")
-		.nth(1)
-		.or_else(|| line.split("[APP:TEXT_FIT_STYLE_DRIFT: id=").nth(1))?;
-	let (id, _) = rest.split_once(' ')?;
-	Some(id.to_string())
+	if let Some(body) = id_body(line, "TEXT_FIT_DRIFT") {
+		return Some(body.rsplit_once(" fit=")?.0.to_string());
+	}
+	let body = id_body(line, "TEXT_FIT_STYLE_DRIFT")?;
+	let (before_drawn, _) = body.rsplit_once(" drawn=")?;
+	Some(before_drawn.rsplit_once(" measured=")?.0.to_string())
 }
 
 /// Parses a `[APP:TEXT_FIT_GONE: id=<id>]` line: the text is not drawn any
 /// more.
 pub fn parse_text_fit_gone(line: &str) -> Option<String> {
-	let rest = line.split("[APP:TEXT_FIT_GONE: id=").nth(1)?;
-	Some(rest.trim_end().strip_suffix(']')?.to_string())
+	Some(id_body(line, "TEXT_FIT_GONE")?.to_string())
 }
 
 #[cfg(test)]

@@ -204,6 +204,8 @@ Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜
 
 ID 整段相等。`paste-overwrite:0:common.txt` 不能拿去點 `paste-overwrite:2:common.txt`，也不能拿去點 `paste-overwrite:0:common.txt.bak`。不要照 native-e2e driver 的寬鬆查法（`lookup_bounds` 仍接受只給路徑的 `paste-overwrite:<path>`）；人工操作一律用完整 ID。
 
+ID 可以含任何字元：空白、`=`、`:`、`]`，甚至欄位自己的名字（repo 資料夾叫 `my repo` 或 `a x=1`）。所有讀日誌的地方（`scripts/bench_native_memory.py` 的 `BOUNDS_RE`／`TEXT_FIT_RE` 等、`scripts/real_ui_round.py`、`scripts/check_native_ime.py`、`crates/native-e2e/src/lib.rs`）都用同一條規則：ID 是 `id=` 之後、到該行尾端固定欄位（`x= y= w= h=`、`rule= … shown=`、`fit= drawn=`、`by=`）之前的全部文字，從行尾往回讀；背景分頁的行尾端還有 ` ws_tab=<n>`，先拿掉。人工讀日誌也照這條，不要用空白切。
+
 2. 沒有這一行，或 `w < 1`，或 `h < 1`，或這一行之後又出現同一 ID 的 `[APP:CTRL_GONE: id=<ID>]`（控制項已收合或關閉，矩形是舊的）：判定 `fail`，證據欄寫 `missing-control`，停止。點擊前要確認沒有比最新 `CTRL_BOUNDS` 更晚的 `CTRL_GONE`。改點旁邊看起來像的列，不算測過。
 3. 同一 ID 出現兩列是回歸。此時兩列輪流以同一個 ID 回報矩形，日誌可能在兩個矩形之間來回跳，也可能只剩一個，所以不要用日誌矩形的數量辨識；改用 T03／T18 的規則：相異 ID 數要等於同路徑列數，並比對 `PASTE_TOGGLED` 的 idx。不成立時判定 `fail`，證據欄寫 `identity-fail` 與兩欄數字，不能按 Apply。
 4. 把 bounds 換算成螢幕上的點，再點那個點。`x`、`y`、`w`、`h` 是實體像素，原點在視窗內容區的左上角，不是螢幕，也不是含標題列的視窗框。`physical()` 乘了 `scale_factor`。直接點 `(x + w/2, y + h/2)` 在 Retina 上會偏到大約兩倍遠。換算順序：

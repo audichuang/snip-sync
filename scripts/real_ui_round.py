@@ -29,7 +29,15 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from bench_native_memory import e2e_scaled
+from bench_native_memory import (
+    BOUNDS_RE,
+    CTRL_GONE_RE,
+    TEXT_FIT_DRIFT_RE,
+    TEXT_FIT_GONE_RE,
+    TEXT_FIT_RE,
+    TEXT_FIT_STYLE_DRIFT_RE,
+    e2e_scaled,
+)
 
 
 REQUIRED_PROTOCOL_ANCESTOR = "f5247ab"
@@ -651,10 +659,11 @@ def clean_provable_leftovers(
 # Log Parsing & Coordinate Math
 # -----------------------------------------------------------------------------
 
-RE_CTRL_BOUNDS = re.compile(
-    r"^\[APP:CTRL_BOUNDS:\s+id=(.*?)\s+x=([-\d.]+)\s+y=([-\d.]+)\s+w=([-\d.]+)\s+h=([-\d.]+)\]$"
-)
-RE_CTRL_GONE = re.compile(r"^\[APP:CTRL_GONE:\s+id=(.*?)\]$")
+# An id holds any character (spaces, `=`, `:`, `]`): the patterns that read it live in
+# bench_native_memory.py, anchored at the end of the line where the fixed fields are, and every
+# harness uses them (crates/native-e2e/src/lib.rs reads the same lines by the same rule).
+RE_CTRL_BOUNDS = BOUNDS_RE
+RE_CTRL_GONE = CTRL_GONE_RE
 RE_VIEWPORT = re.compile(r"^\[APP:VIEWPORT:\s+(\d+)x(\d+)\]$")
 
 
@@ -675,19 +684,19 @@ def parse_control_bounds_from_lines(lines: List[str], target_id: str) -> Control
     for n, line in enumerate(lines, 1):
         line = line.strip()
         m_bounds = RE_CTRL_BOUNDS.match(line)
-        if m_bounds and m_bounds.group(1) == target_id:
+        if m_bounds and m_bounds["id"] == target_id:
             latest = ControlBoundsMatch(
                 control_id=target_id,
-                x=float(m_bounds.group(2)),
-                y=float(m_bounds.group(3)),
-                w=float(m_bounds.group(4)),
-                h=float(m_bounds.group(5)),
+                x=float(m_bounds["x"]),
+                y=float(m_bounds["y"]),
+                w=float(m_bounds["w"]),
+                h=float(m_bounds["h"]),
                 line_number=n,
                 raw_text=line,
             )
         elif RE_CTRL_GONE.match(line):
             m_gone = RE_CTRL_GONE.match(line)
-            if m_gone and m_gone.group(1) == target_id:
+            if m_gone and m_gone["id"] == target_id:
                 latest = None
 
     if latest is None:
@@ -710,15 +719,12 @@ def parse_latest_viewport(lines: List[str]) -> Tuple[int, int]:
 # `TEXT_FIT` is the app's check of one text's box against the rule of its role
 # (docs/adr/0005-one-fit-rule-table.md). A line of a background tab ends with
 # ` ws_tab=<id>` inside its brackets.
-RE_TEXT_FIT = re.compile(
-    r"^\[APP:TEXT_FIT:\s+id=(\S+)\s+rule=(\S+)\s+natural=(-?\d+)\s+floor=(-?\d+)\s+fit=(-|-?\d+)"
-    r"\s+drawn=(-?\d+)\s+visible=(-?\d+)\s+clipped=([01])\s+cut=([01])\s+shown=(\d+)/(\d+)(?:\s+ws_tab=\d+)?\]$"
-)
-RE_TEXT_FIT_DRIFT = re.compile(r"^\[APP:TEXT_FIT_DRIFT:\s+id=(\S+)\s+fit=(-?\d+)\s+drawn=(-?\d+)(?:\s+ws_tab=\d+)?\]$")
+RE_TEXT_FIT = TEXT_FIT_RE
+RE_TEXT_FIT_DRIFT = TEXT_FIT_DRIFT_RE
 # A box drawn in another family, size or weight than the one its floor and counts
 # were measured in: the same kind of problem as a width that drifted.
-RE_TEXT_FIT_STYLE_DRIFT = re.compile(r"^\[APP:TEXT_FIT_STYLE_DRIFT:\s+id=(\S+)\s+measured=(\S+)\s+drawn=(\S+)(?:\s+ws_tab=\d+)?\]$")
-RE_TEXT_FIT_GONE = re.compile(r"^\[APP:TEXT_FIT_GONE:\s+id=(\S+?)(?:\s+ws_tab=\d+)?\]$")
+RE_TEXT_FIT_STYLE_DRIFT = TEXT_FIT_STYLE_DRIFT_RE
+RE_TEXT_FIT_GONE = TEXT_FIT_GONE_RE
 RE_TEXT_FIT_RULE = re.compile(r"^(whole|readable(\d+)|kv(\d+))$")
 
 
