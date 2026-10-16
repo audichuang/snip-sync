@@ -9295,3 +9295,56 @@ fn test_an_outside_create_of_a_two_spelling_folder_makes_apply_stale() {
 		assert_eq!(scan_tree(&ws), before, "{outside}: wrote something");
 	}
 }
+
+/// A folder of a placed destination's tail that exists by the time of
+/// planning breaks what `resolve` promised (the anchor is the nearest
+/// existing ancestor): the plan is stale, not a plan with that folder as
+/// an incidental create.
+#[test]
+fn test_a_placed_tail_folder_created_before_planning_is_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	let dest = placed(&ws.join("new").join("sub"));
+	fs::create_dir(ws.join("new")).unwrap();
+	let mapping = ImportMapping::with_primary(dest);
+	let err =
+		plan_import("// file: a.txt\nA\n", "", &roots_of(&mapping), &mapping)
+			.unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"expected StaleDestination, got {err:?}"
+	);
+	assert!(!ws.join("new/sub").exists());
+}
+
+/// Two destinations that name one new folder in two cases (on a filesystem
+/// that folds case), the first level created between resolving and
+/// planning: not an unconfirmed-free plan that makes the folder.
+#[test]
+fn test_two_spellings_of_a_new_folder_created_before_planning_are_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	if !test_dir_case_insensitive(&ws) {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+				|| cfg!(target_os = "linux"),
+			"needs a case-insensitive filesystem"
+		);
+		return;
+	}
+	let primary = placed(&ws.join("new").join("sub"));
+	let other = placed(&ws.join("NEW").join("SUB"));
+	fs::create_dir(ws.join("new")).unwrap();
+	let mut mapping = ImportMapping::with_primary(primary);
+	mapping.map_prefix("q", other);
+	let err = plan_import(
+		"// file: q/b.txt\nB\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	)
+	.unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"expected StaleDestination, got {err:?}"
+	);
+	assert!(!ws.join("new/sub").exists());
+}
