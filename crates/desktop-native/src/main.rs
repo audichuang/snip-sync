@@ -16084,14 +16084,14 @@ mod tests {
 					}
 					git_dated(&r, &args, date);
 				};
-				commit("init.txt", "init", None, "2025-10-01T10:00:00Z");
-				git(&r, &["checkout", "-q", "-b", "side"]);
 				commit(
-					"side.txt",
-					"side work",
+					"init.txt",
+					"init",
 					Some("AVAVAV Tomas <av@x>"),
-					"2025-10-02T10:00:00Z",
+					"2025-10-01T10:00:00Z",
 				);
+				git(&r, &["checkout", "-q", "-b", "side"]);
+				commit("side.txt", "side work", None, "2025-10-02T10:00:00Z");
 				git(&r, &["checkout", "-q", "main"]);
 				git_dated(
 					&r,
@@ -16307,51 +16307,45 @@ mod tests {
 				assert_clean(bad);
 			}
 
-			/// How many graphemes of `text` a box `visible` wide shows when
-			/// drawn in `weight`, shaped here from the text system and not
-			/// through the code under test: gpui keeps the longest prefix
-			/// whose width and the ellipsis's fit.
+			/// How many whole graphemes of `text` a box `visible` wide shows
+			/// when drawn in `weight`, from gpui's own cut
+			/// (`LineWrapper::truncate_line`, the call `text_ellipsis` makes)
+			/// and not through the code under test: the oracle is the
+			/// function that draws.
 			fn shown_in_weight(
 				window: &gpui::Window,
 				text: &str,
 				visible: f32,
 				weight: gpui::FontWeight,
+				chrome: f32,
 			) -> usize {
 				use unicode_segmentation::UnicodeSegmentation;
-				let width = |s: &str| {
-					let mut font = gpui::font(crate::theme::UI_FONT);
-					font.weight = weight;
-					let run = gpui::TextRun {
-						len: s.len(),
-						font,
-						color: gpui::black(),
-						background_color: None,
-						underline: None,
-						strikethrough: None,
-					};
-					f32::from(
-						window
-							.text_system()
-							.shape_line(
-								s.to_string().into(),
-								gpui::px(crate::theme::UI_TEXT),
-								&[run],
-								None,
-							)
-							.width,
-					)
-				};
-				let graphemes: Vec<&str> = text.graphemes(true).collect();
-				if width(text) <= visible + 0.5 {
-					return graphemes.len();
+				let mut font = gpui::font(crate::theme::UI_FONT);
+				font.weight = weight;
+				let mut runs = vec![gpui::TextRun {
+					len: text.len(),
+					font: font.clone(),
+					color: gpui::black(),
+					background_color: None,
+					underline: None,
+					strikethrough: None,
+				}];
+				let mut wrapper = window
+					.text_system()
+					.line_wrapper(font, gpui::px(crate::theme::UI_TEXT));
+				let cut = wrapper.truncate_line(
+					text.to_string().into(),
+					gpui::px(visible - chrome),
+					"\u{2026}",
+					&mut runs,
+				);
+				match cut
+					.strip_suffix('\u{2026}')
+					.filter(|_| cut.as_ref() != text)
+				{
+					Some(kept) => kept.graphemes(true).count(),
+					None => text.graphemes(true).count(),
 				}
-				(0..=graphemes.len())
-					.rev()
-					.find(|&k| {
-						width(&format!("{}\u{2026}", graphemes[..k].concat()))
-							<= visible + 0.01
-					})
-					.unwrap_or(0)
 			}
 
 			/// The viewer's own name is drawn in semibold, and the column,
@@ -16390,12 +16384,14 @@ mod tests {
 					"{}",
 					author.describe()
 				);
+				let chrome = FitRole::Author.chrome();
 				let own = cx.update(|window, _| {
 					shown_in_weight(
 						window,
 						&author.text,
 						author.visible,
 						gpui::FontWeight::SEMIBOLD,
+						chrome,
 					)
 				});
 				assert!(
@@ -16409,6 +16405,46 @@ mod tests {
 					"TEXT_FIT counts what is drawn: {}",
 					author.describe()
 				);
+				// Every other author, kerned ones among them ("Taylor Smith",
+				// "AVAVAV Tomas"), is counted as gpui cuts it, in regular.
+				let mut others = 0;
+				for t in s.iter().filter(|t| {
+					t.role == FitRole::Author && t.present && t.row != Some(0)
+				}) {
+					others += 1;
+					let kept = cx.update(|window, _| {
+						shown_in_weight(
+							window,
+							&t.text,
+							t.visible,
+							gpui::FontWeight::NORMAL,
+							chrome,
+						)
+					});
+					assert_eq!(
+						t.shown,
+						kept,
+						"TEXT_FIT counts what is drawn: {}",
+						t.describe()
+					);
+					assert!(
+						kept >= 3.min(t.total),
+						"{kept} graphemes, below the rule: {}",
+						t.describe()
+					);
+				}
+				assert!(others >= 3, "{others} other authors drawn");
+				let names: Vec<&str> = s
+					.iter()
+					.filter(|t| t.role == FitRole::Author && t.present)
+					.map(|t| t.text.as_str())
+					.collect();
+				for kerned in ["Taylor Smith", "AVAVAV Tomas"] {
+					assert!(
+						names.contains(&kerned),
+						"{kerned} not drawn: {names:?}"
+					);
+				}
 			}
 
 			macro_rules! fit_rows_cells {

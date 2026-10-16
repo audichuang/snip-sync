@@ -46,7 +46,7 @@ Log 工具視窗裡一段文字和別的文字搶寬度時（commit 列的 subje
 
 ## 量測與繪製用同一個文字樣式
 
-字型家族、字級、字重只在一處定義：`FitRole::style_for(own)`（`FitStyle`）。`FitCell::render` 把它的三個值都釘在盒子上（所以祖先設的字重、字級不會漏進文字），下限（`floor_px`）、自然寬、清單層的作者欄下限與 `TEXT_FIT` 的 `shown` 都用同一個樣式量。唯一不是 `Regular` 的是自己的作者名稱（`Author` 且 `own`，semibold）：`FitCell::own(true)` 帶著它，清單層算作者欄下限時每個作者名也依它是不是自己的來量（快取鍵含這一點，`git_user_email` 在第一批列之後才到）。畫完後探針再從 `window.text_style()` 讀 gpui 實際用的樣式，不同就印 `[APP:TEXT_FIT_STYLE_DRIFT: id= measured= drawn=]`（`style_drift`；`shown` 以實際繪製的樣式計，不被量測樣式掩蓋），與寬度的 drift 一樣在 `#[gpui::test]`、native-e2e 與 `real_ui_round.py text-fit --check` 都算失敗。真實字型矩陣的 fixture 有一列是使用者本人、名稱是 56 個 W，並用獨立的 semibold 整形數字檢查作者欄在 1080 寬、預設窗格時仍留得下 3 個 grapheme。
+字型家族、字級、字重只在一處定義：`FitRole::style_for(own)`（`FitStyle`）。`FitCell::render` 把它的三個值都釘在盒子上（所以祖先設的字重、字級不會漏進文字），下限（`floor_px`）、自然寬、清單層的作者欄下限與 `TEXT_FIT` 的 `shown` 都用同一個樣式量。唯一不是 `Regular` 的是自己的作者名稱（`Author` 且 `own`，semibold）：`FitCell::own(true)` 帶著它，清單層算作者欄下限時每個作者名也依它是不是自己的來量（快取鍵含這一點，`git_user_email` 在第一批列之後才到）。畫完後探針再從 `window.text_style()` 讀 gpui 實際用的樣式，不同就印 `[APP:TEXT_FIT_STYLE_DRIFT: id= measured= drawn=]`（`style_drift`；`shown` 以實際繪製的樣式計，不被量測樣式掩蓋），與寬度的 drift 一樣在 `#[gpui::test]`、native-e2e 與 `real_ui_round.py text-fit --check` 都算失敗。真實字型矩陣的 fixture 有一列是使用者本人、名稱是 56 個 W，另有兩列字偶距明顯的名字（`Taylor Smith`、`AVAVAV Tomas`）；測試以 gpui 自己的 `LineWrapper::truncate_line`（`text_ellipsis` 呼叫的那個函式）當準則，檢查每個作者的 `shown` 等於它實際留下的 grapheme、且作者欄在 1080 寬、預設窗格時仍留得下 3 個。準則不是另一套算法。
 
 重畫只有一個機制（`refresh_if_stale`）：這一幀依據的寬和量到的寬不同時排一次重畫，每個新寬度最多 3 次（`Window::refresh` 在繪製中是 no-op，所以排在這一幀結束之後）。面板寬、清單寬、篩選 chip 列都走它。
 
