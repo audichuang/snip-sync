@@ -1301,6 +1301,7 @@ impl WorkbenchModel {
 		)
 		.selector(id.clone())
 		.pad(4.)
+		.frame(if active { 1. } else { 0. })
 		.trailing(trailing)
 		.fixed_width(width)
 		.render(&self.probes, window)

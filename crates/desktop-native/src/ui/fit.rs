@@ -765,6 +765,7 @@ pub(crate) struct FitCell {
 	leading: Option<AnyElement>,
 	trailing: Option<AnyElement>,
 	pad: f32,
+	frame: f32,
 	width: FitWidth,
 }
 
@@ -778,6 +779,7 @@ impl FitCell {
 			leading: None,
 			trailing: None,
 			pad: 0.,
+			frame: 0.,
 			width: FitWidth::Flex,
 		}
 	}
@@ -809,6 +811,14 @@ impl FitCell {
 	/// Padding left and right of the content (a chip's 6px).
 	pub(crate) fn pad(mut self, px: f32) -> Self {
 		self.pad = px;
+		self
+	}
+
+	/// A border of this width on each side that the caller adds to the box
+	/// after [`FitCell::render`] (an active overflow chip's ring). It sits
+	/// outside what the probe's canvas fills, so the probe adds it back.
+	pub(crate) fn frame(mut self, border: f32) -> Self {
+		self.frame = border;
 		self
 	}
 
@@ -850,6 +860,7 @@ impl FitCell {
 			leading,
 			trailing,
 			pad,
+			frame: border,
 			width,
 		} = self;
 		let role = id.role;
@@ -908,11 +919,15 @@ impl FitCell {
 						// Across only: a row scrolled out of its list is not
 						// clipped in width.
 						let mask = window.content_mask().bounds;
-						let drawn = f32::from(b.size.width);
-						let visible_w =
-							(f32::from(b.right().min(mask.right()))
-								- f32::from(b.left().max(mask.left())))
-							.clamp(0., drawn);
+						// The canvas fills the box inside the border.
+						let (left, right) = (
+							f32::from(b.left()) - border,
+							f32::from(b.right()) + border,
+						);
+						let drawn = right - left;
+						let visible_w = (right.min(f32::from(mask.right()))
+							- left.max(f32::from(mask.left())))
+						.clamp(0., drawn);
 						// The shown count is read off the text system: do it
 						// only when what it depends on changed.
 						let known = frame.borrow().known_fit(&id).filter(|k| {
@@ -940,7 +955,7 @@ impl FitCell {
 								natural,
 								floor,
 								fit,
-								x: f32::from(b.origin.x),
+								x: left,
 								drawn,
 								visible: visible_w,
 								clipped: visible_w < drawn - 0.5,
@@ -952,7 +967,13 @@ impl FitCell {
 					},
 					|_, _, _, _| {},
 				)
+				// From the box's own corner: an absolute child with no
+				// offset starts after the padding, so a padded chip's probe
+				// would stand 4 to 6px to the right of the chip and be
+				// reported clipped where the chip is last on its bar.
 				.absolute()
+				.top_0()
+				.left_0()
 				.size_full(),
 			);
 		}
@@ -1521,6 +1542,53 @@ mod render_tests {
 		assert!((f.x - 150.).abs() < 0.5, "{f:?}");
 		assert!((f.drawn - 50.).abs() < 0.5, "{f:?}");
 		assert!((f.visible - 50.).abs() < 0.5, "{f:?}");
+		assert!(!f.clipped && !f.drifts(), "{f:?}");
+	}
+
+	/// A cell whose caller adds a border after `render` (an active overflow
+	/// chip's ring).
+	struct Ringed {
+		probes: Option<Probes>,
+	}
+
+	impl Render for Ringed {
+		fn render(
+			&mut self,
+			window: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			div()
+				.size_full()
+				.child(
+					div().w(px(200.)).flex().flex_row().child(
+						FitCell::new(FitId::new("t", FitRole::ChipMore), "ab")
+							.pad(4.)
+							.frame(1.)
+							.fixed_width(60.)
+							.render(&self.probes, window)
+							.border_1(),
+					),
+				)
+				.children(probe_frame_end(&self.probes))
+		}
+	}
+
+	/// #229: the border a caller adds sits outside the probe's canvas, so
+	/// `frame` adds it back: the probe's box is the solver's width, not two
+	/// pixels less (which `TEXT_FIT_DRIFT` reports).
+	#[gpui::test]
+	fn a_ringed_cell_is_probed_with_its_border(cx: &mut TestAppContext) {
+		let probes = Probes::for_test();
+		let shared = probes.clone();
+		let (_, cx) = cx.add_window_view(|_, _| Ringed {
+			probes: Some(probes),
+		});
+		cx.run_until_parked();
+		let f = shared
+			.text_fit("text-fit:t:chip-more")
+			.expect("the text was recorded");
+		assert!(f.x.abs() < 0.5, "{f:?}");
+		assert!((f.drawn - 60.).abs() < 0.5, "{f:?}");
 		assert!(!f.clipped && !f.drifts(), "{f:?}");
 	}
 }
