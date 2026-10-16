@@ -15365,6 +15365,134 @@ mod tests {
 			assert!(!sub.join("sub").exists());
 		}
 
+		/// Stripping `sub/` makes both items `a.ts`, which the engine
+		/// refuses.
+		const RESTORE_BASE_COLLIDING_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: a.ts\ny\n// FILE: sub/a.ts\nx\n";
+
+		/// An adjusted plan the engine refuses keeps the hint row, so
+		/// [Use as-is] can undo the choice (#240).
+		#[gpui::test]
+		fn a_refused_adjusted_plan_keeps_the_hint_and_as_is_recovers(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_COLLIDING_PAYLOAD);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			click(cx, "paste-adjust");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("paste_err_plan")
+				);
+				assert!(plan.adjust_paths);
+			});
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"the hint row vanished after the engine refused the plan"
+			);
+			click(cx, "paste-as-is");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.error.is_none(), "{:?}", plan.error);
+				assert!(!plan.adjust_paths);
+				let paths: Vec<&str> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["a.ts", "sub/a.ts"]);
+			});
+		}
+
+		/// The same on a worker, whose refusal carries no suggestion.
+		#[gpui::test]
+		fn a_remote_refused_adjusted_plan_keeps_the_hint_and_as_is_recovers(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(
+				&model,
+				cx,
+				RESTORE_BASE_COLLIDING_PAYLOAD,
+			);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			let wait_landed =
+				|model: &Entity<WorkbenchModel>, cx: &mut VisualTestContext| {
+					for _ in 0..300 {
+						settle(cx);
+						if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+							break;
+						}
+						std::thread::sleep(Duration::from_millis(10));
+					}
+					assert!(
+						!model.read_with(cx, |m, _| m.paste.is_loading()),
+						"the re-plan never landed"
+					);
+				};
+			click(cx, "paste-adjust");
+			wait_landed(&model, cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("paste_err_plan")
+				);
+			});
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"the hint row vanished after the worker refused the plan"
+			);
+			click(cx, "paste-as-is");
+			wait_landed(&model, cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.error.is_none(), "{:?}", plan.error);
+				assert!(!plan.adjust_paths);
+				let paths: Vec<&str> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["a.ts", "sub/a.ts"]);
+			});
+		}
+
 		/// Click the centre of the rendered control `id`, the way a user
 		/// does. Fails when the UI renders no such element, so it also pins
 		/// the id shape the drivers rely on.
