@@ -22,6 +22,22 @@ _Avoid_: tab、分頁
 貼上規劃與寫入的地方：本機的一個資料夾，或遠端工作區 worker 上的一個資料夾。CLI 與桌面 App 都只經它規劃、重驗與套用；本機目標套用保留下來的計畫，遠端目標由 worker 在自己的磁碟上重新規劃後寫入。
 _Avoid_: 貼上目的地（單獨使用，易與目的資料夾混淆）、paste destination
 
+**目的資料夾**（destination folder）:
+貼上的預設落點：CLI 的 `--repo`（遠端是 `--in`），桌面 App 在樹上選的資料夾。可以還不存在；不存在時規劃只讀不寫，Apply 經使用者同意才建立。
+_Avoid_: 目標資料夾、貼上目的地
+
+**導入路徑**（import path）:
+把剪貼簿裡某個 prefix 底下的 entry 送到別的資料夾的對應（CLI 的 `--map PREFIX=PATH`）。和目的資料夾一樣可以還不存在。
+_Avoid_: 對應資料夾、mapping folder
+
+**錨點與尾段**（anchor, tail）:
+落點（`PlacedRoot`）的兩部分：錨點是最近一個已存在的祖先（canonical），尾段是它底下還要建立的名稱。資料夾已存在時尾段是空的。尾段在每一種路由裡都接在錨點後面、檔案相對路徑前面。
+_Avoid_: base、missing parts
+
+**指定新資料夾**（requested folder）與**順帶新資料夾**（incidental folder）:
+還不存在、要在 Apply 建立的資料夾分兩種。指定新資料夾是使用者指名的目的資料夾或導入路徑的尾段（`requested_dirs`），只在 Apply 經同意（`confirmed_new_dirs`）後、在寫入鎖之下建立。順帶新資料夾是檔案路徑隱含的中間資料夾，照舊在寫檔時直接建立、不需同意。
+_Avoid_: 新資料夾（單獨使用，分不出需不需要同意）
+
 ## 錯誤
 
 **原因**（Reason）:
