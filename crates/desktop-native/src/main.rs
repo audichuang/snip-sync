@@ -23491,12 +23491,14 @@ mod tests {
 					),
 					("docs/readme.txt", "paste_err_destination_not_dir", None),
 				];
-				#[cfg(unix)]
-				cases.push((
-					"link",
-					"paste_err_destination",
-					Some("not under the workspace"),
-				));
+				// A runtime guard, not a `cfg`: `mut` is used on every platform.
+				if cfg!(unix) {
+					cases.push((
+						"link",
+						"paste_err_destination",
+						Some("not under the workspace"),
+					));
+				}
 				for (typed, key, words) in cases {
 					cx.simulate_keystrokes("cmd-a");
 					cx.simulate_input(typed);
