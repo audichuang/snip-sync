@@ -1289,6 +1289,8 @@ mod tests {
 		let plan = s.plan().unwrap();
 		assert!(plan.collapsed_dirs.contains(&ax), "the fold survived");
 		assert_eq!(plan.cursor(), PasteCursor::Dir(ax));
+		// P5 of `invariants`: the cursor stands on a drawn row.
+		assert!(plan.cursor_visible());
 		assert!(plan.detail_preview().is_none());
 		assert!(s.detail().is_none());
 	}
