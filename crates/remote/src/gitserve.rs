@@ -1111,6 +1111,13 @@ mod tests {
 			gone(&held).0,
 			"git log exited but a detached process kept its output open"
 		);
+		// Unexpected git output keeps no output.
+		let malformed = Failure::git("", &GitError::Malformed(secret.into()));
+		assert!(malformed.message.contains(secret));
+		assert_eq!(
+			gone(&malformed).0,
+			"unexpected git output (details withheld)"
+		);
 		// A row built without the producer's text never sends its message.
 		let bare = Failure::new(
 			secret,

@@ -532,7 +532,7 @@ Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實�
 
 規格落差另外記在 `scorecard.md` 末尾，不算判定：
 
-- T13b 的拒絕文字：HEAD 移動被 `paste.rs` 的 `stale_reason_msg`(經 `commit_msg`)歸到 `stale_modified`，畫面是「目的地檔案已在外部修改: destination HEAD commit changed from … to …」。前半句說檔案被改，與實際原因不符。記在這裡；T13b 不因此判 `ui-defect`。
+- T13b 的拒絕文字：預覽後目的地 HEAD 移動屬於 `StaleChange::Repository`，畫面是「目的地儲存庫在預覽後已變更（HEAD、分支或索引），請重新預覽」（i18n `err_dest_repo_changed`）。看到「目的地檔案已在外部修改」就是回歸，判 `ui-defect`。
 - 預覽的版面衝突列（父目錄被檔案佔住等）現在標為「拒絕」並說整個 commit 會被拒；路徑規則不安全（如 `../x`）仍是一般「跳過」。CLI 的 `--dry-run` 對被拒的 commit 不計入「would be created」。
 
 檔案模式和 IDE 套件的逐位元組契約由 `fixtures/clipboard-contract.json` 與 core／CLI 測試負責。本規程不重跑那一套。

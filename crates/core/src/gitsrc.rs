@@ -153,7 +153,30 @@ impl GitError {
 			Self::Cleanup { args, .. } => {
 				format!("cleaning up git {args} failed (details withheld)")
 			}
-			_ => self.to_string(),
+			Self::Malformed(_) => {
+				"unexpected git output (details withheld)".to_string()
+			}
+			Self::Remote { .. } => {
+				"remote git failure (details withheld)".to_string()
+			}
+			Self::Io(_) => "I/O error (details withheld)".to_string(),
+			// Nothing in these carries stderr or OS text: Display as is.
+			Self::NotFound
+			| Self::Timeout { .. }
+			| Self::Cancelled { .. }
+			| Self::QueueTimeout { .. }
+			| Self::QueueFull { .. }
+			| Self::WorktreeBusy { .. }
+			| Self::OutputLimit { .. }
+			| Self::PatchLimit { .. }
+			| Self::OutputHeldOpen { .. }
+			| Self::NestedProcess { .. }
+			| Self::NotARepository(_)
+			| Self::ToplevelAbove(_)
+			| Self::InvalidRevision(_)
+			| Self::Shallow(_)
+			| Self::OutsideBoundary { .. }
+			| Self::VerifyLimit { .. } => self.to_string(),
 		}
 	}
 

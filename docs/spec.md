@@ -200,7 +200,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 貼上 commits:兩邊都經 `PasteTarget`(`plan_commits` / `check_commits` / `apply_commits`);本機目標用 `transfer::CommitReplayPreview`(`capture_in` / `revalidate` / `apply`)。
 - 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
-- 貼上目標:兩邊都經 `snip_remote::PasteTarget`(`Local` 在本機跑上面的函式,`Remote` 經 `Client` 交給 worker);錯誤統一為 `PasteError`(`stale_reason`、`is_repo_busy`、`is_collision`,遠端 Apply 失聯為 `OutcomeUnknown`)。新鮮度各自檢查:本機 Apply 套用保留的計畫並在寫入鎖內重驗;worker 可短期保留原始檔案 payload，但 Apply 仍重新規劃並比對 digest。覆寫門禁的判定在核心:`FilePlan::overwrites_existing`、`CommitReplayPlan::existing_writes`、`RestorePlan::existing_targets`。
+- 貼上目標:兩邊都經 `snip_remote::PasteTarget`(`Local` 在本機跑上面的函式,`Remote` 經 `Client` 交給 worker);錯誤統一為 `PasteError`(`reason()`、`is_stale`、`is_repo_busy`、`is_collision`,遠端 Apply 失聯為 `OutcomeUnknown`)。新鮮度各自檢查:本機 Apply 套用保留的計畫並在寫入鎖內重驗;worker 可短期保留原始檔案 payload，但 Apply 仍重新規劃並比對 digest。覆寫門禁的判定在核心:`FilePlan::overwrites_existing`、`CommitReplayPlan::existing_writes`、`RestorePlan::existing_targets`。
 - 遠端複製:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`);遠端貼上經 `PasteTarget::Remote`,它依協商版本送出檔案預覽／套用或 `replay_plan`／`replay_apply`,worker 跑上面同一組函式(§8「貼上」)。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 

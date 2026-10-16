@@ -782,13 +782,18 @@ impl PasteApplyResult {
 		}
 		// The first is worded in full; the others are named, so every path
 		// that did not land is on screen.
-		args.push(
+		// A worker that sent only `errors` has no paths: the other lines'
+		// own text stays on screen instead.
+		let rest = if f.failures.len() == f.errors.len() {
 			failures[1..]
 				.iter()
 				.map(|f| f.path.as_str())
 				.collect::<Vec<_>>()
-				.join(", "),
-		);
+				.join(", ")
+		} else {
+			f.errors[1..].join("; ")
+		};
+		args.push(rest);
 		Msg::with_msg_arg("status_paste_partial_more", args, 5, first)
 	}
 
@@ -2650,6 +2655,35 @@ pub(crate) mod tests {
 			short_shas(&shas, usize::MAX),
 			"aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee, ffffffff"
 		);
+	}
+
+	#[test]
+	fn apply_status_of_an_old_peer_keeps_every_error_line() {
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: vec![
+					"alpha broke".into(),
+					"beta broke".into(),
+					"gamma broke".into(),
+				],
+				failures: Vec::new(),
+			},
+			created_commits: Vec::new(),
+		};
+		let msg = result.status();
+		for locale in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = msg.render(locale);
+			for line in ["alpha broke", "beta broke", "gamma broke"] {
+				assert!(text.contains(line), "{line} missing: {text}");
+			}
+			assert!(!text.contains(": ;") && !text.contains(", ,"), "{text}");
+			assert!(!text.ends_with("：") && !text.ends_with(": "), "{text}");
+		}
 	}
 
 	#[test]
