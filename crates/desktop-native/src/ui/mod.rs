@@ -81,6 +81,7 @@ mod left;
 mod log;
 mod log_view;
 mod paste;
+pub(crate) mod probe_line;
 mod remote;
 
 use changes::*;
@@ -257,7 +258,7 @@ impl ProbeFrame {
 		if !self.probed_this_frame.insert(id.to_string())
 			&& !id.starts_with("change-row:")
 		{
-			app_log!("[APP:CTRL_DUPLICATE: id={}]", id);
+			app_log!("{}", probe_line::duplicate(id));
 		}
 		if let Some(v) = v {
 			self.seen_order.push((id.to_string(), v));
@@ -497,14 +498,7 @@ pub fn probe(
 				};
 				if frame.borrow_mut().probe(&id, v) {
 					if let Some(v) = v {
-						app_log!(
-							"[APP:CTRL_BOUNDS: id={} x={} y={} w={} h={}]",
-							id,
-							v[0],
-							v[1],
-							v[2],
-							v[3]
-						);
+						app_log!("{}", probe_line::bounds(&id, v));
 					}
 				}
 			},
@@ -532,13 +526,13 @@ pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 							window.viewport_size().width,
 						));
 					for id in gone {
-						app_log!("[APP:CTRL_GONE: id={}]", id);
+						app_log!("{}", probe_line::gone(&id));
 					}
 					for id in frame.borrow_mut().end_text_fits() {
-						app_log!("[APP:TEXT_FIT_GONE: id={}]", id);
+						app_log!("{}", probe_line::text_fit_gone(&id));
 					}
 					for (id, by) in covered {
-						app_log!("[APP:CTRL_COVERED: id={} by={}]", id, by);
+						app_log!("{}", probe_line::covered(&id, &by));
 					}
 				},
 				|_, _, _, _| {},
