@@ -2865,6 +2865,100 @@ pub(crate) mod tests {
 		}
 	}
 
+	/// The file-mode tree as text: `R label files`, `D name files d<depth>`
+	/// and `F path d<depth>`, a `+` after a folded node.
+	fn shape(plan: &PastePreviewPlan) -> Vec<String> {
+		plan.tree_rows()
+			.iter()
+			.map(|r| match r {
+				PasteNode::Root {
+					label,
+					sum,
+					collapsed,
+					..
+				} => format!(
+					"R {label} {}{}",
+					sum.files,
+					if *collapsed { "+" } else { "" }
+				),
+				PasteNode::Dir {
+					name,
+					depth,
+					sum,
+					collapsed,
+					..
+				} => format!(
+					"D {name} {} d{depth}{}",
+					sum.files,
+					if *collapsed { "+" } else { "" }
+				),
+				PasteNode::File(ix, depth) => {
+					format!("F {} d{depth}", plan.items[*ix].path)
+				}
+				PasteNode::Commit(c) => format!("C {c}"),
+			})
+			.collect()
+	}
+
+	const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+	fn tree_plan(raw: &str) -> (tempfile::TempDir, PastePreviewPlan) {
+		let dir = tempfile::tempdir().unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		(dir, plan)
+	}
+
+	/// The label of the (only) destination root a plan writes into.
+	fn root_label(plan: &PastePreviewPlan) -> String {
+		root_name(
+			&plan
+				.items
+				.iter()
+				.find(|i| !i.planned_skip())
+				.unwrap()
+				.dest_root,
+		)
+	}
+
+	/// The folder `path` ("" is the root row) of the plan's first written root.
+	fn key(plan: &PastePreviewPlan, path: &str) -> DirKey {
+		DirKey {
+			root: plan
+				.items
+				.iter()
+				.find(|i| !i.planned_skip())
+				.unwrap()
+				.dest_root
+				.clone(),
+			path: path.into(),
+		}
+	}
+
+	fn ix_of(plan: &PastePreviewPlan, path: &str) -> usize {
+		plan.items.iter().position(|i| i.path == path).unwrap()
+	}
+
+	fn sum_of(plan: &PastePreviewPlan, path: &str) -> DirSummary {
+		plan.tree_rows()
+			.into_iter()
+			.find_map(|n| match n {
+				PasteNode::Root { key, sum, .. }
+				| PasteNode::Dir { key, sum, .. }
+					if key.path == path =>
+				{
+					Some(sum)
+				}
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("no folder row {path:?}"))
+	}
+
 	#[test]
 	fn change_tree_groups_by_root_and_directory_in_display_order() {
 		let dir = tempfile::tempdir().unwrap();
@@ -2876,47 +2970,356 @@ pub(crate) mod tests {
 			1,
 		)
 		.unwrap();
-		let paths: Vec<String> =
-			plan.items.iter().map(|i| i.path.clone()).collect();
-		let path = |ix: usize| paths[ix].clone();
-		let rows = plan.tree_rows();
-		let root = plan.items[0].dest_root_name.clone();
-		let shown: Vec<String> = rows
-			.iter()
-			.map(|r| match r {
-				PasteNode::Root(n, c) => format!("R {n} {c}"),
-				PasteNode::Dir(d, c) => format!("D {d} {c}"),
-				PasteNode::File(ix, depth) => {
-					format!("F {} {depth}", path(*ix))
-				}
-				PasteNode::Commit(c) => format!("C {c}"),
-			})
-			.collect();
+		let root = root_label(&plan);
 		assert_eq!(
-			shown,
+			shape(&plan),
 			[
 				format!("R {root} 4"),
-				"D r 1".into(),
-				"F r/a.txt 2".into(),
-				"D r/b 2".into(),
-				"F r/b/y.txt 2".into(),
-				"F r/b/z.txt 2".into(),
-				"D r/c/d 1".into(),
-				"F r/c/d/e.txt 2".into(),
+				"D r 4 d1".into(),
+				"D b 2 d2".into(),
+				"F r/b/y.txt d3".into(),
+				"F r/b/z.txt d3".into(),
+				"D c/d 1 d2".into(),
+				"F r/c/d/e.txt d3".into(),
+				"F r/a.txt d2".into(),
 			]
 		);
-		// Up / Down walk the tree's order, not the plan's.
-		plan.selected_item_idx =
-			plan.items.iter().position(|i| i.path == "r/a.txt").unwrap();
+		// Up / Down walk the rows on screen, folders included.
+		plan.selected_item_idx = ix_of(&plan, "r/b/y.txt");
 		plan.select_next();
-		assert_eq!(path(plan.selected_item_idx), "r/b/y.txt");
+		assert_eq!(plan.cursor(), PasteCursor::Item(ix_of(&plan, "r/b/z.txt")));
 		plan.select_next();
+		assert_eq!(plan.cursor(), PasteCursor::Dir(key(&plan, "r/c/d")));
 		plan.select_next();
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/c/d/e.txt"))
+		);
 		plan.select_next();
-		assert_eq!(path(plan.selected_item_idx), "r/c/d/e.txt");
+		assert_eq!(plan.cursor(), PasteCursor::Item(ix_of(&plan, "r/a.txt")));
+		plan.select_next();
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/a.txt")),
+			"the last row stays"
+		);
 		plan.select_prev();
-		assert_eq!(path(plan.selected_item_idx), "r/b/z.txt");
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(ix_of(&plan, "r/c/d/e.txt"))
+		);
 	}
+
+	/// #239: a path with several folders is a tree, not one flat folder row.
+	#[test]
+	fn paste_tree_nests_directories() {
+		let (_dir, plan) = tree_plan(SRC_TREE);
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 3"),
+				"D src 3 d1".into(),
+				"D app 2 d2".into(),
+				"F src/app/a.ts d3".into(),
+				"F src/app/b.ts d3".into(),
+				"D lib 1 d2".into(),
+				"F src/lib/c.ts d3".into(),
+			]
+		);
+		let order: Vec<&str> = plan
+			.display_order()
+			.into_iter()
+			.map(|ix| plan.items[ix].path.as_str())
+			.collect();
+		assert_eq!(order, ["src/app/a.ts", "src/app/b.ts", "src/lib/c.ts"]);
+	}
+
+	#[test]
+	fn paste_tree_compresses_single_child_chains_and_counts_actions() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
+		fs::write(dir.path().join("a/b/c/x.ts"), "old\n").unwrap();
+		let raw = "// clipcode-root: a\n// FILE: a/b/c/x.ts\nX\n// FILE: a/b/c/y.ts\nY\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 2"),
+				"D a/b/c 2 d1".into(),
+				"F a/b/c/x.ts d2".into(),
+				"F a/b/c/y.ts d2".into(),
+			]
+		);
+		let folder = key(&plan, "a/b/c");
+		assert_eq!(
+			plan.counts_under(&folder),
+			PasteCounts {
+				creates: 1,
+				overwrites: 0,
+				existing: 1,
+				deletes: 0,
+				skips: 1,
+			}
+		);
+		let x = ix_of(&plan, "a/b/c/x.ts");
+		plan.toggle_overwrite(x);
+		assert_eq!(
+			plan.counts_under(&folder),
+			PasteCounts {
+				creates: 1,
+				overwrites: 1,
+				existing: 1,
+				deletes: 0,
+				skips: 0,
+			}
+		);
+		assert_eq!(sum_of(&plan, "a/b/c").tick(), Tick::All);
+	}
+
+	#[test]
+	fn skipped_rows_stay_at_the_root_level_with_their_raw_path() {
+		let (_dir, plan) = tree_plan(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n// FILE: p/x/.git/hooks/h\n3\n",
+		);
+		assert!(
+			plan.items.iter().any(|i| i.planned_skip()),
+			"the protected paths are skipped rows"
+		);
+		let root = root_label(&plan);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {root} 3"),
+				"D p 1 d1".into(),
+				"F p/a.txt d2".into(),
+				"F .git/config d1".into(),
+				"F p/x/.git/hooks/h d1".into(),
+			]
+		);
+	}
+
+	#[test]
+	fn same_named_roots_stay_apart() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let other = tempfile::tempdir().unwrap();
+		let c = ix_of(&plan, "src/lib/c.ts");
+		let name = plan.items[c].dest_root_name.clone();
+		plan.items[c].dest_root = other.path().join(&name);
+		let mut roots: Vec<usize> = shape(&plan)
+			.iter()
+			.filter_map(|l| l.strip_prefix("R "))
+			.map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
+			.collect();
+		roots.sort_unstable();
+		assert_eq!(roots, [1, 2], "{:?}", shape(&plan));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_symlinked_destination_is_one_root() {
+		let tmp = tempfile::tempdir().unwrap();
+		let real = tmp.path().join("real").join("web");
+		fs::create_dir_all(&real).unwrap();
+		fs::create_dir(tmp.path().join("links")).unwrap();
+		let link = tmp.path().join("links").join("web");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n",
+			&link,
+			&[],
+			1,
+		)
+		.unwrap();
+		let roots = shape(&plan).iter().filter(|l| l.starts_with("R ")).count();
+		assert_eq!(roots, 1, "{:?}", shape(&plan));
+	}
+
+	#[test]
+	fn folder_include_is_tri_state_and_ignores_sibling_prefixes() {
+		let (_dir, mut plan) = tree_plan(
+			"// clipcode-root: src\n// FILE: src/a/y.ts\nY\n// FILE: src/ab/x.ts\nX\n// FILE: src/a/z.ts\nZ\n// FILE: .git/config\nG\n",
+		);
+		let sel = |plan: &PastePreviewPlan, path: &str| {
+			plan.items[ix_of(plan, path)].selected
+		};
+		assert_eq!(plan.set_dir_selected(&key(&plan, "src/a")), Some(false));
+		assert!(!sel(&plan, "src/a/y.ts") && !sel(&plan, "src/a/z.ts"));
+		assert!(sel(&plan, "src/ab/x.ts"), "src/ab is not under src/a");
+		assert_eq!(sum_of(&plan, "src").tick(), Tick::Partial);
+		assert_eq!(sum_of(&plan, "src/a").tick(), Tick::Empty);
+		assert_eq!(plan.set_dir_selected(&key(&plan, "src")), Some(true));
+		assert!(["src/a/y.ts", "src/a/z.ts", "src/ab/x.ts"]
+			.iter()
+			.all(|p| sel(&plan, p)));
+		// The root row never reaches a row that was skipped when planned.
+		let root = key(&plan, "");
+		assert_eq!(plan.set_dir_selected(&root), Some(false));
+		assert_eq!(plan.set_dir_selected(&root), Some(true));
+		assert!(!sel(&plan, ".git/config"));
+		assert_eq!(plan.counts().creates, 3);
+	}
+
+	#[test]
+	fn folding_a_folder_moves_the_cursor_onto_it_and_steps_skip_hidden_rows() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let app = key(&plan, "src/app");
+		let b = ix_of(&plan, "src/app/b.ts");
+		plan.selected_item_idx = b;
+		assert_eq!(
+			plan.toggle_dir_collapsed(&app),
+			Some(PasteCursor::Dir(app.clone()))
+		);
+		assert_eq!(
+			plan.cursor(),
+			PasteCursor::Item(b),
+			"folding does not move the cursor itself"
+		);
+		// The session applies the move.
+		plan.cursor_dir = Some(app.clone());
+		let order: Vec<&str> = plan
+			.display_order()
+			.into_iter()
+			.map(|ix| plan.items[ix].path.as_str())
+			.collect();
+		assert_eq!(order, ["src/lib/c.ts"]);
+		assert_eq!(
+			plan.step_target(true),
+			PasteCursor::Dir(key(&plan, "src/lib"))
+		);
+		assert_eq!(
+			plan.step_target(false),
+			PasteCursor::Dir(key(&plan, "src"))
+		);
+		// A cursor that stays visible is left alone.
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		plan.selected_item_idx = ix_of(&plan, "src/lib/c.ts");
+		assert_eq!(plan.toggle_dir_collapsed(&key(&plan, "src/app")), None);
+	}
+
+	#[test]
+	fn left_and_right_walk_the_tree() {
+		let (_dir, mut plan) = tree_plan(SRC_TREE);
+		let (lib, root) = (key(&plan, "src/lib"), key(&plan, ""));
+		let c = ix_of(&plan, "src/lib/c.ts");
+		plan.selected_item_idx = c;
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Move(PasteCursor::Dir(lib.clone()))
+		);
+		assert_eq!(
+			plan.nav_right(),
+			TreeStep::Nothing,
+			"a file has no children"
+		);
+		plan.cursor_dir = Some(lib.clone());
+		assert_eq!(plan.nav_left(), TreeStep::Fold(lib.clone()));
+		assert_eq!(plan.toggle_dir_collapsed(&lib), None);
+		assert_eq!(plan.nav_right(), TreeStep::Unfold(lib.clone()));
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Move(PasteCursor::Dir(key(&plan, "src"))),
+			"a folded folder goes up to its parent"
+		);
+		assert_eq!(plan.toggle_dir_collapsed(&lib), None);
+		assert_eq!(plan.nav_right(), TreeStep::Move(PasteCursor::Item(c)));
+		plan.cursor_dir = Some(root.clone());
+		assert_eq!(plan.nav_left(), TreeStep::Fold(root.clone()));
+		assert_eq!(plan.toggle_dir_collapsed(&root), None);
+		assert_eq!(
+			plan.nav_left(),
+			TreeStep::Nothing,
+			"nothing above the root"
+		);
+		assert_eq!(plan.nav_right(), TreeStep::Unfold(root));
+
+		// A commit replay is a flat list under its headers.
+		let (_dir, plan) = mixed_plan();
+		assert_eq!(plan.nav_left(), TreeStep::Nothing);
+		assert_eq!(plan.nav_right(), TreeStep::Nothing);
+	}
+
+	#[test]
+	fn big_previews_open_with_the_first_level_folded() {
+		let raw = |n: usize| {
+			let mut raw = String::from("// clipcode-root: p\n");
+			for i in 0..n {
+				raw.push_str(&format!("// FILE: p/d{i}/f.txt\nx\n"));
+			}
+			raw
+		};
+		let (_dir, plan) = tree_plan(&raw(201));
+		assert_eq!(
+			shape(&plan),
+			[format!("R {} 201", root_label(&plan)), "D p 201 d1+".into()]
+		);
+		assert_eq!(plan.cursor(), PasteCursor::Dir(key(&plan, "p")));
+		assert!(plan.detail_preview().is_none());
+
+		let (_dir, plan) = tree_plan(&raw(200));
+		assert!(plan.collapsed_dirs.is_empty());
+		assert!(!shape(&plan).iter().any(|l| l.ends_with('+')));
+	}
+
+	#[test]
+	fn a_remap_keeps_folds_of_folders_that_still_exist() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.choose_keep_relative("a").unwrap();
+		plan.choose_keep_relative("b").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+		let (ax, by) = (key(&plan, "a/x"), key(&plan, "b/y"));
+		assert_eq!(
+			plan.toggle_dir_collapsed(&ax),
+			Some(PasteCursor::Dir(ax.clone()))
+		);
+		plan.cursor_dir = Some(ax.clone());
+		assert_eq!(plan.toggle_dir_collapsed(&by), None);
+		plan.cursor_dir = Some(by.clone());
+
+		plan.choose_keep_relative("a").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+		plan.normalize_cursor();
+		assert!(plan.collapsed_dirs.contains(&ax));
+		assert!(plan.collapsed_dirs.contains(&by));
+		assert_eq!(plan.cursor_dir, Some(by));
+
+		let gone = key(&plan, "gone/dir");
+		plan.collapsed_dirs.insert(gone.clone());
+		plan.normalize_cursor();
+		assert!(!plan.collapsed_dirs.contains(&gone));
+		assert!(plan.collapsed_dirs.contains(&ax));
+	}
+
+	#[test]
+	fn dir_control_ids_keep_the_driver_shape() {
+		assert_eq!(
+			dir_control_id(DirControl::Row, 0, "長路徑/a b"),
+			"paste-dir:0:長路徑/a b"
+		);
+		assert_eq!(
+			dir_control_id(DirControl::Toggle, 1, ""),
+			"paste-dir-toggle:1:"
+		);
+		assert_eq!(
+			dir_control_id(DirControl::Include, 0, "src"),
+			"paste-dir-include:0:src"
+		);
+	}
+
 	use std::fs;
 
 	/// A remote Apply whose answer never came may have written: it is
@@ -5736,13 +6139,13 @@ pub(crate) mod tests {
 			plan.selected_item_idx, 0,
 			"step_target must not mutate selection"
 		);
-		assert_eq!(target, 1);
+		assert_eq!(target, PasteCursor::Item(1));
 		let target_back = plan.step_target(false);
 		assert_eq!(
 			plan.selected_item_idx, 0,
 			"step_target must not mutate selection"
 		);
-		assert_eq!(target_back, 0);
+		assert_eq!(target_back, PasteCursor::Item(0));
 
 		let folded_target = plan.toggle_commit_collapsed(0);
 		assert_eq!(

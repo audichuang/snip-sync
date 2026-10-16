@@ -777,6 +777,80 @@ mod tests {
 		);
 	}
 
+	const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+	fn dir_key(s: &PastePreview, path: &str) -> DirKey {
+		let plan = s.plan().unwrap();
+		DirKey {
+			root: plan.items[0].dest_root.clone(),
+			path: path.into(),
+		}
+	}
+
+	fn index_of(s: &PastePreview, path: &str) -> usize {
+		s.plan()
+			.unwrap()
+			.items
+			.iter()
+			.position(|i| i.path == path)
+			.unwrap()
+	}
+
+	/// A folder fold grows the retained set (its key), so unlike a commit
+	/// fold (#refused_fold_reselect_keeps_the_hidden_row_with_its_detail)
+	/// a refusal undoes the whole fold, not only the move.
+	#[test]
+	fn refused_dir_fold_leaves_tree_and_cursor_unchanged() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut o = small_ordinary();
+		let mut s = landed(SRC_TREE, dir.path(), Some(&o));
+		let c = index_of(&s, "src/lib/c.ts");
+		assert_eq!(s.select(c, Some(&o)), Nav::Moved(c));
+		fill_budget(&s, &mut o);
+		let app = dir_key(&s, "src/app");
+		let res = s.toggle_dir_fold(app, Some(&o));
+		assert!(
+			matches!(res, Folded::Reselected(Nav::Refused(ref e)) if e.key == "preview_memory_limit"),
+			"{res:?}"
+		);
+		let plan = s.plan().unwrap();
+		assert!(plan.collapsed_dirs.is_empty());
+		assert_eq!(plan.selected_item_idx, c);
+		assert!(plan.cursor_dir.is_none());
+		assert_eq!(
+			s.detail().and_then(|d| d.path.as_deref()),
+			Some("src/lib/c.ts")
+		);
+		// With room, the same fold goes through.
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let app = dir_key(&s, "src/app");
+		assert!(matches!(s.toggle_dir_fold(app.clone(), None), Folded::Kept));
+		assert!(s.plan().unwrap().collapsed_dirs.contains(&app));
+	}
+
+	#[test]
+	fn selecting_a_folder_drops_the_detail_and_a_file_brings_it_back() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let b = index_of(&s, "src/app/b.ts");
+		assert_eq!(s.select(b, None), Nav::Moved(b));
+		assert!(s.detail().is_some());
+		let app = dir_key(&s, "src/app");
+		assert_eq!(s.select_dir(app.clone(), None), Nav::MovedDir);
+		assert!(s.detail().is_none());
+		assert_eq!(s.plan().unwrap().cursor_dir, Some(app));
+		// A late diff read for the file the cursor left is not shown.
+		let stale = s.plan().unwrap().detail_at(b).unwrap();
+		assert!(s.replace_detail(b, stale, None).is_ok());
+		assert!(s.detail().is_none());
+		assert_eq!(s.select(b, None), Nav::Moved(b));
+		assert!(s.plan().unwrap().cursor_dir.is_none());
+		assert_eq!(
+			s.detail().and_then(|d| d.path.as_deref()),
+			Some("src/app/b.ts")
+		);
+	}
+
 	#[test]
 	fn refused_navigation_keeps_plan_selection_detail_and_busy_state() {
 		let dir = tempfile::tempdir().unwrap();

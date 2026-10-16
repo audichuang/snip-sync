@@ -15174,6 +15174,209 @@ mod tests {
 			cx.run_until_parked();
 		}
 
+		const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+		/// `click` for an id built at run time.
+		fn click_dyn(cx: &mut VisualTestContext, id: String) {
+			click(cx, Box::leak(id.into_boxed_str()));
+		}
+
+		fn paste_ix(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> usize {
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.position(|i| i.path == path)
+					.unwrap()
+			})
+		}
+
+		fn paste_dir(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> crate::paste::DirKey {
+			model.read_with(cx, |m, _| crate::paste::DirKey {
+				root: m.paste.plan().unwrap().items[0].dest_root.clone(),
+				path: path.into(),
+			})
+		}
+
+		fn paste_cursor(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> crate::paste::PasteCursor {
+			model.read_with(cx, |m, _| m.paste.plan().unwrap().cursor())
+		}
+
+		fn paste_tick(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> crate::paste::Tick {
+			use crate::paste::PasteNode;
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.tree_rows()
+					.into_iter()
+					.find_map(|n| match n {
+						PasteNode::Root { key, sum, .. }
+						| PasteNode::Dir { key, sum, .. }
+							if key.path == path =>
+						{
+							Some(sum.tick())
+						}
+						_ => None,
+					})
+					.unwrap_or_else(|| panic!("no folder row {path:?}"))
+			})
+		}
+
+		fn paste_selected(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> Vec<bool> {
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.map(|i| i.selected)
+					.collect()
+			})
+		}
+
+		/// #239: folders of the paste preview are rows of their own, driven
+		/// by the keyboard and the mouse like the Changes tree.
+		#[gpui::test]
+		fn paste_folders_fold_with_arrows_and_toggle_with_space_and_clicks(
+			cx: &mut TestAppContext,
+		) {
+			use crate::paste::{PasteCursor, Tick};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, SRC_TREE);
+			let a = paste_ix(&model, cx, "src/app/a.ts");
+			let row_a = crate::paste::RowControl::Row.id(a, "src/app/a.ts");
+			let app = paste_dir(&model, cx, "src/app");
+
+			// A click on the folder row selects it: no file detail.
+			click(cx, "paste-dir:0:src/app");
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+			model.read_with(cx, |m, _| assert!(m.paste.detail().is_none()));
+
+			cx.simulate_keystrokes("left");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.contains(&app))
+			});
+			assert!(cx
+				.debug_bounds(Box::leak(row_a.clone().into_boxed_str()))
+				.is_none());
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+
+			cx.simulate_keystrokes("right");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.is_empty())
+			});
+			assert!(cx
+				.debug_bounds(Box::leak(row_a.clone().into_boxed_str()))
+				.is_some());
+			cx.simulate_keystrokes("right");
+			cx.run_until_parked();
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Item(a));
+			cx.simulate_keystrokes("left");
+			cx.run_until_parked();
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+
+			// Space on a folder takes its files out, then puts them back.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(paste_selected(&model, cx), [false, false, true]);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.paste.plan().unwrap().counts().creates, 1)
+			});
+			assert_eq!(paste_tick(&model, cx, "src/app"), Tick::Empty);
+			assert_eq!(paste_tick(&model, cx, "src"), Tick::Partial);
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(paste_selected(&model, cx), [true, true, true]);
+
+			// The folder checkbox: all out, one file back (partial), then all.
+			click(cx, "paste-dir-include:0:src");
+			assert_eq!(paste_selected(&model, cx), [false, false, false]);
+			click_dyn(
+				cx,
+				crate::paste::RowControl::Include.id(a, "src/app/a.ts"),
+			);
+			assert_eq!(paste_tick(&model, cx, "src"), Tick::Partial);
+			click(cx, "paste-dir-include:0:src");
+			assert_eq!(paste_selected(&model, cx), [true, true, true]);
+
+			// A folder under the cursor does not stop Apply.
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			for (path, body) in [
+				("src/app/a.ts", "A"),
+				("src/app/b.ts", "B"),
+				("src/lib/c.ts", "C"),
+			] {
+				assert_eq!(fs::read_to_string(dest.join(path)).unwrap(), body);
+			}
+		}
+
+		#[gpui::test]
+		fn folder_chevron_folds_and_moves_a_hidden_cursor_onto_the_folder(
+			cx: &mut TestAppContext,
+		) {
+			use crate::paste::PasteCursor;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, SRC_TREE);
+			let b = paste_ix(&model, cx, "src/app/b.ts");
+			let (app, lib) = (
+				paste_dir(&model, cx, "src/app"),
+				paste_dir(&model, cx, "src/lib"),
+			);
+			click_dyn(cx, crate::paste::RowControl::Row.id(b, "src/app/b.ts"));
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Item(b));
+
+			click(cx, "paste-dir-toggle:0:src/app");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.collapsed_dirs.contains(&app));
+				assert!(plan.items[b].selected, "folding is not a selection");
+			});
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+			model.read_with(cx, |m, _| assert!(m.paste.detail().is_none()));
+
+			click(cx, "paste-dir-toggle:0:src/lib");
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.contains(&lib))
+			});
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app));
+		}
+
 		/// The branch name keeps its width before the repo count gives way
 		/// (#194): the `×N` suffix shrinks to nothing first.
 		#[gpui::test]
