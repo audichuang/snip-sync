@@ -1239,6 +1239,10 @@ impl WorkbenchModel {
 				return;
 			}
 			self.log_deferred = false;
+			#[cfg(test)]
+			{
+				self.history_replace_loads += 1;
+			}
 			let scope = self.log_scope();
 			self.log_scope_key = scope.iter().map(|(r, _)| r.clone()).collect();
 			self.log_feeds.clear();
@@ -3561,6 +3565,11 @@ impl WorkbenchModel {
 	/// A discovery that changed the workspace's repositories reloads a
 	/// loaded log.
 	pub fn sync_log_scope(&mut self, cx: &mut Context<Self>) {
+		// The open repo's read is in flight and reloads the log when it
+		// lands: reloading here too would read it twice.
+		if self.log_reload_for == Some(self.generation) {
+			return;
+		}
 		if self.log_deferred {
 			if self.reset_history_query(
 				self.active_ref_filter.clone(),

@@ -278,6 +278,7 @@ mod reader;
 mod reason;
 mod recent;
 pub mod remote;
+mod repo_set;
 mod selector;
 pub mod syntax;
 pub mod tabs;
@@ -311,6 +312,7 @@ use crate::history::RevTree;
 use crate::i18n::{Locale, Msg};
 use crate::paste::PastePreviewPlan;
 use crate::reader::{Preview, PreviewSource, Reader};
+use crate::repo_set::{RepoOp, RepoSet};
 use crate::syntax::Language;
 use crate::text_input::{InputEvent, TextInput};
 use crate::tree::FileTreeNode;
@@ -578,6 +580,35 @@ pub fn slot_insert(
 	pos
 }
 
+/// Whether the slots are in `(name, root)` order.
+pub fn slots_sorted(slots: &[ChangeRepo]) -> bool {
+	slots.iter().map(|s| (&s.name, &s.root)).is_sorted()
+}
+
+/// Puts the slots back in `(name, root)` order after a rename moved some,
+/// renumbering their rows. The rows of one slot keep their order.
+pub fn slots_resort(slots: &mut Vec<ChangeRepo>, files: &mut [FileChangeItem]) {
+	let mut order: Vec<usize> = (0..slots.len()).collect();
+	order.sort_by(|&a, &b| {
+		(slots[a].name.as_str(), slots[a].root.as_path())
+			.cmp(&(slots[b].name.as_str(), slots[b].root.as_path()))
+	});
+	let mut new_of_old = vec![0u32; slots.len()];
+	for (new, &old) in order.iter().enumerate() {
+		new_of_old[old] = new as u32;
+	}
+	for f in files.iter_mut() {
+		f.repo = new_of_old[f.repo as usize];
+	}
+	files.sort_by_key(|f| f.repo);
+	let mut old: Vec<Option<ChangeRepo>> =
+		std::mem::take(slots).into_iter().map(Some).collect();
+	*slots = order
+		.into_iter()
+		.map(|i| old[i].take().expect("each slot moves once"))
+		.collect();
+}
+
 /// Removes slot `slot` and its rows.
 pub fn slot_remove(
 	slots: &mut Vec<ChangeRepo>,
@@ -781,7 +812,7 @@ pub struct WorkbenchModel {
 	pub workspace_root: PathBuf,
 	/// `--restore-dir`: the paste destination of the launch's own tab only.
 	pub restore_dir: Option<PathBuf>,
-	pub repos: Vec<RepoEntry>,
+	pub repos: RepoSet,
 	pub selected_repo_idx: Option<usize>,
 
 	// Git log.
@@ -974,6 +1005,10 @@ pub struct WorkbenchModel {
 	pub generation: u64,
 	pub preview_generation: u64,
 	pub history_generation: u64,
+	/// Replace loads of the log that got past the discovery wait: a test
+	/// counts how many one repo-set change costs.
+	#[cfg(test)]
+	pub(crate) history_replace_loads: u64,
 	pub tree_generation: u64,
 	pub mode: String,
 	pub focus_handle: FocusHandle,
@@ -1062,6 +1097,9 @@ pub struct WorkbenchModel {
 	pub log_commit_root: Option<PathBuf>,
 	/// A Replace load waited for discovery to reach the picked repositories.
 	pub log_deferred: bool,
+	/// The `generation` of the repo read whose landing reloads the Log: the
+	/// scope sync leaves the reload to it, so one change reads the Log once.
+	log_reload_for: Option<u64>,
 	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
 	pub remote_path_input: Entity<TextInput>,
@@ -1372,7 +1410,7 @@ impl WorkbenchModel {
 		let mut model = Self {
 			workspace_root: workspace.clone().unwrap_or_default(),
 			restore_dir,
-			repos: Vec::new(),
+			repos: RepoSet::new(),
 			selected_repo_idx: None,
 			commits: Vec::new(),
 			refs: Vec::new(),
@@ -1503,6 +1541,8 @@ impl WorkbenchModel {
 			generation: 0,
 			preview_generation: 0,
 			history_generation: 0,
+			#[cfg(test)]
+			history_replace_loads: 0,
 			tree_generation: 0,
 			mode,
 			focus_handle: cx.focus_handle(),
@@ -1559,6 +1599,7 @@ impl WorkbenchModel {
 			log_feeds: Vec::new(),
 			log_commit_root: None,
 			log_deferred: false,
+			log_reload_for: None,
 			remote: remote::MasterState {
 				hosts: remote::load_hosts(),
 				recent: remote::load_recent(),
@@ -1795,12 +1836,29 @@ impl WorkbenchModel {
 		res
 	}
 
+	/// The slot of `root`, made if it is new. Its name is the repo's name
+	/// in the list now: `fallback` is the one a read took when it began,
+	/// which a rename since has made stale.
 	fn ensure_change_slot(
 		&mut self,
 		root: &std::path::Path,
-		name: &str,
+		fallback: &str,
 	) -> usize {
-		slot_insert(&mut self.change_repos, &mut self.files, root, name)
+		let name = self
+			.repos
+			.iter()
+			.find(|r| r.root == root)
+			.map_or(fallback, |r| r.name.as_str());
+		let pos =
+			slot_insert(&mut self.change_repos, &mut self.files, root, name);
+		if slots_sorted(&self.change_repos) {
+			return pos;
+		}
+		slots_resort(&mut self.change_repos, &mut self.files);
+		self.change_repos
+			.iter()
+			.position(|s| s.root == root)
+			.unwrap_or(pos)
 	}
 
 	/// Installs one repo's status read into its slot: rows past
@@ -1854,6 +1912,10 @@ impl WorkbenchModel {
 			let (root, name) =
 				(self.repos[r].root.clone(), self.repos[r].name.clone());
 			slot_insert(&mut self.change_repos, &mut self.files, &root, &name);
+		}
+		// A rename renames the node in place: the order follows the names.
+		if !slots_sorted(&self.change_repos) {
+			slots_resort(&mut self.change_repos, &mut self.files);
 		}
 	}
 
@@ -1946,11 +2008,7 @@ impl WorkbenchModel {
 		let name = self.change_repos[slot].name.clone();
 		let result = result.map(|(summary, changes, total)| {
 			if let Some(summary) = summary {
-				if let Some(entry) =
-					self.repos.iter_mut().find(|r| r.root == root)
-				{
-					entry.summary = Ok(summary);
-				}
+				self.repos.set_summary(root, summary);
 			}
 			(changes, total)
 		});
@@ -2578,7 +2636,6 @@ impl WorkbenchModel {
 	}
 
 	fn release_workspace_state(&mut self, cx: &mut Context<Self>) {
-		release_vec(&mut self.repos);
 		self.selected_repo_idx = None;
 		self.release_repo_state();
 		self.ws_tree = None;
@@ -2607,6 +2664,7 @@ impl WorkbenchModel {
 		self.pinned_repo = None;
 		self.carried_repo = None;
 		self.refresh_reload = false;
+		self.log_deferred = false;
 		release_vec(&mut self.manual_repos);
 		self.add_cancel = None;
 		self.is_loading = false;
@@ -2622,6 +2680,10 @@ impl WorkbenchModel {
 		self.remote.scan_recovery = None;
 		self.selected_file_root = None;
 		self.clear_workspace_inputs(cx);
+		// Last: the log's scope is released by now, so the settle has
+		// nothing to reload, and the paste preview is already closed.
+		let change = self.repos.apply(RepoOp::Release, &self.workspace_root);
+		self.repos_changed(change, cx);
 	}
 
 	/// Drops everything that belongs to the open repo and stops its reads, so
@@ -2682,6 +2744,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_branch_menu_open);
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
+		self.log_reload_for = None;
 		self.log_commit_root = None;
 		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
@@ -3233,43 +3296,50 @@ impl WorkbenchModel {
 		});
 	}
 
-	/// Replaces the list with the manual repos plus the open one, so the
-	/// selection keeps naming the same repo while later pages arrive.
-	fn begin_rescan(&mut self) {
+	/// One page of a scan: the first of a rescan (`wipe`) first shrinks the
+	/// list to the manual repos plus the open one, so the selection keeps
+	/// naming the same repo while later pages arrive. A newer read of a known
+	/// repo replaces it.
+	fn apply_scan_page(
+		&mut self,
+		wipe: bool,
+		page: Vec<RepoEntry>,
+		cx: &mut Context<Self>,
+	) {
+		let keys: Vec<_> = page.iter().map(repo_key).collect();
+		let op = if wipe {
+			RepoOp::Rescan {
+				kept: self.rescan_kept(),
+				page,
+			}
+		} else {
+			RepoOp::Merge(page)
+		};
+		let change = self.repos.apply(op, &self.workspace_root);
+		// Found again by the walk: no longer a repo only kept.
+		if self.carried_repo.as_ref().is_some_and(|c| keys.contains(c)) {
+			self.carried_repo = None;
+		}
+		self.repos_changed(change, cx);
+	}
+
+	/// What a rescan keeps of the list: the manual repos plus the open one.
+	/// A repo only kept (not a manual one) is carried until the walk finds
+	/// it or proves it gone.
+	fn rescan_kept(&mut self) -> Vec<RepoEntry> {
 		let open = self.pinned_repo.as_ref().and_then(|key| {
-			let pos =
-				self.repos.iter().position(|e| repo_key_matches(e, key))?;
-			Some(self.repos.swap_remove(pos))
+			self.repos
+				.iter()
+				.find(|e| repo_key_matches(e, key))
+				.cloned()
 		});
-		self.repos.clear();
 		let mut keep = self.manual_repos.clone();
 		keep.extend(open);
-		self.merge_repo_entries(keep);
 		// A manual repo is kept regardless of the walk.
 		self.carried_repo = self.pinned_repo.clone().filter(|key| {
 			!self.manual_repos.iter().any(|m| repo_key_matches(m, key))
 		});
-	}
-
-	/// Adds or refreshes entries; a newer read of a known repo replaces it.
-	fn merge_repo_entries(&mut self, extra: Vec<RepoEntry>) {
-		for entry in extra {
-			let key = repo_key(&entry);
-			if self.carried_repo.as_ref() == Some(&key) {
-				self.carried_repo = None;
-			}
-			match self
-				.repos
-				.iter()
-				.position(|have| repo_key_matches(have, &key))
-			{
-				Some(pos) => self.repos[pos] = entry,
-				None => self.repos.push(entry),
-			}
-		}
-		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
-		self.repos
-			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
+		keep
 	}
 
 	fn push_discovery_error(&mut self, item: (PathBuf, Failure)) {
@@ -3324,8 +3394,8 @@ impl WorkbenchModel {
 			return;
 		};
 		if self.repo().is_some() {
-			if let Some(idx) = self.selected_repo_idx {
-				self.repos[idx].summary = Ok(summary);
+			if let Some(root) = self.repo_root() {
+				self.repos.set_summary(&root, summary);
 			}
 		}
 	}
@@ -3335,21 +3405,24 @@ impl WorkbenchModel {
 	fn drop_vanished_repo(
 		&mut self,
 		key: &(PathBuf, PathBuf),
+		cx: &mut Context<Self>,
 	) -> Option<String> {
-		let pos = self.repos.iter().position(|e| repo_key_matches(e, key))?;
-		let gone = self.repos.remove(pos);
+		let pos = self.repos.position_of(key)?;
+		let (gone_root, gone_name) =
+			(self.repos[pos].root.clone(), self.repos[pos].name.clone());
 		// Its kept selection names files that can no longer be read.
-		self.tree_selections.retain(|(root, _)| root != &gone.root);
-		if self.pinned_repo.as_ref() == Some(key) {
+		self.tree_selections.retain(|(root, _)| root != &gone_root);
+		let was_open = self.pinned_repo.as_ref() == Some(key);
+		if was_open {
 			self.pinned_repo = None;
 			self.selected_repo_idx = None;
 			self.release_repo_state();
-			return Some(gone.name);
 		}
-		self.selected_repo_idx = self.pinned_repo.as_ref().and_then(|pinned| {
-			self.repos.iter().position(|e| repo_key_matches(e, pinned))
-		});
-		None
+		let change = self
+			.repos
+			.apply(RepoOp::Remove(key.clone()), &self.workspace_root);
+		self.repos_changed(change, cx);
+		was_open.then_some(gone_name)
 	}
 
 	/// A paste preview opened (or remapped) before the scan finished lists
@@ -3357,8 +3430,7 @@ impl WorkbenchModel {
 	/// scan finishes and whenever a preview job lands, since a job in flight
 	/// at the scan's end hands back the old candidates.
 	fn refresh_paste_candidates(&mut self, cx: &mut Context<Self>) {
-		let roots: Vec<PathBuf> =
-			self.repos.iter().map(|r| r.root.clone()).collect();
+		let roots = self.repos.roots();
 		match self.paste.refresh_candidates(&roots, self.preview.as_ref()) {
 			Ok(true) => {
 				app_log!("[APP:PASTE_CANDIDATES_REFRESHED]");
@@ -3404,11 +3476,12 @@ impl WorkbenchModel {
 		self.ensure_ws_tree(cx);
 		// Only a complete walk proves the kept repo is gone; a capped or
 		// partial one may simply not have reached it yet.
-		let vanished =
+		let carried =
 			matches!(self.discovery_status, Some(ScanStatus::Complete))
 				.then(|| self.carried_repo.take())
-				.flatten()
-				.and_then(|key| self.drop_vanished_repo(&key));
+				.flatten();
+		let vanished =
+			carried.and_then(|key| self.drop_vanished_repo(&key, cx));
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
 		self.set_status(
 			"status_repos_loaded",
@@ -3431,10 +3504,8 @@ impl WorkbenchModel {
 				self.select_repo_internal(idx, true, cx);
 			}
 		}
-		self.sync_change_slots();
+		self.settle_repo_consumers(cx);
 		self.start_changes_queue(false, cx);
-		self.sync_log_scope(cx);
-		self.refresh_paste_candidates(cx);
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -3497,18 +3568,16 @@ impl WorkbenchModel {
 		{
 			self.manual_repos.push(entry.clone());
 		}
-		self.repos.push(entry);
-		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
-		self.repos
-			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
-		if let Some(pos) = self
+		let change = self
 			.repos
-			.iter()
-			.position(|have| repo_key_matches(have, &key))
-		{
+			.apply(RepoOp::Merge(vec![entry]), &self.workspace_root);
+		if let Some(pos) = self.repos.position_of(&key) {
 			self.pinned_repo = Some(key);
+			// Before the fan-out: the open repo's own reload then owns the
+			// Log's, and the Log is not read twice.
 			self.select_repo_internal(pos, false, cx);
 		}
+		self.repos_changed(change, cx);
 		cx.notify();
 	}
 
@@ -3965,12 +4034,13 @@ impl WorkbenchModel {
 		}
 		self.generation += 1;
 		self.preview_generation += 1;
+		let task_generation = self.generation;
 		if reload_log {
 			self.history_generation += 1;
 			let _ = arm_cancel(&mut self.history_cancel);
+			self.log_reload_for = Some(task_generation);
 		}
 		self.tree_generation += 1;
-		let task_generation = self.generation;
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
@@ -4295,6 +4365,7 @@ impl WorkbenchModel {
 					}
 				}
 				if reload_log {
+					model.log_reload_for = None;
 					model.load_history(cx);
 				} else {
 					model.log_kept_on_repo_switch();
@@ -5021,6 +5092,8 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if let Err(err) = self.paste.enqueue(request) {
+			// A remap's plan is idle again, without its writes.
+			self.refresh_paste_candidates(cx);
 			self.set_status_msg(err);
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
@@ -5049,9 +5122,14 @@ impl WorkbenchModel {
 		if discarded {
 			app_log!("[APP:PASTE_DISCARDED: cancelled]");
 		}
+		// Whatever landed, the preview is idle again (or closed): bring
+		// its candidates up to date with the repos added while it was busy.
+		// Before the plan is shown, so its candidates are logged as they are.
+		if landed.is_some() {
+			self.refresh_paste_candidates(cx);
+		}
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
-				self.refresh_paste_candidates(cx);
 				self.show_landed_plan(remap);
 				let selected_idx =
 					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
@@ -5195,8 +5273,7 @@ impl WorkbenchModel {
 		}
 
 		let target_dest = self.current_restore_destination();
-		let known_roots: Vec<std::path::PathBuf> =
-			self.repos.iter().map(|r| r.root.clone()).collect();
+		let known_roots = self.repos.roots();
 		self.pending_focus = Some(self.paste_focus.clone());
 		self.queue_paste(
 			paste::PasteRequest::Clipboard {
@@ -5256,6 +5333,8 @@ impl WorkbenchModel {
 		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
 			paste::preview::Remapped::NoPlan => {}
 			paste::preview::Remapped::Invalid(err) => {
+				// Idle again with its old mapping.
+				self.refresh_paste_candidates(cx);
 				self.set_status_msg(err);
 				cx.notify();
 			}
@@ -5747,11 +5826,14 @@ impl WorkbenchModel {
 								"[APP:PASTE_STALE_DETECTED: {}]",
 								err.token.as_str()
 							);
-							model.status = err.msg.clone();
 							model.paste.apply_failed(
-								err.msg,
+								err.msg.clone(),
 								model.preview.as_ref(),
 							);
+							// Idle again: the repos added while it applied
+							// are candidates now.
+							model.refresh_paste_candidates(cx);
+							model.status = err.msg;
 						}
 					}
 					cx.notify();
@@ -5984,11 +6066,8 @@ async fn drive_discovery(
 			if model.discovery_generation != generation {
 				return true;
 			}
-			if wipe {
-				model.begin_rescan();
-				wipe = false;
-			}
-			model.merge_repo_entries(processed.0);
+			model.apply_scan_page(wipe, processed.0, cx);
+			wipe = false;
 			for err in processed.1 {
 				model.push_discovery_error(err);
 			}
@@ -10722,10 +10801,10 @@ mod tests {
 				total: 0,
 			};
 			model.update(cx, |m, cx| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("ra"), "ra"),
 					make_test_repo(tmp.path().join("rb"), "rb"),
-				];
+				]);
 				m.change_repos =
 					vec![failed("ra", "why-alpha"), failed("rb", "why-beta")];
 				// Each repo keeps a row, so its note sits under it
@@ -15823,14 +15902,12 @@ mod tests {
 			let Some(_clip) = clipboard() else { return };
 			let ws = tempfile::tempdir().unwrap();
 			let a = repo(ws.path(), "a", &[]);
-			let b = repo(ws.path(), "b", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
-			settle_until(cx, "both repos found", |cx| {
-				model.read_with(cx, |m, _| m.repos.len() == 2)
-			});
-			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			repos_settled(&model, cx, 1);
 			paste(&model, cx, "// FILE: x/one.txt\n1\n// FILE: y/two.txt\n2\n");
-			let b = dunce::canonicalize(b).unwrap();
+			// Found by the scan only now.
+			let late = scanned_entry(&repo(ws.path(), "b", &[]));
+			let b = late.root.clone();
 			let before = model.read_with(cx, |m, _| {
 				let choices = &m.paste.plan().unwrap().prefix_choices;
 				assert!(!choices.is_empty());
@@ -15838,7 +15915,7 @@ mod tests {
 				choices[0].candidates.clone()
 			});
 			model.update_in(cx, |m, _, cx| {
-				m.repos.push(late);
+				m.apply_scan_page(false, vec![late], cx);
 				m.finish_discovery(cx);
 			});
 			model.read_with(cx, |m, _| {
@@ -15862,18 +15939,15 @@ mod tests {
 			let Some(_clip) = clipboard() else { return };
 			let ws = tempfile::tempdir().unwrap();
 			let a = repo(ws.path(), "a", &[]);
-			let b = repo(ws.path(), "b", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
-			settle_until(cx, "both repos found", |cx| {
-				model.read_with(cx, |m, _| m.repos.len() == 2)
-			});
-			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			repos_settled(&model, cx, 1);
 			paste(&model, cx, "// FILE: x/one.txt\n1\n");
-			let b = dunce::canonicalize(b).unwrap();
+			let late = scanned_entry(&repo(ws.path(), "b", &[]));
+			let b = late.root.clone();
 			model.update_in(cx, |m, _, cx| {
 				m.choose_paste_prefix("x", 0, cx);
 				assert!(m.paste.is_loading(), "remap job in flight");
-				m.repos.push(late);
+				m.apply_scan_page(false, vec![late], cx);
 				m.finish_discovery(cx);
 				assert!(m.paste.is_loading(), "refresh skipped while loading");
 			});
@@ -15891,6 +15965,424 @@ mod tests {
 				for choice in &m.paste.plan().unwrap().prefix_choices {
 					assert!(choice.candidates.contains(&b));
 				}
+			});
+		}
+
+		/// A repo outside the workspace, in a directory of its own: the
+		/// workspace scan cannot find it, so only the user adding it brings
+		/// it into the set. Its root comes back canonical.
+		fn external_repo(name: &str) -> (tempfile::TempDir, PathBuf) {
+			let tmp = tempfile::tempdir().unwrap();
+			let root = repo(tmp.path(), name, &[]);
+			let root = dunce::canonicalize(root).unwrap();
+			(tmp, root)
+		}
+
+		/// Adds `path` the way a user does: the Project window's plus button,
+		/// the path field, Enter.
+		fn add_repo_by_gesture(cx: &mut VisualTestContext, path: &Path) {
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click(cx, "btn-add-repo");
+			click(cx, "input-add-repo");
+			cx.simulate_input(&path.display().to_string());
+			cx.simulate_keystrokes("enter");
+		}
+
+		/// The workspace's repos are all found and the scan is over.
+		fn repos_settled(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			n: usize,
+		) {
+			settle_until(cx, "the workspace's repos", |cx| {
+				model.read_with(cx, |m, _| !m.is_loading && m.repos.len() == n)
+			});
+		}
+
+		/// The entry the scan builds for a repo it found.
+		fn scanned_entry(root: &Path) -> crate::RepoEntry {
+			use snip_core::gitrun::CancelToken;
+			crate::resolve_added_repo(root.to_path_buf(), &CancelToken::new())
+				.unwrap()
+		}
+
+		/// A repo added by hand while a paste preview is open joins every
+		/// prefix choice's candidates (#227): adding is a change of the
+		/// repo set like a scan page, not a scan's end.
+		#[gpui::test]
+		fn manually_added_repo_joins_an_open_paste_previews_candidates(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n// FILE: y/two.txt\n2\n");
+			let before = model.read_with(cx, |m, _| {
+				let choices = &m.paste.plan().unwrap().prefix_choices;
+				assert!(!choices.is_empty());
+				assert!(choices.iter().all(|c| !c.candidates.contains(&ext)));
+				choices
+					.iter()
+					.map(|c| c.candidates.clone())
+					.collect::<Vec<_>>()
+			});
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the added repo", |cx| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 2 && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("the preview stays open");
+				assert_eq!(plan.prefix_choices.len(), before.len());
+				for (choice, old) in plan.prefix_choices.iter().zip(&before) {
+					assert!(
+						choice.candidates.contains(&ext),
+						"{:?} lacks {ext:?}",
+						choice.candidates
+					);
+					assert_eq!(
+						choice.candidates[..old.len()],
+						old[..],
+						"existing candidates keep their index"
+					);
+				}
+			});
+		}
+
+		/// A scan page that lands while the scan is still running already
+		/// reaches the paste preview, and leaves Changes and Log to the
+		/// scan's end (#227): the first page of a Refresh must not drop the
+		/// rows of the repos it has not found again yet.
+		#[gpui::test]
+		fn scan_page_updates_paste_candidates_before_the_scan_ends(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			let b = repo(ws.path(), "b", &[]);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			let scope_before =
+				model.read_with(cx, |m, _| m.log_scope_key.clone());
+			let entry =
+				crate::resolve_added_repo(b, &CancelToken::new()).unwrap();
+			let b_root = entry.root.clone();
+			model.update_in(cx, |m, _, cx| {
+				m.is_loading = true;
+				m.apply_scan_page(false, vec![entry], cx);
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.repos.iter().any(|r| r.root == b_root));
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(
+						choice.candidates.contains(&b_root),
+						"a page of the running scan reaches the preview"
+					);
+				}
+				assert!(
+					!m.change_repos.iter().any(|s| s.root == b_root),
+					"Changes waits for the scan's end"
+				);
+				assert_eq!(m.log_scope_key, scope_before);
+			});
+			model.update_in(cx, |m, _, cx| {
+				m.is_loading = false;
+				m.finish_discovery(cx);
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.change_repos.iter().any(|s| s.root == b_root));
+			});
+		}
+
+		/// An Apply that fails stale returns the preview to idle: a repo
+		/// added while it was applying (the one moment candidates cannot be
+		/// extended) is in its candidates by then (#227).
+		#[gpui::test]
+		fn failed_apply_rebinds_candidates_to_repos_added_while_applying(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let entry =
+				crate::resolve_added_repo(ext.clone(), &CancelToken::new())
+					.unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			repos_settled(&model, cx, 1);
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			model.update_in(cx, |m, _, cx| m.choose_paste_keep("x", cx));
+			settle_until(cx, "the mapping", |cx| {
+				model.read_with(cx, |m, _| !m.paste.is_loading())
+			});
+			// The target appears behind the preview's back: Apply goes stale.
+			fs::create_dir_all(dest.join("x")).unwrap();
+			fs::write(dest.join("x/one.txt"), "external").unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.apply_paste_restore(cx);
+				assert!(m.paste.is_applying());
+				m.install_added_repo(Ok(entry), cx);
+			});
+			settle_until(cx, "the apply to fail", |cx| {
+				model.read_with(cx, |m, _| !m.paste.is_applying())
+			});
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("the preview stays open");
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("stale_created")
+				);
+				assert!(!plan.prefix_choices.is_empty());
+				for choice in &plan.prefix_choices {
+					assert!(
+						choice.candidates.contains(&ext),
+						"{:?} lacks {ext:?}",
+						choice.candidates
+					);
+				}
+			});
+		}
+
+		/// A manually added namesake renames the repo it shares a name with:
+		/// the Changes nodes follow the rename and keep their order (#227).
+		#[gpui::test]
+		fn changes_nodes_follow_a_rename_from_a_manually_added_namesake(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			fs::create_dir(ws.path().join("nested")).unwrap();
+			let app = repo(&ws.path().join("nested"), "app", &[]);
+			repo(ws.path(), "zeta", &[]);
+			let (_ext_tmp, ext) = external_repo("app");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(app));
+			repos_settled(&model, cx, 2);
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the added namesake", |cx| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 3 && m.change_repos.len() == 3
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				for slot in &m.change_repos {
+					let name = m
+						.repos
+						.iter()
+						.find(|r| r.root == slot.root)
+						.map(|r| r.name.as_str());
+					assert_eq!(
+						Some(slot.name.as_str()),
+						name,
+						"the node of {:?} keeps its old name",
+						slot.root
+					);
+				}
+				let order: Vec<_> = m
+					.change_repos
+					.iter()
+					.map(|s| (s.name.clone(), s.root.clone()))
+					.collect();
+				let mut sorted = order.clone();
+				sorted.sort();
+				assert_eq!(order, sorted, "nodes are in (name, root) order");
+			});
+		}
+
+		/// A Refresh that finds a repo ahead of the one the repo selector's
+		/// cursor is on shifts the list: the cursor stays on its repo, so
+		/// Enter opens the repo it pointed at (#227).
+		#[gpui::test]
+		fn repo_selector_cursor_stays_on_its_repo_when_a_rescan_reorders_it(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "c", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			cx.simulate_keystrokes("alt-shift-r");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.popover, Some(crate::Popover::Repo));
+			});
+			cx.simulate_keystrokes("down");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos[m.popover_cursor].name, "c");
+			});
+			repo(ws.path(), "b", &[]);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			repos_settled(&model, cx, 3);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.popover, Some(crate::Popover::Repo));
+			});
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repo().map(|r| r.name.as_str()), Some("c"));
+			});
+		}
+
+		/// One Refresh that changes the repo set reloads the Log once: the
+		/// open repo's reload and the scope change are one reload (#227).
+		#[gpui::test]
+		fn refresh_that_changes_the_repo_set_reloads_the_log_once(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 2 && m.history_loaded
+				})
+			});
+			repo(ws.path(), "c", &[]);
+			let before = model.read_with(cx, |m, _| m.history_replace_loads);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			repos_settled(&model, cx, 3);
+			settle_until(cx, "the log of three repos", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 3 && m.history_loaded
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.history_replace_loads - before, 1);
+			});
+		}
+
+		/// A paste job already reading when a repo is added lands with it.
+		/// Guards the landing refresh the fan-out must not break (#227).
+		#[gpui::test]
+		fn paste_job_in_flight_lands_with_a_repo_added_meanwhile(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::gitrun::CancelToken;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let entry =
+				crate::resolve_added_repo(ext.clone(), &CancelToken::new())
+					.unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			clip::write_text("// FILE: x/one.txt\n1\n").unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.trigger_paste_preview(cx);
+				assert!(m.paste.is_loading());
+				m.install_added_repo(Ok(entry), cx);
+			});
+			settle_until(cx, "the preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&ext));
+				}
+			});
+		}
+
+		/// Every source of a change to the repo set advances its revision
+		/// and leaves the consumers settled: a scan page and a rescan, a repo
+		/// added by hand, a vanished repo dropped, the workspace released.
+		/// A remote scan's failure (`Clear`) needs a fault injected into the
+		/// worker, and is covered by the type: a change that is not handed
+		/// to `repos_changed` does not build, and panics when dropped.
+		#[gpui::test]
+		fn every_repo_set_source_fans_out(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 1);
+			let b = scanned_entry(&repo(ws.path(), "b", &[]));
+			let c = scanned_entry(&repo(ws.path(), "c", &[]));
+			let c_key = crate::repo_key(&c);
+			let ext_entry = scanned_entry(&ext);
+			let rev = |m: &WorkbenchModel| m.repos.rev();
+			let mut last = model.read_with(cx, |m, _| rev(m));
+			let mut advanced = |cx: &mut VisualTestContext, what: &str| {
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					assert!(rev(m) > last, "{what} advances the revision");
+					last = rev(m);
+					assert!(!m.is_loading);
+					m.assert_repo_consumers_settled();
+				});
+			};
+
+			model.update_in(cx, |m, _, cx| {
+				m.apply_scan_page(false, vec![b], cx);
+				m.assert_repo_consumers_settled();
+			});
+			advanced(cx, "a scan page");
+			model.update_in(cx, |m, _, cx| {
+				m.apply_scan_page(true, vec![c], cx);
+				m.assert_repo_consumers_settled();
+			});
+			advanced(cx, "a rescan");
+			model.update_in(cx, |m, _, cx| {
+				m.install_added_repo(Ok(ext_entry), cx);
+				m.assert_repo_consumers_settled();
+			});
+			advanced(cx, "a repo added by hand");
+			model.update_in(cx, |m, _, cx| {
+				assert!(m.drop_vanished_repo(&c_key, cx).is_none());
+				m.assert_repo_consumers_settled();
+			});
+			advanced(cx, "a vanished repo");
+			model.update_in(cx, |m, _, cx| m.release_workspace_state(cx));
+			model.read_with(cx, |m, _| {
+				assert!(rev(m) > last, "the release advances the revision");
+				assert!(m.repos.is_empty());
+				m.assert_repo_consumers_settled();
+			});
+		}
+
+		/// A repo added by hand reloads the Log once, with the new repo in
+		/// its scope (#227).
+		#[gpui::test]
+		fn manual_add_reloads_the_log_once_with_the_new_repo(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			repo(ws.path(), "b", &[]);
+			let (_ext_tmp, ext) = external_repo("ext");
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			repos_settled(&model, cx, 2);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.len() == 2 && m.history_loaded
+				})
+			});
+			let before = model.read_with(cx, |m, _| m.history_replace_loads);
+			add_repo_by_gesture(cx, &ext);
+			settle_until(cx, "the log with the added repo", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_scope_key.contains(&ext) && m.history_loaded
+				})
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.history_replace_loads - before, 1);
 			});
 		}
 
@@ -16579,8 +17071,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos =
-					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().to_path_buf(),
+					"repo",
+				)]);
 				m.change_repos = vec![crate::ChangeRepo {
 					root: tmp.path().to_path_buf(),
 					name: "repo".into(),
@@ -16608,10 +17102,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("r1"), "r1"),
 					make_test_repo(tmp.path().join("r2"), "r2"),
-				];
+				]);
 				m.change_repos = vec![
 					crate::ChangeRepo {
 						root: tmp.path().join("r1"),
@@ -16653,8 +17147,10 @@ mod tests {
 			let n = 200;
 			model.update(cx, |m, cx| {
 				m.probes = Some(crate::ui::Probes::for_test());
-				m.repos =
-					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().to_path_buf(),
+					"repo",
+				)]);
 				m.change_repos = vec![crate::ChangeRepo {
 					root: tmp.path().to_path_buf(),
 					name: "repo".into(),
@@ -16698,8 +17194,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos =
-					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().to_path_buf(),
+					"repo",
+				)]);
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
@@ -16728,10 +17226,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("r1"), "r1"),
 					make_test_repo(tmp.path().join("r2"), "r2"),
-				];
+				]);
 				m.log_feeds = vec![
 					crate::multi_log::Feed {
 						name: "r1".into(),
@@ -16846,7 +17344,7 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos.clear();
+				m.repos.replace_for_test(Vec::new());
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Incomplete);
 				m.discovery_errors = vec![(
@@ -16881,7 +17379,7 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, cx| {
-				m.repos.clear();
+				m.repos.replace_for_test(Vec::new());
 				m.discovery_errors.clear();
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
@@ -16953,7 +17451,7 @@ mod tests {
 				snip_core::workspace::ScanStatus::Incomplete,
 			] {
 				model.update(cx, |m, _| {
-					m.repos.clear();
+					m.repos.replace_for_test(Vec::new());
 					m.discovery_status = Some(status);
 					m.discovery_errors.clear();
 					m.is_loading = false;
@@ -16995,7 +17493,7 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos.clear();
+				m.repos.replace_for_test(Vec::new());
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.discovery_errors.clear();
@@ -17014,7 +17512,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.change_repos.clear();
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
@@ -17031,7 +17532,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.change_repos = vec![crate::ChangeRepo {
 					root: tmp.path().join("r1"),
 					name: "r1".into(),
@@ -17054,10 +17558,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("r1"), "r1"),
 					make_test_repo(tmp.path().join("r2"), "r2"),
-				];
+				]);
 				m.change_repos = vec![
 					crate::ChangeRepo {
 						root: tmp.path().join("r1"),
@@ -17089,7 +17593,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.change_repos = vec![crate::ChangeRepo {
 					root: tmp.path().join("r1"),
 					name: "r1".into(),
@@ -17119,7 +17626,10 @@ mod tests {
 				snip_core::workspace::ScanStatus::Cancelled,
 			] {
 				model.update(cx, |m, _| {
-					m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+					m.repos.replace_for_test(vec![make_test_repo(
+						tmp.path().join("r1"),
+						"r1",
+					)]);
 					m.change_repos = vec![crate::ChangeRepo {
 						root: tmp.path().join("r1"),
 						name: "r1".into(),
@@ -17195,10 +17705,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("alpha"), "alpha"),
 					make_test_repo(tmp.path().join("beta"), "beta"),
-				];
+				]);
 				m.change_repos = vec![
 					crate::ChangeRepo {
 						root: tmp.path().join("alpha"),
@@ -17252,10 +17762,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![
+				m.repos.replace_for_test(vec![
 					make_test_repo(tmp.path().join("alpha"), "alpha"),
 					make_test_repo(tmp.path().join("beta"), "beta"),
-				];
+				]);
 				m.change_repos = vec![
 					crate::ChangeRepo {
 						root: tmp.path().join("alpha"),
@@ -17287,7 +17797,10 @@ mod tests {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.change_repos = vec![crate::ChangeRepo {
 					root: tmp.path().join("r1"),
 					name: "r1".into(),
@@ -17362,7 +17875,7 @@ mod tests {
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
 				m.commits.clear();
-				m.repos.clear();
+				m.repos.replace_for_test(Vec::new());
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.discovery_errors.clear();
@@ -17382,7 +17895,10 @@ mod tests {
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
 				m.commits.clear();
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
@@ -17411,7 +17927,10 @@ mod tests {
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
 				m.commits.clear();
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
@@ -17429,7 +17948,10 @@ mod tests {
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			model.update(cx, |m, _| {
 				m.commits.clear();
-				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.repos.replace_for_test(vec![make_test_repo(
+					tmp.path().join("r1"),
+					"r1",
+				)]);
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
@@ -23075,6 +23597,48 @@ mod tests {
 		q.push(1);
 		q.clear_pending();
 		assert_eq!(q.take(), None);
+	}
+
+	/// A node renamed in place moves to where its new name sorts, and its
+	/// rows with it, in the order they had (#227).
+	#[test]
+	fn a_renamed_change_slot_moves_with_its_rows() {
+		use std::path::Path;
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		for n in ["a", "b", "c"] {
+			let root = format!("/w/{n}");
+			let slot = slot_insert(&mut slots, &mut files, Path::new(&root), n);
+			let rows = ["1", "2"]
+				.map(|i| {
+					change(
+						&format!("{n}{i}.txt"),
+						SourceKind::Working,
+						slot as u32,
+					)
+				})
+				.to_vec();
+			slot_replace_rows(&mut files, slot, rows);
+		}
+		slots[0].name = "z".into();
+		assert!(!slots_sorted(&slots));
+		slots_resort(&mut slots, &mut files);
+		assert!(slots_sorted(&slots));
+		let names: Vec<_> = slots.iter().map(|s| s.name.as_str()).collect();
+		assert_eq!(names, ["b", "c", "z"]);
+		let paths: Vec<_> =
+			files.iter().map(|f| (f.repo, f.path.as_str())).collect();
+		assert_eq!(
+			paths,
+			[
+				(0, "b1.txt"),
+				(0, "b2.txt"),
+				(1, "c1.txt"),
+				(1, "c2.txt"),
+				(2, "a1.txt"),
+				(2, "a2.txt"),
+			]
+		);
 	}
 
 	#[test]

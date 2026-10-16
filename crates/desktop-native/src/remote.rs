@@ -18,6 +18,7 @@ use gpui::Context;
 use crate::i18n::Msg;
 use crate::reader::PreviewSource;
 use crate::reason::reason_msg;
+use crate::repo_set::RepoOp;
 use crate::tree::{
 	listed_tree_result, FileTreeNode, ListedChild, TreeIo, TreeIoResult,
 };
@@ -1444,10 +1445,7 @@ impl WorkbenchModel {
 							if retries > 0 {
 								app_log!("[APP:REMOTE_SCAN_RECOVERED: retries={retries} repos={}]", e.repos.len());
 							}
-							if wipe {
-								model.begin_rescan();
-							}
-							model.merge_repo_entries(e.repos);
+							model.apply_scan_page(wipe, e.repos, cx);
 							for err in e.errors {
 								model.push_discovery_error(err);
 							}
@@ -1526,11 +1524,16 @@ impl WorkbenchModel {
 							model.is_loading = false;
 							model.refresh_reload = false;
 							if wipe {
-								model.repos.clear();
 								model.pinned_repo = None;
 								model.selected_repo_idx = None;
 								model.release_repo_state();
-								model.sync_change_slots();
+								// The scan is over (`is_loading` is off), so
+								// the Changes nodes go with the list.
+								let change = model.repos.apply(
+									RepoOp::Clear,
+									&model.workspace_root,
+								);
+								model.repos_changed(change, cx);
 							}
 							model.ensure_ws_tree(cx);
 							if model
