@@ -289,19 +289,6 @@ impl PasteError {
 				})
 		)
 	}
-
-	/// The engine's own refusal, in the local paste's words. `None` when no
-	/// engine answered: a folder that does not resolve, or a worker that
-	/// could not be reached.
-	pub fn refusal(&self) -> Option<String> {
-		match self {
-			Self::Local(err) => Some(err.paste_message()),
-			Self::Remote(RemoteError::Refused { message, .. }) => {
-				Some(message.clone())
-			}
-			_ => None,
-		}
-	}
 }
 
 /// A remote Apply's failure. A lost answer may hide a write.
@@ -861,29 +848,6 @@ mod tests {
 			msg: "m".into(),
 		})
 		.is_collision());
-
-		assert!(PasteError::Local(TransferError::UnsafePath("x".into()))
-			.refusal()
-			.is_some());
-		assert!(PasteError::Remote(RemoteError::Refused {
-			code: ErrorCode::Stale,
-			message: "m".into(),
-			reason: None,
-		})
-		.refusal()
-		.is_some());
-		assert!(PasteError::Remote(RemoteError::Connect("x".into()))
-			.refusal()
-			.is_none());
-		assert!(PasteError::OutcomeUnknown(RemoteError::TimedOut)
-			.refusal()
-			.is_none());
-		assert!(PasteError::Destination {
-			path: "/p".into(),
-			source: io::Error::new(io::ErrorKind::NotFound, "n"),
-		}
-		.refusal()
-		.is_none());
 
 		assert_eq!(
 			PasteError::Local(TransferError::SpecialFile("p".into()))

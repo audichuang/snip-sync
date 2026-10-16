@@ -5,15 +5,17 @@
 //!
 //! Each constructor below is an exhaustive `match`: a new variant does not
 //! compile until it is listed here, and the count assertion then fails until
-//! a sample of it exists. A variant that still leaks goes into `KNOWN_GAPS`
-//! (#225 replaces the raw fallbacks with a reason type); the list is asserted
-//! exactly, so it can only shrink.
+//! a sample of it exists. Nothing is allowed to leak: every message is
+//! worded by [`reason_msg`], so a rendering with an English run, no Chinese
+//! at all, or an empty slot fails the test (#225).
 
 use super::*;
 use crate::i18n::Locale;
+use crate::reason::reason_msg;
 use crate::PreviewErr;
+use snip_core::commits::CommitError;
 use snip_core::gitsrc::{GitError, StartReason};
-use snip_core::reason::Reason;
+use snip_core::reason::{Reason, StaleChange};
 use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError};
 use std::collections::BTreeSet;
 
@@ -28,15 +30,14 @@ const D: &str = "datatoken";
 /// not scrub, so a mapper that echoes it is a leak.
 const W: &str = "permission denied by worker";
 
-/// The sample text of a refusal `code`'s message: replaced by wording when
-/// the code has a dictionary key, echoed (the paste's own text) when not.
-fn refusal_text(code: ErrorCode) -> &'static str {
-	if crate::remote::refusal_key(code).is_some() {
-		W
-	} else {
-		D
-	}
+/// The sample text of a refusal `code`'s message: the worker's English,
+/// which no mapper may show.
+fn refusal_text(_code: ErrorCode) -> &'static str {
+	W
 }
+
+/// Literals a mapper may show as data (a command to run), scrubbed like `D`.
+const ALLOWED_LITERALS: &[&str] = &["git fetch --unshallow"];
 
 const ALL_CODES: [ErrorCode; 15] = [
 	ErrorCode::Forbidden,
@@ -305,10 +306,23 @@ fn git_samples() -> Vec<(String, GitError)> {
 	v
 }
 
-/// Rendered in zh-TW with the data the test passed in cut out, so the
-/// English words around a datum join into a run.
+/// Rendered in zh-TW. [`check`] cuts the data the test passed in out, so
+/// the English words around a datum join into a run.
 fn zh(msg: &Msg) -> String {
-	msg.render(Locale::ZhTw).replace(D, "")
+	msg.render(Locale::ZhTw)
+}
+
+/// `text` with the data the test passed in cut out.
+fn scrub(text: &str) -> String {
+	let mut out = text.replace(D, "");
+	for lit in ALLOWED_LITERALS {
+		out = out.replace(lit, "");
+	}
+	out
+}
+
+fn has_cjk(text: &str) -> bool {
+	text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
 }
 
 /// The first run of two ASCII words in `text`, if any. A word is letters,
@@ -322,232 +336,505 @@ fn english_run(text: &str) -> Option<String> {
 	re.find(text).map(|m| m.as_str().to_string())
 }
 
-/// What the mappers produced: labels that leak English, and labels whose
-/// text is empty once the data is scrubbed (a mapper that dropped its wording).
+/// An empty slot in a rendering: an empty quote pair or bracket pair, a
+/// trailing or doubled separator.
+fn has_empty_slot(text: &str) -> bool {
+	let t = text.trim_end();
+	text.contains("「」")
+		|| text.contains("（）")
+		|| text.contains("()")
+		|| text.contains("''")
+		|| text.contains("\"\"")
+		|| text.contains("：：")
+		|| text.contains(": :")
+		|| t.ends_with('：')
+		|| t.ends_with(':')
+		|| t.ends_with('、')
+		|| t.ends_with(',')
+}
+
+/// What the mappers produced, by label.
 #[derive(Default)]
 struct Found {
+	/// English runs the data scrub does not cover.
 	leaks: BTreeSet<String>,
-	empty: BTreeSet<String>,
+	/// No text, or no Chinese character, once the data is scrubbed: a mapper
+	/// that dropped its wording, or showed only data.
+	no_wording: BTreeSet<String>,
+	/// An empty quote pair, bracket pair or separator.
+	empties: BTreeSet<String>,
 }
 
 fn check(label: String, text: &str, found: &mut Found) {
-	if english_run(text).is_some() {
-		found.leaks.insert(label);
-	} else if text.trim().is_empty() {
-		found.empty.insert(label);
+	let bare = scrub(text);
+	let text = text.replace(D, "x");
+	let text = text.as_str();
+	if english_run(&bare).is_some() {
+		found.leaks.insert(label.clone());
+	}
+	if !has_cjk(&bare) {
+		found.no_wording.insert(label.clone());
+	}
+	if has_empty_slot(text) {
+		found.empties.insert(label);
 	}
 }
 
-/// Mappings that still leak English into the zh-TW UI, `mapper/variant`.
-/// #225 (a reason type for the desktop) removes these; fix one and delete
-/// its line, or the test fails. A new leak is not allowed in.
-const KNOWN_GAPS: &[&str] = &[
-	"PreviewErr::git/Cancelled",
-	"PreviewErr::git/Cleanup",
-	"PreviewErr::git/Failed",
-	"PreviewErr::git/InvalidRevision",
-	"PreviewErr::git/Malformed",
-	"PreviewErr::git/NestedProcess",
-	"PreviewErr::git/NotARepository",
-	"PreviewErr::git/NotFound",
-	"PreviewErr::git/OutputHeldOpen",
-	"PreviewErr::git/OutsideBoundary",
-	"PreviewErr::git/QueueFull",
-	"PreviewErr::git/QueueTimeout",
-	"PreviewErr::git/Shallow",
-	"PreviewErr::git/Timeout",
-	"PreviewErr::git/ToplevelAbove",
-	"PreviewErr::git/VerifyLimit",
-	"PreviewErr::git/WorktreeBusy",
-	"commit_msg[local git,false]/Cancelled",
-	"commit_msg[local git,false]/Cleanup",
-	"commit_msg[local git,false]/Failed",
-	"commit_msg[local git,false]/HostRefused#0",
-	"commit_msg[local git,false]/HostRefused#1",
-	"commit_msg[local git,false]/HostRefused#10",
-	"commit_msg[local git,false]/HostRefused#11",
-	"commit_msg[local git,false]/HostRefused#12",
-	"commit_msg[local git,false]/HostRefused#2",
-	"commit_msg[local git,false]/HostRefused#3",
-	"commit_msg[local git,false]/HostRefused#4",
-	"commit_msg[local git,false]/HostRefused#5",
-	"commit_msg[local git,false]/HostRefused#6",
-	"commit_msg[local git,false]/HostRefused#7",
-	"commit_msg[local git,false]/HostRefused#8",
-	"commit_msg[local git,false]/HostRefused#9",
-	"commit_msg[local git,false]/HostStart#0",
-	"commit_msg[local git,false]/HostStart#1",
-	"commit_msg[local git,false]/HostStart#2",
-	"commit_msg[local git,false]/HostStart#3",
-	"commit_msg[local git,false]/InvalidRevision",
-	"commit_msg[local git,false]/Malformed",
-	"commit_msg[local git,false]/NestedProcess",
-	"commit_msg[local git,false]/NotARepository",
-	"commit_msg[local git,false]/NotFound",
-	"commit_msg[local git,false]/OutputHeldOpen",
-	"commit_msg[local git,false]/OutputLimit",
-	"commit_msg[local git,false]/OutsideBoundary",
-	"commit_msg[local git,false]/PatchLimit",
-	"commit_msg[local git,false]/QueueFull",
-	"commit_msg[local git,false]/QueueTimeout",
-	"commit_msg[local git,false]/Shallow",
-	"commit_msg[local git,false]/Timeout",
-	"commit_msg[local git,false]/ToplevelAbove",
-	"commit_msg[local git,false]/VerifyLimit",
-	"commit_msg[local git,true]/Cancelled",
-	"commit_msg[local git,true]/Cleanup",
-	"commit_msg[local git,true]/Failed",
-	"commit_msg[local git,true]/HostRefused#0",
-	"commit_msg[local git,true]/HostRefused#1",
-	"commit_msg[local git,true]/HostRefused#10",
-	"commit_msg[local git,true]/HostRefused#11",
-	"commit_msg[local git,true]/HostRefused#12",
-	"commit_msg[local git,true]/HostRefused#2",
-	"commit_msg[local git,true]/HostRefused#3",
-	"commit_msg[local git,true]/HostRefused#4",
-	"commit_msg[local git,true]/HostRefused#5",
-	"commit_msg[local git,true]/HostRefused#6",
-	"commit_msg[local git,true]/HostRefused#7",
-	"commit_msg[local git,true]/HostRefused#8",
-	"commit_msg[local git,true]/HostRefused#9",
-	"commit_msg[local git,true]/HostStart#0",
-	"commit_msg[local git,true]/HostStart#1",
-	"commit_msg[local git,true]/HostStart#2",
-	"commit_msg[local git,true]/HostStart#3",
-	"commit_msg[local git,true]/InvalidRevision",
-	"commit_msg[local git,true]/Malformed",
-	"commit_msg[local git,true]/NestedProcess",
-	"commit_msg[local git,true]/NotARepository",
-	"commit_msg[local git,true]/NotFound",
-	"commit_msg[local git,true]/OutputHeldOpen",
-	"commit_msg[local git,true]/OutputLimit",
-	"commit_msg[local git,true]/OutsideBoundary",
-	"commit_msg[local git,true]/PatchLimit",
-	"commit_msg[local git,true]/QueueFull",
-	"commit_msg[local git,true]/QueueTimeout",
-	"commit_msg[local git,true]/Shallow",
-	"commit_msg[local git,true]/Timeout",
-	"commit_msg[local git,true]/ToplevelAbove",
-	"commit_msg[local git,true]/VerifyLimit",
-	"commit_msg[remote,false]/Io(TimedOut)",
-	"commit_msg[remote,false]/Stalled",
-	"commit_msg[remote,false]/TimedOut",
-	"commit_msg[remote,false]/WorkerTooOld",
-	"commit_msg[remote,true]/Io(TimedOut)",
-	"commit_msg[remote,true]/Stalled",
-	"commit_msg[remote,true]/TimedOut",
-	"commit_msg[remote,true]/WorkerTooOld",
-	"describe_msg/Io(TimedOut)",
-	"describe_msg/Stalled",
-	"describe_msg/TimedOut",
-	"describe_msg/WorkerTooOld",
-	"describe_msg_at/Io(TimedOut)",
-	"describe_msg_at/Stalled",
-	"describe_msg_at/TimedOut",
-	"describe_msg_at/WorkerTooOld",
-	"destination_msg/NoReplayResult",
-	"destination_msg[remote]/Io(TimedOut)",
-	"destination_msg[remote]/Stalled",
-	"destination_msg[remote]/TimedOut",
-	"destination_msg[remote]/WorkerTooOld",
-	"destination_msg[unknown]/Io(TimedOut)",
-	"destination_msg[unknown]/Stalled",
-	"destination_msg[unknown]/TimedOut",
-	"destination_msg[unknown]/WorkerTooOld",
-	"file_apply_msg[local git]/Cancelled",
-	"file_apply_msg[local git]/Cleanup",
-	"file_apply_msg[local git]/Failed",
-	"file_apply_msg[local git]/HostRefused#0",
-	"file_apply_msg[local git]/HostRefused#1",
-	"file_apply_msg[local git]/HostRefused#10",
-	"file_apply_msg[local git]/HostRefused#11",
-	"file_apply_msg[local git]/HostRefused#12",
-	"file_apply_msg[local git]/HostRefused#2",
-	"file_apply_msg[local git]/HostRefused#3",
-	"file_apply_msg[local git]/HostRefused#4",
-	"file_apply_msg[local git]/HostRefused#5",
-	"file_apply_msg[local git]/HostRefused#6",
-	"file_apply_msg[local git]/HostRefused#7",
-	"file_apply_msg[local git]/HostRefused#8",
-	"file_apply_msg[local git]/HostRefused#9",
-	"file_apply_msg[local git]/HostStart#0",
-	"file_apply_msg[local git]/HostStart#1",
-	"file_apply_msg[local git]/HostStart#2",
-	"file_apply_msg[local git]/HostStart#3",
-	"file_apply_msg[local git]/InvalidRevision",
-	"file_apply_msg[local git]/Malformed",
-	"file_apply_msg[local git]/NestedProcess",
-	"file_apply_msg[local git]/NotARepository",
-	"file_apply_msg[local git]/NotFound",
-	"file_apply_msg[local git]/OutputHeldOpen",
-	"file_apply_msg[local git]/OutputLimit",
-	"file_apply_msg[local git]/OutsideBoundary",
-	"file_apply_msg[local git]/PatchLimit",
-	"file_apply_msg[local git]/QueueFull",
-	"file_apply_msg[local git]/QueueTimeout",
-	"file_apply_msg[local git]/Shallow",
-	"file_apply_msg[local git]/Timeout",
-	"file_apply_msg[local git]/ToplevelAbove",
-	"file_apply_msg[local git]/VerifyLimit",
-	"file_apply_msg[remote]/Io(TimedOut)",
-	"file_apply_msg[remote]/Stalled",
-	"file_apply_msg[remote]/TimedOut",
-	"file_apply_msg[remote]/WorkerTooOld",
-	"git_error_msg/Cancelled",
-	"git_error_msg/Cleanup",
-	"git_error_msg/Failed",
-	"git_error_msg/InvalidRevision",
-	"git_error_msg/Malformed",
-	"git_error_msg/NestedProcess",
-	"git_error_msg/NotARepository",
-	"git_error_msg/NotFound",
-	"git_error_msg/OutputHeldOpen",
-	"git_error_msg/OutputLimit",
-	"git_error_msg/OutsideBoundary",
-	"git_error_msg/PatchLimit",
-	"git_error_msg/QueueFull",
-	"git_error_msg/QueueTimeout",
-	"git_error_msg/Shallow",
-	"git_error_msg/Timeout",
-	"git_error_msg/ToplevelAbove",
-	"git_error_msg/VerifyLimit",
-	"git_error_msg/WorktreeBusy",
-];
-
-/// Mapped samples whose whole text is data the UI echoes (the sample is `D`,
-/// scrubbed to nothing). Every other mapped sample must render wording; the
-/// list is asserted exactly.
-const ECHO_ONLY: &[&str] = &[
-	"PreviewErr::from(io)/Other",
-	"PreviewErr::git/Host",
-	"PreviewErr::git/HostRefused#13",
-	"PreviewErr::git/HostRefused#14",
-	"PreviewErr::git/Io",
-	"PreviewErr::git/OutputLimit",
-	"PreviewErr::git/PatchLimit",
-	"describe_msg/Connect",
-	"describe_msg/Io(Other)",
-	"describe_msg/PatchTooLarge",
-	"describe_msg/Refused#13",
-	"describe_msg/Refused#14",
-	"describe_msg/Start(None)",
-	"describe_msg_at/Connect",
-	"describe_msg_at/Io(Other)",
-	"describe_msg_at/PatchTooLarge",
-	"describe_msg_at/Refused#13",
-	"describe_msg_at/Refused#14",
-	"describe_msg_at/Start(None)",
-	"git_error_msg/Host",
-	"git_error_msg/HostRefused#13",
-	"git_error_msg/HostRefused#14",
-	"git_error_msg/Io",
-];
-
-fn preview_text(e: &PreviewErr) -> String {
+fn preview_text(e: &PreviewErr) -> Option<String> {
 	match e {
-		PreviewErr::TooLarge | PreviewErr::PatchTooLarge => String::new(),
-		PreviewErr::Failed(m) => zh(m),
+		PreviewErr::TooLarge | PreviewErr::PatchTooLarge => None,
+		PreviewErr::Failed(m) => Some(zh(m)),
 	}
+}
+
+/// Every dictionary key a message names, nested ones included.
+fn keys_of(msg: &Msg, out: &mut Vec<String>) {
+	out.push(msg.key.to_string());
+	for &i in &msg.key_args {
+		if let Some(arg) = msg.args.get(i) {
+			out.push(arg.clone());
+		}
+	}
+	if let Some(inner) = msg.inner.as_deref() {
+		keys_of(&inner.1, out);
+	}
+}
+
+/// The variant of a `Reason`: exhaustive on purpose.
+fn reason_variant(r: &Reason) -> usize {
+	match r {
+		Reason::Refused { .. } => 0,
+		Reason::Start { .. } => 1,
+		Reason::Disconnected { .. } => 2,
+		Reason::Protocol => 3,
+		Reason::WorkerTooOld { .. } => 4,
+		Reason::TimedOut => 5,
+		Reason::Cancelled => 6,
+		Reason::GitMissing => 7,
+		Reason::GitFailed { .. } => 8,
+		Reason::GitBusy => 9,
+		Reason::RepoBusy => 10,
+		Reason::WorkerNeedsRestart => 11,
+		Reason::TooLarge => 12,
+		Reason::PatchTooLarge => 13,
+		Reason::VerifyLimit => 14,
+		Reason::NotARepository { .. } => 15,
+		Reason::InsideParentRepo { .. } => 16,
+		Reason::InvalidRevision { .. } => 17,
+		Reason::Shallow { .. } => 18,
+		Reason::OutsideShare => 19,
+		Reason::Internal { .. } => 20,
+		Reason::Io { .. } => 21,
+		Reason::NotFound { .. } => 22,
+		Reason::PermissionDenied { .. } => 23,
+		Reason::EmptySelection => 24,
+		Reason::UnsafePath { .. } => 25,
+		Reason::NotRegularFile { .. } => 26,
+		Reason::OutsideRoot { .. } => 27,
+		Reason::Collision { .. } => 28,
+		Reason::StagedAndWorking { .. } => 29,
+		Reason::AmbiguousRoots { .. } => 30,
+		Reason::PayloadTooLarge { .. } => 31,
+		Reason::SourceChanged { .. } => 32,
+		Reason::DestinationChanged { .. } => 33,
+		Reason::CrossRepoCommits => 34,
+		Reason::Discontinuous { .. } => 35,
+		Reason::NotEnoughCommits { .. } => 36,
+		Reason::NotCommitPayload => 37,
+		Reason::InvalidPayload { .. } => 38,
+		Reason::OutsideScope { .. } => 39,
+		Reason::Unverifiable { .. } => 40,
+		Reason::SubmoduleNotCheckedOut => 41,
+		Reason::SubmoduleUnreadable { .. } => 42,
+		Reason::ScanErrorsOmitted { .. } => 43,
+		Reason::DepthLimitedOmitted { .. } => 44,
+	}
+}
+const REASON_VARIANTS: usize = 45;
+
+fn stale_changes() -> Vec<StaleChange> {
+	vec![
+		StaleChange::Created { rel: D.into() },
+		StaleChange::Deleted { rel: D.into() },
+		StaleChange::Modified { rel: D.into() },
+		StaleChange::Repository,
+		StaleChange::Preview,
+	]
+}
+
+/// Every `Reason` variant, with every `ErrorCode`, `StartReason` (and none)
+/// and `StaleChange`. Data fields hold `D`, so a mapper that echoes anything
+/// else is a leak.
+pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
+	let d = || D.to_string();
+	let mut v: Vec<(String, Reason)> = vec![
+		(
+			"Start(None)".into(),
+			Reason::Start {
+				start: None,
+				detail: d(),
+			},
+		),
+		("Disconnected".into(), Reason::Disconnected { detail: d() }),
+		("Protocol".into(), Reason::Protocol),
+		(
+			"WorkerTooOld".into(),
+			Reason::WorkerTooOld {
+				worker: d(),
+				have: 1,
+				need: 2,
+			},
+		),
+		("TimedOut".into(), Reason::TimedOut),
+		("Cancelled".into(), Reason::Cancelled),
+		("GitMissing".into(), Reason::GitMissing),
+		("GitFailed".into(), Reason::GitFailed { stderr: d() }),
+		("GitBusy".into(), Reason::GitBusy),
+		("RepoBusy".into(), Reason::RepoBusy),
+		("WorkerNeedsRestart".into(), Reason::WorkerNeedsRestart),
+		("TooLarge".into(), Reason::TooLarge),
+		("PatchTooLarge".into(), Reason::PatchTooLarge),
+		("VerifyLimit".into(), Reason::VerifyLimit),
+		(
+			"NotARepository".into(),
+			Reason::NotARepository { path: d() },
+		),
+		(
+			"InsideParentRepo".into(),
+			Reason::InsideParentRepo { path: d() },
+		),
+		(
+			"InvalidRevision".into(),
+			Reason::InvalidRevision { rev: d() },
+		),
+		("Shallow".into(), Reason::Shallow { sha: d() }),
+		("OutsideShare".into(), Reason::OutsideShare),
+		("Internal".into(), Reason::Internal { detail: d() }),
+		("Io".into(), Reason::Io { detail: d() }),
+		("NotFound".into(), Reason::NotFound { path: d() }),
+		(
+			"PermissionDenied".into(),
+			Reason::PermissionDenied { path: d() },
+		),
+		("EmptySelection".into(), Reason::EmptySelection),
+		("UnsafePath".into(), Reason::UnsafePath { path: d() }),
+		(
+			"NotRegularFile".into(),
+			Reason::NotRegularFile { path: d() },
+		),
+		("OutsideRoot".into(), Reason::OutsideRoot { path: d() }),
+		("Collision".into(), Reason::Collision { path: d() }),
+		(
+			"StagedAndWorking".into(),
+			Reason::StagedAndWorking { path: d() },
+		),
+		(
+			"AmbiguousRoots".into(),
+			Reason::AmbiguousRoots {
+				basename: d(),
+				roots: vec![d(), d()],
+			},
+		),
+		(
+			"AmbiguousRoots(wire)".into(),
+			Reason::AmbiguousRoots {
+				basename: d(),
+				roots: Vec::new(),
+			},
+		),
+		(
+			"PayloadTooLarge".into(),
+			Reason::PayloadTooLarge {
+				limit: 1,
+				actual: 2,
+				path: Some(d()),
+			},
+		),
+		(
+			"PayloadTooLarge(no path)".into(),
+			Reason::PayloadTooLarge {
+				limit: 1,
+				actual: 2,
+				path: None,
+			},
+		),
+		("CrossRepoCommits".into(), Reason::CrossRepoCommits),
+		(
+			"Discontinuous".into(),
+			Reason::Discontinuous {
+				base: d(),
+				tip: d(),
+				at: d(),
+				first_parent: None,
+			},
+		),
+		(
+			"NotEnoughCommits".into(),
+			Reason::NotEnoughCommits {
+				requested: 3,
+				available: 2,
+			},
+		),
+		("NotCommitPayload".into(), Reason::NotCommitPayload),
+		(
+			"InvalidPayload".into(),
+			Reason::InvalidPayload { detail: d() },
+		),
+		(
+			"OutsideScope".into(),
+			Reason::OutsideScope {
+				path: d(),
+				scope: d(),
+			},
+		),
+		("Unverifiable".into(), Reason::Unverifiable { path: d() }),
+		(
+			"SubmoduleNotCheckedOut".into(),
+			Reason::SubmoduleNotCheckedOut,
+		),
+		(
+			"SubmoduleUnreadable".into(),
+			Reason::SubmoduleUnreadable { detail: d() },
+		),
+		(
+			"ScanErrorsOmitted".into(),
+			Reason::ScanErrorsOmitted { count: 3 },
+		),
+		(
+			"DepthLimitedOmitted".into(),
+			Reason::DepthLimitedOmitted { count: 3 },
+		),
+	];
+	for code in ALL_CODES {
+		v.push((
+			format!("Refused#{}", code_index(code)),
+			Reason::Refused { code },
+		));
+	}
+	for start in ALL_REASONS {
+		v.push((
+			format!("Start(Some#{})", reason_index(start)),
+			Reason::Start {
+				start: Some(start),
+				detail: d(),
+			},
+		));
+	}
+	for (i, change) in stale_changes().into_iter().enumerate() {
+		v.push((
+			format!("SourceChanged#{i}"),
+			Reason::SourceChanged {
+				change: change.clone(),
+			},
+		));
+		v.push((
+			format!("DestinationChanged#{i}"),
+			Reason::DestinationChanged { change },
+		));
+	}
+	v
+}
+
+/// Every `TransferError` variant: exhaustive on purpose.
+fn transfer_variant(e: &TransferError) -> usize {
+	match e {
+		TransferError::EmptySelection => 0,
+		TransferError::UnsafePath(_) => 1,
+		TransferError::SpecialFile(_) => 2,
+		TransferError::DestinationNotRegular(_) => 3,
+		TransferError::PathNotFound(_) => 4,
+		TransferError::PathOutsideRoot(_) => 5,
+		TransferError::UnknownRoot(_) => 6,
+		TransferError::StagedWorkingConflict { .. } => 7,
+		TransferError::MixedSourceCollision { .. } => 8,
+		TransferError::AmbiguousRootBasenames { .. } => 9,
+		TransferError::WireHeaderCollision { .. } => 10,
+		TransferError::TargetCollision { .. } => 11,
+		TransferError::PayloadLimitExceeded { .. } => 12,
+		TransferError::StaleSource { .. } => 13,
+		TransferError::StaleDestination { .. } => 14,
+		TransferError::UnmappedEntry { .. } => 15,
+		TransferError::CrossRepoCommitsNotSupported => 16,
+		TransferError::DiscontinuousCommits { .. } => 17,
+		TransferError::Git(_) => 18,
+		TransferError::Commit(_) => 19,
+		TransferError::Io(_) => 20,
+	}
+}
+const TRANSFER_VARIANTS: usize = 21;
+
+fn transfer_samples() -> Vec<(String, TransferError)> {
+	let d = || D.to_string();
+	let mut v: Vec<(String, TransferError)> = vec![
+		("EmptySelection".into(), TransferError::EmptySelection),
+		("UnsafePath".into(), TransferError::UnsafePath(d())),
+		("SpecialFile".into(), TransferError::SpecialFile(d())),
+		(
+			"DestinationNotRegular".into(),
+			TransferError::DestinationNotRegular(d()),
+		),
+		("PathNotFound".into(), TransferError::PathNotFound(p())),
+		(
+			"PathOutsideRoot".into(),
+			TransferError::PathOutsideRoot(p()),
+		),
+		("UnknownRoot".into(), TransferError::UnknownRoot(p())),
+		(
+			"StagedWorkingConflict".into(),
+			TransferError::StagedWorkingConflict {
+				root: p(),
+				path: d(),
+			},
+		),
+		(
+			"MixedSourceCollision".into(),
+			TransferError::MixedSourceCollision {
+				root: p(),
+				path: d(),
+				msg: W.into(),
+			},
+		),
+		(
+			"AmbiguousRootBasenames".into(),
+			TransferError::AmbiguousRootBasenames {
+				basename: d(),
+				roots: vec![p(), p()],
+			},
+		),
+		(
+			"WireHeaderCollision".into(),
+			TransferError::WireHeaderCollision { wire_path: d() },
+		),
+		(
+			"TargetCollision".into(),
+			TransferError::TargetCollision {
+				path: p(),
+				msg: W.into(),
+			},
+		),
+		(
+			"PayloadLimitExceeded".into(),
+			TransferError::PayloadLimitExceeded {
+				limit: 1,
+				actual: 2,
+				reason: W.into(),
+				path: Some(d()),
+			},
+		),
+		(
+			"UnmappedEntry".into(),
+			TransferError::UnmappedEntry { raw_path: d() },
+		),
+		(
+			"CrossRepoCommitsNotSupported".into(),
+			TransferError::CrossRepoCommitsNotSupported,
+		),
+		(
+			"DiscontinuousCommits".into(),
+			TransferError::DiscontinuousCommits {
+				base: d(),
+				tip: d(),
+				at: d(),
+				first_parent: Some(d()),
+			},
+		),
+		(
+			"Git".into(),
+			TransferError::Git(GitError::Failed {
+				args: d(),
+				stderr: d(),
+				code: Some(1),
+			}),
+		),
+		("Io".into(), TransferError::Io(std::io::Error::other(D))),
+	];
+	for (i, change) in stale_changes().into_iter().enumerate() {
+		v.push((
+			format!("StaleSource#{i}"),
+			TransferError::StaleSource {
+				root: p(),
+				reason: W.into(),
+				change: change.clone(),
+			},
+		));
+		v.push((
+			format!("StaleDestination#{i}"),
+			TransferError::StaleDestination {
+				root: p(),
+				reason: W.into(),
+				change,
+			},
+		));
+	}
+	for (label, e) in commit_samples() {
+		v.push((format!("Commit({label})"), TransferError::Commit(e)));
+	}
+	v
+}
+
+/// Every `CommitError` variant: exhaustive on purpose.
+fn commit_variant(e: &CommitError) -> usize {
+	match e {
+		CommitError::Git(_) => 0,
+		CommitError::Empty => 1,
+		CommitError::NotEnoughCommits { .. } => 2,
+		CommitError::Discontinuous { .. } => 3,
+		CommitError::NotCommitPayload => 4,
+		CommitError::InvalidPayload(_) => 5,
+		CommitError::OutsideScope { .. } => 6,
+		CommitError::PayloadLimit { .. } => 7,
+	}
+}
+const COMMIT_VARIANTS: usize = 8;
+
+fn commit_samples() -> Vec<(String, CommitError)> {
+	let d = || D.to_string();
+	vec![
+		(
+			"Git".into(),
+			CommitError::Git(GitError::Failed {
+				args: d(),
+				stderr: d(),
+				code: Some(1),
+			}),
+		),
+		("Empty".into(), CommitError::Empty),
+		(
+			"NotEnoughCommits".into(),
+			CommitError::NotEnoughCommits {
+				requested: 3,
+				available: 2,
+			},
+		),
+		(
+			"Discontinuous".into(),
+			CommitError::Discontinuous {
+				base: d(),
+				tip: d(),
+				at: d(),
+				first_parent: None,
+			},
+		),
+		("NotCommitPayload".into(), CommitError::NotCommitPayload),
+		(
+			"InvalidPayload".into(),
+			CommitError::InvalidPayload(D.into()),
+		),
+		(
+			"OutsideScope".into(),
+			CommitError::OutsideScope {
+				path: d(),
+				scope: p(),
+			},
+		),
+		(
+			"PayloadLimit".into(),
+			CommitError::PayloadLimit {
+				limit: 1,
+				actual: 2,
+			},
+		),
+	]
 }
 
 #[test]
@@ -575,6 +862,25 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 	let seen: BTreeSet<_> = gits.iter().map(|(_, e)| git_variant(e)).collect();
 	assert_eq!(seen.len(), GIT_VARIANTS, "a GitError sample is missing");
 
+	let seen: BTreeSet<_> = transfer_samples()
+		.iter()
+		.map(|(_, e)| transfer_variant(e))
+		.collect();
+	assert_eq!(
+		seen.len(),
+		TRANSFER_VARIANTS,
+		"a TransferError sample is missing"
+	);
+	let seen: BTreeSet<_> = commit_samples()
+		.iter()
+		.map(|(_, e)| commit_variant(e))
+		.collect();
+	assert_eq!(
+		seen.len(),
+		COMMIT_VARIANTS,
+		"a CommitError sample is missing"
+	);
+
 	let remote_rebuild = |label: &str| {
 		remote_samples()
 			.into_iter()
@@ -584,6 +890,13 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 	};
 	let git_rebuild = |label: &str| {
 		git_samples()
+			.into_iter()
+			.find(|(l, _)| l == label)
+			.unwrap()
+			.1
+	};
+	let transfer_rebuild = |label: &str| {
+		transfer_samples()
 			.into_iter()
 			.find(|(l, _)| l == label)
 			.unwrap()
@@ -643,11 +956,10 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 			&mut found,
 		);
 		let preview = PreviewErr::git(git_rebuild(label));
-		check(
-			format!("PreviewErr::git/{label}"),
-			&preview_text(&preview),
-			&mut found,
-		);
+		// The two sizes are worded by the preview pane, not by a message.
+		if let Some(text) = preview_text(&preview) {
+			check(format!("PreviewErr::git/{label}"), &text, &mut found);
+		}
 		previews.push(preview);
 		for applying in [false, true] {
 			check(
@@ -681,11 +993,54 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 		PREVIEW_VARIANTS,
 		"a PreviewErr sample is missing"
 	);
+	// `Failed` from an I/O error that is not the size limit.
+	let io_preview = &previews[previews.len() - 2];
 	check(
 		"PreviewErr::from(io)/Other".into(),
-		&preview_text(&previews[previews.len() - 2]),
+		&preview_text(io_preview).unwrap(),
 		&mut found,
 	);
+
+	for (label, _) in transfer_samples() {
+		for (mapper, text) in [
+			(
+				"destination_msg[local]",
+				zh(&destination_msg(
+					None,
+					Path::new(D),
+					PasteError::Local(transfer_rebuild(&label)),
+				)),
+			),
+			(
+				"file_apply_msg[local]",
+				zh(&file_apply_msg(
+					None,
+					Path::new(D),
+					PasteError::Local(transfer_rebuild(&label)),
+				)),
+			),
+			(
+				"commit_msg[local,false]",
+				zh(&commit_msg(
+					None,
+					Path::new(D),
+					PasteError::Local(transfer_rebuild(&label)),
+					false,
+				)),
+			),
+			(
+				"commit_msg[local,true]",
+				zh(&commit_msg(
+					None,
+					Path::new(D),
+					PasteError::Local(transfer_rebuild(&label)),
+					true,
+				)),
+			),
+		] {
+			check(format!("{mapper}/{label}"), &text, &mut found);
+		}
+	}
 
 	for (name, err) in [
 		(
@@ -704,27 +1059,80 @@ fn every_error_the_desktop_words_reads_as_zh_tw() {
 		);
 	}
 
-	let leaks = found.leaks;
-	let known: BTreeSet<String> =
-		KNOWN_GAPS.iter().map(|s| s.to_string()).collect();
-	// A mapped sample renders wording; only a sample that is data alone, or
-	// no text by design, may scrub to nothing.
-	let echo: BTreeSet<String> =
-		ECHO_ONLY.iter().map(|s| s.to_string()).collect();
-	let blank: Vec<_> = found.empty.difference(&echo).collect();
-	let wordy: Vec<_> = echo.difference(&found.empty).collect();
 	assert!(
-		blank.is_empty() && wordy.is_empty(),
-		"samples that render nothing in zh-TW (give them wording): {blank:#?}\n\
-		 echo-only samples that now render wording (delete from ECHO_ONLY): {wordy:#?}"
+		found.leaks.is_empty(),
+		"English leaks into zh-TW: {:#?}",
+		found.leaks
 	);
-	let new: Vec<_> = leaks.difference(&known).collect();
-	let fixed: Vec<_> = known.difference(&leaks).collect();
 	assert!(
-		new.is_empty() && fixed.is_empty(),
-		"English leaks into zh-TW.\nnew leaks (fix them, or #225): {new:#?}\n\
-		 fixed (delete from KNOWN_GAPS): {fixed:#?}"
+		found.no_wording.is_empty(),
+		"samples with no Chinese wording in zh-TW (give them wording): {:#?}",
+		found.no_wording
 	);
+	assert!(
+		found.empties.is_empty(),
+		"samples with an empty slot: {:#?}",
+		found.empties
+	);
+}
+
+/// `reason_msg` is the single translation point: every `Reason`, as the
+/// producer builds it and as a worker sends it (`for_wire`), words in both
+/// languages with every key in both dictionaries, no English run in zh-TW,
+/// Chinese in every zh-TW rendering, no CJK in English, and no empty slot.
+#[test]
+fn every_reason_is_worded_in_both_languages() {
+	let samples = reason_samples();
+	let seen: BTreeSet<_> =
+		samples.iter().map(|(_, r)| reason_variant(r)).collect();
+	assert_eq!(seen.len(), REASON_VARIANTS, "a Reason sample is missing");
+	assert_eq!(seen.iter().max(), Some(&(REASON_VARIANTS - 1)));
+
+	let mut found = Found::default();
+	for (label, reason) in &samples {
+		let wire = reason.clone().for_wire();
+		for (label, reason) in std::iter::once((label.clone(), reason.clone()))
+			.chain(wire.map(|w| (format!("{label}/for_wire"), w)))
+		{
+			let msg = reason_msg(&reason);
+			check(label.clone(), &zh(&msg), &mut found);
+			let en = msg.render(Locale::En).replace(D, "x");
+			assert!(!has_cjk(&en), "{label}: CJK in English: {en}");
+			assert!(!has_empty_slot(&en), "{label}: empty slot in {en}");
+			assert!(!en.trim().is_empty(), "{label}: blank English");
+			let mut keys = Vec::new();
+			keys_of(&msg, &mut keys);
+			for key in keys {
+				for loc in [Locale::ZhTw, Locale::En] {
+					assert!(
+						!crate::i18n::t(&key, loc).is_empty(),
+						"{label}: key {key} missing in {loc:?}"
+					);
+				}
+			}
+		}
+	}
+	assert!(found.leaks.is_empty(), "English leaks: {:#?}", found.leaks);
+	assert!(
+		found.no_wording.is_empty(),
+		"no Chinese wording: {:#?}",
+		found.no_wording
+	);
+	assert!(
+		found.empties.is_empty(),
+		"empty slots: {:#?}",
+		found.empties
+	);
+}
+
+/// A shallow clone's recovery command stays in the message as data.
+#[test]
+fn a_shallow_clone_keeps_its_recovery_command() {
+	let msg = reason_msg(&Reason::Shallow { sha: D.into() });
+	for loc in [Locale::ZhTw, Locale::En] {
+		let text = msg.render(loc);
+		assert!(text.contains("git fetch --unshallow"), "{text}");
+	}
 }
 
 #[test]
@@ -733,4 +1141,12 @@ fn the_leak_detector_sees_a_run_of_english_words() {
 	assert!(english_run("無法讀取 snip-sync 的 worker 輸出").is_none());
 	assert!(english_run(" ssh 無法登入").is_none());
 	assert!(english_run("git  failed: ").is_some());
+}
+
+#[test]
+fn the_empty_slot_detector_sees_a_missing_datum() {
+	assert!(has_empty_slot("「」在開啟的資料夾之外"));
+	assert!(has_empty_slot("上限（）"));
+	assert!(has_empty_slot("操作逾時："));
+	assert!(!has_empty_slot("操作逾時：/x"));
 }

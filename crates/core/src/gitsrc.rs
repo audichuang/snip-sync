@@ -173,11 +173,19 @@ impl GitError {
 			Self::WorktreeBusy { .. } => Reason::RepoBusy,
 			Self::OutputLimit { .. } => Reason::TooLarge,
 			Self::PatchLimit { .. } => Reason::PatchTooLarge,
-			Self::OutputHeldOpen { .. }
-			| Self::NestedProcess { .. }
-			| Self::Cleanup { .. }
-			| Self::Malformed(_) => Reason::Internal {
-				detail: self.to_string(),
+			// The detail is data only (the command, what git printed), not
+			// the English sentence around it: a front end words the
+			// sentence.
+			Self::OutputHeldOpen { args } | Self::NestedProcess { args } => {
+				Reason::Internal {
+					detail: args.clone(),
+				}
+			}
+			Self::Cleanup { args, message } => Reason::Internal {
+				detail: format!("{args}: {message}"),
+			},
+			Self::Malformed(output) => Reason::Internal {
+				detail: output.clone(),
 			},
 			Self::NotARepository(p) => Reason::NotARepository {
 				path: p.display().to_string(),

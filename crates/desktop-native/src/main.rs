@@ -203,6 +203,7 @@ mod multi_log;
 pub mod open_tabs;
 pub mod paste;
 mod reader;
+mod reason;
 mod recent;
 pub mod remote;
 mod selector;
@@ -692,14 +693,7 @@ impl PasteDiffOutcome {
 			Err(err) => {
 				// A remote failure keeps its start reason as a message,
 				// worded when drawn (#206 #208).
-				let why = match err {
-					snip_remote::PasteError::Remote(e)
-					| snip_remote::PasteError::OutcomeUnknown(e) => {
-						crate::remote::describe_msg(e)
-					}
-					// ALLOWED-RAW: pending #225: PasteError text with no Reason yet
-					other => Msg::raw(other.to_string()),
-				};
+				let why = crate::reason::reason_msg(&err.reason());
 				PasteDiffOutcome::Notice(Msg::with_msg_arg(
 					"paste_diff_failed",
 					[String::new()],
@@ -1570,7 +1564,11 @@ impl WorkbenchModel {
 				path,
 				crate::i18n::t("counts_tip", self.locale)
 			),
-			Err(e) => format!("{}\n{}", path, e.message),
+			Err(e) => format!(
+				"{}\n{}",
+				path,
+				crate::reason::failure_msg(e).render(self.locale)
+			),
 		}
 	}
 
@@ -1582,7 +1580,12 @@ impl WorkbenchModel {
 
 	pub(crate) fn discovery_error_msg(&self) -> Msg {
 		if let Some((_, err)) = self.discovery_errors.first() {
-			Msg::new("error_repo_status", [err.message.clone()])
+			Msg::with_msg_arg(
+				"error_repo_status",
+				[String::new()],
+				0,
+				crate::reason::failure_msg(err),
+			)
 		} else {
 			let key = match self.discovery_status {
 				Some(ScanStatus::Incomplete) => "discovery_incomplete",
@@ -3391,7 +3394,12 @@ impl WorkbenchModel {
 		let entry = match outcome {
 			Ok(entry) => entry,
 			Err(err) => {
-				self.set_status("error_repo_status", [err.message]);
+				self.set_status_msg(Msg::with_msg_arg(
+					"error_repo_status",
+					[String::new()],
+					0,
+					crate::reason::failure_msg(&err),
+				));
 				cx.notify();
 				return;
 			}
@@ -4006,9 +4014,11 @@ impl WorkbenchModel {
 			&& anchor_file.is_some();
 		if !is_file_anchor {
 			if let Err(e) = &self.repos[idx].summary {
-				self.show_preview_error(Msg::new(
+				self.show_preview_error(Msg::with_msg_arg(
 					"error_repo_status",
-					[e.message.clone()],
+					[String::new()],
+					0,
+					crate::reason::failure_msg(e),
 				));
 			}
 		}
@@ -4563,7 +4573,12 @@ impl WorkbenchModel {
 			match ExportSelection::new(roots, Some(repo_root.clone()), items) {
 				Ok(s) => s,
 				Err(e) => {
-					self.set_status("error_payload", [e.to_string()]);
+					self.set_status_msg(Msg::with_msg_arg(
+						"error_payload",
+						[String::new()],
+						0,
+						crate::reason::reason_msg(&e.reason()),
+					));
 					cx.notify();
 					return;
 				}
@@ -4635,7 +4650,12 @@ impl WorkbenchModel {
 							if e2e_on() {
 								app_log!("[APP:COPY_FAILED: {reason}]");
 							}
-							Msg::new("error_payload", [e.to_string()])
+							Msg::with_msg_arg(
+								"error_payload",
+								[String::new()],
+								0,
+								crate::reason::reason_msg(&e.reason()),
+							)
 						})?;
 						if report.outcome.copied == 0 {
 							return Err(Msg::new("status_copy_nothing", []));
@@ -4876,8 +4896,7 @@ impl WorkbenchModel {
 						}
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
-							// ALLOWED-RAW: pending #225: git error text shown verbatim
-							.map_err(|e| Msg::raw(e.to_string()))?;
+							.map_err(crate::remote::git_error_msg)?;
 						let exported = plan_commit_export_exact_with(
 							&git,
 							&tip_sha,
@@ -4885,8 +4904,7 @@ impl WorkbenchModel {
 							&opts,
 							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
-						// ALLOWED-RAW: pending #225: git error text shown verbatim
-						.map_err(|e| Msg::raw(e.to_string()))?;
+						.map_err(|e| crate::reason::reason_msg(&e.reason()))?;
 						let out = exported.outcome();
 						let status = commit_copied_status(&out);
 						Ok((out.text, out.commit_count, status))
@@ -5015,9 +5033,15 @@ impl WorkbenchModel {
 				cx.notify();
 			}
 			Some(paste::preview::Landed::WorkerLost) => {
-				self.set_status_msg(Msg::new(
+				// The worker thread ended without an answer: an internal
+				// failure the user cannot cause.
+				self.set_status_msg(Msg::with_msg_arg(
 					"paste_err_plan",
-					["Preview worker ended before producing a result".into()],
+					[String::new()],
+					0,
+					crate::reason::reason_msg(&Reason::Internal {
+						detail: String::new(),
+					}),
 				));
 				cx.notify();
 			}
@@ -5431,16 +5455,18 @@ impl WorkbenchModel {
 										}
 									}
 									Ok(None) => PasteDiffOutcome::Binary,
-									Err(err) => {
-										let s = err.to_string();
-										if s.contains("exceeds")
-											|| s.contains("limit")
-										{
-											PasteDiffOutcome::TooLarge
-										} else {
-											PasteDiffOutcome::Unreadable
+									// The worker's refusal code says it
+									// was too large; its text is never read.
+									Err(
+										snip_remote::RemoteError::Refused {
+											code: snip_remote::ErrorCode::TooLarge,
+											..
 										}
-									}
+										| snip_remote::RemoteError::PatchTooLarge {
+											..
+										},
+									) => PasteDiffOutcome::TooLarge,
+									Err(_) => PasteDiffOutcome::Unreadable,
 								}
 							}
 							None => PasteDiffOutcome::Unreadable,
@@ -5472,15 +5498,15 @@ impl WorkbenchModel {
 								}
 								None => PasteDiffOutcome::Binary,
 							},
-							Err(err) => {
-								let s = err.to_string();
-								if s.contains("exceeds") || s.contains("1 MiB")
-								{
-									PasteDiffOutcome::TooLarge
-								} else {
-									PasteDiffOutcome::Unreadable
-								}
+							// `file_preview` refuses a file over the preview
+							// limit with this kind.
+							Err(err)
+								if err.kind()
+									== std::io::ErrorKind::FileTooLarge =>
+							{
+								PasteDiffOutcome::TooLarge
 							}
+							Err(_) => PasteDiffOutcome::Unreadable,
 						}
 					};
 					if let Some(delay) = delay {
@@ -6012,13 +6038,6 @@ impl From<Msg> for PreviewErr {
 	}
 }
 
-impl From<String> for PreviewErr {
-	fn from(s: String) -> Self {
-		// ALLOWED-RAW: pending #225: a String error with no Reason yet
-		Self::Failed(Msg::raw(s))
-	}
-}
-
 impl PreviewErr {
 	/// A Git read's failure; a start failure is worded when drawn.
 	pub(crate) fn git(e: snip_core::gitsrc::GitError) -> Self {
@@ -6037,8 +6056,9 @@ impl From<std::io::Error> for PreviewErr {
 		if e.kind() == std::io::ErrorKind::FileTooLarge {
 			Self::TooLarge
 		} else {
-			// ALLOWED-RAW: OS error text, shown as the OS words it
-			Self::Failed(Msg::raw(e.to_string()))
+			Self::Failed(crate::reason::reason_msg(
+				&snip_core::reason::io_reason(&e, ""),
+			))
 		}
 	}
 }
@@ -8129,7 +8149,10 @@ mod tests {
 				m.remote_up(cx);
 				m.remote_listing_landed(
 					stale,
-					Err(crate::i18n::Msg::raw("late failure")),
+					Err(crate::i18n::Msg::new(
+						"error_repo_status",
+						["late failure".to_string()],
+					)),
 					cx,
 				);
 				assert_eq!(m.remote.browse.as_ref().unwrap().listing, None);
@@ -10581,7 +10604,7 @@ mod tests {
 					"remote_scan_failed",
 					[String::new()],
 					0,
-					crate::remote::start_msg(
+					crate::reason::start_msg(
 						snip_remote::StartReason::NoWorker,
 						"",
 					),
@@ -10626,7 +10649,7 @@ mod tests {
 			assert_ne!(zh_s, en_s);
 			assert_ne!(zh_n, en_n);
 			// The nested reason follows too, not just the wrapper.
-			let reason = crate::remote::start_msg(
+			let reason = crate::reason::start_msg(
 				snip_remote::StartReason::NoWorker,
 				"",
 			);
@@ -16677,9 +16700,13 @@ mod tests {
 			let state = model.read_with(cx, |m, _| m.changes_empty_state());
 			assert_eq!(
 				state,
-				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::new(
+				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::with_msg_arg(
 					"error_repo_status",
-					["read failed".to_string()]
+					[String::new()],
+					0,
+					crate::reason::failure_msg(&crate::test_failure(
+						"read failed"
+					))
 				)))
 			);
 		}
@@ -16724,9 +16751,13 @@ mod tests {
 			assert_eq!((error_overflow, depth_overflow), (0, 0));
 			assert_eq!(
 				model.read_with(cx, |m, _| m.changes_empty_state()),
-				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::new(
+				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::with_msg_arg(
 					"error_repo_status",
-					["3 more depth-limited directories omitted".to_string()]
+					[String::new()],
+					0,
+					crate::reason::reason_msg(&Reason::DepthLimitedOmitted {
+						count: 3
+					})
 				)))
 			);
 
@@ -17015,7 +17046,10 @@ mod tests {
 						root: tmp.path().join("alpha"),
 						name: "alpha".into(),
 						state: crate::ChangeRepoState::Failed(
-							crate::i18n::Msg::raw("git status failed"),
+							crate::i18n::Msg::new(
+								"error_repo_status",
+								["git status failed".to_string()],
+							),
 						),
 						total: 0,
 					},
@@ -17194,8 +17228,10 @@ mod tests {
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
-				m.history_error =
-					Some(crate::i18n::Msg::raw("git read failure"));
+				m.history_error = Some(crate::i18n::Msg::new(
+					"error_repo_status",
+					["git read failure".to_string()],
+				));
 			});
 			assert_eq!(
 				model.read_with(cx, |m, _| m.log_empty_state()),
@@ -17203,7 +17239,10 @@ mod tests {
 					"error_history",
 					[String::new()],
 					0,
-					crate::i18n::Msg::raw("git read failure")
+					crate::i18n::Msg::new(
+						"error_repo_status",
+						["git read failure".to_string()]
+					)
 				)))
 			);
 		}
@@ -22426,10 +22465,17 @@ mod tests {
 		);
 		match result {
 			Err(err) => {
-				let err_msg = err.to_string();
-				assert!(
-					err_msg.contains("Path leaves the workspace"),
-					"expected 'Path leaves the workspace', got: {err_msg}"
+				// A refusal by its reason, not by the English text.
+				let PreviewErr::Failed(msg) = &err else {
+					panic!("expected a refusal, got: {err:?}");
+				};
+				assert_eq!(
+					*msg,
+					crate::reason::reason_msg(
+						&snip_core::reason::Reason::PermissionDenied {
+							path: String::new()
+						}
+					)
 				);
 			}
 			Ok((preview, _)) => {
@@ -22913,7 +22959,10 @@ mod tests {
 
 		// A failed repo with no rows gets a top-level note; a truncated
 		// list says so under each of its expanded repo rows.
-		slots[2].state = ChangeRepoState::Failed(Msg::raw("boom"));
+		slots[2].state = ChangeRepoState::Failed(Msg::new(
+			"error_repo_status",
+			["boom".to_string()],
+		));
 		slots[1].total = MAX_CHANGES_PER_REPO + 1;
 		let rows =
 			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
@@ -22936,7 +22985,10 @@ mod tests {
 			);
 		}
 		for slot in [2, 3, 4] {
-			slots[slot].state = ChangeRepoState::Failed(Msg::raw("boom"));
+			slots[slot].state = ChangeRepoState::Failed(Msg::new(
+				"error_repo_status",
+				["boom".to_string()],
+			));
 		}
 		// Three unreadable repos: one node after the changes, collapsed
 		// until opened, then one note per repo under it.

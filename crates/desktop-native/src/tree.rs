@@ -367,6 +367,16 @@ pub fn command_for_row(
 	}
 }
 
+/// A folder that could not be listed, worded by what the OS error stands for.
+fn read_dir_failed(err: &std::io::Error) -> Msg {
+	Msg::with_msg_arg(
+		"tree_read_dir_failed",
+		[String::new()],
+		0,
+		crate::reason::reason_msg(&snip_core::reason::io_reason(err, "")),
+	)
+}
+
 /// Reads at most one admitted page. Checks `cancel` between entries.
 /// A name that cannot fit in [`MAX_RETAINED_WORKING_TREE_BYTES`] is skipped
 /// so a single path cannot pin the cursor.
@@ -406,8 +416,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 		None if io.held.is_empty() => match DirectoryScan::open(&io.dir) {
 			Ok(scan) => Some(scan),
 			Err(err) => {
-				result.error =
-					Some(Msg::new("tree_read_dir_failed", [err.to_string()]));
+				result.error = Some(read_dir_failed(&err));
 				return result;
 			}
 		},
@@ -452,10 +461,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 					return result;
 				}
 				Err(ScanError::Io(err)) => {
-					result.error = Some(Msg::new(
-						"tree_read_dir_failed",
-						[err.to_string()],
-					));
+					result.error = Some(read_dir_failed(&err));
 					return result;
 				}
 			};

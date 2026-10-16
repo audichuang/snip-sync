@@ -1059,8 +1059,14 @@ impl PreparedHistory {
 					filtered,
 					shallow.clone(),
 				)
-				// ALLOWED-RAW: pending #225: layout_page returns a String
-				.map_err(|e| GraphAdmissionError::Layout(Msg::raw(e)))
+				// The graph's own Display is an internal diagnostic: it trails
+				// the worded headline as data.
+				.map_err(|e| {
+					GraphAdmissionError::Layout(Msg::detail(
+						Msg::new("err_graph_layout", []),
+						e.to_string(),
+					))
+				})
 			};
 			// Filtered results keep their graph, like IntelliJ: a parent the
 			// filter left out ends in a dashed "skipped" stub. (Path filters
@@ -4075,6 +4081,60 @@ mod tests {
 		assert!(held <= ERROR_RETAINED_RESERVE, "{held}");
 	}
 
+	/// The deepest message a worded reason can be, as history retains it:
+	/// every argument over the clip, every sample of every `Reason`. A
+	/// reason nests at most one message (a headline with arguments inside
+	/// `reason_detail`), which is all the reserve counts.
+	#[test]
+	fn the_metadata_reserve_covers_every_worded_reason() {
+		fn inflate(msg: &mut Msg, long: &str) {
+			for arg in &mut msg.args {
+				*arg = long.to_string();
+			}
+			if let Some(boxed) = msg.inner.as_deref_mut() {
+				inflate(&mut boxed.1, long);
+			}
+		}
+		fn depth(msg: &Msg) -> usize {
+			msg.inner.as_deref().map_or(0, |b| 1 + depth(&b.1))
+		}
+		let long = "x".repeat(10 * MAX_STORED_ERROR_BYTES);
+		let mut deepest = 0;
+		let mut most = 0;
+		for (label, reason) in crate::paste::zh_leaks_tests::reason_samples()
+			.into_iter()
+			.flat_map(|(label, reason)| {
+				let wire = reason.clone().for_wire();
+				[(label.clone(), reason)]
+					.into_iter()
+					.chain(wire.map(|w| (format!("{label}/for_wire"), w)))
+			}) {
+			let mut msg = crate::reason::reason_msg(&reason);
+			assert!(
+				msg.args.len() <= MAX_ERROR_MSG_ARGS,
+				"{label}: {} arguments",
+				msg.args.len()
+			);
+			deepest = deepest.max(depth(&msg));
+			inflate(&mut msg, &long);
+			let error = clip_msg(msg);
+			let status = Msg::with_msg_arg(
+				"error_history",
+				[String::new()],
+				0,
+				error.clone(),
+			);
+			let held = std::mem::size_of::<Option<Msg>>()
+				+ error.heap_bytes()
+				+ std::mem::size_of::<Msg>()
+				+ status.heap_bytes();
+			most = most.max(held);
+			assert!(held <= ERROR_RETAINED_RESERVE, "{label}: {held}");
+		}
+		assert!(deepest <= 1, "a reason nests {deepest} messages");
+		assert!(most > 0);
+	}
+
 	use super::*;
 	use snip_core::gitsrc::Git;
 	use std::process::Command;
@@ -5164,7 +5224,10 @@ mod tests {
 			.all(|key| key.len() <= MAX_RETAINED_TREE_BYTES));
 		tree.note_error(
 			"err".into(),
-			Msg::raw("e".repeat(MAX_RETAINED_TREE_BYTES * 4)),
+			Msg::new(
+				"error_open_repo",
+				["e".repeat(MAX_RETAINED_TREE_BYTES * 4)],
+			),
 		);
 		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 		assert!(tree

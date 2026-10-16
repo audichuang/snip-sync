@@ -380,7 +380,7 @@ pub fn layout_page(
 	resume: bool,
 	filtered: HashSet<String>,
 	shallow: HashSet<String>,
-) -> Result<GraphLayout, String> {
+) -> Result<GraphLayout, GraphError> {
 	let config = GraphConfig {
 		// Row ids namespaced per repository: several unrelated histories
 		// share the lanes, so a root's lane stays empty for a row before
@@ -392,14 +392,13 @@ pub fn layout_page(
 	};
 	let fallback = |config: &GraphConfig| {
 		fallback_linear_layout(commits, refs, head_sha, config)
-			.map_err(|e| format!("Graph layout error: {e}"))
 	};
 	if resume && checkpoint.is_none() {
 		return fallback(&config);
 	}
 	match compute_graph_layout(commits, refs, head_sha, &config, checkpoint) {
 		Err(GraphError::FrontierLimitExceeded { .. }) => fallback(&config),
-		other => other.map_err(|e| format!("Graph layout error: {e}")),
+		other => other,
 	}
 }
 
@@ -407,7 +406,7 @@ pub fn layout_commits(
 	commits: &[CommitSummary],
 	refs: &[GitReference],
 	head_sha: Option<&str>,
-) -> Result<GraphLayout, String> {
+) -> Result<GraphLayout, GraphError> {
 	layout_commits_paged(commits, refs, head_sha, None)
 }
 
@@ -416,7 +415,7 @@ pub fn layout_commits_paged(
 	refs: &[GitReference],
 	head_sha: Option<&str>,
 	checkpoint: Option<&GraphCheckpoint>,
-) -> Result<GraphLayout, String> {
+) -> Result<GraphLayout, GraphError> {
 	layout_page(
 		commits,
 		refs,

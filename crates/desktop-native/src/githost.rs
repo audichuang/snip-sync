@@ -43,8 +43,7 @@ impl GitHost {
 					Some(id) => Ok(Box::new(LocalRepo::known(id))),
 					None => LocalRepo::open(root, read)
 						.map(|r| Box::new(r) as Box<dyn RepoView>)
-						// ALLOWED-RAW: pending #225: git error text shown verbatim
-						.map_err(|e| Msg::raw(e.to_string())),
+						.map_err(crate::remote::git_error_msg),
 				}
 			}
 			Self::Remote {
@@ -155,26 +154,24 @@ mod tests {
 			crate::i18n::t("remote_refs_too_large", crate::i18n::Locale::En)
 		);
 
-		// Remote + other -> to_string()
+		// Remote + other -> worded by its reason, never by its text
 		let other_err = GitError::remote(
 			snip_core::reason::Reason::Protocol,
 			"server died",
 		);
-		let other_str = other_err.to_string();
 		assert_eq!(
 			refs_error(&remote_host, other_err).render(crate::i18n::Locale::En),
-			other_str
+			crate::i18n::t("err_protocol", crate::i18n::Locale::En)
 		);
 
-		// Local + OutputLimit -> to_string()
+		// Local + OutputLimit -> worded by its reason
 		let local_err = GitError::OutputLimit {
 			args: "remote view".into(),
 			limit: 0,
 		};
-		let local_str = local_err.to_string();
 		assert_eq!(
 			refs_error(&local_host, local_err).render(crate::i18n::Locale::En),
-			local_str
+			crate::i18n::t("err_too_large", crate::i18n::Locale::En)
 		);
 	}
 

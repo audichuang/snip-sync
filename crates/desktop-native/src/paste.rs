@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use snip_core::commits::{
 	self, FilePlan, LayoutConflict, NotCopiedReason, ReplayAction,
-	ReplaySkipReason,
+	ReplayFailure, ReplaySkipReason,
 };
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
@@ -33,6 +33,7 @@ use snip_remote::{
 
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
+use crate::reason::reason_msg;
 use crate::syntax::Language;
 
 pub mod preview;
@@ -798,9 +799,10 @@ impl RemotePaste {
 	/// The workspace folder (relative to the workspace) of a tree path.
 	fn rel(&self, path: &Path) -> Result<String, Msg> {
 		crate::remote::remote_rel(&self.session.root, path).ok_or_else(|| {
-			Msg::new(
+			Msg::with_key_arg(
 				"paste_err_destination",
-				[self.shown(path), "not in the remote workspace".into()],
+				[self.shown(path), "err_not_under_workspace".into()],
+				1,
 			)
 		})
 	}
@@ -841,7 +843,8 @@ fn paste_target(
 }
 
 /// A destination the paste could not resolve or reach, named as the user
-/// knows it.
+/// knows it. Worded when drawn, in the language then in force: a plan
+/// outlives a switch of language.
 fn destination_msg(
 	remote: Option<&RemotePaste>,
 	path: &Path,
@@ -849,109 +852,12 @@ fn destination_msg(
 ) -> Msg {
 	let shown =
 		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
-	let why = match err {
-		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => match e {
-			// Worded when drawn, in the language then in force: a plan
-			// outlives a switch of language.
-			RemoteError::Start {
-				reason: Some(reason),
-				detail,
-				..
-			} => return start_destination_msg(shown, reason, detail),
-			// A worker refusal is worded by its code, like a start
-			// reason; the worker's own OS or protocol English is never
-			// shown (#213).
-			RemoteError::Refused {
-				code,
-				message,
-				reason,
-			} => match crate::remote::refusal_key(code) {
-				Some(key) => {
-					return Msg::with_key_arg(
-						"paste_err_destination",
-						[shown, key.to_string()],
-						1,
-					);
-				}
-				None => crate::remote::describe(RemoteError::Refused {
-					code,
-					message,
-					reason,
-				}),
-			},
-			other => crate::remote::describe(other),
-		},
-		PasteError::Local(e) => e.to_string(),
-		PasteError::Destination { source, .. } => source.to_string(),
-		// Worded as the app always did: a protocol error of the worker.
-		PasteError::NoReplayResult => crate::remote::describe(
-			RemoteError::Protocol(PasteError::NoReplayResult.to_string()),
-		),
-	};
-	Msg::new("paste_err_destination", [shown, why])
-}
-
-/// A destination whose worker did not start, for a known reason. The
-/// reason travels as its dictionary key, so the message is worded in the
-/// language in force when it is drawn.
-fn start_destination_msg(
-	shown: String,
-	reason: snip_core::gitsrc::StartReason,
-	detail: String,
-) -> Msg {
-	let key = crate::remote::start_reason_key(reason);
-	// The transport's detail is only the useful part of a key login.
-	if detail.is_empty()
-		|| !matches!(reason, snip_core::gitsrc::StartReason::KeyLogin)
-	{
-		Msg::with_key_arg("paste_err_destination", [shown, key.into()], 1)
-	} else {
-		Msg::with_key_arg(
-			"paste_err_destination_detail",
-			[shown, key.into(), detail],
-			1,
-		)
-	}
-}
-
-/// A stale destination as the message the app shows. The kind comes from
-/// the typed [`snip_remote::Reason`], never from the sentence; the argument
-/// is the engine's own sentence locally and the changed path from a worker.
-/// Pending the one translation point of #225 (a later slice).
-fn stale_msg(err: &PasteError) -> Option<Msg> {
-	use snip_remote::{Reason, StaleChange};
-	if !err.is_stale() {
-		return None;
-	}
-	let change = match err.reason() {
-		Reason::DestinationChanged { change } => Some(change),
-		_ => None,
-	};
-	let text = match (err, &change) {
-		(
-			PasteError::Local(TransferError::StaleDestination {
-				reason, ..
-			}),
-			_,
-		) => reason.clone(),
-		(
-			_,
-			Some(
-				StaleChange::Created { rel }
-				| StaleChange::Deleted { rel }
-				| StaleChange::Modified { rel },
-			),
-		) => rel.clone(),
-		(PasteError::Remote(RemoteError::Refused { message, .. }), _) => {
-			message.clone()
-		}
-		_ => String::new(),
-	};
-	Some(match change {
-		Some(StaleChange::Created { .. }) => Msg::new("stale_created", [text]),
-		Some(StaleChange::Deleted { .. }) => Msg::new("stale_deleted", [text]),
-		_ => Msg::new("stale_modified", [text]),
-	})
+	Msg::with_msg_arg(
+		"paste_err_destination",
+		[shown, String::new()],
+		1,
+		reason_msg(&err.reason()),
+	)
 }
 
 /// A file Apply's failure, worded as before for each target.
@@ -963,12 +869,10 @@ fn file_apply_msg(
 	if err.is_repo_busy() {
 		return repo_busy();
 	}
-	if let Some(msg) = stale_msg(&err) {
-		return msg;
-	}
 	match err {
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
-		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		PasteError::Local(e) => reason_msg(&e.reason()),
+		other if other.is_stale() => reason_msg(&other.reason()),
 		other => destination_msg(remote, dest, other),
 	}
 }
@@ -980,27 +884,33 @@ fn commit_msg(
 	err: PasteError,
 	applying: bool,
 ) -> Msg {
-	if let Some(msg) = stale_msg(&err) {
-		return msg;
+	if err.is_stale() {
+		return reason_msg(&err.reason());
 	}
 	match err {
 		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
 			..
 		})) => repo_busy(),
 		PasteError::Local(TransferError::Git(e)) if applying => {
-			Msg::new("error_open_repo", [e.to_string()])
+			Msg::with_msg_arg(
+				"error_open_repo",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
 		}
-		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
-		// Kept as before: any other worker refusal of a replay, Busy
-		// included, reads as a repository error (see Risks). A code with a
-		// wording of its own shows that wording, never the worker's text.
-		PasteError::Remote(RemoteError::Refused { code, message, .. }) => {
-			match crate::remote::refusal_key(code) {
-				Some(key) => {
-					Msg::with_key_arg("error_open_repo", [key.to_string()], 0)
-				}
-				None => Msg::new("error_open_repo", [message]),
-			}
+		PasteError::Local(e) => reason_msg(&e.reason()),
+		// Kept on purpose (design Risk 1): any other worker refusal of a
+		// replay, Busy included, reads as a repository error, not as
+		// paste_repo_busy. A refusal is worded by its reason, never by the
+		// worker's text.
+		PasteError::Remote(e @ RemoteError::Refused { .. }) => {
+			Msg::with_msg_arg(
+				"error_open_repo",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
 		}
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
 		other => destination_msg(remote, dest, other),
@@ -1125,6 +1035,16 @@ pub(crate) fn layout_conflict_key(conflict: LayoutConflict) -> &'static str {
 	}
 }
 
+/// Why a replay stopped. A worker that sent no reason (an old one) is worded
+/// by the generic I/O cause: the failure's English text is never shown.
+fn replay_failure_reason(fail: &ReplayFailure) -> snip_core::reason::Reason {
+	fail.reason
+		.clone()
+		.unwrap_or(snip_core::reason::Reason::Refused {
+			code: snip_remote::ErrorCode::Io,
+		})
+}
+
 pub(crate) fn layout_conflict_cause_key(
 	conflict: LayoutConflict,
 ) -> &'static str {
@@ -1162,10 +1082,12 @@ fn root_name(path: &Path) -> String {
 
 /// A destination that could not be opened or captured, named by path so the
 /// status says which directory was refused (the OS error alone does not).
-fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
-	Msg::new(
+fn destination_error(dest: &Path, err: &std::io::Error) -> Msg {
+	Msg::with_msg_arg(
 		"paste_err_destination",
-		[dest.display().to_string(), err.to_string()],
+		[dest.display().to_string(), String::new()],
+		1,
+		reason_msg(&snip_core::reason::io_reason(err, "")),
 	)
 }
 
@@ -1695,8 +1617,14 @@ impl PastePreviewPlan {
 		limit: usize,
 		remote: Option<RemotePaste>,
 	) -> Result<Self, Msg> {
-		let payload = commits::parse_commit_payload(raw_text)
-			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
+		let payload = commits::parse_commit_payload(raw_text).map_err(|e| {
+			Msg::with_msg_arg(
+				"paste_err_plan",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
+		})?;
 		// The write scope is the folder the user pasted into: the worker
 		// holds the replay to it the same way.
 		let target = paste_target(remote.as_ref(), dest)?;
@@ -1979,28 +1907,45 @@ impl PastePreviewPlan {
 		let file_plan =
 			match target.plan_files(&self.raw_payload, &route, opts, None) {
 				Ok(plan) => plan,
-				Err(PasteError::Destination { path, source }) => {
-					return Err(destination_error(&path, &source));
+				// No engine answered: the destination did not resolve or the
+				// worker could not be reached.
+				Err(
+					err @ (PasteError::Destination { .. }
+					| PasteError::Remote(
+						RemoteError::Io(_)
+						| RemoteError::Connect(_)
+						| RemoteError::Start { .. }
+						| RemoteError::PatchTooLarge { .. }
+						| RemoteError::Protocol(_)
+						| RemoteError::Cancelled
+						| RemoteError::TimedOut
+						| RemoteError::Stalled { .. }
+						| RemoteError::WorkerTooOld { .. },
+					)
+					| PasteError::OutcomeUnknown(_)
+					| PasteError::NoReplayResult),
+				) => {
+					return Err(destination_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						err,
+					));
 				}
-				Err(err) => match err.refusal() {
-					Some(message) => {
-						if crate::e2e_on() && err.is_collision() {
-							app_log!(
-								"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-							);
-						}
-						self.error =
-							Some(Msg::new("paste_err_plan", [message]));
-						return Ok(());
+				// An engine refused the plan, locally or on the worker.
+				Err(err) => {
+					if crate::e2e_on() && err.is_collision() {
+						app_log!(
+							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+						);
 					}
-					None => {
-						return Err(destination_msg(
-							self.remote.as_ref(),
-							&self.destination,
-							err,
-						));
-					}
-				},
+					self.error = Some(Msg::with_msg_arg(
+						"paste_err_plan",
+						[String::new()],
+						0,
+						reason_msg(&err.reason()),
+					));
+					return Ok(());
+				}
 			};
 		let base = self
 			.retained_bytes()
@@ -2463,9 +2408,14 @@ impl PastePreviewPlan {
 		}
 
 		let Some(ref import_plan) = self.import_plan else {
-			return Err(Msg::new(
+			// An invariant break: Apply without a plan.
+			return Err(Msg::with_msg_arg(
 				"paste_err_plan",
-				["no active import plan".into()],
+				[String::new()],
+				0,
+				reason_msg(&snip_core::reason::Reason::Internal {
+					detail: String::new(),
+				}),
 			));
 		};
 
@@ -2557,44 +2507,39 @@ impl PastePreviewPlan {
 				if subject_is_key {
 					key_args.push(1);
 				}
-				let (cause_arg, cause_is_key) = match fail.layout_conflict {
+				let (cause_arg, cause) = match fail.layout_conflict {
+					// A layout conflict words itself by its key.
 					Some(conflict) => {
-						(layout_conflict_cause_key(conflict), true)
+						key_args.push(2);
+						(layout_conflict_cause_key(conflict).to_string(), None)
 					}
-					None => (fail.error.as_str(), false),
+					// Any other refusal by its reason. A worker that sent
+					// none (an old one) is worded by the generic I/O cause.
+					None => (
+						String::new(),
+						Some(reason_msg(&replay_failure_reason(&fail))),
+					),
 				};
-				if cause_is_key {
-					key_args.push(2);
-				}
-				let msg = if key_args.is_empty() {
-					Msg::new(
-						"commit_replay_refused",
-						[
-							(fail.index + 1).to_string(),
-							subject_arg.to_string(),
-							cause_arg.to_string(),
-						],
-					)
-				} else {
-					Msg::with_key_args(
-						"commit_replay_refused",
-						[
-							(fail.index + 1).to_string(),
-							subject_arg.to_string(),
-							cause_arg.to_string(),
-						],
-						key_args,
-					)
-				};
-				return Err(msg);
+				let msg = Msg::with_key_args(
+					"commit_replay_refused",
+					[
+						(fail.index + 1).to_string(),
+						subject_arg.to_string(),
+						cause_arg,
+					],
+					key_args,
+				);
+				return Err(match cause {
+					Some(cause) => msg.nest(2, cause),
+					None => msg,
+				});
 			}
 			let created = short_shas(&replay_res.created, usize::MAX);
 			return Err(match fail.layout_conflict {
 				Some(conflict) => {
-					let path = fail
-						.conflict_path
-						.as_deref()
-						.unwrap_or(fail.error.as_str());
+					let subject =
+						fail.message.lines().next().unwrap_or("").trim();
+					let path = fail.conflict_path.as_deref().unwrap_or(subject);
 					Msg::with_key_arg(
 						"commit_replay_partial_refused",
 						[
@@ -2606,9 +2551,12 @@ impl PastePreviewPlan {
 						3,
 					)
 				}
-				None => {
-					Msg::new("commit_replay_partial", [created, fail.error])
-				}
+				None => Msg::with_msg_arg(
+					"commit_replay_partial",
+					[created, String::new()],
+					1,
+					reason_msg(&replay_failure_reason(&fail)),
+				),
 			});
 		}
 		Ok(PasteApplyResult {
@@ -2626,7 +2574,7 @@ impl PastePreviewPlan {
 }
 
 #[cfg(test)]
-mod zh_leaks_tests;
+pub(crate) mod zh_leaks_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2791,8 +2739,9 @@ pub(crate) mod tests {
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
 			"stale_created"
 		);
-		// A worker that sends no reason (an old one) still refuses as stale;
-		// the kind of change is not guessed from its sentence.
+		// A worker that sends no reason (an old one) still refuses as stale,
+		// worded by its code; the kind of change is not guessed from its
+		// sentence.
 		let old = RemoteError::Refused {
 			code: ErrorCode::Stale,
 			message: "stale destination in '/w': target file 'a' was created \
@@ -2802,7 +2751,7 @@ pub(crate) mod tests {
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(old)).key,
-			"stale_modified"
+			"remote_refused_stale"
 		);
 		// Never reached the worker: nothing can have been written.
 		assert_eq!(
@@ -2922,16 +2871,18 @@ pub(crate) mod tests {
 			),
 			"stale_deleted"
 		);
-		// The old `stale_msg` other arm: the error's Display, not paste_message.
+		// A local error that is not a stale one is worded by its reason, not
+		// as an external modification and not by its Display.
 		let special = file_apply_msg(
 			None,
 			&dest,
 			PasteError::Local(TransferError::SpecialFile("p".into())),
 		);
-		assert_eq!(special.key, "stale_modified");
 		assert_eq!(
-			special.args[0],
-			TransferError::SpecialFile("p".into()).to_string()
+			special,
+			reason_msg(&snip_core::reason::Reason::NotRegularFile {
+				path: "p".into()
+			})
 		);
 	}
 
@@ -3024,7 +2975,7 @@ pub(crate) mod tests {
 			}))
 		};
 		assert_eq!(key(None, cancelled(), true), "error_open_repo");
-		assert_eq!(key(None, cancelled(), false), "stale_modified");
+		assert_eq!(key(None, cancelled(), false), "err_cancelled");
 	}
 
 	/// Every user-facing surface that shows a remote refusal words it by
