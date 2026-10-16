@@ -985,6 +985,71 @@ mod tests {
 		assert!(untouched(&path, &reserved));
 	}
 
+	/// The made file swapped, from outside, for a non-empty readable file
+	/// that cannot be written: not ours any more, so the row follows the
+	/// existing-file rules instead of failing on the permission.
+	#[cfg(unix)]
+	fn run_over_a_swapped_read_only_file(
+		selection: &RestoreSelection,
+	) -> (
+		RestoreExecutionResult,
+		Vec<usize>,
+		PathBuf,
+		tempfile::TempDir,
+	) {
+		use std::os::unix::fs::PermissionsExt;
+		let (dir, root) = tmp();
+		let (path, reserved) = made_file(&root);
+		fs::remove_file(&path).unwrap();
+		fs::write(&path, "external").unwrap();
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+		let plan = plan_restore(&[&root], &[entry("new.txt", "ours")]);
+		let map = HashMap::from([(0, Reservation::Made(reserved))]);
+		let (result, unwritten) = execute_restore_plan_reserved(
+			&plan,
+			selection,
+			&map,
+			&mut |_, _| {},
+		);
+		(result, unwritten, path, dir)
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_skipped_by_default() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&RestoreSelection::default());
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.created_count + result.overwritten_count, 0);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "external");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_skipped_when_skipping_existing() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&RestoreSelection {
+				skip_existing: true,
+				..Default::default()
+			});
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.created_count + result.overwritten_count, 0);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "external");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_replaced_when_overwriting() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&overwrite());
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.overwritten_count, 1);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "ours");
+	}
+
 	fn entry(path: &str, content: &str) -> RestoreEntry {
 		RestoreEntry {
 			path: path.into(),
