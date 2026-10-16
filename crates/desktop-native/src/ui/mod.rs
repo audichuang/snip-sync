@@ -1094,8 +1094,17 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// The Log panel left the screen: the dropdowns it opened go with it,
+	/// since nothing is left to draw them (O7 of `invariants`).
+	pub(crate) fn log_panel_hidden(&mut self) {
+		self.drop_overlays(crate::overlay::DropScope::AnyLogMenu);
+	}
+
 	fn toggle_log(&mut self, cx: &mut Context<Self>) {
 		self.bottom_visible = !self.bottom_visible;
+		if !self.bottom_visible {
+			self.log_panel_hidden();
+		}
 		// A manual toggle wins over the paste preview's auto-restore.
 		self.paste.forget_log_restore();
 		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible);

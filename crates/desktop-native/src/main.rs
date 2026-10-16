@@ -5394,6 +5394,7 @@ impl WorkbenchModel {
 				.set_status("status_paste_preview", [items_count.to_string()]),
 		}
 		if self.paste.collapse_log(&mut self.bottom_visible) {
+			self.log_panel_hidden();
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
 		// A plan landing under the open destination field (a prefix chosen

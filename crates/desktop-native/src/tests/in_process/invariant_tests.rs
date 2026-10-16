@@ -581,8 +581,13 @@ enum ProbeUse {
 	Click { mods: &'static [Mods], right: bool },
 	/// A text field: typed into, and submitted when `submit`.
 	Field { submit: bool },
-	/// Left alone, and why.
-	Skip(&'static str),
+	/// Left alone: a container or a label, which is no control.
+	Surface,
+	/// Left alone because pressing it does what a lane must not (an OS
+	/// dialog, a workspace switch, the OS clipboard). A press on a control
+	/// that one of these covers lands on the hazard, so those are left
+	/// alone too.
+	Hazard(&'static str),
 }
 
 const ROW: ProbeUse = ProbeUse::Click {
@@ -610,12 +615,11 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 	const WORKSPACE: &str =
 		"opens, switches or closes a workspace (out of scope: lifecycle drain)";
 	const OS_CLIPBOARD: &str = "writes the OS clipboard";
-	const SURFACE: &str = "a container or a label, not a control";
 	if let Some(item) = id.strip_prefix("menu-item:") {
 		return Some(match item {
 			"copy-path" | "copy-relative-path" | "copy-files"
-			| "copy-commits" | "copy-revision" => ProbeUse::Skip(OS_CLIPBOARD),
-			"reveal" => ProbeUse::Skip("opens the OS file manager"),
+			| "copy-commits" | "copy-revision" => ProbeUse::Hazard(OS_CLIPBOARD),
+			"reveal" => ProbeUse::Hazard("opens the OS file manager"),
 			_ => BTN,
 		});
 	}
@@ -688,11 +692,11 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		| "splitter-bottom"
 		| "splitter-log-details"
 		| "splitter-log-files" => {
-			ProbeUse::Skip("a drag handle: layout is #228 and #229")
+			ProbeUse::Hazard("a drag handle: layout is #228 and #229")
 		}
 		// The editor.
 		"btn-tab-close" | "btn-find-prev" | "btn-find-next"
-		| "btn-find-close" | "tree-chevron" | "btn-find-case"
+		| "btn-find-close" | "tree-chevron" | "collapse" | "btn-find-case"
 		| "btn-find-regex" | "btn-prev-diff" | "btn-next-diff"
 		| "btn-expand-folds" | "btn-diff-mode" | "diff-fold" => BTN,
 		// The header and the status bar.
@@ -710,6 +714,7 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		"remote-host" | "remote-folder" => BTN,
 		"remote-recent"
 		| "btn-remote-open-here"
+		| "btn-remote-open"
 		| "workspace-recent"
 		| "btn-open-workspace"
 		| "btn-workspace-open-confirm"
@@ -718,10 +723,10 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		| "workspace-path-input"
 		| "ws-tab"
 		| "btn-remote-up"
-		| "remote-up" => ProbeUse::Skip(WORKSPACE),
-		"btn-open-folder" | "paste-dest-browse" => ProbeUse::Skip(DIALOG),
+		| "remote-up" => ProbeUse::Hazard(WORKSPACE),
+		"btn-open-folder" | "paste-dest-browse" => ProbeUse::Hazard(DIALOG),
 		"btn-copy-commits" | "btn-copy-view" | "btn-copy-cancel" => {
-			ProbeUse::Skip(OS_CLIPBOARD)
+			ProbeUse::Hazard(OS_CLIPBOARD)
 		}
 		// Fields.
 		"log-search-input"
@@ -733,11 +738,14 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		| "selector-input"
 		| "paste-dest-input"
 		| "input-add-repo"
+		| "log-date-since"
+		| "log-date-until"
 		| "log-since-input"
 		| "log-until-input" => FIELD,
 		// Enter on this one opens the folder as the workspace.
 		"remote-path-input" => ProbeUse::Field { submit: false },
-		"left-list"
+		"remote-path"
+		| "left-list"
 		| "log-list"
 		| "log-loading"
 		| "log-error"
@@ -792,12 +800,15 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		| "selector-popover"
 		| "context-menu"
 		| "log-empty"
+		| "tree-loading"
+		| "ref-name"
+		| "ref-repo"
 		| "log-failed-feeds"
 		| "log-filter-bar"
 		| "log-chips"
-		| "workspace-closed-remote-error" => ProbeUse::Skip(SURFACE),
+		| "workspace-closed-remote-error" => ProbeUse::Surface,
 		p if p.starts_with("commit-details-") || p.starts_with("text-fit") => {
-			ProbeUse::Skip(SURFACE)
+			ProbeUse::Surface
 		}
 		_ => return None,
 	})
@@ -1089,7 +1100,6 @@ fn payloads() -> Vec<String> {
 /// A control the last frame drew, with the gestures a lane may make on it.
 struct Control {
 	id: String,
-	bounds: [i32; 4],
 	gestures: Vec<(Mods, Button)>,
 }
 
@@ -1150,12 +1160,26 @@ fn gather(
 		keys: Vec::new(),
 		unclassified: Vec::new(),
 	};
-	for (id, b) in drawn(model, cx) {
+	let frame = drawn(model, cx);
+	// Where a press would land on a hazard: a click on a control that a
+	// hazard covers does what the hazard does.
+	let hazards: Vec<[i32; 4]> = frame
+		.iter()
+		.filter(|(id, _)| matches!(probe_use(id), Some(ProbeUse::Hazard(_))))
+		.map(|(_, b)| *b)
+		.collect();
+	let covered = |b: [i32; 4]| {
+		let (x, y) = (b[0] + b[2] / 2, b[1] + b[3] / 2);
+		hazards.iter().any(|h| {
+			h[0] <= x && x < h[0] + h[2] && h[1] <= y && y < h[1] + h[3]
+		})
+	};
+	for (id, b) in frame {
 		match probe_use(&id) {
 			None => out.unclassified.push(probe_prefix(&id).to_string()),
-			Some(ProbeUse::Skip(_)) => {}
+			Some(ProbeUse::Surface | ProbeUse::Hazard(_)) => {}
 			Some(ProbeUse::Click { mods, right }) => {
-				if middle(b, scale, WINDOW).is_none() {
+				if middle(b, scale, WINDOW).is_none() || covered(b) {
 					continue;
 				}
 				let mut gestures: Vec<_> =
@@ -1163,14 +1187,10 @@ fn gather(
 				if right {
 					gestures.push((Mods::None, Button::Right));
 				}
-				out.clicks.push(Control {
-					id,
-					bounds: b,
-					gestures,
-				});
+				out.clicks.push(Control { id, gestures });
 			}
 			Some(ProbeUse::Field { submit }) => {
-				if middle(b, scale, WINDOW).is_some() {
+				if middle(b, scale, WINDOW).is_some() && !covered(b) {
 					out.fields.push((id, b, submit));
 				}
 			}
@@ -1653,8 +1673,11 @@ fn lane_window<'a>(
 	ws: &Path,
 	clipboard: &str,
 ) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
-	let (model, cx) =
-		open_sized(cx, ws.to_path_buf(), None, WINDOW.0, WINDOW.1);
+	// The hosts of `~/.ssh/config` are the machine's, and a click on one
+	// would start a real ssh: a local lane has none.
+	let (model, cx) = crate::remote::with_test_hosts(Vec::new(), || {
+		open_sized(cx, ws.to_path_buf(), None, WINDOW.0, WINDOW.1)
+	});
 	model.update(cx, |m, cx| {
 		m.probes = Some(crate::ui::Probes::for_test());
 		m.test_clipboard = Some(clipboard.to_string());

@@ -277,7 +277,10 @@ fn fuzz_regression_hiding_the_log_closes_its_dropdown(cx: &mut TestAppContext) {
 		overlays::assert_overlay_panels_match(cx, &model);
 		// Back to a bare state for the next way to hide it.
 		model.update_in(cx, |m, _, cx| m.cancel_paste_preview(cx));
-		model.update(cx, |m, _| m.bottom_visible = true);
+		model.update_in(cx, |m, _, cx| {
+			m.bottom_visible = true;
+			cx.notify();
+		});
 		settle(cx);
 	}
 }

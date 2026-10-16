@@ -1107,6 +1107,7 @@ impl WorkbenchModel {
 	) {
 		if self.log_focus.is_focused(window) && self.bottom_visible {
 			self.bottom_visible = false;
+			self.log_panel_hidden();
 			self.paste.forget_log_restore();
 			app_log!("[APP:LOG_PANEL: visible=false]");
 		} else if self.left_visible {
