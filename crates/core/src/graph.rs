@@ -411,11 +411,80 @@ impl Default for GraphConfig {
 	}
 }
 
+/// Which setting of a [`GraphConfig`] is out of range. The `Display` text is
+/// the diagnostic the CLI and the log print; a front end words the variant.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigFault {
+	#[error("max_frontier_size must be greater than 0")]
+	MaxFrontierSize,
+	#[error("max_rows must be greater than 0")]
+	MaxRows,
+	#[error("max_refs must be greater than 0")]
+	MaxRefs,
+	#[error("max_total_bytes must be greater than 0")]
+	MaxTotalBytes,
+	#[error("unit_x must be positive and finite")]
+	UnitX,
+	#[error("unit_y must be positive and finite")]
+	UnitY,
+	#[error("offset_x must be non-negative and finite")]
+	OffsetX,
+}
+
+/// Which input of a layout is out of range.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum InputFault {
+	#[error(
+		"commit SHA at row {row} is empty or exceeds {} bytes",
+		MAX_SHA_LEN
+	)]
+	CommitSha { row: usize },
+	#[error(
+		"parent SHA {index} for commit {commit} is empty or exceeds {} bytes",
+		MAX_SHA_LEN
+	)]
+	ParentSha { index: usize, commit: String },
+	#[error(
+		"ref SHA at index {index} is empty or exceeds {} bytes",
+		MAX_SHA_LEN
+	)]
+	RefSha { index: usize },
+	/// Both name faults read alike on the CLI; a front end words only the
+	/// long one (an empty name is a bug).
+	#[error(
+		"ref name at index {index} is empty or exceeds {} bytes",
+		MAX_REF_NAME_LEN
+	)]
+	RefNameEmpty { index: usize },
+	#[error(
+		"ref name at index {index} is empty or exceeds {} bytes",
+		MAX_REF_NAME_LEN
+	)]
+	RefNameTooLong { index: usize },
+	#[error(
+		"frontier rail next_sha is empty or exceeds {} bytes",
+		MAX_SHA_LEN
+	)]
+	FrontierSha,
+	#[error(
+		"checkpoint last_seen_sha is empty or exceeds {} bytes",
+		MAX_SHA_LEN
+	)]
+	CheckpointSha,
+}
+
+/// How a page fails to continue the previous one.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ContinuityFault {
+	#[error("first commit {sha} duplicates last commit of previous page")]
+	RepeatsLastCommit { sha: String },
+}
+
 /// Errors returned by the layout engine.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GraphError {
-	#[error("invalid configuration: {message}")]
-	InvalidConfig { message: String },
+	#[error("invalid configuration: {field}")]
+	InvalidConfig { field: ConfigFault },
 
 	#[error(
 		"frontier limit exceeded: active rails ({current}) exceeded limit ({limit})"
@@ -437,14 +506,14 @@ pub enum GraphError {
 	)]
 	ByteLimitExceeded { total: usize, limit: usize },
 
-	#[error("invalid input: {message}")]
-	InvalidInput { message: String },
+	#[error("invalid input: {fault}")]
+	InvalidInput { fault: InputFault },
 
 	#[error("duplicate commit detected within page: sha {sha} at row {row}")]
 	DuplicateCommit { sha: String, row: usize },
 
-	#[error("page continuity error: {message}")]
-	ContinuityError { message: String },
+	#[error("page continuity error: {fault}")]
+	ContinuityError { fault: ContinuityFault },
 }
 
 /// Output of the graph layout engine.
@@ -731,37 +800,37 @@ fn preferred_index_for_commit(
 fn validate_config(config: &GraphConfig) -> Result<(), GraphError> {
 	if config.max_frontier_size == 0 {
 		return Err(GraphError::InvalidConfig {
-			message: "max_frontier_size must be greater than 0".to_string(),
+			field: ConfigFault::MaxFrontierSize,
 		});
 	}
 	if config.max_rows == 0 {
 		return Err(GraphError::InvalidConfig {
-			message: "max_rows must be greater than 0".to_string(),
+			field: ConfigFault::MaxRows,
 		});
 	}
 	if config.max_refs == 0 {
 		return Err(GraphError::InvalidConfig {
-			message: "max_refs must be greater than 0".to_string(),
+			field: ConfigFault::MaxRefs,
 		});
 	}
 	if config.max_total_bytes == 0 {
 		return Err(GraphError::InvalidConfig {
-			message: "max_total_bytes must be greater than 0".to_string(),
+			field: ConfigFault::MaxTotalBytes,
 		});
 	}
 	if !config.unit_x.is_finite() || config.unit_x <= 0.0 {
 		return Err(GraphError::InvalidConfig {
-			message: "unit_x must be positive and finite".to_string(),
+			field: ConfigFault::UnitX,
 		});
 	}
 	if !config.unit_y.is_finite() || config.unit_y <= 0.0 {
 		return Err(GraphError::InvalidConfig {
-			message: "unit_y must be positive and finite".to_string(),
+			field: ConfigFault::UnitY,
 		});
 	}
 	if !config.offset_x.is_finite() || config.offset_x < 0.0 {
 		return Err(GraphError::InvalidConfig {
-			message: "offset_x must be non-negative and finite".to_string(),
+			field: ConfigFault::OffsetX,
 		});
 	}
 	Ok(())
@@ -791,9 +860,7 @@ fn validate_input_bounds(
 	for (row, c) in commits.iter().enumerate() {
 		if c.sha.is_empty() || c.sha.len() > MAX_SHA_LEN {
 			return Err(GraphError::InvalidInput {
-				message: format!(
-					"commit SHA at row {row} is empty or exceeds {MAX_SHA_LEN} bytes"
-				),
+				fault: InputFault::CommitSha { row },
 			});
 		}
 		total_bytes = total_bytes.saturating_add(c.sha.len());
@@ -805,10 +872,10 @@ fn validate_input_bounds(
 		for (pi, p) in c.parents.iter().enumerate() {
 			if p.is_empty() || p.len() > MAX_SHA_LEN {
 				return Err(GraphError::InvalidInput {
-					message: format!(
-						"parent SHA {pi} for commit {} is empty or exceeds {MAX_SHA_LEN} bytes",
-						c.sha
-					),
+					fault: InputFault::ParentSha {
+						index: pi,
+						commit: c.sha.clone(),
+					},
 				});
 			}
 			total_bytes = total_bytes.saturating_add(p.len());
@@ -818,16 +885,16 @@ fn validate_input_bounds(
 	for (i, r) in refs.iter().enumerate() {
 		if r.sha.is_empty() || r.sha.len() > MAX_SHA_LEN {
 			return Err(GraphError::InvalidInput {
-				message: format!(
-					"ref SHA at index {i} is empty or exceeds {MAX_SHA_LEN} bytes"
-				),
+				fault: InputFault::RefSha { index: i },
 			});
 		}
 		if r.name.is_empty() || r.name.len() > MAX_REF_NAME_LEN {
 			return Err(GraphError::InvalidInput {
-				message: format!(
-					"ref name at index {i} is empty or exceeds {MAX_REF_NAME_LEN} bytes"
-				),
+				fault: if r.name.is_empty() {
+					InputFault::RefNameEmpty { index: i }
+				} else {
+					InputFault::RefNameTooLong { index: i }
+				},
 			});
 		}
 		total_bytes = total_bytes.saturating_add(r.sha.len());
@@ -838,9 +905,7 @@ fn validate_input_bounds(
 		for rail in &cp.frontier {
 			if rail.next_sha.is_empty() || rail.next_sha.len() > MAX_SHA_LEN {
 				return Err(GraphError::InvalidInput {
-					message: format!(
-						"frontier rail next_sha is empty or exceeds {MAX_SHA_LEN} bytes"
-					),
+					fault: InputFault::FrontierSha,
 				});
 			}
 			total_bytes = total_bytes.saturating_add(rail.next_sha.len());
@@ -851,9 +916,7 @@ fn validate_input_bounds(
 		if let Some(ref last_sha) = cp.last_seen_sha {
 			if last_sha.is_empty() || last_sha.len() > MAX_SHA_LEN {
 				return Err(GraphError::InvalidInput {
-					message: format!(
-						"checkpoint last_seen_sha is empty or exceeds {MAX_SHA_LEN} bytes"
-					),
+					fault: InputFault::CheckpointSha,
 				});
 			}
 			total_bytes = total_bytes.saturating_add(last_sha.len());
@@ -901,9 +964,9 @@ pub fn compute_graph_layout(
 			if let Some(first_commit) = commits.first() {
 				if &first_commit.sha == last_sha {
 					return Err(GraphError::ContinuityError {
-						message: format!(
-							"first commit {last_sha} duplicates last commit of previous page"
-						),
+						fault: ContinuityFault::RepeatsLastCommit {
+							sha: last_sha.clone(),
+						},
 					});
 				}
 			}
@@ -3244,5 +3307,156 @@ mod tests {
 		for page in 1..=merged.len() {
 			assert_eq!(drawn_parents(&merged, page, &held), want, "{page}");
 		}
+	}
+
+	/// Every error keeps the bytes the CLI and the log printed before the
+	/// faults were typed. Each match is exhaustive: a new fault does not
+	/// compile until a row below names it.
+	#[test]
+	fn every_graph_error_keeps_its_display() {
+		fn config_index(f: &ConfigFault) -> usize {
+			match f {
+				ConfigFault::MaxFrontierSize => 0,
+				ConfigFault::MaxRows => 1,
+				ConfigFault::MaxRefs => 2,
+				ConfigFault::MaxTotalBytes => 3,
+				ConfigFault::UnitX => 4,
+				ConfigFault::UnitY => 5,
+				ConfigFault::OffsetX => 6,
+			}
+		}
+		fn input_index(f: &InputFault) -> usize {
+			match f {
+				InputFault::CommitSha { .. } => 0,
+				InputFault::ParentSha { .. } => 1,
+				InputFault::RefSha { .. } => 2,
+				InputFault::RefNameEmpty { .. } => 3,
+				InputFault::RefNameTooLong { .. } => 4,
+				InputFault::FrontierSha => 5,
+				InputFault::CheckpointSha => 6,
+			}
+		}
+		let config = [
+			(
+				ConfigFault::MaxFrontierSize,
+				"max_frontier_size must be greater than 0",
+			),
+			(ConfigFault::MaxRows, "max_rows must be greater than 0"),
+			(ConfigFault::MaxRefs, "max_refs must be greater than 0"),
+			(
+				ConfigFault::MaxTotalBytes,
+				"max_total_bytes must be greater than 0",
+			),
+			(ConfigFault::UnitX, "unit_x must be positive and finite"),
+			(ConfigFault::UnitY, "unit_y must be positive and finite"),
+			(
+				ConfigFault::OffsetX,
+				"offset_x must be non-negative and finite",
+			),
+		];
+		assert_eq!(
+			config
+				.iter()
+				.map(|(f, _)| config_index(f))
+				.collect::<HashSet<_>>()
+				.len(),
+			7
+		);
+		for (field, text) in config {
+			assert_eq!(
+				GraphError::InvalidConfig { field }.to_string(),
+				format!("invalid configuration: {text}")
+			);
+		}
+		let input = [
+			(
+				InputFault::CommitSha { row: 3 },
+				"commit SHA at row 3 is empty or exceeds 128 bytes",
+			),
+			(
+				InputFault::ParentSha {
+					index: 1,
+					commit: "abc".into(),
+				},
+				"parent SHA 1 for commit abc is empty or exceeds 128 bytes",
+			),
+			(
+				InputFault::RefSha { index: 2 },
+				"ref SHA at index 2 is empty or exceeds 128 bytes",
+			),
+			(
+				InputFault::RefNameEmpty { index: 4 },
+				"ref name at index 4 is empty or exceeds 1024 bytes",
+			),
+			(
+				InputFault::RefNameTooLong { index: 4 },
+				"ref name at index 4 is empty or exceeds 1024 bytes",
+			),
+			(
+				InputFault::FrontierSha,
+				"frontier rail next_sha is empty or exceeds 128 bytes",
+			),
+			(
+				InputFault::CheckpointSha,
+				"checkpoint last_seen_sha is empty or exceeds 128 bytes",
+			),
+		];
+		assert_eq!(
+			input
+				.iter()
+				.map(|(f, _)| input_index(f))
+				.collect::<HashSet<_>>()
+				.len(),
+			7
+		);
+		for (fault, text) in input {
+			assert_eq!(
+				GraphError::InvalidInput { fault }.to_string(),
+				format!("invalid input: {text}")
+			);
+		}
+		assert_eq!(
+			GraphError::ContinuityError {
+				fault: ContinuityFault::RepeatsLastCommit { sha: "abc".into() }
+			}
+			.to_string(),
+			"page continuity error: first commit abc duplicates last commit of previous page"
+		);
+		assert_eq!(
+			GraphError::DuplicateCommit {
+				sha: "abc".into(),
+				row: 2
+			}
+			.to_string(),
+			"duplicate commit detected within page: sha abc at row 2"
+		);
+		assert_eq!(
+			GraphError::RowLimitExceeded {
+				requested: 5,
+				limit: 4
+			}
+			.to_string(),
+			"input rows limit exceeded: requested 5 rows, limit is 4"
+		);
+		assert_eq!(
+			GraphError::RefLimitExceeded {
+				requested: 5,
+				limit: 4
+			}
+			.to_string(),
+			"input refs limit exceeded: requested 5 refs, limit is 4"
+		);
+		assert_eq!(
+			GraphError::ByteLimitExceeded { total: 5, limit: 4 }.to_string(),
+			"input bytes limit exceeded: total 5 bytes, limit is 4"
+		);
+		assert_eq!(
+			GraphError::FrontierLimitExceeded {
+				current: 5,
+				limit: 4
+			}
+			.to_string(),
+			"frontier limit exceeded: active rails (5) exceeded limit (4)"
+		);
 	}
 }
