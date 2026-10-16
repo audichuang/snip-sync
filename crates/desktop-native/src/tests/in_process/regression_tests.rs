@@ -178,3 +178,37 @@ fn fuzz_regression_releasing_the_workspace_leaves_the_log_no_preview_to_own(
 		invariants::assert_holds(m, cx, &[L6]);
 	});
 }
+
+/// L6, L8: closing the tab while the selected commit's details are still
+/// being read must drop that read. `close_tab` cleared the selection by hand
+/// without moving `details_generation`, so the details landed on a Log with
+/// nothing selected (found by `fuzz_local_workbench_keeps_derived_state`:
+/// select, next page, close the tab).
+#[gpui::test]
+fn fuzz_regression_a_details_read_in_flight_when_the_tab_closes_is_dropped(
+	cx: &mut TestAppContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	let alpha = repo(ws.path(), "alpha", &[]);
+	fs::write(alpha.join("a.txt"), "one").unwrap();
+	git(&alpha, &["add", "."]);
+	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| !m.commits.is_empty())
+	});
+	// One turn of the event loop: the reads the click starts have not run
+	// when the tab closes.
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx);
+		assert!(m.selected_commit.is_some());
+		m.close_tab(0, cx);
+	});
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.selected_commit.is_none());
+		invariants::assert_holds(m, cx, &[L6, L8]);
+	});
+}
