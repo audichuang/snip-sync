@@ -153,9 +153,9 @@ def _flat_heap(span: int = 50 * MIB, resident: int = 26 * MIB) -> list[dict]:
 
 # Controls drawn once "+" adds an empty tab with its workspace menu open.
 MENU_AFTER_NEW_TAB = [
-    "[APP:CTRL_BOUNDS: id=btn-open-workspace x=10 y=50 w=20 h=20]",
-    "[APP:CTRL_BOUNDS: id=workspace-path-input x=10 y=70 w=100 h=20]",
-    "[APP:CTRL_BOUNDS: id=btn-workspace-open-confirm x=10 y=90 w=20 h=20]",
+    "[APP:CTRL_BOUNDS: x=10 y=50 w=20 h=20 id=btn-open-workspace]",
+    "[APP:CTRL_BOUNDS: x=10 y=70 w=100 h=20 id=workspace-path-input]",
+    "[APP:CTRL_BOUNDS: x=10 y=90 w=20 h=20 id=btn-workspace-open-confirm]",
 ]
 
 
@@ -1767,8 +1767,8 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
         def make_session():
             s = mock.MagicMock()
             s.lines = [
-                "[APP:CTRL_BOUNDS: id=btn-workspace-menu x=10 y=10 w=20 h=20]",
-                "[APP:CTRL_BOUNDS: id=btn-close-workspace x=10 y=30 w=20 h=20]",
+                "[APP:CTRL_BOUNDS: x=10 y=10 w=20 h=20 id=btn-workspace-menu]",
+                "[APP:CTRL_BOUNDS: x=10 y=30 w=20 h=20 id=btn-close-workspace]",
             ]
             s.texts = mock.MagicMock(side_effect=lambda start=0: list(s.lines[start:]))
             s.app = {"pid": 1000, "starttime": 50, "exe": "/bin/snip", "comm": "snip"}
@@ -1783,7 +1783,7 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
                     s.lines.extend([
                         "[APP:WORKSPACE: state=closed generation=1]",
                         "phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 generation=1",
-                        "[APP:CTRL_BOUNDS: id=ws-tab-new x=10 y=110 w=20 h=20]",
+                        "[APP:CTRL_BOUNDS: x=10 y=110 w=20 h=20 id=ws-tab-new]",
                     ])
                 elif tuple(bounds) == (10, 110, 20, 20):  # ws-tab-new: menu opens in the new tab
                     s.lines.extend(MENU_AFTER_NEW_TAB)
@@ -1839,8 +1839,8 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
 
         startup_lines = [
             "[APP:READY_REPOS: 15]",
-            "[APP:CTRL_BOUNDS: id=btn-workspace-menu x=10 y=10 w=20 h=20]",
-            "[APP:CTRL_BOUNDS: id=btn-close-workspace x=10 y=30 w=20 h=20]",
+            "[APP:CTRL_BOUNDS: x=10 y=10 w=20 h=20 id=btn-workspace-menu]",
+            "[APP:CTRL_BOUNDS: x=10 y=30 w=20 h=20 id=btn-close-workspace]",
         ]
         session.lines = list(startup_lines)
         session.texts = mock.MagicMock(side_effect=lambda start=0: list(session.lines[start:]))
@@ -1856,7 +1856,7 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
                 session.lines.extend([
                     "[APP:WORKSPACE: state=closed generation=1]",
                     "phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 generation=1",
-                    "[APP:CTRL_BOUNDS: id=ws-tab-new x=10 y=110 w=20 h=20]",
+                    "[APP:CTRL_BOUNDS: x=10 y=110 w=20 h=20 id=ws-tab-new]",
                 ])
             elif tuple(bounds) == (10, 110, 20, 20):  # ws-tab-new
                 session.lines.extend(MENU_AFTER_NEW_TAB)
@@ -1933,7 +1933,7 @@ class _TreeSession:
 
     def __init__(self, folder: bool = False) -> None:
         self.folder = folder
-        self.lines = ["[APP:CTRL_BOUNDS: id=tree-row:a.txt x=10 y=20 w=100 h=20]"]
+        self.lines = ["[APP:CTRL_BOUNDS: x=10 y=20 w=100 h=20 id=tree-row:a.txt]"]
         self.held: set[str] = set()
         self.clicks = 0
         self.app = None

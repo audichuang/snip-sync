@@ -79,7 +79,7 @@ fn parse_viewport(line: &str) -> Option<(i32, i32)> {
 #[test]
 fn bounds_line_parsing() {
 	let (id, v) = parse_bounds(
-		"[APP:CTRL_BOUNDS: id=paste-overwrite:3:長路徑/a b.txt x=12 y=-3 w=100 h=20]",
+		"[APP:CTRL_BOUNDS: x=12 y=-3 w=100 h=20 id=paste-overwrite:3:長路徑/a b.txt]",
 	)
 	.unwrap();
 	assert_eq!(id, "paste-overwrite:3:長路徑/a b.txt");
@@ -99,7 +99,7 @@ fn bounds_line_parsing() {
 	);
 	assert_eq!(
 		parse_covered(
-			"[APP:CTRL_COVERED: id=log-filter-user by=btn-log-refresh]"
+			"[APP:CTRL_COVERED: by=btn-log-refresh id=log-filter-user]"
 		),
 		Some(("log-filter-user".to_string(), "btn-log-refresh".to_string()))
 	);

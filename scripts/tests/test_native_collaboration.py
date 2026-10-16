@@ -257,7 +257,7 @@ class SelectionTests(unittest.TestCase):
         control = f"btn-browse-tree:{oid}"
         # CI emitted preview completion 44.7 ms before this ready prepaint probe.
         preview = f"[APP:E2E_PREVIEW: source=commit_diff rev={oid} path=src/keep.txt]"
-        bounds = f"[APP:CTRL_BOUNDS: id={control} x=907 y=203 w=72 h=22]"
+        bounds = f"[APP:CTRL_BOUNDS: x=907 y=203 w=72 h=22 id={control}]"
         cases = (
             ("delayed", [bounds], None, 0.05),
             ("never", [], driver.MissingControl, 0.2),
@@ -1354,7 +1354,7 @@ class SelectorFilterTests(unittest.TestCase):
 
     @staticmethod
     def bounds(control: str, y: int) -> str:
-        return f"[APP:CTRL_BOUNDS: id={control} x=10 y={y} w=200 h=24]"
+        return f"[APP:CTRL_BOUNDS: x=10 y={y} w=200 h=24 id={control}]"
 
     def test_rust_debug_quoting(self):
         self.assertEqual(driver.rust_debug_str("accounts"), '"accounts"')

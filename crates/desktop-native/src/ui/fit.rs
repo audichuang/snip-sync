@@ -1999,9 +1999,53 @@ mod render_tests {
 				.is_some_and(|d| d.ends_with("/600")),
 			"{f:?}"
 		);
-		assert!(f
-			.style_drift_line("text-fit:t:author")
-			.starts_with("[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:t:author"));
+		let line = f.style_drift_line("text-fit:t:author");
+		assert!(
+			line.starts_with("[APP:TEXT_FIT_STYLE_DRIFT: measured="),
+			"{line}"
+		);
+		assert!(line.ends_with(" id=text-fit:t:author]"), "{line}");
+	}
+
+	/// Whatever an id holds, the TEXT_FIT family prints it last, to the
+	/// closing bracket, in a shown tab and in a background tab, and the
+	/// driver's parser reads it back whole.
+	#[gpui::test]
+	fn every_text_fit_line_reads_back_its_id_whole(cx: &mut TestAppContext) {
+		use crate::tabs::{set_active_tab, tag_line, with_log_tab};
+		let f = dressed(cx, Dress::AfterRender);
+		for id in [
+			"text-fit:row:my repo:subject",
+			"text-fit:row:report ws_tab=2",
+			"text-fit:row:ends in x=",
+			"text-fit:row:has id=inside it",
+			"text-fit:row:ends in by=",
+			"text-fit:row:ends in drawn=",
+		] {
+			for tab in [None, Some(2)] {
+				set_active_tab(Some(1));
+				let tag = |line: String| with_log_tab(tab, || tag_line(line));
+				let fit = tag(f.line(id));
+				assert_eq!(
+					snip_native_e2e::parse_text_fit(&fit).map(|(id, _)| id),
+					Some(id.to_string()),
+					"{fit}"
+				);
+				let drift = tag(f.drift_line(id));
+				assert_eq!(
+					snip_native_e2e::parse_text_fit_drift(&drift).as_deref(),
+					Some(id),
+					"{drift}"
+				);
+				let style = tag(f.style_drift_line(id));
+				assert_eq!(
+					snip_native_e2e::parse_text_fit_drift(&style).as_deref(),
+					Some(id),
+					"{style}"
+				);
+				set_active_tab(None);
+			}
+		}
 	}
 
 	// ── the cut: what the floor and the probe say is what gpui draws ──

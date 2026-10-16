@@ -86,9 +86,9 @@ class FakeSystemOperations(rur.SystemOperations):
 class TestLogParsing(unittest.TestCase):
     def test_parse_control_bounds_finds_latest_entry(self):
         lines = [
-            "[APP:CTRL_BOUNDS: id=btn-apply x=10 y=20 w=80 h=30]",
-            "[APP:CTRL_BOUNDS: id=btn-other x=100 y=100 w=50 h=50]",
-            "[APP:CTRL_BOUNDS: id=btn-apply x=15 y=25 w=85 h=35]",
+            "[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 id=btn-apply]",
+            "[APP:CTRL_BOUNDS: x=100 y=100 w=50 h=50 id=btn-other]",
+            "[APP:CTRL_BOUNDS: x=15 y=25 w=85 h=35 id=btn-apply]",
         ]
         match = rur.parse_control_bounds_from_lines(lines, "btn-apply")
         self.assertEqual(match.control_id, "btn-apply")
@@ -100,7 +100,7 @@ class TestLogParsing(unittest.TestCase):
 
     def test_parse_control_bounds_respects_ctrl_gone(self):
         lines = [
-            "[APP:CTRL_BOUNDS: id=btn-apply x=10 y=20 w=80 h=30]",
+            "[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 id=btn-apply]",
             "[APP:CTRL_GONE: id=btn-apply]",
         ]
         with self.assertRaisesRegex(ValueError, "missing-control btn-apply"):
@@ -108,21 +108,21 @@ class TestLogParsing(unittest.TestCase):
 
     def test_parse_control_bounds_reactivates_after_subsequent_bounds(self):
         lines = [
-            "[APP:CTRL_BOUNDS: id=btn-apply x=10 y=20 w=80 h=30]",
+            "[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 id=btn-apply]",
             "[APP:CTRL_GONE: id=btn-apply]",
-            "[APP:CTRL_BOUNDS: id=btn-apply x=12 y=22 w=80 h=30]",
+            "[APP:CTRL_BOUNDS: x=12 y=22 w=80 h=30 id=btn-apply]",
         ]
         match = rur.parse_control_bounds_from_lines(lines, "btn-apply")
         self.assertEqual(match.x, 12.0)
         self.assertEqual(match.line_number, 3)
 
     def test_parse_control_bounds_missing_control_raises(self):
-        lines = ["[APP:CTRL_BOUNDS: id=btn-other x=10 y=20 w=80 h=30]"]
+        lines = ["[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 id=btn-other]"]
         with self.assertRaisesRegex(ValueError, "missing-control btn-apply"):
             rur.parse_control_bounds_from_lines(lines, "btn-apply")
 
     def test_parse_control_bounds_zero_or_negative_dimensions_raises(self):
-        lines = ["[APP:CTRL_BOUNDS: id=btn-zero x=10 y=20 w=0 h=30]"]
+        lines = ["[APP:CTRL_BOUNDS: x=10 y=20 w=0 h=30 id=btn-zero]"]
         with self.assertRaisesRegex(ValueError, "invalid-control-dimensions"):
             rur.parse_control_bounds_from_lines(lines, "btn-zero")
 
@@ -143,10 +143,12 @@ class TestLogParsing(unittest.TestCase):
 
 
 def fit_line(tid: str, rule: str = "readable6", natural: int = 100, floor: int = 50, fit: str = "100",
-             drawn: int = 100, visible: int = 100, clipped: int = 0, cut: int = 0, shown: str = "10/10") -> str:
+             drawn: int = 100, visible: int = 100, clipped: int = 0, cut: int = 0, shown: str = "10/10",
+             tab: str = "") -> str:
+    """`tab` is a background tab's field (`ws_tab=2 `): before `id=`, which is the last field."""
     return (
-        f"[APP:TEXT_FIT: id={tid} rule={rule} natural={natural} floor={floor} fit={fit} drawn={drawn} "
-        f"visible={visible} clipped={clipped} cut={cut} shown={shown}]"
+        f"[APP:TEXT_FIT: rule={rule} natural={natural} floor={floor} fit={fit} drawn={drawn} "
+        f"visible={visible} clipped={clipped} cut={cut} shown={shown} {tab}id={tid}]"
     )
 
 
@@ -173,7 +175,7 @@ class TestTextFit(unittest.TestCase):
         self.assertIn("text-fit:ref:refs/heads/feature/x:pane-name", entries)
 
     def test_a_background_tab_line_is_read(self):
-        line = fit_line("text-fit:row:a:subject")[:-1] + " ws_tab=2]"
+        line = fit_line("text-fit:row:a:subject", tab="ws_tab=2 ")
         entries, _ = rur.parse_text_fit([line])
         self.assertIn("text-fit:row:a:subject", entries)
 
@@ -181,14 +183,14 @@ class TestTextFit(unittest.TestCase):
         tid = "text-fit:row:a:subject"
         lines = [
             fit_line(tid, drawn=90),
-            f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]",
+            f"[APP:TEXT_FIT_DRIFT: fit=100 drawn=90 id={tid}]",
             "[APP:VIEWPORT: 1800x1440]",
         ]
         self.assertEqual(rur.parse_text_fit(lines)[1], [])
         lines.insert(2, "[APP:VIEWPORT: 900x600]")
         lines += [
             fit_line(tid, drawn=90),
-            f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]",
+            f"[APP:TEXT_FIT_DRIFT: fit=100 drawn=90 id={tid}]",
         ]
         self.assertEqual(rur.parse_text_fit(lines)[1], [tid])
         # A later line without a DRIFT clears it.
@@ -199,7 +201,7 @@ class TestTextFit(unittest.TestCase):
         tid = "text-fit:row:a:author"
         lines = [
             fit_line(tid),
-            f"[APP:TEXT_FIT_STYLE_DRIFT: id={tid} measured=Inter/13/400 drawn=Inter/13/600]",
+            f"[APP:TEXT_FIT_STYLE_DRIFT: measured=Inter/13/400 drawn=Inter/13/600 id={tid}]",
         ]
         self.assertEqual(rur.parse_text_fit(lines)[1], [tid])
         # The next line of the text, without a drift line, clears it.
@@ -275,22 +277,38 @@ ODD_ROW_KEYS = [
     "a rule=whole fit=1 drawn=2:ab12cd3",
     " lead and trail :ab12cd3",
 ]
+# Whole ids that END in what the line's own fields look like: the background tab's tag, `by=`, `x=`, `id=`.
+ODD_ENDINGS = [
+    "report ws_tab=2",
+    "row ends in by=",
+    "row ends in x=",
+    "row ends in id=",
+    "row has id=inside it",
+    "ws_tab=2 id=x",
+    "row ends in drawn=",
+]
+
+
+def odd_text_ids(role: str) -> list[str]:
+    return [f"text-fit:row:{key}:{role}" for key in ODD_ROW_KEYS] + [f"text-fit:row:{end}" for end in ODD_ENDINGS]
+
+
+def odd_control_ids() -> list[str]:
+    return [f"commit-row:{key}" for key in ODD_ROW_KEYS] + [f"change-row:{end}" for end in ODD_ENDINGS]
 
 
 class TestIdsWithAnyCharacter(unittest.TestCase):
     def test_a_text_fit_line_of_every_odd_id_is_read(self):
-        for key in ODD_ROW_KEYS:
-            tid = f"text-fit:row:{key}:subject"
-            for tag in ("", " ws_tab=2"):
+        for tid in odd_text_ids("subject"):
+            for tag in ("", "ws_tab=2 "):
                 with self.subTest(id=tid, tag=tag):
-                    line = fit_line(tid)[:-1] + tag + "]"
+                    line = fit_line(tid, tab=tag)
                     entries, drift = rur.parse_text_fit([line])
                     self.assertEqual(list(entries), [tid])
                     self.assertEqual(drift, [])
 
     def test_a_clipped_or_short_text_of_an_odd_id_fails_the_check(self):
-        for key in ODD_ROW_KEYS:
-            tid = f"text-fit:row:{key}:subject"
+        for tid in odd_text_ids("subject"):
             with self.subTest(id=tid):
                 header = fit_line("text-fit:log-header:ref-hint", rule="kv6", fit="-", shown="8/8")
                 entries, drift = rur.parse_text_fit(
@@ -301,19 +319,19 @@ class TestIdsWithAnyCharacter(unittest.TestCase):
                 self.assertTrue(any("rule" in p and tid in p for p in problems), problems)
 
     def test_drifts_and_gone_lines_of_an_odd_id_are_read(self):
-        for key in ODD_ROW_KEYS:
-            tid = f"text-fit:row:{key}:author"
-            with self.subTest(id=tid):
-                width = [fit_line(tid), f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]"]
-                self.assertEqual(rur.parse_text_fit(width)[1], [tid])
-                style = [
-                    fit_line(tid),
-                    f"[APP:TEXT_FIT_STYLE_DRIFT: id={tid} measured=JetBrains Mono/13/400 drawn=Inter/13/600]",
-                ]
-                self.assertEqual(rur.parse_text_fit(style)[1], [tid])
-                gone = [*width, f"[APP:TEXT_FIT_GONE: id={tid}]"]
-                entries, drift = rur.parse_text_fit(gone)
-                self.assertEqual((list(entries), drift), ([], []))
+        for tid in odd_text_ids("author"):
+            for tab in ("", "ws_tab=2 "):
+                with self.subTest(id=tid, tab=tab):
+                    width = [fit_line(tid, tab=tab), f"[APP:TEXT_FIT_DRIFT: fit=100 drawn=90 {tab}id={tid}]"]
+                    self.assertEqual(rur.parse_text_fit(width)[1], [tid])
+                    style = [
+                        fit_line(tid, tab=tab),
+                        f"[APP:TEXT_FIT_STYLE_DRIFT: measured=JetBrains Mono/13/400 drawn=Inter/13/600 {tab}id={tid}]",
+                    ]
+                    self.assertEqual(rur.parse_text_fit(style)[1], [tid])
+                    gone = [*width, f"[APP:TEXT_FIT_GONE: {tab}id={tid}]"]
+                    entries, drift = rur.parse_text_fit(gone)
+                    self.assertEqual((list(entries), drift), ([], []))
 
     def test_the_subcommand_check_fails_on_the_row_of_a_repo_with_a_space(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,15 +353,15 @@ class TestIdsWithAnyCharacter(unittest.TestCase):
             self.assertIn("my repo", out.stderr)
 
     def test_control_bounds_and_gone_of_an_odd_id_are_read(self):
-        for key in ODD_ROW_KEYS:
-            cid = f"commit-row:{key}"
-            with self.subTest(id=cid):
-                lines = [f"[APP:CTRL_BOUNDS: id={cid} x=10 y=20 w=80 h=30]"]
-                match = rur.parse_control_bounds_from_lines(lines, cid)
-                self.assertEqual((match.control_id, match.x, match.w), (cid, 10.0, 80.0))
-                gone = [*lines, f"[APP:CTRL_GONE: id={cid}]"]
-                with self.assertRaisesRegex(ValueError, "missing-control"):
-                    rur.parse_control_bounds_from_lines(gone, cid)
+        for cid in odd_control_ids():
+            for tab in ("", "ws_tab=2 "):
+                with self.subTest(id=cid, tab=tab):
+                    lines = [f"[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 {tab}id={cid}]"]
+                    match = rur.parse_control_bounds_from_lines(lines, cid)
+                    self.assertEqual((match.control_id, match.x, match.w), (cid, 10.0, 80.0))
+                    gone = [*lines, f"[APP:CTRL_GONE: {tab}id={cid}]"]
+                    with self.assertRaisesRegex(ValueError, "missing-control"):
+                        rur.parse_control_bounds_from_lines(gone, cid)
 
 
 class TestAppWindowTitle(unittest.TestCase):
@@ -373,7 +391,7 @@ class TestPointCoordinateMath(unittest.TestCase):
             w=20.0,
             h=20.0,
             line_number=25486,
-            raw_text="[APP:CTRL_BOUNDS: id=btn-paste x=1027 y=9 w=20 h=20]",
+            raw_text="[APP:CTRL_BOUNDS: x=1027 y=9 w=20 h=20 id=btn-paste]",
         )
         viewport = (1080, 720)
         frame = {"X": 545.0, "Y": 281.0, "Width": 1080.0, "Height": 752.0}
@@ -398,7 +416,7 @@ class TestPointCoordinateMath(unittest.TestCase):
             w=40.0,
             h=60.0,
             line_number=100,
-            raw_text="[APP:CTRL_BOUNDS: id=btn-test x=100 y=200 w=40 h=60]",
+            raw_text="[APP:CTRL_BOUNDS: x=100 y=200 w=40 h=60 id=btn-test]",
         )
         # Logical frame 900x632 => Physical viewport width 1800, content height 600 * 2 = 1200
         viewport = (1800, 1200)
@@ -1073,7 +1091,7 @@ class TestWindowCommands(unittest.TestCase):
         self.run_dir = Path(self.temp_dir.name)
         self.log = self.run_dir / "app-gate-b.log"
         self.log.write_text(
-            "[APP:VIEWPORT: 1080x720]\n[APP:CTRL_BOUNDS: id=ws-tab:0 x=10 y=4 w=100 h=26]\n", encoding="utf-8"
+            "[APP:VIEWPORT: 1080x720]\n[APP:CTRL_BOUNDS: x=10 y=4 w=100 h=26 id=ws-tab:0]\n", encoding="utf-8"
         )
         (self.run_dir / "app-process.json").write_text(json.dumps({"pid": 42, "gate": "b", "log": str(self.log)}))
         self.write_env(rur.script_sha256())

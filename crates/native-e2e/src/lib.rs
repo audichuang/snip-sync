@@ -201,9 +201,49 @@ mod tests {
 	use super::*;
 	use std::collections::HashMap;
 
+	/// The tail a background tab's line gets: the tag is a field before
+	/// `id=`, which is the last field of the line.
+	const TAGS: [&str; 2] = ["", "ws_tab=2 "];
+
+	/// Ids a repository, a branch or a file can give, whole: spaces, `=`, `:`,
+	/// a `]`, the line's own field names, and the background tab's tag. Every
+	/// id runs from `id=` to the line's closing `]`, so none of them can
+	/// move where it ends.
+	const ODD_IDS: [&str; 12] = [
+		"commit-row:my repo:ab12cd3",
+		"commit-row:a=b:c d:ab12cd3",
+		"commit-row:odd ] name:ab12cd3",
+		"commit-row:x x=1 y=2 w=3 h=4",
+		"change-row:report ws_tab=2",
+		"change-row:a rule=whole by=b fit=1 drawn=2",
+		"commit-row: lead and trail ",
+		"row:ends in by=",
+		"row:ends in x=",
+		"row:ends in id=",
+		"row:has id=inside it",
+		"row:ws_tab=2 id=x",
+	];
+
+	/// What the app writes for a `CTRL_COVERED`'s second id: no space, `]`,
+	/// `%` or line break, so the first ` id=` of the line is the real one.
+	fn encode_by(by: &str) -> String {
+		let mut out = String::new();
+		for c in by.chars() {
+			match c {
+				'%' => out.push_str("%25"),
+				' ' => out.push_str("%20"),
+				']' => out.push_str("%5D"),
+				'\n' => out.push_str("%0A"),
+				'\r' => out.push_str("%0D"),
+				c => out.push(c),
+			}
+		}
+		out
+	}
+
 	#[test]
 	fn text_fit_lines_are_parsed() {
-		let line = "[APP:TEXT_FIT: id=text-fit:row:ab12:subject rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79]";
+		let line = "[APP:TEXT_FIT: rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79 id=text-fit:row:ab12:subject]";
 		assert_eq!(
 			parse_text_fit(line),
 			Some(("text-fit:row:ab12:subject".to_string(), true))
@@ -219,20 +259,20 @@ mod tests {
 			Some(("text-fit:row:ab12:subject".to_string(), false))
 		);
 		// A branch name is part of an id, with its slashes.
-		let pane = "[APP:TEXT_FIT: id=text-fit:ref:refs/heads/feature/x:pane-name rule=readable6 natural=9 floor=9 fit=9 drawn=9 visible=9 clipped=0 cut=0 shown=1/1]";
+		let pane = "[APP:TEXT_FIT: rule=readable6 natural=9 floor=9 fit=9 drawn=9 visible=9 clipped=0 cut=0 shown=1/1 id=text-fit:ref:refs/heads/feature/x:pane-name]";
 		assert_eq!(
 			parse_text_fit(pane).unwrap().0,
 			"text-fit:ref:refs/heads/feature/x:pane-name"
 		);
 		let drift =
-			"[APP:TEXT_FIT_DRIFT: id=text-fit:row:ab12:date fit=126 drawn=120]";
+			"[APP:TEXT_FIT_DRIFT: fit=126 drawn=120 id=text-fit:row:ab12:date]";
 		assert_eq!(
 			parse_text_fit_drift(drift).as_deref(),
 			Some("text-fit:row:ab12:date")
 		);
 		assert_eq!(parse_text_fit_drift(line), None);
 		assert_eq!(parse_text_fit(drift), None);
-		let style = "[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:row:ab12:author measured=Inter/13/400 drawn=Inter/13/600]";
+		let style = "[APP:TEXT_FIT_STYLE_DRIFT: measured=Inter/13/400 drawn=Inter/13/600 id=text-fit:row:ab12:author]";
 		assert_eq!(
 			parse_text_fit_drift(style).as_deref(),
 			Some("text-fit:row:ab12:author")
@@ -248,104 +288,98 @@ mod tests {
 		assert_eq!(parse_text_fit_gone(line), None);
 	}
 
-	/// Ids a repository or a branch can give: spaces, `=`, `:`, a `]`, and
-	/// words the line's own fields use. A line is read from its end, where
-	/// its fixed fields are, so none of them can move the id's end.
-	const ODD_IDS: [&str; 6] = [
-		"row:my repo:ab12cd3",
-		"row:a=b:c d:ab12cd3",
-		"row:odd ] name:ab12cd3",
-		"row:x x=1 y=2 w=3 h=4:ab12cd3",
-		"row:a rule=whole by=b fit=1 drawn=2:ab12cd3",
-		"row: lead and trail :ab12cd3",
-	];
-
-	/// The tail a background tab's line gets inside its brackets.
-	const TAGS: [&str; 2] = ["", " ws_tab=2"];
-
-	fn tagged(line: &str, tag: &str) -> String {
-		format!("{}{tag}]", line.strip_suffix(']').unwrap())
-	}
-
 	#[test]
 	fn any_character_in_an_id_is_read_back() {
 		for id in ODD_IDS {
 			for tag in TAGS {
-				let fit = tagged(&format!("[APP:TEXT_FIT: id=text-fit:{id}:subject rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79]"), tag);
+				let fit = format!("[APP:TEXT_FIT: rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79 {tag}id={id}]");
 				assert_eq!(
 					parse_text_fit(&fit),
-					Some((format!("text-fit:{id}:subject"), true)),
+					Some((id.to_string(), true)),
 					"{fit}"
 				);
 				assert_eq!(
-					parse_text_fit_clipped(&fit),
-					Some(format!("text-fit:{id}:subject")),
+					parse_text_fit_clipped(&fit).as_deref(),
+					Some(id),
 					"{fit}"
 				);
-				let drift = tagged(&format!("[APP:TEXT_FIT_DRIFT: id=text-fit:{id}:date fit=126 drawn=120]"), tag);
+				let drift = format!(
+					"[APP:TEXT_FIT_DRIFT: fit=126 drawn=120 {tag}id={id}]"
+				);
 				assert_eq!(
-					parse_text_fit_drift(&drift),
-					Some(format!("text-fit:{id}:date")),
+					parse_text_fit_drift(&drift).as_deref(),
+					Some(id),
 					"{drift}"
 				);
-				let style = tagged(&format!("[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:{id}:author measured=JetBrains Mono/13/400 drawn=Inter/13/600]"), tag);
+				let style = format!("[APP:TEXT_FIT_STYLE_DRIFT: measured=JetBrains Mono/13/400 drawn=Inter/13/600 {tag}id={id}]");
 				assert_eq!(
-					parse_text_fit_drift(&style),
-					Some(format!("text-fit:{id}:author")),
+					parse_text_fit_drift(&style).as_deref(),
+					Some(id),
 					"{style}"
 				);
-				let gone = tagged(
-					&format!("[APP:TEXT_FIT_GONE: id=text-fit:{id}:date]"),
-					tag,
-				);
+				let gone = format!("[APP:TEXT_FIT_GONE: {tag}id={id}]");
 				assert_eq!(
-					parse_text_fit_gone(&gone),
-					Some(format!("text-fit:{id}:date")),
+					parse_text_fit_gone(&gone).as_deref(),
+					Some(id),
 					"{gone}"
 				);
-				let bounds = tagged(&format!("[APP:CTRL_BOUNDS: id=commit-row:{id} x=12 y=-3 w=100 h=20]"), tag);
+				let bounds = format!(
+					"[APP:CTRL_BOUNDS: x=12 y=-3 w=100 h=20 {tag}id={id}]"
+				);
 				assert_eq!(
 					parse_bounds(&bounds),
-					Some((format!("commit-row:{id}"), [12, -3, 100, 20])),
+					Some((id.to_string(), [12, -3, 100, 20])),
 					"{bounds}"
 				);
-				let ctrl_gone = tagged(
-					&format!("[APP:CTRL_GONE: id=commit-row:{id}]"),
-					tag,
-				);
+				let ctrl_gone = format!("[APP:CTRL_GONE: {tag}id={id}]");
 				assert_eq!(
-					parse_gone(&ctrl_gone),
-					Some(format!("commit-row:{id}")),
+					parse_gone(&ctrl_gone).as_deref(),
+					Some(id),
 					"{ctrl_gone}"
 				);
-				let dup = tagged(
-					&format!("[APP:CTRL_DUPLICATE: id=commit-row:{id}]"),
-					tag,
-				);
-				assert_eq!(
-					parse_duplicate(&dup),
-					Some(format!("commit-row:{id}")),
-					"{dup}"
-				);
+				let dup = format!("[APP:CTRL_DUPLICATE: {tag}id={id}]");
+				assert_eq!(parse_duplicate(&dup).as_deref(), Some(id), "{dup}");
 			}
 		}
 	}
 
+	/// A line that is not the kind asked for is not read as it: the same id
+	/// under another kind's name.
 	#[test]
-	fn a_covered_pair_splits_at_the_last_by() {
+	fn a_line_of_another_kind_is_not_read() {
+		assert_eq!(parse_gone("[APP:CTRL_DUPLICATE: id=a]"), None);
+		assert_eq!(parse_duplicate("[APP:CTRL_GONE: id=a]"), None);
+		assert_eq!(parse_bounds("[APP:CTRL_GONE: id=a]"), None);
+		assert_eq!(parse_covered("[APP:CTRL_GONE: id=a]"), None);
+		assert_eq!(parse_text_fit_gone("[APP:CTRL_GONE: id=a]"), None);
+	}
+
+	/// The covered control is the line's `id=`; the one that covers it is
+	/// a field before it, with no space in it, so a name that holds
+	/// ` id=`, ` ws_tab=2` or ` by=` cannot move either id.
+	#[test]
+	fn a_covered_pair_reads_both_ids_whole() {
+		let bys = [
+			"btn-log-refresh",
+			"pick-repo:my repo",
+			"row: id=x ws_tab=2",
+			"row ends in by=",
+			"row 100% ] done",
+		];
 		for tag in TAGS {
-			let line = tagged(
-				"[APP:CTRL_COVERED: id=commit-row:my repo:ab12cd3 by=btn-log-refresh]",
-				tag,
-			);
-			assert_eq!(
-				parse_covered(&line),
-				Some((
-					"commit-row:my repo:ab12cd3".to_string(),
-					"btn-log-refresh".to_string()
-				)),
-				"{line}"
-			);
+			for id in ODD_IDS {
+				for by in bys {
+					let line = format!(
+						"[APP:CTRL_COVERED: by={} {tag}id={id}]",
+						encode_by(by)
+					);
+					assert_eq!(
+						parse_covered(&line),
+						Some((id.to_string(), by.to_string())),
+						"{line}"
+					);
+				}
+			}
 		}
 	}
 
@@ -442,7 +476,7 @@ mod tests {
 		assert_eq!(parse_duplicate("[APP:LOG_CHIPS: ..."), None);
 		assert_eq!(
 			parse_covered(
-				"[APP:CTRL_COVERED: id=log-filter-user by=btn-log-refresh]"
+				"[APP:CTRL_COVERED: by=btn-log-refresh id=log-filter-user]"
 			),
 			Some((
 				"log-filter-user".to_string(),

@@ -1410,6 +1410,50 @@ mod tests {
 		assert_eq!(tag_with("[READY:IDLE]".into(), 3), "[READY:IDLE]");
 	}
 
+	/// A line that ends in an id the user can spell any way is tagged before
+	/// the `id=` field, which stays the last one: an id that is itself
+	/// `... ws_tab=2` is not the tag, and the tag is not part of the id.
+	#[test]
+	fn a_line_that_ends_in_an_id_is_tagged_before_it() {
+		for (line, tagged) in [
+			(
+				"[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=report ws_tab=2]",
+				"[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 ws_tab=3 id=report ws_tab=2]",
+			),
+			(
+				"[APP:CTRL_GONE: id=a b]",
+				"[APP:CTRL_GONE: ws_tab=3 id=a b]",
+			),
+			(
+				"[APP:CTRL_GONE: id=report ws_tab=2]",
+				"[APP:CTRL_GONE: ws_tab=3 id=report ws_tab=2]",
+			),
+			(
+				"[APP:CTRL_DUPLICATE: id=x id=y]",
+				"[APP:CTRL_DUPLICATE: ws_tab=3 id=x id=y]",
+			),
+			(
+				"[APP:CTRL_COVERED: by=b%20id=c id=a ws_tab=1]",
+				"[APP:CTRL_COVERED: by=b%20id=c ws_tab=3 id=a ws_tab=1]",
+			),
+			(
+				"[APP:TEXT_FIT_GONE: id=text-fit:a ws_tab=2]",
+				"[APP:TEXT_FIT_GONE: ws_tab=3 id=text-fit:a ws_tab=2]",
+			),
+			(
+				"[APP:TEXT_FIT_DRIFT: fit=1 drawn=2 id=t]",
+				"[APP:TEXT_FIT_DRIFT: fit=1 drawn=2 ws_tab=3 id=t]",
+			),
+		] {
+			assert_eq!(tag_with(line.into(), 3), tagged);
+		}
+		// Lines that carry no free-text id keep their tag at the end.
+		assert_eq!(
+			tag_with("[APP:WS_TAB_ACTIVE: id=2 ix=1]".into(), 3),
+			"[APP:WS_TAB_ACTIVE: id=2 ix=1 ws_tab=3]"
+		);
+	}
+
 	#[test]
 	fn only_a_background_tab_tags_its_lines() {
 		set_active_tab(Some(1));
