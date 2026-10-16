@@ -1468,4 +1468,59 @@ mod render_tests {
 		assert_eq!(shared.text_fit_clipped(), ["text-fit:t:subject"]);
 		assert!(shared.text_fit_drift().is_empty());
 	}
+
+	/// A padded chip as the last on a bar that clips: its box ends where the
+	/// bar does.
+	struct LastOnTheBar {
+		probes: Option<Probes>,
+	}
+
+	impl Render for LastOnTheBar {
+		fn render(
+			&mut self,
+			window: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			div()
+				.size_full()
+				.child(
+					div()
+						.w(px(200.))
+						.flex()
+						.flex_row()
+						.overflow_hidden()
+						.child(div().w(px(150.)).flex_shrink_0())
+						.child(
+							FitCell::new(
+								FitId::new("t", FitRole::ChipMore),
+								"ab",
+							)
+							.pad(6.)
+							.fixed_width(50.)
+							.render(&self.probes, window),
+						),
+				)
+				.children(probe_frame_end(&self.probes))
+		}
+	}
+
+	/// #229: a cell's probe covers the cell's own box: padding does not move
+	/// it, so the last chip of a bar is not reported clipped by the bar that
+	/// holds it exactly.
+	#[gpui::test]
+	fn a_padded_cell_is_probed_where_it_is_drawn(cx: &mut TestAppContext) {
+		let probes = Probes::for_test();
+		let shared = probes.clone();
+		let (_, cx) = cx.add_window_view(|_, _| LastOnTheBar {
+			probes: Some(probes),
+		});
+		cx.run_until_parked();
+		let f = shared
+			.text_fit("text-fit:t:chip-more")
+			.expect("the text was recorded");
+		assert!((f.x - 150.).abs() < 0.5, "{f:?}");
+		assert!((f.drawn - 50.).abs() < 0.5, "{f:?}");
+		assert!((f.visible - 50.).abs() < 0.5, "{f:?}");
+		assert!(!f.clipped && !f.drifts(), "{f:?}");
+	}
 }

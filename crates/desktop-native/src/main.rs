@@ -15288,6 +15288,1124 @@ mod tests {
 			assert!(bad.is_empty(), "{bad:?}");
 		}
 
+		/// #229: the width x locale x hash x panes matrix. Every cell opens
+		/// a window with the OS text system and the embedded fonts, draws
+		/// the fixture's Log and reads the whole window's `TEXT_FIT` (#228):
+		/// what each text shows is checked against the rule of its role
+		/// (graphemes, never pixels). It is inline so that
+		/// `check_test_refresh.sh` (which reads what follows `mod tests {`)
+		/// still bans `.refresh()` here.
+		mod fit_matrix {
+			use super::*;
+			use crate::ui::{rule_holds, FitRole};
+			use std::collections::{BTreeMap, BTreeSet};
+
+			/// Which panes the Log shows beside the list.
+			#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+			enum Panes {
+				/// The details and branches panes, as the app opens.
+				Default,
+				/// Both switched off in the "more" menu: the widest list.
+				ListOnly,
+			}
+
+			/// One text of the latest frame, as the probe saw it.
+			#[derive(Clone, Debug)]
+			struct Seen {
+				id: String,
+				role: FitRole,
+				/// The display row of a commit row's text.
+				row: Option<usize>,
+				/// Drawn at all: a dropped text only has a `fit` of 0.
+				present: bool,
+				x: f32,
+				visible: f32,
+				natural: f32,
+				shown: usize,
+				total: usize,
+				key_graphemes: usize,
+				clipped: bool,
+				drifts: bool,
+				text: String,
+			}
+
+			impl Seen {
+				/// What is in sight, from left to right.
+				fn span(&self) -> (f32, f32) {
+					(self.x, self.x + self.visible)
+				}
+
+				fn describe(&self) -> String {
+					format!(
+						"{} {:?} shown {}/{} rule {} visible {:.1} natural {:.1}",
+						self.id,
+						self.text,
+						self.shown,
+						self.total,
+						self.role.rule().name(),
+						self.visible,
+						self.natural
+					)
+				}
+			}
+
+			/// Every text of the latest frame. A commit row's is tied to its
+			/// display row by the row key (`log_row_key`).
+			fn snapshot(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> Vec<Seen> {
+				model.read_with(cx, |m, _| {
+					let keys: BTreeMap<String, usize> = m
+						.display_commits()
+						.iter()
+						.enumerate()
+						.map(|(ix, c)| (m.log_row_key(c), ix))
+						.collect();
+					m.probes
+						.as_ref()
+						.expect("probes are on")
+						.text_fits()
+						.into_iter()
+						.map(|(id, f)| {
+							let rest =
+								id.strip_prefix("text-fit:").unwrap_or(&id);
+							let scope =
+								rest.rsplit_once(':').map_or(rest, |(s, _)| s);
+							let row = scope
+								.strip_prefix("row:")
+								.and_then(|k| keys.get(k).copied());
+							Seen {
+								row,
+								present: f.fit != Some(0.),
+								role: f.role,
+								x: f.x,
+								visible: f.visible,
+								natural: f.natural,
+								shown: f.shown,
+								total: f.total,
+								key_graphemes: f.key_graphemes,
+								clipped: f.clipped,
+								drifts: f.drifts(),
+								text: f.text.to_string(),
+								id,
+							}
+						})
+						.collect()
+				})
+			}
+
+			/// What a cell's checks need to know besides the texts.
+			struct CellCtx {
+				hash: bool,
+				width: f32,
+				/// The first rows that must have been drawn.
+				drawn_rows: usize,
+				/// Rows that have refs, and collapsed merges.
+				ref_rows: Vec<usize>,
+				collapsed_rows: Vec<usize>,
+				/// The list's left and right edge, and each row's gutter.
+				list: (f32, f32),
+				gutters: BTreeMap<usize, (f32, f32)>,
+			}
+
+			fn cell_ctx(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				width: f32,
+				hash: bool,
+				drawn_rows: usize,
+			) -> CellCtx {
+				let (ref_rows, collapsed_rows, n) =
+					model.read_with(cx, |m, _| {
+						let rows = m.display_commits();
+						let refs = (0..rows.len())
+							.filter(|&ix| {
+								m.graph_layout.as_ref().is_some_and(|l| {
+									!l.rows[ix].refs.is_empty()
+								})
+							})
+							.collect();
+						let collapsed = (0..rows.len())
+							.filter(|&ix| {
+								m.collapsed_merges.contains(&rows[ix].sha)
+							})
+							.collect();
+						(refs, collapsed, rows.len())
+					});
+				let list = bounds_of(cx, "log-list".into())
+					.map(|b| (f32::from(b.left()), f32::from(b.right())))
+					.expect("the Log's list is drawn");
+				let mut gutters = BTreeMap::new();
+				for ix in 0..n {
+					if let Some(b) = bounds_of(cx, format!("log-gutter:{ix}")) {
+						gutters.insert(
+							ix,
+							(f32::from(b.left()), f32::from(b.right())),
+						);
+					}
+				}
+				CellCtx {
+					hash,
+					width,
+					drawn_rows,
+					ref_rows,
+					collapsed_rows,
+					list,
+					gutters,
+				}
+			}
+
+			/// I1 to I4 over one snapshot; every violation, each naming the
+			/// cell, the text, how much of it shows and the rule.
+			fn check(cell: &str, s: &[Seen], ctx: &CellCtx) -> Vec<String> {
+				let mut bad = Vec::new();
+				let mut say = |i: &str, what: String| {
+					bad.push(format!("{cell}: {i} {what}"));
+				};
+				for t in s {
+					if t.id.starts_with("text-fit:row:") && t.row.is_none() {
+						say(
+							"stale",
+							format!("{} is of no displayed row", t.id),
+						);
+					}
+					if !t.present {
+						continue;
+					}
+					// I1: what shows satisfies the role's rule.
+					if !rule_holds(
+						t.role.rule(),
+						t.shown,
+						t.total,
+						t.key_graphemes,
+					) {
+						say("I1", format!("breaks its rule: {}", t.describe()));
+					}
+					// I2: nothing is clipped by an ancestor or drawn in a
+					// width the solver did not give.
+					if t.clipped || t.drifts {
+						say(
+							"I2",
+							format!(
+								"clipped={} drift={}: {}",
+								t.clipped,
+								t.drifts,
+								t.describe()
+							),
+						);
+					}
+				}
+				// Per row.
+				let mut rows: BTreeMap<usize, Vec<&Seen>> = BTreeMap::new();
+				for t in s {
+					if let Some(ix) = t.row {
+						rows.entry(ix).or_default().push(t);
+					}
+				}
+				for ix in 0..ctx.drawn_rows {
+					let subject = rows.get(&ix).and_then(|r| {
+						r.iter().find(|t| t.role == FitRole::Subject)
+					});
+					assert!(
+						subject.is_some(),
+						"{cell}: row {ix} was not drawn: fixture or window height is wrong"
+					);
+				}
+				for (ix, texts) in &rows {
+					let has = |r: FitRole| {
+						texts.iter().find(|t| t.role == r).map(|t| t.present)
+					};
+					// I3: what is in sight never overlaps and stays in the
+					// list.
+					let mut spans: Vec<(String, (f32, f32))> = texts
+						.iter()
+						.filter(|t| t.present && t.visible > 0.5)
+						.map(|t| (format!("{:?}", t.role), t.span()))
+						.collect();
+					if let Some(g) = ctx.gutters.get(ix) {
+						spans.push(("Gutter".into(), *g));
+					}
+					for (i, (an, a)) in spans.iter().enumerate() {
+						if a.0 < ctx.list.0 - 0.5 || a.1 > ctx.list.1 + 0.5 {
+							say(
+								"I3",
+								format!(
+									"row {ix} {an} [{:.1},{:.1}] leaves the list [{:.1},{:.1}]",
+									a.0, a.1, ctx.list.0, ctx.list.1
+								),
+							);
+						}
+						for (bn, b) in &spans[i + 1..] {
+							if a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5 {
+								say(
+									"I3",
+									format!(
+										"row {ix} {an} [{:.1},{:.1}] overlaps {bn} [{:.1},{:.1}]",
+										a.0, a.1, b.0, b.1
+									),
+								);
+							}
+						}
+					}
+					// I4: what a row has.
+					if ctx.hash != (has(FitRole::Hash) == Some(true)) {
+						say(
+							"I4",
+							format!(
+								"row {ix}: the hash column is {:?} with the hash setting {}",
+								has(FitRole::Hash),
+								ctx.hash
+							),
+						);
+					}
+					let group: Vec<(FitRole, bool)> = [
+						FitRole::BranchLabel,
+						FitRole::TagLabel,
+						FitRole::RefMore,
+					]
+					.into_iter()
+					.filter_map(|r| has(r).map(|p| (r, p)))
+					.collect();
+					if group.iter().any(|(_, p)| *p != group[0].1) {
+						say(
+							"I4",
+							format!(
+								"row {ix}: the labels do not come and go together: {group:?}"
+							),
+						);
+					}
+					if ctx.width >= 1080.
+						&& ctx.ref_rows.contains(ix)
+						&& !group.iter().any(|(_, p)| *p)
+					{
+						say(
+							"I4",
+							format!(
+								"row {ix} has refs but no labels at {}",
+								ctx.width
+							),
+						);
+					}
+					if ctx.collapsed_rows.contains(ix)
+						&& has(FitRole::Collapsed).is_none()
+					{
+						say(
+							"I4",
+							format!("collapsed row {ix} has no chip text"),
+						);
+					}
+					for r in [FitRole::Date, FitRole::Subject] {
+						if has(r) != Some(true) {
+							say("I4", format!("row {ix} has no {r:?}"));
+						}
+					}
+				}
+				bad
+			}
+
+			/// I3 for what is not a row: the filter chips stay clear of the
+			/// buttons beside them and inside the list's width; the header's
+			/// buttons stay inside the panel and clear of the hint.
+			fn check_bars(
+				cell: &str,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				ctx: &CellCtx,
+				s: &[Seen],
+			) -> Vec<String> {
+				let scale = cx.update(|w, _| w.scale_factor());
+				let window_w =
+					cx.update(|w, _| f32::from(w.viewport_size().width));
+				let (ids, bounds): (Vec<String>, BTreeMap<String, [i32; 4]>) =
+					model.read_with(cx, |m, _| {
+						let p = m.probes.as_ref().expect("probes are on");
+						let ids = p.drawn();
+						let b = ids
+							.iter()
+							.filter_map(|id| Some((id.clone(), p.bounds(id)?)))
+							.collect();
+						(ids, b)
+					});
+				let span = |id: &str| -> Option<(f32, f32)> {
+					let b = bounds.get(id)?;
+					Some((b[0] as f32 / scale, (b[0] + b[2]) as f32 / scale))
+				};
+				let mut bad = Vec::new();
+				let chips: Vec<&String> = ids
+					.iter()
+					.filter(|id| {
+						id.starts_with("log-filter-")
+							&& !id.ends_with("-clear")
+							&& !id.contains(':')
+					})
+					.collect();
+				let blockers = [
+					"btn-log-refresh",
+					"btn-head",
+					"btn-compare",
+					"btn-copy-commits",
+				];
+				let overlaps = |a: (f32, f32), b: (f32, f32)| {
+					a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5
+				};
+				for chip in &chips {
+					let Some(c) = span(chip) else { continue };
+					if c.1 > ctx.list.1 + 0.5 {
+						bad.push(format!(
+							"{cell}: I3 chip {chip} ends at {:.1} past the list's {:.1}",
+							c.1, ctx.list.1
+						));
+					}
+					for other in blockers {
+						if span(other).is_some_and(|o| overlaps(c, o)) {
+							bad.push(format!(
+								"{cell}: I3 chip {chip} overlaps {other}"
+							));
+						}
+					}
+					for other in &chips {
+						if *other != *chip
+							&& span(other).is_some_and(|o| overlaps(c, o))
+						{
+							bad.push(format!(
+								"{cell}: I3 chip {chip} overlaps chip {other}"
+							));
+						}
+					}
+				}
+				let hint = s
+					.iter()
+					.find(|t| t.role == FitRole::RefHint && t.present)
+					.map(Seen::span);
+				for button in ["btn-log-more", "btn-log-hide"] {
+					let Some(b) = span(button) else { continue };
+					// The panel runs from the list's left edge to the
+					// window's right one (the details pane is inside it).
+					if b.0 < ctx.list.0 - 0.5 || b.1 > window_w + 0.5 {
+						bad.push(format!(
+							"{cell}: I3 {button} [{:.1},{:.1}] is not whole in the panel [{:.1},{:.1}]",
+							b.0, b.1, ctx.list.0, window_w
+						));
+					}
+					if hint.is_some_and(|h| overlaps(b, h)) {
+						bad.push(format!(
+							"{cell}: I3 {button} overlaps the ref hint {hint:?}"
+						));
+					}
+				}
+				bad
+			}
+
+			fn assert_clean(bad: Vec<String>) {
+				assert!(
+					bad.is_empty(),
+					"{} violations:\n{}",
+					bad.len(),
+					bad.join("\n")
+				);
+			}
+
+			/// The Log of the row matrix: the main history with a merge of a
+			/// side branch, a CJK subject and author, a CJK tag, five tags
+			/// (their `+N`), a long branch name, dates with wide digits
+			/// ("10/24", "04:44"). Collapsed, rows 0 to 5 are HEAD, bump,
+			/// the CJK one, fix, the merge and init.
+			struct FitFixture {
+				merge7: String,
+			}
+
+			fn fit_fixture(dir: &Path) -> FitFixture {
+				let r = dir.join("solo");
+				fs::create_dir(&r).unwrap();
+				git(&r, &["init", "-q", "-b", "main"]);
+				let commit = |file: &str,
+				              subject: &str,
+				              author: Option<&str>,
+				              date: &str| {
+					fs::write(r.join(file), file).unwrap();
+					git(&r, &["add", "."]);
+					let mut args = vec!["commit", "-q", "-m", subject];
+					if let Some(a) = author {
+						args.extend(["--author", a]);
+					}
+					git_dated(&r, &args, date);
+				};
+				commit("init.txt", "init", None, "2025-10-01T10:00:00Z");
+				git(&r, &["checkout", "-q", "-b", "side"]);
+				commit("side.txt", "side work", None, "2025-10-02T10:00:00Z");
+				git(&r, &["checkout", "-q", "main"]);
+				git_dated(
+					&r,
+					&[
+						"merge",
+						"-q",
+						"--no-ff",
+						"side",
+						"-m",
+						"merge side work into main",
+					],
+					"2025-10-03T10:00:00Z",
+				);
+				let merge7 = {
+					let out = Command::new("git")
+						.current_dir(&r)
+						.args(["rev-parse", "--short=7", "HEAD"])
+						.output()
+						.expect("git rev-parse");
+					String::from_utf8(out.stdout).unwrap().trim().to_string()
+				};
+				commit(
+					"fix.txt",
+					"fix",
+					Some("\u{9673}\u{5927}\u{6587}\u{6e2c}\u{8a66}\u{4f5c}\u{8005}\u{540d}\u{7a31} <c@x>"),
+					"2025-10-10T15:59:00Z",
+				);
+				git(
+					&r,
+					&["branch", "feature/a-rather-long-branch-name-for-labels"],
+				);
+				commit(
+					"zh.txt",
+					"\u{4fee}\u{6b63}\u{9060}\u{7aef}\u{5de5}\u{4f5c}\u{5340}\u{5728}\u{6162}\u{901f}\u{9023}\u{7dda}\u{4e0b}\u{8b80}\u{53d6}\u{5927}\u{578b}\u{6a94}\u{6848}\u{903e}\u{6642}\u{5f8c}\u{7121}\u{6cd5}\u{91cd}\u{8a66}\u{7684}\u{554f}\u{984c}",
+					Some("Alexandra Konstantinopoulou <a@x>"),
+					"2025-10-24T04:44:00Z",
+				);
+				git(
+					&r,
+					&["tag", "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}"],
+				);
+				commit(
+					"bump.txt",
+					"bump dependencies and regenerate the lockfile for the release",
+					None,
+					"2025-12-20T15:30:00Z",
+				);
+				for t in ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"] {
+					git(&r, &["tag", t]);
+				}
+				commit(
+					"head.txt",
+					"a subject long enough to want the whole row for itself and then some more words",
+					None,
+					"2025-12-21T15:30:00Z",
+				);
+				git(&r, &["tag", "v0.3.0"]);
+				git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+				git(
+					&r,
+					&[
+						"symbolic-ref",
+						"refs/remotes/origin/HEAD",
+						"refs/remotes/origin/main",
+					],
+				);
+				FitFixture { merge7 }
+			}
+
+			/// Two repositories with a `topic-03` each, and a branch of each
+			/// that only it has: `only-in-core` (its repo's name is too wide
+			/// for any pane or menu row, so it is dropped) and `ci` (a short
+			/// name with a repo name that fits whole).
+			fn chip_fixture(dir: &Path) {
+				for (name, own) in [
+					("repo-01-core-with-a-long-name", "only-in-core"),
+					("repo-02-api", "ci"),
+				] {
+					let r = repo(dir, name, &[]);
+					for branch in ["topic-03", own] {
+						git(&r, &["checkout", "-q", "-b", branch]);
+						fs::write(r.join(format!("{branch}.txt")), "b")
+							.unwrap();
+						git(&r, &["add", "."]);
+						git(
+							&r,
+							&["commit", "-q", "-m", &format!("{branch} work")],
+						);
+						git(&r, &["checkout", "-q", "main"]);
+					}
+				}
+			}
+
+			/// The locales a cell goes through, with `check` run for each:
+			/// the first is what the app opens in, `alt-l` switches.
+			fn each_locale(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				mut run: impl FnMut(&Entity<WorkbenchModel>, &mut VisualTestContext),
+			) {
+				let mut seen = BTreeSet::new();
+				for _ in 0..2 {
+					let loc = model.read_with(cx, |m, _| m.locale);
+					assert!(
+						seen.insert(format!("{loc:?}")),
+						"alt-l did not switch"
+					);
+					run(model, cx);
+					cx.simulate_keystrokes("alt-l");
+					settle(cx);
+				}
+				assert_eq!(seen.len(), 2);
+			}
+
+			/// Opens the row matrix's window: the fixture, merge collapsed,
+			/// hash and panes as the cell says. `None` without a real text
+			/// system.
+			fn open_rows<'a>(
+				cx: &'a mut TestAppContext,
+				ws: &Path,
+				fx: &FitFixture,
+				w: f32,
+				h: f32,
+				hash: bool,
+				panes: Panes,
+			) -> Option<(Entity<WorkbenchModel>, &'a mut VisualTestContext)>
+			{
+				let (model, cx) = open_real_text(cx, ws.to_path_buf(), w, h)?;
+				settle_until(cx, "the log rows", |cx| {
+					model.read_with(cx, |m, _| m.display_commits().len() >= 7)
+				});
+				settle(cx);
+				click_probed(&model, cx, &format!("collapse:{}", fx.merge7));
+				assert_eq!(
+					model.read_with(cx, |m, _| m.collapsed_merges.len()),
+					1,
+					"the merge did not collapse"
+				);
+				if hash {
+					click_probed(&model, cx, "btn-log-more");
+					click_probed(&model, cx, "log-more:hash");
+				}
+				if panes == Panes::ListOnly {
+					for pane in ["log-more:details", "log-more:branches"] {
+						click_probed(&model, cx, "btn-log-more");
+						click_probed(&model, cx, pane);
+					}
+				}
+				settle(cx);
+				assert_eq!(model.read_with(cx, |m, _| m.log_show_hash), hash);
+				Some((model, cx))
+			}
+
+			fn rows_cell(
+				cx: &mut TestAppContext,
+				name: &str,
+				w: f32,
+				h: f32,
+				hash: bool,
+				panes: Panes,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some((model, cx)) =
+					open_rows(cx, ws.path(), &fx, w, h, hash, panes)
+				else {
+					return;
+				};
+				let mut bad = Vec::new();
+				let mut roles: BTreeSet<String> = BTreeSet::new();
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc}");
+					let ctx = cell_ctx(model, cx, w, hash, 5);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+				});
+				// The branches pane, when drawn: a ref's click puts it in the
+				// header's hint.
+				if click_if_probed(
+					&model,
+					cx,
+					"ref:refs/heads/feature/a-rather-long-branch-name-for-labels",
+				) {
+					settle(cx);
+					let name = format!("{name} ref-hint");
+					let ctx = cell_ctx(&model, cx, w, hash, 0);
+					let s = snapshot(&model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, &model, cx, &ctx, &s));
+				}
+				for role in FitRole::ALL {
+					if matrix_cell(role) == name
+						&& !roles.contains(&format!("{role:?}"))
+					{
+						bad.push(format!(
+							"{name}: {role:?} is named to this cell but was never drawn in it"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			macro_rules! fit_rows_cells {
+				($($name:ident: ($w:expr, $h:expr, $hash:expr, $panes:expr)),* $(,)?) => {
+					const FIT_ROWS_CELLS: &[&str] = &[$(stringify!($name)),*];
+					$(
+						#[gpui::test]
+						fn $name(cx: &mut TestAppContext) {
+							rows_cell(cx, stringify!($name), $w, $h, $hash, $panes);
+						}
+					)*
+				};
+			}
+
+			fit_rows_cells! {
+				fit_rows_w0900_hash_off_panes_default: (900., 600., false, Panes::Default),
+				fit_rows_w0900_hash_off_panes_listonly: (900., 600., false, Panes::ListOnly),
+				fit_rows_w0900_hash_on_panes_default: (900., 600., true, Panes::Default),
+				fit_rows_w0900_hash_on_panes_listonly: (900., 600., true, Panes::ListOnly),
+				fit_rows_w1080_hash_off_panes_default: (1080., 720., false, Panes::Default),
+				fit_rows_w1080_hash_off_panes_listonly: (1080., 720., false, Panes::ListOnly),
+				fit_rows_w1080_hash_on_panes_default: (1080., 720., true, Panes::Default),
+				fit_rows_w1080_hash_on_panes_listonly: (1080., 720., true, Panes::ListOnly),
+				fit_rows_w1440_hash_off_panes_default: (1440., 900., false, Panes::Default),
+				fit_rows_w1440_hash_off_panes_listonly: (1440., 900., false, Panes::ListOnly),
+				fit_rows_w1440_hash_on_panes_default: (1440., 900., true, Panes::Default),
+				fit_rows_w1440_hash_on_panes_listonly: (1440., 900., true, Panes::ListOnly),
+			}
+
+			/// The matrix cell that draws `role`: the structural test checks
+			/// each is a cell that exists, and each cell checks that what it
+			/// is named for was drawn in it.
+			fn matrix_cell(role: FitRole) -> &'static str {
+				match role {
+					FitRole::Hash => "fit_rows_w1080_hash_on_panes_default",
+					FitRole::Author => "fit_rows_w1440_hash_off_panes_default",
+					FitRole::RefHint
+					| FitRole::PaneGroup
+					| FitRole::PaneRefName => "fit_rows_w1440_hash_off_panes_default",
+					FitRole::PaneRepo
+					| FitRole::MenuRefName
+					| FitRole::MenuRepo
+					| FitRole::ChipRepo
+					| FitRole::ChipBranch
+					| FitRole::ChipUser
+					| FitRole::ChipMore => "fit_chips_w1080",
+					FitRole::ChipDate => "fit_chips_w1440",
+					FitRole::Subject
+					| FitRole::BranchLabel
+					| FitRole::TagLabel
+					| FitRole::RefMore
+					| FitRole::Collapsed
+					| FitRole::Date => "fit_rows_w1080_hash_off_panes_default",
+				}
+			}
+
+			/// The chip matrix: two active filters (a long repo name and a
+			/// short branch), the branches pane and the branch menu, in both
+			/// locales.
+			fn chips_cell(cx: &mut TestAppContext, name: &str, w: f32, h: f32) {
+				let ws = tempfile::tempdir().unwrap();
+				chip_fixture(ws.path());
+				let Some((model, cx)) =
+					open_real_text(cx, ws.path().to_path_buf(), w, h)
+				else {
+					return;
+				};
+				settle_until(cx, "the two feeds", |cx| {
+					model.read_with(cx, |m, _| {
+						m.log_feeds.len() == 2 && m.display_commits().len() >= 4
+					})
+				});
+				settle(cx);
+				let mut bad = Vec::new();
+				let mut roles: BTreeSet<String> = BTreeSet::new();
+				// Before any filter every repo is in scope: the pane and the
+				// menu name the repo of a branch that only one has.
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc} unfiltered");
+					let ctx = cell_ctx(model, cx, w, false, 0);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+					for own in ["only-in-core", "ci"] {
+						let id =
+							format!("text-fit:ref:refs/heads/{own}:pane-name");
+						if !s.iter().any(|t| t.id == id) {
+							bad.push(format!(
+								"{name}: the branches pane drew no row of {own}"
+							));
+						}
+					}
+					open_menu(model, cx, "branch");
+					click_probed(model, cx, "log-branch-group:refs_local");
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&format!("{name} menu"), &s, &ctx));
+					for own in ["only-in-core", "ci"] {
+						let id = format!(
+							"text-fit:log-branch:refs/heads/{own}:menu-name"
+						);
+						if !s.iter().any(|t| t.id == id) {
+							bad.push(format!(
+								"{name}: the branch menu drew no row of {own}"
+							));
+						}
+					}
+					cx.simulate_keystrokes("escape");
+					settle(cx);
+				});
+				click_probed(&model, cx, "ref:refs/heads/topic-03");
+				open_menu(&model, cx, "repo");
+				click_probed(
+					&model,
+					cx,
+					"log-repo:repo-01-core-with-a-long-name",
+				);
+				settle(cx);
+				settle(cx);
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc}");
+					let ctx = cell_ctx(model, cx, w, false, 0);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+					// Of the chips on the bar with a value, a shorter one is
+					// whole when a longer one is cut.
+					let valued: Vec<&Seen> = s
+						.iter()
+						.filter(|t| {
+							t.present
+								&& t.id.contains(":chip-")
+								&& t.total > t.key_graphemes
+						})
+						.collect();
+					assert!(!valued.is_empty(), "{name}: no chip has a value");
+					for cut in valued.iter().filter(|t| t.shown < t.total) {
+						for short in
+							valued.iter().filter(|t| t.natural < cut.natural)
+						{
+							if short.shown < short.total {
+								bad.push(format!(
+									"{name}: the shorter chip is cut while a longer one is: {} / {}",
+									short.describe(),
+									cut.describe()
+								));
+							}
+						}
+					}
+					// An active chip the bar folded into "more" has its clear
+					// item there.
+					for (key, chip) in
+						[("repo", "chip-repo"), ("branch", "chip-branch")]
+					{
+						let on_bar = s.iter().any(|t| {
+							t.present
+								&& t.id
+									== format!(
+										"text-fit:log-filter-{key}:{chip}"
+									)
+						});
+						if on_bar {
+							continue;
+						}
+						click_probed(model, cx, "log-filter-more");
+						let clear = format!("log-filter-{key}-clear");
+						let drawn = model.read_with(cx, |m, _| {
+							m.probes.as_ref().unwrap().bounds(&clear).is_some()
+						});
+						if !drawn {
+							bad.push(format!(
+								"{name}: the {key} filter is on neither the bar nor the more menu"
+							));
+						}
+						click_probed(model, cx, "log-filter-more");
+					}
+				});
+				for role in FitRole::ALL {
+					if matrix_cell(role) == name
+						&& !roles.contains(&format!("{role:?}"))
+					{
+						bad.push(format!(
+							"{name}: {role:?} is named to this cell but was never drawn in it"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			/// Opens the filter menu `key` (repo, branch, user, date): from
+			/// its chip on the bar, else from the "more" chip's menu.
+			fn open_menu(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				key: &str,
+			) {
+				if !click_if_probed(model, cx, &format!("log-filter-{key}")) {
+					click_probed(model, cx, "log-filter-more");
+					click_probed(model, cx, &format!("log-filter-more:{key}"));
+				}
+			}
+
+			macro_rules! fit_chips_cells {
+				($($name:ident: ($w:expr, $h:expr)),* $(,)?) => {
+					const FIT_CHIPS_CELLS: &[&str] = &[$(stringify!($name)),*];
+					$(
+						#[gpui::test]
+						fn $name(cx: &mut TestAppContext) {
+							chips_cell(cx, stringify!($name), $w, $h);
+						}
+					)*
+				};
+			}
+
+			fit_chips_cells! {
+				fit_chips_w0900: (900., 600.),
+				fit_chips_w1080: (1080., 720.),
+				fit_chips_w1440: (1440., 900.),
+			}
+
+			/// The axes the row matrix crosses, as cell names.
+			#[test]
+			fn fit_matrix_cells_cover_every_axis_combination() {
+				let mut want = BTreeSet::new();
+				for w in ["0900", "1080", "1440"] {
+					for hash in ["off", "on"] {
+						for panes in ["default", "listonly"] {
+							want.insert(format!(
+								"fit_rows_w{w}_hash_{hash}_panes_{panes}"
+							));
+						}
+					}
+				}
+				let have: BTreeSet<String> =
+					FIT_ROWS_CELLS.iter().map(|c| c.to_string()).collect();
+				assert_eq!(have, want);
+				assert_eq!(
+					FIT_ROWS_CELLS.len(),
+					want.len(),
+					"a cell is listed twice"
+				);
+			}
+
+			/// Every role is named to a cell that exists; the cell itself
+			/// checks that it drew it.
+			#[test]
+			fn every_fit_role_names_the_cell_that_draws_it() {
+				let cells: BTreeSet<&str> = FIT_ROWS_CELLS
+					.iter()
+					.chain(FIT_CHIPS_CELLS)
+					.copied()
+					.collect();
+				for role in FitRole::ALL {
+					assert!(
+						cells.contains(matrix_cell(role)),
+						"{role:?} is named to {}, which is no cell",
+						matrix_cell(role)
+					);
+				}
+			}
+
+			// ───────── the resize paths (M3) ─────────
+
+			/// (id, present, shown, clipped) of every text: what two ways to
+			/// a width must agree on.
+			fn shape(s: &[Seen]) -> BTreeMap<String, (bool, usize, bool)> {
+				s.iter()
+					.map(|t| (t.id.clone(), (t.present, t.shown, t.clipped)))
+					.collect()
+			}
+
+			fn assert_same(
+				tag: &str,
+				resized: &BTreeMap<String, (bool, usize, bool)>,
+				fresh: &BTreeMap<String, (bool, usize, bool)>,
+			) {
+				let mut bad = Vec::new();
+				for id in
+					resized.keys().chain(fresh.keys()).collect::<BTreeSet<_>>()
+				{
+					let (a, b) = (resized.get(id), fresh.get(id));
+					if a != b {
+						bad.push(format!(
+							"{tag}: {id}: resized {a:?} vs fresh {b:?} (present, shown, clipped)"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			/// A fresh window at `w`x`h`, as the row matrix opens one.
+			fn fresh_rows(
+				cx: &mut TestAppContext,
+				ws: &Path,
+				fx: &FitFixture,
+				w: f32,
+				h: f32,
+				hash: bool,
+			) -> Option<Vec<Seen>> {
+				let (model, cx) =
+					open_rows(cx, ws, fx, w, h, hash, Panes::Default)?;
+				Some(snapshot(&model, cx))
+			}
+
+			/// I5: what is drawn at a width is drawn at every wider one.
+			/// The author column is left out: the labels come before it, so
+			/// at 900 it may be there while at 950 the labels took its room
+			/// (ADR 0005). So is the collapsed chip, which gives way to the
+			/// labels that come back as the list widens.
+			fn assert_monotone(
+				narrow: (f32, &[Seen]),
+				wide: (f32, &[Seen]),
+				bad: &mut Vec<String>,
+			) {
+				for t in narrow.1.iter().filter(|t| {
+					t.present
+						&& t.row.is_some() && !matches!(
+						t.role,
+						FitRole::Author | FitRole::Collapsed
+					)
+				}) {
+					let there = wide.1.iter().find(|u| u.id == t.id);
+					if !there.is_some_and(|u| u.present) {
+						bad.push(format!(
+							"I5: {} is drawn at {} but not at {}",
+							t.describe(),
+							narrow.0,
+							wide.0
+						));
+					}
+				}
+			}
+
+			fn resize_walk(cx: &mut TestAppContext, hash: bool) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let sizes = [(1440., 900.), (1080., 720.), (900., 600.)];
+				let mut reference = Vec::new();
+				for (w, h) in sizes {
+					let Some(s) = fresh_rows(cx, ws.path(), &fx, w, h, hash)
+					else {
+						return;
+					};
+					reference.push((w, s));
+				}
+				let mut bad = Vec::new();
+				for pair in reference.windows(2) {
+					assert_monotone(
+						(pair[1].0, &pair[1].1),
+						(pair[0].0, &pair[0].1),
+						&mut bad,
+					);
+				}
+				assert_monotone(
+					(reference[2].0, &reference[2].1),
+					(reference[0].0, &reference[0].1),
+					&mut bad,
+				);
+				assert_clean(bad);
+				let reference: BTreeMap<u32, _> = reference
+					.iter()
+					.map(|(w, s)| (*w as u32, shape(s)))
+					.collect();
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1440.,
+					900.,
+					hash,
+					Panes::Default,
+				) else {
+					return;
+				};
+				for (w, h) in
+					[(1080., 720.), (900., 600.), (1080., 720.), (1440., 900.)]
+				{
+					cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+					settle(cx);
+					assert_same(
+						&format!("walk to {w} hash={hash}"),
+						&shape(&snapshot(&model, cx)),
+						&reference[&(w as u32)],
+					);
+				}
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_resize_walk_hash_off(cx: &mut TestAppContext) {
+				resize_walk(cx, false);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_resize_walk_hash_on(cx: &mut TestAppContext) {
+				resize_walk(cx, true);
+			}
+
+			/// 1080 to 1600 crosses the 1200 the panes' widths change at.
+			fn widening(cx: &mut TestAppContext, hash: bool) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some(fresh) =
+					fresh_rows(cx, ws.path(), &fx, 1600., 900., hash)
+				else {
+					return;
+				};
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1080.,
+					720.,
+					hash,
+					Panes::Default,
+				) else {
+					return;
+				};
+				cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+				settle(cx);
+				assert_same(
+					&format!("widen 1080 to 1600 hash={hash}"),
+					&shape(&snapshot(&model, cx)),
+					&shape(&fresh),
+				);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_widening_1080_to_1600_hash_off(
+				cx: &mut TestAppContext,
+			) {
+				widening(cx, false);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_widening_1080_to_1600_hash_on(
+				cx: &mut TestAppContext,
+			) {
+				widening(cx, true);
+			}
+		}
+
 		/// A merge lists the files changed against any parent. Those the
 		/// first parent has as well are marked, and the marked set is keyed
 		/// by the merge (#188).
