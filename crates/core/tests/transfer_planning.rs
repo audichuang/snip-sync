@@ -7904,3 +7904,202 @@ fn test_a_snapshot_without_the_new_fields_still_revalidates_and_matches() {
 		serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
 	assert_eq!(back, new);
 }
+
+#[cfg(unix)]
+fn overwrite() -> RestoreSelection {
+	RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	}
+}
+
+/// `dir/name` with `body`, its modified time copied from `like`, so a
+/// freshness record (size, mtime, hash) cannot tell the two files apart.
+#[cfg(unix)]
+fn write_like(dir: &Path, name: &str, body: &str, like: &Path) {
+	fs::create_dir_all(dir).unwrap();
+	let path = dir.join(name);
+	fs::write(&path, body).unwrap();
+	let mtime = fs::metadata(like).unwrap().modified().unwrap();
+	fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_modified(mtime)
+		.unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_repointed_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	fs::create_dir(dst.path().join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: link/new/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_file(dst.path().join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", dst.path().join("link")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert!(!dst.exists("real2/new/a.txt"));
+	assert!(!dst.exists("real1/new/a.txt"));
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_replaced_by_a_folder_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	fs::remove_file(dst.path().join("link")).unwrap();
+	fs::create_dir(dst.path().join("link")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert!(!dst.exists("link/new/a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_overwrite_whose_folder_became_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("old/a.txt", "same\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\nnew\n// file: keep.txt\nkeep\n",
+	);
+	// A look-alike behind a symlink: same bytes, same size, same mtime.
+	let original = dst.path().join("old/a.txt");
+	write_like(&dst.path().join("other"), "a.txt", "same\n", &original);
+	fs::remove_dir_all(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&overwrite()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert_eq!(dst.read("other/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_whose_folder_became_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("old/a.txt", "same\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] old/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	let original = dst.path().join("old/a.txt");
+	write_like(&dst.path().join("other"), "a.txt", "same\n", &original);
+	fs::remove_dir_all(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert_eq!(dst.read("other/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_overwrite_through_a_folder_that_was_a_symlink_at_preview_still_applies(
+) {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("real/a.txt", "old\n");
+	dst.commit("seed");
+	std::os::unix::fs::symlink("real", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/a.txt\nnew\n");
+	let res = plan.apply(&overwrite()).unwrap();
+	assert_eq!(res.overwritten_count, 1);
+	assert_eq!(dst.read("real/a.txt"), "new");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_matches_preview_compares_the_symlinks_the_preview_recorded() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	fs::create_dir(dst.path().join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	let preview = plan.destination_freshness().clone();
+	let linked = preview.symlinked_dirs.as_ref().expect("recorded");
+	assert_eq!(linked.len(), 1);
+	let (dir, target) = linked.iter().next().unwrap();
+	assert!(dir.ends_with("link"), "{dir:?}");
+	assert_eq!(
+		target,
+		&dunce::canonicalize(dst.path().join("real1")).unwrap()
+	);
+	assert!(preview.matches_preview(&preview));
+
+	// A symlink the preview did not see.
+	let mut extra = preview.clone();
+	extra
+		.symlinked_dirs
+		.as_mut()
+		.unwrap()
+		.insert(dst.path().join("sneaky"), dst.path().join("real2"));
+	assert!(!extra.matches_preview(&preview));
+
+	// A symlink that points somewhere else now.
+	let mut moved = preview.clone();
+	let key = moved
+		.symlinked_dirs
+		.as_ref()
+		.unwrap()
+		.keys()
+		.next()
+		.unwrap()
+		.clone();
+	moved
+		.symlinked_dirs
+		.as_mut()
+		.unwrap()
+		.insert(key, dunce::canonicalize(dst.path().join("real2")).unwrap());
+	assert!(!moved.matches_preview(&preview));
+
+	// Fewer symlinks than the preview saw is fine; so is a preview from an
+	// older master that recorded none.
+	let mut fewer = preview.clone();
+	fewer.symlinked_dirs.as_mut().unwrap().clear();
+	assert!(fewer.matches_preview(&preview));
+	let mut old_preview = preview.clone();
+	old_preview.symlinked_dirs = None;
+	assert!(extra.matches_preview(&old_preview));
+}
