@@ -248,6 +248,7 @@ impl Jobs {
 pub(crate) struct Answer<'w, W: Write> {
 	out: &'w mut W,
 	fault: Option<crate::fault::Fault>,
+	hang_up: bool,
 }
 
 impl<'w, W: Write> Answer<'w, W> {
@@ -255,7 +256,11 @@ impl<'w, W: Write> Answer<'w, W> {
 		out: &'w mut W,
 		fault: Option<crate::fault::Fault>,
 	) -> Self {
-		Self { out, fault }
+		Self {
+			out,
+			fault,
+			hang_up: false,
+		}
 	}
 
 	/// One `Pending` frame, flushed.
@@ -264,9 +269,27 @@ impl<'w, W: Write> Answer<'w, W> {
 	}
 
 	/// The request's whole answer (its chunks and `Joined` included),
-	/// flushed. Once per request.
+	/// flushed. Once per request. A reply-layer fault renders the answer
+	/// first and then drops, halves or paces its bytes.
 	pub(crate) fn reply(&mut self, response: &Response) -> io::Result<()> {
-		write_response(self.out, response)
+		let Some(writer) = self
+			.fault
+			.as_ref()
+			.and_then(crate::fault::Fault::reply_writer)
+		else {
+			return write_response(self.out, response);
+		};
+		let mut bytes = Vec::new();
+		write_response(&mut bytes, response)?;
+		writer.write(self.out, &bytes)?;
+		self.hang_up |= writer.hangs_up();
+		Ok(())
+	}
+
+	/// Whether a reply-layer fault ended this connection: the dispatch hangs
+	/// up once the request's branch is done.
+	pub(crate) fn hang_up(&self) -> bool {
+		self.hang_up
 	}
 
 	/// Extra time the work behind this request takes: a `Fault::Delay`.
@@ -275,7 +298,15 @@ impl<'w, W: Write> Answer<'w, W> {
 		// decides what it means here.
 		match self.fault.as_ref()? {
 			crate::fault::Fault::Delay(d) => Some(*d),
-			crate::fault::Fault::PageDelay(_) => None,
+			crate::fault::Fault::PageDelay(_)
+			| crate::fault::Fault::Refuse(_)
+			| crate::fault::Fault::HangUp
+			| crate::fault::Fault::Garbage
+			| crate::fault::Fault::HeartbeatThenHangUp
+			| crate::fault::Fault::Stall(_)
+			| crate::fault::Fault::RunThenHangUp
+			| crate::fault::Fault::TruncatedReply
+			| crate::fault::Fault::Throttle { .. } => None,
 		}
 	}
 
@@ -283,7 +314,15 @@ impl<'w, W: Write> Answer<'w, W> {
 	pub(crate) fn page_delay(&self) -> Option<Duration> {
 		match self.fault.as_ref()? {
 			crate::fault::Fault::PageDelay(d) => Some(*d),
-			crate::fault::Fault::Delay(_) => None,
+			crate::fault::Fault::Delay(_)
+			| crate::fault::Fault::Refuse(_)
+			| crate::fault::Fault::HangUp
+			| crate::fault::Fault::Garbage
+			| crate::fault::Fault::HeartbeatThenHangUp
+			| crate::fault::Fault::Stall(_)
+			| crate::fault::Fault::RunThenHangUp
+			| crate::fault::Fault::TruncatedReply
+			| crate::fault::Fault::Throttle { .. } => None,
 		}
 	}
 }
