@@ -887,37 +887,20 @@ pub struct WorkbenchModel {
 	pub commit_rows_cache: std::cell::RefCell<
 		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
 	>,
-	pub commit_details: Option<crate::history::CommitDetails>,
 	/// Details pane height under the changed files once dragged; `None`
 	/// keeps the default share (the files get most of the pane).
 	pub log_details_h: Option<f32>,
 	/// The multi-selection's commit list is open (collapsed by default).
 	pub log_selection_expanded: bool,
-	/// Details of an open multi-selection's commits, newest first.
-	pub selection_details: Vec<crate::history::CommitDetails>,
 	/// Commits whose details list every containing branch read.
 	pub log_branches_all: Vec<String>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
 
-	// Files of the selected commit or compare.
-	pub commit_files: Vec<(String, Option<ChangeType>)>,
-	/// Per file of a multi-selection: index in `log_selected` of the newest
-	/// selected commit that touched it.
-	pub commit_file_origin: Vec<u32>,
-	/// Listed files that are submodule commits (no content to copy).
-	pub commit_file_gitlinks: Vec<String>,
-	/// The listing was cut to `MAX_COMMIT_FILES`.
-	pub commit_files_truncated: bool,
-	/// For the selected merge commit: its files unchanged against the first
-	/// parent (listed only through another parent), keyed by the raw SHA.
-	pub commit_files_first_parent_same:
-		Option<(String, std::collections::HashSet<String>)>,
-	pub selected_commit_file: Option<String>,
-	/// Cmd/Shift multi-selection in the changed files; empty means just
-	/// `selected_commit_file`. Cleared with every change of that one.
-	pub commit_file_sel: Vec<String>,
+	/// Everything shown for the Log selection; replaced whole whenever the
+	/// selection changes (`reset_commit_view`), so no member outlives it.
+	pub commit_view: crate::history::CommitView,
 	pub compare: Option<(String, String)>,
 
 	// Tool windows.
@@ -1093,8 +1076,6 @@ pub struct WorkbenchModel {
 	pub log_scope_key: Vec<PathBuf>,
 	/// The merged log's per-repository feeds.
 	pub log_feeds: Vec<multi_log::Feed>,
-	/// Repository of the commit or compare the reader shows from the log.
-	pub log_commit_root: Option<PathBuf>,
 	/// A Replace load waited for discovery to reach the picked repositories.
 	pub log_deferred: bool,
 	/// The `generation` of the repo read whose landing reloads the Log: the
@@ -1457,21 +1438,13 @@ impl WorkbenchModel {
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
-			commit_details: None,
 			log_details_h: None,
 			log_selection_expanded: false,
-			selection_details: Vec::new(),
 			log_branches_all: Vec::new(),
 			details_generation: 0,
 			details_cancel: None,
 			git_user_email: None,
-			commit_files: Vec::new(),
-			commit_file_origin: Vec::new(),
-			commit_file_gitlinks: Vec::new(),
-			commit_files_truncated: false,
-			commit_files_first_parent_same: None,
-			selected_commit_file: None,
-			commit_file_sel: Vec::new(),
+			commit_view: Default::default(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -1597,7 +1570,6 @@ impl WorkbenchModel {
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
 			log_feeds: Vec::new(),
-			log_commit_root: None,
 			log_deferred: false,
 			log_reload_for: None,
 			remote: remote::MasterState {
@@ -1633,7 +1605,10 @@ impl WorkbenchModel {
 						| PreviewSource::Compare { .. }
 				) =>
 			{
-				self.log_commit_root.clone().or_else(|| self.repo_root())
+				self.commit_view
+					.log_commit_root
+					.clone()
+					.or_else(|| self.repo_root())
 			}
 			(Some((root, id)), Some(p)) if *id == preview_identity(p) => {
 				Some(root.clone())
@@ -2723,11 +2698,7 @@ impl WorkbenchModel {
 		self.range_head = None;
 		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
-		release_vec(&mut self.commit_files);
-		release_vec(&mut self.commit_file_origin);
-		release_vec(&mut self.commit_file_gitlinks);
-		self.commit_files_first_parent_same.take();
-		release_vec(&mut self.selection_details);
+		self.reset_commit_view();
 		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
@@ -2745,12 +2716,8 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_reload_for = None;
-		self.log_commit_root = None;
-		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
 		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
@@ -4094,7 +4061,13 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.commit_files.clear();
+		// The same commit stays selected while the repo is read again, so
+		// its details stay; everything else of the view is read anew.
+		let details = self.commit_view.commit_details.take();
+		self.reset_commit_view();
+		if self.selected_commit.is_some() {
+			self.commit_view.commit_details = details;
+		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
 		let reloading = self.repos[idx].root.clone();
@@ -4119,9 +4092,6 @@ impl WorkbenchModel {
 			self.hidden_commits.clear();
 			self.history_walk = None;
 			self.history_error = None;
-		}
-		if !preserve_anchors {
-			self.commit_details = None;
 		}
 		if !preserve_anchors && reload_log {
 			self.log_filter = LogQuery::default();
@@ -4436,7 +4406,7 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.commit_files.clear();
+		self.reset_commit_view();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
@@ -5884,9 +5854,7 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
-		self.commit_files.clear();
+		self.reset_commit_view();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
 	}
@@ -8872,15 +8840,16 @@ mod tests {
 			});
 			for _ in 0..50 {
 				settle(cx);
-				let done =
-					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				let done = model.read_with(cx, |m, _| {
+					!m.commit_view.commit_files.is_empty()
+				});
 				if done {
 					break;
 				}
 			}
 			let commit_file = model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty());
-				m.commit_files[0].0.clone()
+				assert!(!m.commit_view.commit_files.is_empty());
+				m.commit_view.commit_files[0].0.clone()
 			});
 			model.update(cx, |m, cx| {
 				m.select_commit_file(&commit_file, cx);
@@ -11647,15 +11616,18 @@ mod tests {
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let files = ["a.txt", "b.txt", "c.txt", "d.txt"];
 			model.update(cx, |m, cx| {
-				m.commit_files =
+				m.commit_view.commit_files =
 					files.iter().map(|f| (f.to_string(), None)).collect();
-				m.selected_commit_file = Some("b.txt".into());
+				m.commit_view.selected_commit_file = Some("b.txt".into());
 				m.toggle_commit_file("d.txt", cx);
-				assert_eq!(m.commit_file_sel, ["b.txt", "d.txt"]);
+				assert_eq!(m.commit_view.commit_file_sel, ["b.txt", "d.txt"]);
 				m.toggle_commit_file("b.txt", cx);
-				assert_eq!(m.commit_file_sel, ["d.txt"]);
+				assert_eq!(m.commit_view.commit_file_sel, ["d.txt"]);
 				m.extend_commit_files(&files, "d.txt", cx);
-				assert_eq!(m.commit_file_sel, ["b.txt", "c.txt", "d.txt"]);
+				assert_eq!(
+					m.commit_view.commit_file_sel,
+					["b.txt", "c.txt", "d.txt"]
+				);
 			});
 		}
 
@@ -11671,9 +11643,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("src/a.rs", Modified),
 					("src/gone.rs", Deleted),
 					("pom.xml", Modified),
@@ -11681,7 +11653,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("src/a.rs".into());
+				m.commit_view.selected_commit_file = Some("src/a.rs".into());
 				m.toggle_commit_file("src/", cx);
 				m.toggle_commit_file("pom.xml", cx);
 				let menu = m.commit_file_menu("src", true);
@@ -11726,9 +11698,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("common.txt", Modified),
 					("emoji.txt", Modified),
 					("dir/gone.txt", Deleted),
@@ -11736,7 +11708,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("emoji.txt".into());
+				m.commit_view.selected_commit_file = Some("emoji.txt".into());
 				m.toggle_commit_file("common.txt", cx);
 				let menu = m.commit_file_menu("common.txt", false);
 				menu.into_iter()
@@ -11775,10 +11747,10 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
 				m.log_details_by_dir = false;
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("z.txt", Modified),
 					("a/x.txt", Modified),
 					("b.txt", Modified),
@@ -11786,7 +11758,7 @@ mod tests {
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
 				// Click order: b.txt, a/x.txt, z.txt.
-				m.selected_commit_file = Some("b.txt".into());
+				m.commit_view.selected_commit_file = Some("b.txt".into());
 				m.toggle_commit_file("a/x.txt", cx);
 				m.toggle_commit_file("z.txt", cx);
 				let menu = m.commit_file_menu("z.txt", false);
@@ -11830,9 +11802,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("common.txt", Modified),
 					("emoji.txt", Modified),
 					("dir/gone.txt", Deleted),
@@ -11840,7 +11812,8 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("dir/keep.txt".into());
+				m.commit_view.selected_commit_file =
+					Some("dir/keep.txt".into());
 				m.toggle_commit_file("dir/", cx);
 				let menu = m.commit_file_menu("dir", true);
 				menu.into_iter()
@@ -13922,13 +13895,18 @@ mod tests {
 			cx.simulate_click(merge.center(), gpui::Modifiers::none());
 			settle_until(cx, "the merge's files", |cx| {
 				model.read_with(cx, |m, _| {
-					m.commit_files.len() == 2
-						&& m.commit_files_first_parent_same.is_some()
+					m.commit_view.commit_files.len() == 2
+						&& m.commit_view
+							.commit_files_first_parent_same
+							.is_some()
 				})
 			});
 			model.read_with(cx, |m, _| {
-				let (_, same) =
-					m.commit_files_first_parent_same.as_ref().expect("marker");
+				let (_, same) = m
+					.commit_view
+					.commit_files_first_parent_same
+					.as_ref()
+					.expect("marker");
 				assert!(same.contains("main.txt"), "{same:?}");
 				assert!(!same.contains("side.txt"), "{same:?}");
 			});
@@ -19045,14 +19023,18 @@ mod tests {
 			for _ in 0..50 {
 				settle(cx);
 				let loaded = model.read_with(cx, |m, _| {
-					!m.commit_files.is_empty() && m.preview.is_some()
+					!m.commit_view.commit_files.is_empty()
+						&& m.preview.is_some()
 				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files must load first"
+				);
 				assert!(m.preview.is_some(), "the diff must load first");
 			});
 
@@ -19073,8 +19055,14 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
-				assert!(m.commit_files.is_empty(), "stale files kept");
-				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					m.commit_view.commit_files.is_empty(),
+					"stale files kept"
+				);
+				assert!(
+					m.commit_view.commit_details.is_none(),
+					"stale details kept"
+				);
 				assert!(
 					!commit_preview_shown(m),
 					"stale commit diff kept after the branch filter",
@@ -19122,14 +19110,18 @@ mod tests {
 			for _ in 0..50 {
 				settle(cx);
 				let loaded = model.read_with(cx, |m, _| {
-					!m.commit_files.is_empty() && commit_preview_shown(m)
+					!m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
 				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files must load first"
+				);
 				assert!(commit_preview_shown(m), "the diff must load first");
 			});
 
@@ -19148,27 +19140,19 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
-				assert!(m.commit_files.is_empty(), "stale files kept");
-				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					m.commit_view.commit_files.is_empty(),
+					"stale files kept"
+				);
+				assert!(
+					m.commit_view.commit_details.is_none(),
+					"stale details kept"
+				);
 				assert!(
 					!commit_preview_shown(m),
 					"stale commit diff kept after the repository filter",
 				);
 			});
-		}
-
-		/// True when nothing of a Log selection's commit view is left.
-		fn commit_view_is_empty(m: &WorkbenchModel) -> bool {
-			m.commit_files.is_empty()
-				&& m.commit_file_origin.is_empty()
-				&& m.commit_file_gitlinks.is_empty()
-				&& !m.commit_files_truncated
-				&& m.commit_files_first_parent_same.is_none()
-				&& m.selected_commit_file.is_none()
-				&& m.commit_file_sel.is_empty()
-				&& m.commit_details.is_none()
-				&& m.selection_details.is_empty()
-				&& m.log_commit_root.is_none()
 		}
 
 		/// Every member of the commit view goes with the selection, whichever
@@ -19216,13 +19200,14 @@ mod tests {
 			at(cx, i, gpui::Modifiers::none());
 			settle_until(cx, "the first commit's files", |cx| {
 				model.read_with(cx, |m, _| {
-					!m.preview_loading && !m.commit_files.is_empty()
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
 				})
 			});
 			at(cx, j, gpui::Modifiers::secondary_key());
 			settle_until(cx, "the multi-selection's files", |cx| {
 				model.read_with(cx, |m, _| {
-					!m.preview_loading && !m.commit_file_origin.is_empty()
+					!m.preview_loading
+						&& !m.commit_view.commit_file_origin.is_empty()
 				})
 			});
 			model.read_with(cx, |m, _| {
@@ -19239,7 +19224,10 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(m.log_selected.is_empty(), "multi-selection kept");
-				assert!(commit_view_is_empty(m), "a commit view member stayed");
+				assert!(
+					m.commit_view.is_reset(),
+					"a commit view member stayed"
+				);
 			});
 		}
 
@@ -19265,7 +19253,7 @@ mod tests {
 			click(cx, "log-subject:0");
 			settle_until(cx, "the commit's files", |cx| {
 				model.read_with(cx, |m, _| {
-					!m.preview_loading && !m.commit_files.is_empty()
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
 				})
 			});
 			model.read_with(cx, |m, _| {
@@ -19287,7 +19275,10 @@ mod tests {
 				assert!(m.history_error.is_some(), "the search failed");
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(m.log_selected.is_empty(), "multi-selection kept");
-				assert!(commit_view_is_empty(m), "a commit view member stayed");
+				assert!(
+					m.commit_view.is_reset(),
+					"a commit view member stayed"
+				);
 				assert!(!commit_preview_shown(m), "stale commit diff kept");
 			});
 		}
@@ -19379,7 +19370,7 @@ mod tests {
 			settle(cx);
 			assert!(
 				model.read_with(cx, |m, _| {
-					m.preview_loading && m.commit_files.is_empty()
+					m.preview_loading && m.commit_view.commit_files.is_empty()
 				}),
 				"the Log read must be held in flight",
 			);
@@ -19406,7 +19397,7 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(
-					m.commit_files.is_empty(),
+					m.commit_view.commit_files.is_empty(),
 					"the late Log read reinstalled files",
 				);
 				assert!(

@@ -152,7 +152,7 @@ impl WorkbenchModel {
 				let file_path = self
 					.selected_file
 					.as_deref()
-					.or(self.selected_commit_file.as_deref());
+					.or(self.commit_view.selected_commit_file.as_deref());
 				if let Some(path) = file_path {
 					let name =
 						path.rsplit('/').next().unwrap_or(path).to_string();

@@ -556,23 +556,27 @@ impl WorkbenchModel {
 		} else {
 			path.to_string()
 		};
-		let multi = self.commit_file_sel.len() > 1
-			&& self.commit_file_sel.contains(&key);
+		let multi = self.commit_view.commit_file_sel.len() > 1
+			&& self.commit_view.commit_file_sel.contains(&key);
 		let copy: Vec<CopyTarget> = if multi {
-			let targets: Vec<&str> =
-				self.commit_file_sel.iter().map(String::as_str).collect();
+			let targets: Vec<&str> = self
+				.commit_view
+				.commit_file_sel
+				.iter()
+				.map(String::as_str)
+				.collect();
 			commit_copy_selection(
-				&self.commit_files,
-				&self.commit_file_gitlinks,
-				self.commit_files_truncated,
+				&self.commit_view.commit_files,
+				&self.commit_view.commit_file_gitlinks,
+				self.commit_view.commit_files_truncated,
 				self.log_details_by_dir,
 				&targets,
 			)
 		} else {
 			commit_copy_paths(
-				&self.commit_files,
-				&self.commit_file_gitlinks,
-				self.commit_files_truncated,
+				&self.commit_view.commit_files,
+				&self.commit_view.commit_file_gitlinks,
+				self.commit_view.commit_files_truncated,
 				path,
 				is_dir,
 			)
@@ -597,7 +601,10 @@ impl WorkbenchModel {
 			(!copy.is_empty()).then_some(MenuAct::CopyNode(copy)),
 		)];
 		let rev = self.commit_file_rev(path).or_else(|| {
-			self.log_commit_root.clone().map(|r| (r, String::new()))
+			self.commit_view
+				.log_commit_root
+				.clone()
+				.map(|r| (r, String::new()))
 		});
 		if !is_dir {
 			v.push(item(

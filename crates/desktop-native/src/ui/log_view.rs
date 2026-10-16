@@ -933,14 +933,19 @@ impl WorkbenchModel {
 	fn commit_rows(&self, by_dir: bool) -> Rc<Vec<ChangeItemRow>> {
 		use std::hash::{Hash, Hasher};
 		let mut h = std::collections::hash_map::DefaultHasher::new();
-		(&self.commit_files, by_dir, &self.changed_dirs_collapsed).hash(&mut h);
+		(
+			&self.commit_view.commit_files,
+			by_dir,
+			&self.changed_dirs_collapsed,
+		)
+			.hash(&mut h);
 		let key = h.finish();
 		let mut cache = self.commit_rows_cache.borrow_mut();
 		if let Some((_, rows)) = cache.as_ref().filter(|(k, _)| *k == key) {
 			return rows.clone();
 		}
 		let rows = Rc::new(super::changes::commit_file_rows(
-			&self.commit_files,
+			&self.commit_view.commit_files,
 			by_dir,
 			&self.changed_dirs_collapsed,
 		));
@@ -956,9 +961,11 @@ impl WorkbenchModel {
 			.iter()
 			.filter_map(|r| match r {
 				ChangeItemRow::Dir { path, .. } => Some(format!("{path}/")),
-				ChangeItemRow::File { file_idx, .. } => {
-					self.commit_files.get(*file_idx).map(|(p, _)| p.clone())
-				}
+				ChangeItemRow::File { file_idx, .. } => self
+					.commit_view
+					.commit_files
+					.get(*file_idx)
+					.map(|(p, _)| p.clone()),
 				_ => None,
 			})
 			.collect();
@@ -976,7 +983,7 @@ impl WorkbenchModel {
 		let log = &self.probes;
 		let by_dir = self.log_details_by_dir;
 		let rows = self.commit_rows(by_dir);
-		let n = self.commit_files.len();
+		let n = self.commit_view.commit_files.len();
 		let files_header = div()
 			.flex()
 			.flex_row()
@@ -1038,7 +1045,9 @@ impl WorkbenchModel {
 				)
 				.on_click(cx.listener(|this, _, _, cx| {
 					this.changed_dirs_collapsed =
-						super::changes::commit_file_dirs(&this.commit_files);
+						super::changes::commit_file_dirs(
+							&this.commit_view.commit_files,
+						);
 					cx.notify();
 				}))
 				.children(probe(log, "details-collapse-all")),
@@ -1137,7 +1146,7 @@ impl WorkbenchModel {
 				// A folder in the selection is keyed "dir/".
 				let key = format!("{path}/");
 				let sel = self.rev_tree.is_none()
-					&& self.commit_file_sel.contains(&key);
+					&& self.commit_view.commit_file_sel.contains(&key);
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
@@ -1161,8 +1170,11 @@ impl WorkbenchModel {
 						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 							// IntelliJ: a menu outside the selection selects
 							// its row alone.
-							if !sel && !this.commit_file_sel.is_empty() {
-								this.commit_file_sel = vec![key.clone()];
+							if !sel
+								&& !this.commit_view.commit_file_sel.is_empty()
+							{
+								this.commit_view.commit_file_sel =
+									vec![key.clone()];
 							}
 							let items = this.commit_file_menu(&path, true);
 							w.focus(&this.log_focus);
@@ -1216,17 +1228,19 @@ impl WorkbenchModel {
 					.into_any_element()
 			}
 			ChangeItemRow::File { file_idx, depth } => {
-				let Some((path, ct)) = self.commit_files.get(file_idx).cloned()
+				let Some((path, ct)) =
+					self.commit_view.commit_files.get(file_idx).cloned()
 				else {
 					return div().into_any_element();
 				};
 				let (letter, color) = change_style(ct);
 				let deleted = ct == Some(ChangeType::Deleted);
 				let sel = self.rev_tree.is_none()
-					&& if self.commit_file_sel.is_empty() {
-						self.selected_commit_file.as_deref() == Some(&path)
+					&& if self.commit_view.commit_file_sel.is_empty() {
+						self.commit_view.selected_commit_file.as_deref()
+							== Some(&path)
 					} else {
-						self.commit_file_sel.contains(&path)
+						self.commit_view.commit_file_sel.contains(&path)
 					};
 				let id = format!("commit-file:{path}");
 				let (dir, name) = match path.rsplit_once('/') {
@@ -1237,6 +1251,7 @@ impl WorkbenchModel {
 				// A merge's file that the first parent has as well: it is
 				// listed only because another parent changed it (#188).
 				let same_first = self
+					.commit_view
 					.commit_files_first_parent_same
 					.as_ref()
 					.is_some_and(|(sha, set)| {
@@ -1430,10 +1445,16 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let row = self.commits.iter().find(|c| c.sha == sha);
 		let details = self
+			.commit_view
 			.commit_details
 			.as_ref()
 			.filter(|d| d.sha == sha)
-			.or_else(|| self.selection_details.iter().find(|d| d.sha == sha));
+			.or_else(|| {
+				self.commit_view
+					.selection_details
+					.iter()
+					.find(|d| d.sha == sha)
+			});
 		let message = details
 			.map(|d| d.message.clone())
 			.or_else(|| row.map(|c| c.subject.clone()))
