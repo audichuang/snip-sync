@@ -460,3 +460,67 @@ fn every_family_with_state_has_an_invariant(cx: &mut TestAppContext) {
 	names.dedup();
 	assert_eq!(names.len(), fields.len());
 }
+
+/// What a driver reads: a member that does not hold in a drawn frame is one
+/// `[APP:INVARIANT_BROKEN]` line, printed once while it stays broken and
+/// again when it comes back after holding. A window without probes (a
+/// normal launch) prints none, and never evaluates them.
+#[gpui::test]
+fn a_broken_invariant_is_logged_once_for_the_driver(cx: &mut TestAppContext) {
+	let ws = two_repos();
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| !m.commits.is_empty())
+	});
+	let broken_lines = |cx: &mut VisualTestContext| -> Vec<(String, String)> {
+		crate::test_log::take()
+			.iter()
+			.filter_map(|l| snip_native_e2e::parse_invariant_broken(l))
+			.collect()
+	};
+	let frame = |cx: &mut VisualTestContext| {
+		model.update(cx, |_, cx| cx.notify());
+		settle(cx);
+	};
+	let l4 = |m: &mut WorkbenchModel, on: bool| {
+		m.held_selection = None;
+		m.commit_view.commit_files.clear();
+		m.commit_view.commit_file_origin =
+			if on { vec![7] } else { Vec::new() };
+	};
+
+	// No probes: broken, drawn, and nothing printed.
+	let _ = crate::test_log::take();
+	model.update(cx, |m, _| l4(m, true));
+	frame(cx);
+	assert_eq!(broken_lines(cx), []);
+	model.update(cx, |m, _| l4(m, false));
+
+	// Probes on, as an E2E run has them.
+	model.update(cx, |m, cx| {
+		m.probes = Some(crate::ui::Probes::for_test());
+		cx.notify();
+	});
+	frame(cx);
+	let _ = crate::test_log::take();
+	model.update(cx, |m, _| l4(m, true));
+	frame(cx);
+	let lines = broken_lines(cx);
+	assert_eq!(lines.len(), 1, "{lines:?}");
+	assert_eq!(lines[0].0, "L4");
+	assert!(lines[0].1.contains("origin"), "{:?}", lines[0]);
+	// Still broken in the next frames: not printed again.
+	frame(cx);
+	frame(cx);
+	assert_eq!(broken_lines(cx), []);
+	// Repaired, then broken again: printed again.
+	model.update(cx, |m, _| l4(m, false));
+	frame(cx);
+	assert_eq!(broken_lines(cx), []);
+	model.update(cx, |m, _| l4(m, true));
+	frame(cx);
+	let lines = broken_lines(cx);
+	assert_eq!(lines.len(), 1, "{lines:?}");
+	assert_eq!(lines[0].0, "L4");
+}

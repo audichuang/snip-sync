@@ -36,6 +36,16 @@ pub(crate) fn covered(id: &str, by: &str) -> String {
 	format!("[APP:CTRL_COVERED: by={} id={id}]", encode_by(by))
 }
 
+/// `[APP:INVARIANT_BROKEN: detail=<detail, encoded> id=<label>]`: a member of
+/// `invariants` that does not hold in the frame just drawn. The detail is
+/// free text, so it is encoded like `by` and the label comes last.
+pub(crate) fn invariant_broken(label: &str, detail: &str) -> String {
+	format!(
+		"[APP:INVARIANT_BROKEN: detail={} id={label}]",
+		encode_by(detail)
+	)
+}
+
 fn encode_by(by: &str) -> String {
 	let mut out = String::with_capacity(by.len());
 	for c in by.chars() {
@@ -112,6 +122,14 @@ mod tests {
 					Some(id),
 					"{line}"
 				);
+				for detail in ODD {
+					let line = printed(tab, invariant_broken(id, detail));
+					assert_eq!(
+						e2e::parse_invariant_broken(&line),
+						Some((id.to_string(), detail.to_string())),
+						"{line}"
+					);
+				}
 				for by in ODD {
 					let line = printed(tab, covered(id, by));
 					assert_eq!(
