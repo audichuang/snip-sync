@@ -15721,6 +15721,35 @@ mod tests {
 			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app));
 		}
 
+		/// While a remap plans again the rows are gone; a folder cursor the
+		/// plan keeps for the next landing must not draw the old folder's
+		/// detail (title and all-zero counts) over an empty list.
+		#[gpui::test]
+		fn a_cleared_preview_draws_no_folder_detail(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, SRC_TREE);
+			click(cx, "paste-dir:0:src/app");
+			assert!(cx.debug_bounds("paste-dir-detail").is_some());
+
+			// A prefix this paste does not have: the remap is refused after
+			// the plan was cleared, and the empty plan stays on screen.
+			model.update(cx, |m, cx| {
+				m.rebuild_paste_plan("nope".into(), None, cx)
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items.is_empty());
+				assert!(plan.cursor_dir.is_some(), "kept for the landing");
+			});
+			assert!(cx.debug_bounds("paste-dir-detail").is_none());
+		}
+
 		/// Two commits that both touch `src/`: a fold of the folder under one
 		/// commit must not touch the other's.
 		fn shared_folder_commits_payload() -> String {

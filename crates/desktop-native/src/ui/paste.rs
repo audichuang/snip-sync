@@ -996,6 +996,7 @@ impl WorkbenchModel {
 				d.child(
 					div()
 						.id("paste-dir-detail")
+						.debug_selector(|| "paste-dir-detail".to_string())
 						.relative()
 						.flex()
 						.flex_row()
