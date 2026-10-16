@@ -1750,23 +1750,86 @@ fn a_snapshot_naming_a_folder_outside_the_workspace_is_a_bad_request() {
 	let (client, id) = open(&w, &ws);
 	let mapping = PasteMapping::default();
 	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
-	let mut expect = planned.expect();
-	expect
+	let elsewhere = tmp.path().join("elsewhere");
+
+	let mut missing = planned.expect();
+	missing
 		.freshness
 		.missing_dirs
 		.get_or_insert_default()
-		.insert(tmp.path().join("elsewhere"));
-	let code = refused(client.import_apply(
-		&id,
-		"",
-		&text,
-		&mapping,
-		&unchecked(&[]),
-		&expect,
-		None,
-	));
-	assert_eq!(code, ErrorCode::BadRequest);
-	assert!(!ws.join("a.txt").exists());
+		.insert(elsewhere.clone());
+	let mut linked = planned.expect();
+	linked
+		.freshness
+		.symlinked_dirs
+		.get_or_insert_default()
+		.insert(elsewhere.clone(), ws.clone());
+	for (what, expect) in
+		[("missing_dirs", missing), ("symlinked_dirs", linked)]
+	{
+		let code = refused(client.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&expect,
+			None,
+		));
+		assert_eq!(code, ErrorCode::BadRequest, "{what}");
+		assert!(!ws.join("a.txt").exists(), "{what}");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_repointed_after_a_remote_preview_is_stale_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("real1")).unwrap();
+	fs::create_dir_all(ws.join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", ws.join("link")).unwrap();
+	let text = [entry("link/a.txt", "a"), entry("keep.txt", "keep")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert_eq!(
+		planned
+			.expect()
+			.freshness
+			.symlinked_dirs
+			.as_ref()
+			.map(|m| m.len()),
+		Some(1)
+	);
+	fs::remove_file(ws.join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", ws.join("link")).unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker wrote through a symlink that points elsewhere");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert!(!ws.join("real2/a.txt").exists());
+	assert!(!ws.join("real1/a.txt").exists());
+	assert!(!ws.join("keep.txt").exists());
 }
 
 #[test]
@@ -1787,9 +1850,12 @@ fn an_older_masters_snapshot_without_the_new_fields_still_applies() {
 	let freshness = json["freshness"].as_object_mut().unwrap();
 	freshness.remove("repos");
 	freshness.remove("missing_dirs");
+	freshness.remove("symlinked_dirs");
 	let expect: snip_remote::proto::ImportExpect =
 		serde_json::from_value(json).unwrap();
 	assert!(expect.freshness.repos.is_none());
+	assert!(expect.freshness.missing_dirs.is_none());
+	assert!(expect.freshness.symlinked_dirs.is_none());
 	client
 		.import_apply(&id, "", &text, &mapping, &unchecked(&[]), &expect, None)
 		.unwrap();
