@@ -1848,7 +1848,7 @@ impl Render for WorkbenchModel {
 			}
 		};
 
-		div()
+		let frame = div()
 			.track_focus(&self.focus_handle)
 			.key_context("Workbench")
 			.on_action(cx.listener(|this, _: &Quit, _, cx| {
@@ -2096,7 +2096,13 @@ impl Render for WorkbenchModel {
 			.child(self.render_status(cx))
 			.children(self.render_toast())
 			.children(self.render_context_menu(cx))
-			.children(probe_frame_end(&self.probes))
+			.children(probe_frame_end(&self.probes));
+		// A driver's run reads the registry's verdict on every frame it
+		// draws; a normal launch never evaluates it.
+		if self.probes.is_some() {
+			self.log_broken_invariants(cx);
+		}
+		frame
 	}
 }
 

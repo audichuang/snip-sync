@@ -1085,6 +1085,10 @@ pub struct WorkbenchModel {
 	/// The current branch the branches pane drew its HEAD marker from this
 	/// frame; `None` when the pane was not drawn (B1 of `invariants`).
 	pub(crate) last_branch_current: std::cell::Cell<Option<Option<String>>>,
+	/// The `Always` members already reported by `[APP:INVARIANT_BROKEN]` and
+	/// still broken: each is printed once per breakage.
+	pub(crate) invariants_logged:
+		std::cell::RefCell<Vec<crate::invariants::Invariant>>,
 	/// Repo of the failed preview load when `preview_error` is Some.
 	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1591,6 +1595,7 @@ impl WorkbenchModel {
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
 			last_branch_current: std::cell::Cell::new(None),
+			invariants_logged: std::cell::RefCell::new(Vec::new()),
 			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),

@@ -305,6 +305,29 @@ pub(crate) fn assert_holds(m: &WorkbenchModel, cx: &App, ids: &[Invariant]) {
 	assert!(broken.is_empty(), "invariants broken: {broken:#?}");
 }
 
+impl WorkbenchModel {
+	/// Prints one `[APP:INVARIANT_BROKEN]` line for each `Always` member that
+	/// does not hold in the frame just drawn: once while it stays broken, and
+	/// again when it breaks anew. Called only with probes on (an E2E run).
+	pub(crate) fn log_broken_invariants(&self, cx: &App) {
+		let broken = check(self, cx, When::Always);
+		let mut logged = self.invariants_logged.borrow_mut();
+		logged.retain(|id| broken.iter().any(|v| v.id == *id));
+		for v in broken {
+			if !logged.contains(&v.id) {
+				logged.push(v.id);
+				app_log!(
+					"{}",
+					crate::ui::probe_line::invariant_broken(
+						&v.id.label(),
+						&v.detail
+					)
+				);
+			}
+		}
+	}
+}
+
 /// The roots a repo-keyed field may name: the workspace's repos, its folder
 /// and that folder's canonical path.
 fn known_root(m: &WorkbenchModel, root: &Path) -> bool {
@@ -947,6 +970,7 @@ pub(crate) fn classify(m: &WorkbenchModel) -> Vec<(&'static str, Family)> {
 		last_changes_empty: _,
 		last_log_empty: _,
 		last_branch_current: _,
+		invariants_logged: _,
 		preview_error_root: _,
 		log_repo_filter: _,
 		log_scope_key: _,
@@ -1128,6 +1152,7 @@ pub(crate) fn classify(m: &WorkbenchModel) -> Vec<(&'static str, Family)> {
 		("last_changes_empty", Family::Cache),
 		("last_log_empty", Family::Cache),
 		("last_branch_current", Family::Cache),
+		("invariants_logged", Family::Cache),
 		("preview_error_root", Family::Preview),
 		("log_repo_filter", Family::Source),
 		("log_scope_key", Family::LogScope),

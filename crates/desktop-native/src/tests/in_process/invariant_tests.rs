@@ -473,10 +473,12 @@ fn a_broken_invariant_is_logged_once_for_the_driver(cx: &mut TestAppContext) {
 	settle_until(cx, "the Log", |cx| {
 		model.read_with(cx, |m, _| !m.commits.is_empty())
 	});
-	let broken_lines = |cx: &mut VisualTestContext| -> Vec<(String, String)> {
+	let broken_lines = || -> Vec<(String, String)> {
 		crate::test_log::take()
 			.iter()
 			.filter_map(|l| snip_native_e2e::parse_invariant_broken(l))
+			// The state also breaks L5 and L6: one member is read here.
+			.filter(|(id, _)| id == "L4")
 			.collect()
 	};
 	let frame = |cx: &mut VisualTestContext| {
@@ -494,7 +496,7 @@ fn a_broken_invariant_is_logged_once_for_the_driver(cx: &mut TestAppContext) {
 	let _ = crate::test_log::take();
 	model.update(cx, |m, _| l4(m, true));
 	frame(cx);
-	assert_eq!(broken_lines(cx), []);
+	assert_eq!(broken_lines(), []);
 	model.update(cx, |m, _| l4(m, false));
 
 	// Probes on, as an E2E run has them.
@@ -506,21 +508,21 @@ fn a_broken_invariant_is_logged_once_for_the_driver(cx: &mut TestAppContext) {
 	let _ = crate::test_log::take();
 	model.update(cx, |m, _| l4(m, true));
 	frame(cx);
-	let lines = broken_lines(cx);
+	let lines = broken_lines();
 	assert_eq!(lines.len(), 1, "{lines:?}");
 	assert_eq!(lines[0].0, "L4");
 	assert!(lines[0].1.contains("origin"), "{:?}", lines[0]);
 	// Still broken in the next frames: not printed again.
 	frame(cx);
 	frame(cx);
-	assert_eq!(broken_lines(cx), []);
+	assert_eq!(broken_lines(), []);
 	// Repaired, then broken again: printed again.
 	model.update(cx, |m, _| l4(m, false));
 	frame(cx);
-	assert_eq!(broken_lines(cx), []);
+	assert_eq!(broken_lines(), []);
 	model.update(cx, |m, _| l4(m, true));
 	frame(cx);
-	let lines = broken_lines(cx);
+	let lines = broken_lines();
 	assert_eq!(lines.len(), 1, "{lines:?}");
 	assert_eq!(lines[0].0, "L4");
 }
