@@ -1577,6 +1577,7 @@ impl Render for WorkbenchModel {
 		// are drawn, after this tab (and the tab bar above it) rendered.
 		self.publish_gate(window, cx);
 		// Triggers are written again as this frame draws them.
+		self.overlays.clear_trigger_slots();
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}

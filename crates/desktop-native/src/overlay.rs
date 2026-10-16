@@ -596,6 +596,14 @@ impl OverlayStack {
 	}
 
 	/// Every invariant that does not hold, with what is wrong.
+	///
+	/// Hand-over to #230's `check_invariants` (its §3.1 signature is
+	/// `(&self, WindowId, &TooltipGate, &dyn Fn(OverlayKind) -> bool)`; this
+	/// one reads the model and the app instead, so #230 adapts in place):
+	/// its O1 (two floating layers) cannot happen here, the type has one
+	/// floating slot, so it has no breaker; its O2 is `O6` below; its O3
+	/// (open layer iff its panel is drawn) is the test-side
+	/// `assert_overlay_panels_match`.
 	pub(crate) fn check_invariants(
 		m: &WorkbenchModel,
 		cx: &App,
@@ -855,6 +863,11 @@ impl WorkbenchModel {
 			// Already open: whoever asked takes the keyboard into it, and
 			// an inline layer opens over nothing floating, so a floating
 			// layer opened since goes.
+			self.overlays.pending_return = None;
+			if let Some(layer) = self.overlays.floating.take() {
+				self.teardown(layer, CloseWhy::Replaced);
+				cx.notify();
+			}
 			return;
 		}
 		if kind.is_floating() && !crate::tabs::is_shown(self.ws_tab) {

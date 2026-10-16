@@ -2834,8 +2834,11 @@ impl WorkbenchModel {
 		}
 		// A callback that lands in a background tab opens nothing: no field
 		// is drawn to take the keyboard when the tab is shown again.
-		self.overlays.set_workspace_picker(true);
-		self.pending_focus = Some(self.workspace_path_input.read(cx).handle());
+		if self.overlays.is_open(overlay::OverlayKind::WorkspaceMenu) {
+			self.overlays.set_workspace_picker(true);
+			self.pending_focus =
+				Some(self.workspace_path_input.read(cx).handle());
+		}
 		cx.notify();
 	}
 
@@ -24467,7 +24470,8 @@ mod tests {
 				let slot = model.read_with(cx, |m, _| {
 					m.overlays.trigger_slot(TriggerId::LogChip(LogMenu::Branch))
 				});
-				let at = slot.get().expect("the chip is drawn at 1080w").center();
+				let at =
+					slot.get().expect("the chip is drawn at 1080w").center();
 				cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
 				settle(cx);
 				assert!(
