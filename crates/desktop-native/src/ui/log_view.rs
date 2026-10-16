@@ -83,6 +83,7 @@ impl WorkbenchModel {
 		                   cx: &mut Context<Self>| {
 			div()
 				.id(id)
+				.debug_selector(|| id.into())
 				.relative()
 				.flex_shrink_0()
 				.size(px(20.))
@@ -146,6 +147,7 @@ impl WorkbenchModel {
 					.child(
 						div()
 							.id("log-search-input")
+							.debug_selector(|| "log-search-input".into())
 							.relative()
 							.flex_1()
 							.min_w_0()

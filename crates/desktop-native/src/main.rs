@@ -19157,6 +19157,141 @@ mod tests {
 			});
 		}
 
+		/// True when nothing of a Log selection's commit view is left.
+		fn commit_view_is_empty(m: &WorkbenchModel) -> bool {
+			m.commit_files.is_empty()
+				&& m.commit_file_origin.is_empty()
+				&& m.commit_file_gitlinks.is_empty()
+				&& !m.commit_files_truncated
+				&& m.commit_files_first_parent_same.is_none()
+				&& m.selected_commit_file.is_none()
+				&& m.commit_file_sel.is_empty()
+				&& m.commit_details.is_none()
+				&& m.selection_details.is_empty()
+				&& m.log_commit_root.is_none()
+		}
+
+		/// Every member of the commit view goes with the selection, whichever
+		/// path dropped it (#230). A multi-selection fills `commit_file_origin`;
+		/// a repository filter that hides it used to leave that behind.
+		#[gpui::test]
+		fn commit_view_resets_with_the_selection(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			for i in 0..3 {
+				fs::write(alpha.join(format!("a{i}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {i}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 5)
+			});
+			// Two rows of one repository: the merged log sorts by date, so
+			// rows 0 and 1 may belong to different repositories, and a
+			// toggle across them is refused.
+			let (i, j) = model.read_with(cx, |m, _| {
+				let rows = m.display_commits();
+				let feeds: Vec<_> = rows
+					.iter()
+					.map(|c| crate::multi_log::split_id(&c.sha).1)
+					.collect();
+				let i = 0;
+				let j = (1..feeds.len())
+					.find(|&j| feeds[j] == feeds[i])
+					.expect("two rows of one repository");
+				(i, j)
+			});
+			let at = |cx: &mut VisualTestContext,
+			          ix: usize,
+			          mods: gpui::Modifiers| {
+				cx.run_until_parked();
+				let id: &'static str =
+					Box::leak(format!("log-subject:{ix}").into_boxed_str());
+				let row = cx.debug_bounds(id).expect("a commit row");
+				cx.simulate_click(row.center(), mods);
+			};
+			at(cx, i, gpui::Modifiers::none());
+			settle_until(cx, "the first commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_files.is_empty()
+				})
+			});
+			at(cx, j, gpui::Modifiers::secondary_key());
+			settle_until(cx, "the multi-selection's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_file_origin.is_empty()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "a multi-selection");
+			});
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			settle_until(cx, "the selection to leave", |cx| {
+				model.read_with(cx, |m, _| {
+					m.selected_commit.is_none() && m.history_loaded
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.log_selected.is_empty(), "multi-selection kept");
+				assert!(commit_view_is_empty(m), "a commit view member stayed");
+			});
+		}
+
+		/// A search the Log cannot run hides the commits it replaced, so it
+		/// drops the selection too (#230): the right side must not show a
+		/// commit that is no longer listed.
+		#[gpui::test]
+		fn a_failed_log_reload_drops_the_selection_it_hid(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			for i in 0..3 {
+				fs::write(alpha.join(format!("a{i}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {i}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 4)
+			});
+			click(cx, "log-subject:0");
+			settle_until(cx, "the commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_files.is_empty()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_some(), "a commit is selected");
+			});
+
+			// An empty text does not reload; the unbalanced parenthesis then
+			// fails `git log --extended-regexp --grep=(` with status 128.
+			// (If a platform's regex accepts it, search `[` instead.)
+			click(cx, "btn-log-regex");
+			click(cx, "log-search-input");
+			cx.simulate_input("(");
+			cx.simulate_keystrokes("enter");
+			settle_until(cx, "the failed reload", |cx| {
+				model.read_with(cx, |m, _| m.history_error.is_some())
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.history_error.is_some(), "the search failed");
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.log_selected.is_empty(), "multi-selection kept");
+				assert!(commit_view_is_empty(m), "a commit view member stayed");
+				assert!(!commit_preview_shown(m), "stale commit diff kept");
+			});
+		}
+
 		/// A file preview still loading (a slow read) is not the Log's: the
 		/// repository chip must not discard it (#202).
 		#[gpui::test]
@@ -20275,6 +20410,85 @@ mod tests {
 				}
 				assert_eq!(count(&root, cx), 1, "B drains its own load first");
 				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				b_load.set(true);
+				wait(cx, "B closed", |cx| count(&root, cx) == 0);
+			}
+
+			/// A tab that waits for a held job before it closes still shows its
+			/// Log and still takes clicks. A click on a row starts nothing and
+			/// changes nothing: it must not leave a load flag no job will
+			/// ever clear (#230).
+			#[gpui::test]
+			fn a_log_click_during_a_drain_starts_nothing(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, b) = two_workspaces();
+				let beta = b.join("beta");
+				for i in 0..2 {
+					fs::write(beta.join(format!("b{i}.txt")), "x\n").unwrap();
+					git(&beta, &["add", "."]);
+					git(&beta, &["commit", "-q", "-m", &format!("beta {i}")]);
+				}
+				let (root, cx) = open_tabs(cx, FirstTab::Local(a), None);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "tab A loaded", |cx| workspace_ready(&ta, cx));
+				open_typed(&root, cx, &b);
+				wait(cx, "tab B opened", |cx| {
+					count(&root, cx) == 2 && {
+						let tb = tab(&root, cx, 1);
+						workspace_ready(&tb, cx)
+					}
+				});
+				let tb = tab(&root, cx, 1);
+
+				// A selection that already landed.
+				click_id(cx, "ws-tab:1".into());
+				wait(cx, "B's log", |cx| {
+					tb.read_with(cx, |m, _| m.display_commits().len() >= 3)
+				});
+				click_id(cx, "log-subject:0".into());
+				wait(cx, "B's selection", |cx| {
+					tb.read_with(cx, |m, _| {
+						m.selected_commit.is_some() && !m.preview_loading
+					})
+				});
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+
+				// A closes; B's own close waits for the held job.
+				click_id(cx, "ws-tab:0".into());
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "A closed", |cx| count(&root, cx) == 1);
+				cx.simulate_keystrokes("cmd-w");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert_eq!(count(&root, cx), 1, "B drains its own load first");
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+
+				let anchor = tb.read_with(cx, |m, _| m.selected_commit.clone());
+				let selected = tb.read_with(cx, |m, _| m.log_selected.clone());
+				let secondary = gpui::Modifiers::secondary_key();
+				let shift = gpui::Modifiers {
+					shift: true,
+					..Default::default()
+				};
+				for (row, mods) in
+					[(1, secondary), (2, shift), (1, gpui::Modifiers::none())]
+				{
+					cx.run_until_parked();
+					let id = sel(format!("log-subject:{row}"));
+					let bounds = cx.debug_bounds(id).expect("a commit row");
+					cx.simulate_click(bounds.center(), mods);
+					settle(cx);
+					tb.read_with(cx, |m, _| {
+						assert!(
+							!m.preview_loading,
+							"a click on {id} ({mods:?}) during a drain left a load flag"
+						);
+						assert_eq!(m.selected_commit, anchor, "{id} {mods:?}");
+						assert_eq!(m.log_selected, selected, "{id} {mods:?}");
+					});
+				}
 				b_load.set(true);
 				wait(cx, "B closed", |cx| count(&root, cx) == 0);
 			}
