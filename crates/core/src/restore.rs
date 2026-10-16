@@ -570,7 +570,7 @@ fn suggest_from_source_root(
 	probe: &dyn DirProbe,
 	source_root: &str,
 ) -> Option<RestoreBaseSuggestion> {
-	if rels.is_empty() || !is_folder_name(source_root) {
+	if rels.is_empty() {
 		return None;
 	}
 	let target_name = base_name_of(primary_root);
@@ -612,11 +612,14 @@ fn suggest_from_source_root(
 		);
 	}
 
-	// Copied with the repo as root, and that folder exists here.
-	if probe.is_dir(&format!(
-		"{}/{source_root}",
-		primary_root.trim_end_matches('/')
-	)) {
+	// Copied with the repo as root, and that folder exists here. Only a
+	// real folder name may become a prefix; the strip above reads the paths
+	// alone, as TS does, so it stands whatever the root says.
+	if is_folder_name(source_root)
+		&& probe.is_dir(&format!(
+			"{}/{source_root}",
+			primary_root.trim_end_matches('/')
+		)) {
 		if already_anchored {
 			return None;
 		}
@@ -1430,15 +1433,22 @@ mod tests {
 				"clipcode-root {root:?} must not produce a suggestion for one file"
 			);
 		}
-		// A strip would also be a suggestion about a folder that is not named.
+		// The strip reads the paths alone, as TS does: a degenerate root
+		// does not take it away.
 		let p = probe(&[], &[]);
-		assert!(suggest(
-			"/work/inv-svc-console",
-			&["inv-svc-console/src/a.ts", "inv-svc-console/lib/b.ts"],
-			&p,
-			Some(".."),
-		)
-		.is_none());
+		assert_eq!(
+			suggest(
+				"/work/inv-svc-console",
+				&["inv-svc-console/src/a.ts", "inv-svc-console/lib/b.ts"],
+				&p,
+				Some(".."),
+			)
+			.unwrap()
+			.base,
+			RestoreBase::Strip {
+				segment: "inv-svc-console".into()
+			}
+		);
 		// An ordinary name still works next to them.
 		let p = probe(&["/work/inv-svc-console"], &[REPO]);
 		assert_eq!(
