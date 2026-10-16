@@ -1062,12 +1062,12 @@ impl DestinationFreshnessSnapshot {
 		// preview did not show. This also guards a snapshot that carries no
 		// `missing_dirs`.
 		let mut checked = HashSet::new();
-		let mut chain_ok: HashSet<PathBuf> = HashSet::new();
+		let mut chain_ok: HashSet<(PathBuf, PathBuf)> = HashSet::new();
 		for (path, target) in &self.target_files {
 			let Some(parent) = path.parent() else {
 				continue;
 			};
-			if !checked.insert((parent, target.existed)) {
+			if !checked.insert((parent, target.existed, target.root.path())) {
 				continue;
 			}
 			if !target.existed {
@@ -1115,7 +1115,9 @@ impl DestinationFreshnessSnapshot {
 				.ancestors()
 				.take_while(|a| *a != boundary && a.starts_with(&boundary))
 			{
-				if chain_ok.contains(dir) {
+				// Verified up to this very boundary: the rest of the way
+				// is verified too. Another boundary may reach further.
+				if chain_ok.contains(&(dir.to_path_buf(), boundary.clone())) {
 					break;
 				}
 				let now = match fs::symlink_metadata(dir) {
@@ -1147,7 +1149,7 @@ impl DestinationFreshnessSnapshot {
 						&boundary, dir,
 					));
 				}
-				chain_ok.insert(dir.to_path_buf());
+				chain_ok.insert((dir.to_path_buf(), boundary.clone()));
 			}
 		}
 
@@ -1253,25 +1255,36 @@ fn not_a_directory() -> io::Error {
 	}
 }
 
-/// Where the folder chain above a planned target stops being looked at: its
-/// root. A delete records its own folder as its root, so for a target that
-/// sits directly in its recorded root the nearest destination root above that
-/// folder stands in.
+/// Where the folder chain above a planned target stops being looked at.
+///
+/// It is read off the target's lexical path, never off the canonical folder a
+/// delete records as its root: that folder is where the file really is, and a
+/// delete reached through a symlink would have the chain end at the symlink's
+/// destination, with the symlink itself left outside it. So the candidates
+/// are the recorded root (when the path sits below it) and the deepest
+/// destination root above the target's folder, and the shallower of the two
+/// wins. A target that sits directly in a root (or whose folder is its own
+/// recorded root, as a delete's is) goes up to the nearest destination root
+/// above it, so the folder itself is looked at.
 fn chain_boundary(
 	path: &Path,
 	target: &TargetFileFreshness,
 	roots: &HashMap<CanonicalRootId, RepoFreshness>,
 ) -> PathBuf {
 	let root = target.root.path();
-	let parent = path.parent();
-	if parent != Some(root) {
+	let Some(parent) = path.parent() else {
 		return root.to_path_buf();
-	}
-	roots
+	};
+	let above = roots
 		.keys()
 		.map(CanonicalRootId::path)
-		.filter(|r| *r != root && root.starts_with(r))
-		.max_by_key(|r| r.components().count())
+		.filter(|r| *r != parent && parent.starts_with(r))
+		.max_by_key(|r| r.components().count());
+	let recorded = parent.starts_with(root).then_some(root);
+	[recorded, above]
+		.into_iter()
+		.flatten()
+		.min_by_key(|r| r.components().count())
 		.unwrap_or(root)
 		.to_path_buf()
 }

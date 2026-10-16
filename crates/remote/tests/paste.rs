@@ -1832,6 +1832,75 @@ fn a_symlink_repointed_after_a_remote_preview_is_stale_on_a_worker() {
 	assert!(!ws.join("keep.txt").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_delete_through_a_symlink_repointed_after_a_remote_preview_is_stale_on_a_worker(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("real1")).unwrap();
+	fs::create_dir_all(ws.join("real2")).unwrap();
+	fs::write(ws.join("real1/a.txt"), "same\n").unwrap();
+	std::os::unix::fs::symlink("real1", ws.join("link")).unwrap();
+	let text = format!(
+		"// File: [DELETED] link/a.txt\n{}",
+		entry("keep.txt", "keep")
+	);
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert_eq!(
+		planned
+			.expect()
+			.freshness
+			.symlinked_dirs
+			.as_ref()
+			.map(|m| m.len()),
+		Some(1),
+		"a delete planned through a symlink records it"
+	);
+	// A look-alike behind the symlink's new target: same bytes, same mtime.
+	fs::write(ws.join("real2/a.txt"), "same\n").unwrap();
+	let mtime = fs::metadata(ws.join("real1/a.txt"))
+		.unwrap()
+		.modified()
+		.unwrap();
+	fs::File::options()
+		.write(true)
+		.open(ws.join("real2/a.txt"))
+		.unwrap()
+		.set_modified(mtime)
+		.unwrap();
+	fs::remove_file(ws.join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", ws.join("link")).unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker deleted through a symlink that points elsewhere");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert!(ws.join("real2/a.txt").exists());
+	assert!(ws.join("real1/a.txt").exists());
+	assert!(!ws.join("keep.txt").exists());
+}
+
 #[test]
 fn an_older_masters_snapshot_without_the_new_fields_still_applies() {
 	let _serial = serial();

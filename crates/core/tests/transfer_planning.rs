@@ -8030,6 +8030,151 @@ fn test_a_delete_whose_folder_became_a_symlink_after_preview_is_stale() {
 	assert!(!dst.exists("keep.txt"));
 }
 
+/// `dst/real1/<rel>` with a look-alike under `dst/real2/<rel>` (same bytes,
+/// same size, same mtime), and `dst/link` pointing at `real1`.
+#[cfg(unix)]
+fn delete_through_a_symlink_fixture(rel: &str) -> TestRepo {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write(&format!("real1/{rel}"), "same\n");
+	dst.commit("seed");
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+	dst
+}
+
+/// Points `dst/link` at `real2`, which holds a look-alike of `real1/<rel>`.
+#[cfg(unix)]
+fn repoint_link_to_a_look_alike(dst: &TestRepo, rel: &str) {
+	let original = dst.path().join("real1").join(rel);
+	let (dir, name) = match rel.rsplit_once('/') {
+		Some((d, n)) => (dst.path().join("real2").join(d), n),
+		None => (dst.path().join("real2"), rel),
+	};
+	write_like(&dir, name, "same\n", &original);
+	fs::remove_file(dst.path().join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", dst.path().join("link")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_through_a_symlink_repointed_after_preview_is_stale() {
+	let dst = delete_through_a_symlink_fixture("a.txt");
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] link/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	repoint_link_to_a_look_alike(&dst, "a.txt");
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert_eq!(dst.read("real2/a.txt"), "same\n");
+	assert_eq!(dst.read("real1/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_nested_delete_through_a_symlink_repointed_after_preview_is_stale() {
+	let dst = delete_through_a_symlink_fixture("sub/a.txt");
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] link/sub/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	repoint_link_to_a_look_alike(&dst, "sub/a.txt");
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert_eq!(dst.read("real2/sub/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_planned_through_a_symlink_records_the_symlink() {
+	let dst = delete_through_a_symlink_fixture("sub/a.txt");
+	let plan = plan_one(dst.path(), "// file: [DELETED] link/sub/a.txt\n");
+	let linked = plan
+		.destination_freshness()
+		.symlinked_dirs
+		.as_ref()
+		.expect("recorded");
+	assert_eq!(
+		linked.get(&dunce::canonicalize(dst.path()).unwrap().join("link")),
+		Some(&dunce::canonicalize(dst.path().join("real1")).unwrap()),
+		"{linked:?}"
+	);
+	assert_eq!(linked.len(), 1, "{linked:?}");
+}
+
+/// Targets under a nested destination root may carry different boundaries (a
+/// planner can hand a path inside the inner root to the outer one). A folder
+/// verified up to the inner boundary must not stand in for the folders
+/// between the inner and the outer one.
+#[cfg(unix)]
+#[test]
+fn test_a_folder_verified_to_a_deeper_boundary_does_not_hide_the_folders_above()
+{
+	let tmp = tempfile::tempdir().unwrap();
+	let outer = dunce::canonicalize(tmp.path()).unwrap().join("outer");
+	let inner = outer.join("inner");
+	for i in 0..40 {
+		fs::create_dir_all(inner.join(format!("x/d{i}"))).unwrap();
+	}
+	let outer_id = CanonicalRootId::new(&outer).unwrap();
+	let inner_id = CanonicalRootId::new(&inner).unwrap();
+
+	// Many targets bounded by the inner root, each verifying `inner/x`, and
+	// one in `inner/x` bounded by the outer root: unless the map yields that
+	// one first, it meets `inner/x` already verified.
+	let mut targets: Vec<(PathBuf, String)> = (0..40)
+		.map(|i| (inner.join(format!("x/d{i}/a.txt")), format!("x/d{i}/a.txt")))
+		.collect();
+	let far = inner.join("x/far.txt");
+	targets.push((far.clone(), "inner/x/far.txt".into()));
+	let mut snapshot = DestinationFreshnessSnapshot::capture_paths(
+		&[outer.clone(), inner.clone()],
+		&targets,
+	)
+	.unwrap();
+	snapshot.symlinked_dirs = Some(Default::default());
+	for (path, target) in snapshot.target_files.iter_mut() {
+		target.root = if *path == far {
+			outer_id.clone()
+		} else {
+			inner_id.clone()
+		};
+	}
+	snapshot.revalidate().unwrap();
+
+	// `outer/inner` becomes a symlink after the preview.
+	fs::rename(&inner, outer.join("inner_real")).unwrap();
+	std::os::unix::fs::symlink("inner_real", &inner).unwrap();
+	let err = snapshot.revalidate().unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created {
+			rel: "inner".into()
+		}
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_through_a_folder_that_was_a_symlink_at_preview_still_applies()
+{
+	let dst = delete_through_a_symlink_fixture("a.txt");
+	let plan = plan_one(dst.path(), "// file: [DELETED] link/a.txt\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.deleted_count, 1);
+	assert!(!dst.exists("real1/a.txt"));
+}
+
 #[cfg(unix)]
 #[test]
 fn test_an_overwrite_through_a_folder_that_was_a_symlink_at_preview_still_applies(
