@@ -727,12 +727,14 @@ fn all_parts(present: Vec<Part<LogCell>>) -> Vec<Part<LogCell>> {
 /// The graph gutter, author and date widths of every row of a list, decided
 /// once from the worst row of each kind. One order for every shortfall (ADR
 /// 0005): the date is whole before anything else (or the column is gone, on
-/// a list under about 250px); the subject gets its readable floor; a
-/// collapsed chip and the ref labels' floors come before the author column,
+/// a list under about 250px); the subject gets its readable floor; the ref
+/// labels' floors, then the collapsed chip, come before the author column,
 /// so the author goes first and then, when even the labels' floors do not
-/// fit, the labels are dropped as a group; then the labels grow, the subject
-/// to its comfortable width, the author, the date and the gutter, and the
-/// subject takes the rest.
+/// fit, the labels are dropped as a group. The collapsed chip only explains
+/// the `+` in the gutter, so it never costs a row its labels: it is the
+/// first of them to go. Then the labels grow, the subject to its comfortable
+/// width, the author, the date and the gutter, and the subject takes the
+/// rest.
 pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
 	let avail = i.list_w - ROW_PAD_R;
 	let date = Part::new(
@@ -809,8 +811,9 @@ pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
 
 /// How one row of a `list_w` wide list divides its width, in the list's
 /// columns. The columns come first, the same in every row; then the subject's
-/// floor, the collapsed chip, the ref labels (all or none), the shorter label
-/// whole before the longer, and the subject takes what is left. A list that
+/// floor, the ref labels (all or none), the collapsed chip (it gives way
+/// before the labels do), the shorter label whole before the longer, and the
+/// subject takes what is left. A list that
 /// had room for its worst row's floors has it for every row's.
 pub(super) fn fit_log_row(
 	list_w: f32,
@@ -3050,8 +3053,33 @@ mod row_fit_tests {
 		]
 	}
 
+	/// The collapsed chip of a merge row: none, English, and CJK at 1em (the
+	/// widest per character), so the chip's width differs by font.
+	fn collapsed_shapes() -> Vec<(&'static str, Option<f32>)> {
+		let w = |text: &str, wide: bool| {
+			natural_px(
+				FitRole::Collapsed,
+				text,
+				&measure(FitRole::Collapsed, wide),
+			)
+		};
+		vec![
+			("no chip", None),
+			("collapsed en", Some(w("+3 collapsed nodes", false))),
+			(
+				"collapsed cjk",
+				Some(w(
+					"+3 \u{500b}\u{5df2}\u{6536}\u{5408}\u{7bc0}\u{9ede}",
+					true,
+				)),
+			),
+		]
+	}
+
 	#[derive(Clone)]
 	struct Shape {
+		collapsed_label: &'static str,
+		collapsed: Option<f32>,
 		list_w: f32,
 		hash: bool,
 		label: &'static str,
@@ -3087,7 +3115,7 @@ mod row_fit_tests {
 			))
 			.max(bound_m(&format!("{}{ELLIPSIS}", "W".repeat(6))))
 				+ FIT_MARGIN,
-			collapsed: None,
+			collapsed: s.collapsed,
 			labels: s.labels.clone(),
 		};
 		let cols = fit_list(&input);
@@ -3107,7 +3135,7 @@ mod row_fit_tests {
 					0,
 					&subject_m,
 				),
-				collapsed: None,
+				collapsed: s.collapsed,
 				labels: s.labels.clone(),
 			},
 		);
@@ -3127,7 +3155,12 @@ mod row_fit_tests {
 						for gutter in [24., 40., 72., 392.] {
 							for author in [None, Some("t"), Some(CJK_AUTHOR)] {
 								for date_need in [110., 124.8] {
+									for (collapsed_label, collapsed) in
+										collapsed_shapes()
+									{
 									out.push(Shape {
+										collapsed_label,
+										collapsed,
 										list_w,
 										hash,
 										label,
@@ -3138,6 +3171,7 @@ mod row_fit_tests {
 										author,
 										date_need,
 									});
+									}
 								}
 							}
 						}
@@ -3150,8 +3184,15 @@ mod row_fit_tests {
 
 	fn tag(s: &Shape) -> String {
 		format!(
-			"list {} hash={} labels={} subject={:?} gutter={} author={:?} need={}",
-			s.list_w, s.hash, s.label, s.subject, s.gutter, s.author, s.date_need
+			"list {} hash={} labels={} chip={} subject={:?} gutter={} author={:?} need={}",
+			s.list_w,
+			s.hash,
+			s.label,
+			s.collapsed_label,
+			s.subject,
+			s.gutter,
+			s.author,
+			s.date_need
 		)
 	}
 
@@ -3265,6 +3306,16 @@ mod row_fit_tests {
 					bad.push(format!("{t}: author {w} under its floor"));
 				}
 			}
+			if let Some(natural) = s.collapsed {
+				if row.shown(LogCell::Collapsed)
+					&& (row.width(LogCell::Collapsed) - natural).abs() > 0.01
+				{
+					bad.push(format!(
+						"{t}: the collapsed chip is cut to {}",
+						row.width(LogCell::Collapsed)
+					));
+				}
+			}
 			let u = used(&row, &s.labels);
 			if u > s.list_w - ROW_PAD_R + 0.01 {
 				bad.push(format!("{t}: {u} wide in a {} row", s.list_w));
@@ -3330,7 +3381,7 @@ mod row_fit_tests {
 							0,
 							&subject_m,
 						),
-						collapsed: None,
+						collapsed: s.collapsed,
 						labels: other.clone(),
 					},
 				);
@@ -3348,7 +3399,8 @@ mod row_fit_tests {
 	}
 
 	/// P-3: from a 1080 window on (a 574px list), the labels are there,
-	/// hash column on or off.
+	/// hash column on or off, with or without a collapsed chip (the chip
+	/// gives way first).
 	#[test]
 	fn labels_stay_from_the_1080_list() {
 		let mut bad = Vec::new();

@@ -14251,7 +14251,26 @@ mod tests {
 			w: f32,
 			hash: bool,
 		) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
-			let (model, cx) = open_sized(cx, ws.to_path_buf(), None, w, 720.);
+			open_log_window_in(cx, ws, w, hash, false)
+				.expect("the Noop text system is always there")
+		}
+
+		/// Like `open_log_window`; with `real` the OS text system measures
+		/// (`None` where the platform has none).
+		fn open_log_window_in<'a>(
+			cx: &'a mut TestAppContext,
+			ws: &Path,
+			w: f32,
+			hash: bool,
+			real: bool,
+		) -> Option<(Entity<WorkbenchModel>, &'a mut VisualTestContext)> {
+			let (model, cx) = if real {
+				open_real_text(cx, ws.to_path_buf(), w, 720.)?
+			} else {
+				let (model, cx) =
+					open_sized(cx, ws.to_path_buf(), None, w, 720.);
+				(model, cx)
+			};
 			settle_until(cx, "the log rows", |cx| {
 				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
 			});
@@ -14263,7 +14282,7 @@ mod tests {
 			}
 			assert_eq!(model.read_with(cx, |m, _| m.log_show_hash), hash);
 			settle(cx);
-			(model, cx)
+			Some((model, cx))
 		}
 
 		/// A1, A2, A3, A5, A6 on the HEAD row at every window width and
@@ -14292,14 +14311,10 @@ mod tests {
 			);
 		}
 
-		/// A merge row collapsed to "N hidden": the subject keeps a readable
-		/// floor and the chip is whole.
-		#[gpui::test]
-		fn a_collapsed_merge_row_keeps_a_readable_subject(
-			cx: &mut TestAppContext,
-		) {
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "solo", &[]);
+		/// A merge of a three-commit side branch at HEAD, tagged and on
+		/// `origin/main`: collapsed, its row has the chip and two labels.
+		fn merge_with_labels(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
 			git(&r, &["checkout", "-q", "-b", "side"]);
 			for i in 0..3 {
 				fs::write(r.join(format!("s{i}.txt")), "s").unwrap();
@@ -14323,6 +14338,17 @@ mod tests {
 			);
 			git(&r, &["tag", "v0.3.0"]);
 			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+		}
+
+		/// A merge row collapsed to "N hidden": the subject keeps a readable
+		/// floor and the chip is whole (or, with the hash column on, gone:
+		/// the labels come before it).
+		#[gpui::test]
+		fn a_collapsed_merge_row_keeps_a_readable_subject(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			merge_with_labels(ws.path());
 			let mut bad = Vec::new();
 			for w in [1000., 1080., 1160.] {
 				for hash in [false, true] {
@@ -14339,6 +14365,9 @@ mod tests {
 					let collapsed =
 						seen_cell(&model, cx, 0, RowCell::Collapsed);
 					match collapsed {
+						// The chip is only an explanation: with the hash
+						// column on it gives way to the labels.
+						None if hash => {}
 						None => bad.push(format!(
 							"{w} hash={hash}: no collapsed chip"
 						)),
@@ -14358,6 +14387,168 @@ mod tests {
 				bad.len(),
 				bad.join("\n")
 			);
+		}
+
+		/// A collapsed merge row from a 1080 window on: the labels are always
+		/// there (the user's rule), the explanation chip is only drawn whole
+		/// or not at all, and it is what gives way when both do not fit
+		/// (ADR 0005). English and Chinese chips, Noop and real text widths.
+		#[gpui::test]
+		fn a_collapsed_merge_row_keeps_its_labels_over_the_chip(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::Locale;
+			let ws = tempfile::tempdir().unwrap();
+			merge_with_labels(ws.path());
+			let mut bad = Vec::new();
+			let mut chip_dropped = 0;
+			for real in [false, true] {
+				for loc in [Locale::ZhTw, Locale::En] {
+					for w in [1080., 1120., 1160.] {
+						for hash in [false, true] {
+							let Some((model, cx)) = open_log_window_in(
+								cx,
+								ws.path(),
+								w,
+								hash,
+								real,
+							) else {
+								continue;
+							};
+							model.update(cx, |m, cx| {
+								if m.locale != loc {
+									m.toggle_locale(cx);
+								}
+							});
+							let sha7 = model.read_with(cx, |m, _| {
+								m.display_commits()[0].sha[..7].to_string()
+							});
+							click_probed(
+								&model,
+								cx,
+								&format!("collapse:{sha7}"),
+							);
+							settle(cx);
+							assert_eq!(
+								model.read_with(cx, |m, _| m
+									.collapsed_merges
+									.len()),
+								1,
+								"the merge did not collapse"
+							);
+							let t =
+								format!("{w} hash={hash} real={real} {loc:?}");
+							match seen_cell(&model, cx, 0, RowCell::Collapsed) {
+								None => chip_dropped += 1,
+								Some(c) if c.visible < c.natural - 1. => {
+									bad.push(format!("{t}: chip cut {c:?}"))
+								}
+								Some(_) => {}
+							}
+							// A6: both labels of the HEAD row are there.
+							for v in row_policy_violations(&model, cx, 0, w) {
+								bad.push(format!("{t}: {v}"));
+							}
+						}
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+			assert!(
+				chip_dropped > 0,
+				"no cell made the chip give way, so nothing was tested"
+			);
+		}
+
+		/// On a list too narrow for the subject (it gets no width at all),
+		/// the subject's box takes no margin: the solver did not pay the
+		/// gap, so a margin would push the fixed columns after it out of the
+		/// row. The box starts where the gutter ends.
+		#[gpui::test]
+		fn a_subject_without_room_leaves_no_margin(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let mut unplaced = 0;
+			let mut bad = Vec::new();
+			for w in (440..=520).step_by(16).map(|w| w as f32) {
+				for hash in [false, true] {
+					let (model, cx) = open_log_window(cx, ws.path(), w, hash);
+					let Some(f) = row_text_fit(
+						&model,
+						cx,
+						0,
+						crate::ui::FitRole::Subject,
+					) else {
+						continue;
+					};
+					if f.fit != Some(0.) {
+						continue;
+					}
+					unplaced += 1;
+					let gutter = seen_cell(&model, cx, 0, RowCell::Gutter)
+						.expect("the gutter is drawn");
+					if (f.x - (gutter.x + gutter.w)).abs() > 0.5 {
+						bad.push(format!(
+							"{w} hash={hash}: the subject starts at {} but the gutter ends at {}",
+							f.x,
+							gutter.x + gutter.w
+						));
+					}
+				}
+			}
+			assert!(unplaced > 0, "no width left the subject without room");
+			assert!(bad.is_empty(), "{}", bad.join("\n"));
+		}
+
+		/// A window resized where the filter bar's chips do not move: their
+		/// container is held at the width of the "more" chip, so the bar's own
+		/// canvas sees the same width and asks for no redraw. The list and
+		/// the log panel have their own canvases for exactly this: without
+		/// them the rows would keep the old width's columns until some
+		/// input.
+		#[gpui::test]
+		fn log_rows_follow_a_resize_the_filter_bar_does_not_see(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			for (from, to) in [(640., 740.), (760., 640.)] {
+				for hash in [false, true] {
+					let (model, rcx) =
+						open_log_window(cx, ws.path(), from, hash);
+					let chips = |m: &WorkbenchModel| {
+						(
+							m.log_filter_layout.container_w.get(),
+							m.log_filter_layout.last_mask.get(),
+						)
+					};
+					let before = model.read_with(rcx, |m, _| chips(m));
+					rcx.simulate_resize(gpui::size(
+						gpui::px(to),
+						gpui::px(720.),
+					));
+					settle(rcx);
+					let after = model.read_with(rcx, |m, _| chips(m));
+					assert_eq!(
+						before, after,
+						"the filter bar's chips moved: this resize is one it would have redrawn for"
+					);
+					let shape = log_row_shape(&model, rcx, 0);
+					let (fresh_model, fcx) =
+						open_log_window(cx, ws.path(), to, hash);
+					let fresh = log_row_shape(&fresh_model, fcx, 0);
+					assert_same_shape(
+						&format!("{from} -> {to} hash={hash}"),
+						&shape,
+						&fresh,
+					);
+				}
+			}
 		}
 
 		/// The `log_row_shape` of the HEAD row after `from` -> `to` resize with no
@@ -14412,9 +14603,11 @@ mod tests {
 
 		/// A window widened from 1080 to 1600 draws its rows as a fresh
 		/// 1600 window does, with no input in between. No filter chip is
-		/// active, so the bar's split stays and its redraws are not what
-		/// settles the rows: once the frames settle, it has none left to ask
-		/// for (`refresh_count` is back to 0).
+		/// active, so the bar's split stays, and once the frames settle the
+		/// bar has no redraw left to ask for (`refresh_count` is back to 0).
+		/// The bar's container does move with this resize, so its canvas may
+		/// well be what redraws the list here: the list's own canvas is
+		/// pinned by `log_rows_follow_a_resize_the_filter_bar_does_not_see`.
 		#[gpui::test]
 		fn log_rows_follow_a_widening_without_input(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
