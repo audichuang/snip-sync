@@ -142,6 +142,21 @@ impl GitError {
 		}
 	}
 
+	/// The `Display` text without what git or the OS said: a failed run or
+	/// a failed cleanup keeps its fixed command label and loses its stderr
+	/// or message. What a worker sends where it withholds details.
+	pub fn withheld_text(&self) -> String {
+		match self {
+			Self::Failed { args, .. } => {
+				format!("git {args} failed (details withheld)")
+			}
+			Self::Cleanup { args, .. } => {
+				format!("cleaning up git {args} failed (details withheld)")
+			}
+			_ => self.to_string(),
+		}
+	}
+
 	/// Why this failed, as data for a front end to word. The `Display` text
 	/// stays the CLI's. An exhaustive match: a new variant must decide.
 	pub fn reason(&self) -> Reason {

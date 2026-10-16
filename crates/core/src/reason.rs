@@ -204,6 +204,16 @@ pub enum Reason {
 	SubmoduleUnreadable {
 		detail: String,
 	},
+	/// A front end's own summary row: `count` scan errors past the kept
+	/// ones were dropped. Never produced by a worker.
+	ScanErrorsOmitted {
+		count: u64,
+	},
+	/// A front end's own summary row: `count` depth-limited directories
+	/// past the kept ones were dropped. Never produced by a worker.
+	DepthLimitedOmitted {
+		count: u64,
+	},
 }
 
 /// An error row of a scan: the English `message` the CLI prints, and the
@@ -212,6 +222,10 @@ pub enum Reason {
 pub struct Failure {
 	pub message: String,
 	pub reason: Reason,
+	/// The text a worker may send in place of `message` when the reason
+	/// withholds what git or the OS said: `message` with that part cut
+	/// out. `None` where no such text was built.
+	pub withheld: Option<String>,
 }
 
 impl Failure {
@@ -219,6 +233,17 @@ impl Failure {
 		Self {
 			message: message.into(),
 			reason,
+			withheld: None,
+		}
+	}
+
+	/// A failed git call, `context` being what the row says before git's
+	/// own words (such as "repository identity: ").
+	pub fn git(context: &str, e: &crate::gitsrc::GitError) -> Self {
+		Self {
+			message: format!("{context}{e}"),
+			reason: e.reason(),
+			withheld: Some(format!("{context}{}", e.withheld_text())),
 		}
 	}
 
@@ -336,7 +361,9 @@ impl Reason {
 			| Self::NotEnoughCommits { .. }
 			| Self::NotCommitPayload
 			| Self::SubmoduleNotCheckedOut
-			| Self::SubmoduleUnreadable { .. } => Some(self.scrubbed()),
+			| Self::SubmoduleUnreadable { .. }
+			| Self::ScanErrorsOmitted { .. }
+			| Self::DepthLimitedOmitted { .. } => Some(self.scrubbed()),
 		}
 	}
 
@@ -445,7 +472,9 @@ impl Reason {
 			| Self::Discontinuous { .. }
 			| Self::NotEnoughCommits { .. }
 			| Self::NotCommitPayload
-			| Self::SubmoduleNotCheckedOut => self,
+			| Self::SubmoduleNotCheckedOut
+			| Self::ScanErrorsOmitted { .. }
+			| Self::DepthLimitedOmitted { .. } => self,
 		}
 	}
 }
@@ -502,6 +531,8 @@ mod tests {
 			Reason::Unverifiable { .. } => 39,
 			Reason::SubmoduleNotCheckedOut => 41,
 			Reason::SubmoduleUnreadable { .. } => 42,
+			Reason::ScanErrorsOmitted { .. } => 43,
+			Reason::DepthLimitedOmitted { .. } => 44,
 		}
 	}
 
@@ -585,6 +616,8 @@ mod tests {
 			Reason::Unverifiable { path: s() },
 			Reason::SubmoduleNotCheckedOut,
 			Reason::SubmoduleUnreadable { detail: s() },
+			Reason::ScanErrorsOmitted { count: 3 },
+			Reason::DepthLimitedOmitted { count: 5 },
 		];
 		// A second sample for the variants whose nested type has its own
 		// shapes.

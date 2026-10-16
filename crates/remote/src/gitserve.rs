@@ -27,14 +27,75 @@ pub(crate) static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
 /// withheld by the row's reason, never by looking for words in its text.
 /// The text is the old masters' and the CLI's; the reason, emptied of every
 /// path and detail, is what a new master words.
+///
+/// An exhaustive match: a reason that can carry git's or the OS's own words
+/// must be listed under `Withhold` to send only the producer's withheld
+/// text, so a new variant does not compile until it is decided.
 fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
-	let text = match failure.reason {
-		Reason::GitFailed { .. } => "git failed (details withheld)".to_string(),
+	enum Policy {
+		/// The producer's fixed text (command label and context), never
+		/// the message; `fallback` where it built none.
+		Withhold(&'static str),
+		/// The message, with the share's path scrubbed out.
+		Scrub,
+	}
+	let policy = match &failure.reason {
+		Reason::GitFailed { .. } => Policy::Withhold("git failed"),
 		// The text of an invariant break may be git's own output.
-		Reason::Internal { .. } => {
-			"unexpected git failure (details withheld)".to_string()
-		}
-		_ => scrub(&failure.message, share),
+		Reason::Internal { .. } => Policy::Withhold("unexpected git failure"),
+		Reason::Refused { .. }
+		| Reason::Start { .. }
+		| Reason::Disconnected { .. }
+		| Reason::Protocol
+		| Reason::WorkerTooOld { .. }
+		| Reason::TimedOut
+		| Reason::Cancelled
+		| Reason::GitMissing
+		| Reason::GitBusy
+		| Reason::RepoBusy
+		| Reason::WorkerNeedsRestart
+		| Reason::TooLarge
+		| Reason::PatchTooLarge
+		| Reason::VerifyLimit
+		| Reason::NotARepository { .. }
+		| Reason::InsideParentRepo { .. }
+		| Reason::InvalidRevision { .. }
+		| Reason::Shallow { .. }
+		| Reason::OutsideShare
+		| Reason::Io { .. }
+		| Reason::NotFound { .. }
+		| Reason::PermissionDenied { .. }
+		| Reason::EmptySelection
+		| Reason::UnsafePath { .. }
+		| Reason::NotRegularFile { .. }
+		| Reason::OutsideRoot { .. }
+		| Reason::Collision { .. }
+		| Reason::StagedAndWorking { .. }
+		| Reason::AmbiguousRoots { .. }
+		| Reason::PayloadTooLarge { .. }
+		| Reason::SourceChanged { .. }
+		| Reason::DestinationChanged { .. }
+		| Reason::CrossRepoCommits
+		| Reason::Discontinuous { .. }
+		| Reason::NotEnoughCommits { .. }
+		| Reason::NotCommitPayload
+		| Reason::InvalidPayload { .. }
+		| Reason::OutsideScope { .. }
+		| Reason::Unverifiable { .. }
+		| Reason::SubmoduleNotCheckedOut
+		| Reason::SubmoduleUnreadable { .. }
+		| Reason::ScanErrorsOmitted { .. }
+		| Reason::DepthLimitedOmitted { .. } => Policy::Scrub,
+	};
+	let text = match policy {
+		Policy::Withhold(fallback) => scrub(
+			&failure
+				.withheld
+				.clone()
+				.unwrap_or_else(|| format!("{fallback} (details withheld)")),
+			share,
+		),
+		Policy::Scrub => scrub(&failure.message, share),
 	};
 	(text, failure.reason.clone().scrubbed())
 }
@@ -1000,21 +1061,71 @@ mod tests {
 	#[test]
 	fn sanitize_scan_error_withholds_failed_stderr() {
 		let share = Path::new("/var/workspace");
-		let failure = Failure::new(
-			"git status failed: fatal: not a git repository: /Volumes/My Drive/secret/.git",
-			Reason::GitFailed {
-				stderr: "fatal: /Volumes/My Drive/secret/.git".into(),
+		let secret =
+			"fatal: not a git repository: /Volumes/My Drive/secret/.git";
+		let failed = || GitError::Failed {
+			args: "status".into(),
+			stderr: secret.into(),
+			code: Some(128),
+		};
+		let gone = |f: &Failure| sanitize_scan_error(f, share);
+		let git_failed = Reason::GitFailed {
+			stderr: String::new(),
+		};
+		// The words the CLI and old masters saw, label and context kept.
+		for (context, text) in [
+			("", "git status failed (details withheld)"),
+			(
+				"repository identity: ",
+				"repository identity: git status failed (details withheld)",
+			),
+			(
+				"submodules: ",
+				"submodules: git status failed (details withheld)",
+			),
+		] {
+			let f = Failure::git(context, &failed());
+			assert!(f.message.contains(secret), "the CLI keeps git's words");
+			assert_eq!(
+				gone(&f),
+				(text.to_string(), git_failed.clone()),
+				"context {context:?}"
+			);
+		}
+		// A cleanup failure keeps its label and loses its message.
+		let cleanup = Failure::git(
+			"",
+			&GitError::Cleanup {
+				args: "log".into(),
+				message: "/Volumes/secret".into(),
 			},
 		);
 		assert_eq!(
-			sanitize_scan_error(&failure, share),
-			(
-				"git failed (details withheld)".to_string(),
-				Reason::GitFailed {
-					stderr: String::new()
-				}
-			)
+			gone(&cleanup).0,
+			"cleaning up git log failed (details withheld)"
 		);
+		// The other invariant breaks keep their fixed text.
+		let held =
+			Failure::git("", &GitError::OutputHeldOpen { args: "log".into() });
+		assert_eq!(
+			gone(&held).0,
+			"git log exited but a detached process kept its output open"
+		);
+		// A row built without the producer's text never sends its message.
+		let bare = Failure::new(
+			secret,
+			Reason::GitFailed {
+				stderr: secret.into(),
+			},
+		);
+		assert_eq!(gone(&bare).0, "git failed (details withheld)");
+		let bare = Failure::new(
+			secret,
+			Reason::Internal {
+				detail: secret.into(),
+			},
+		);
+		assert_eq!(gone(&bare).0, "unexpected git failure (details withheld)");
 		// The row is withheld by its reason: the same words under another
 		// reason are only scrubbed.
 		let other = Failure::new(
@@ -1024,7 +1135,7 @@ mod tests {
 			},
 		);
 		assert_eq!(
-			sanitize_scan_error(&other, share),
+			gone(&other),
 			(
 				"git status failed: x".to_string(),
 				Reason::Io {

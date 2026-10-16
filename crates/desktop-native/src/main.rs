@@ -3292,10 +3292,35 @@ impl WorkbenchModel {
 
 	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
 		self.is_loading = false;
-		// The errors past the kept ones stay counted in
-		// `discovery_error_overflow` (and the directories past the depth
-		// limit in `discovery_depth_overflow`) until the next scan: they
-		// are numbers, not error rows with a reason of their own.
+		// The rows past the kept ones become one row each, typed by what
+		// they stand for: they are shown (the scan-error count, the retry
+		// button, the empty states) as they always were.
+		if self.discovery_error_overflow > 0 {
+			let count = self.discovery_error_overflow;
+			self.discovery_errors.push((
+				self.workspace_root.clone(),
+				Failure::new(
+					format!("{count} more discovery errors omitted"),
+					Reason::ScanErrorsOmitted {
+						count: count as u64,
+					},
+				),
+			));
+			self.discovery_error_overflow = 0;
+		}
+		if self.discovery_depth_overflow > 0 {
+			let count = self.discovery_depth_overflow;
+			self.discovery_errors.push((
+				self.workspace_root.clone(),
+				Failure::new(
+					format!("{count} more depth-limited directories omitted"),
+					Reason::DepthLimitedOmitted {
+						count: count as u64,
+					},
+				),
+			));
+			self.discovery_depth_overflow = 0;
+		}
 		self.place_selection(cx);
 		self.ensure_ws_tree(cx);
 		// Only a complete walk proves the kept repo is gone; a capped or
@@ -3360,7 +3385,7 @@ impl WorkbenchModel {
 
 	fn install_added_repo(
 		&mut self,
-		outcome: Result<RepoEntry, Failure>,
+		outcome: Result<RepoEntry, Box<Failure>>,
 		cx: &mut Context<Self>,
 	) {
 		let entry = match outcome {
@@ -5955,12 +5980,13 @@ pub(crate) fn test_failure(text: &str) -> Failure {
 fn resolve_added_repo(
 	path: PathBuf,
 	cancel: &CancelToken,
-) -> Result<RepoEntry, Failure> {
+) -> Result<RepoEntry, Box<Failure>> {
 	if cancel.is_cancelled() {
-		return Err(Failure::new("cancelled", Reason::Cancelled));
+		return Err(Box::new(Failure::new("cancelled", Reason::Cancelled)));
 	}
-	let path = dunce::canonicalize(&path)
-		.map_err(|err| Failure::io(&err, &path.display().to_string()))?;
+	let path = dunce::canonicalize(&path).map_err(|err| {
+		Box::new(Failure::io(&err, &path.display().to_string()))
+	})?;
 	let opts = RunOptions {
 		cancel: Some(cancel.clone()),
 		..RunOptions::interactive(None)
@@ -16655,6 +16681,73 @@ mod tests {
 					"error_repo_status",
 					["read failed".to_string()]
 				)))
+			);
+		}
+
+		/// Scan notes past the kept ones are one typed row each, shown as
+		/// before: a workspace with only depth-limited directories past the
+		/// cap still counts a scan error, offers the retry and says so in
+		/// the Changes empty state.
+		#[gpui::test]
+		fn finish_discovery_turns_overflow_counts_into_typed_rows(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::reason::Reason;
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, cx| {
+				m.repos.clear();
+				m.discovery_errors.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.discovery_depth_overflow = 3;
+				m.finish_discovery(cx);
+			});
+			let (rows, error_overflow, depth_overflow) =
+				model.read_with(cx, |m, _| {
+					(
+						m.discovery_errors
+							.iter()
+							.map(|(_, f)| (f.message.clone(), f.reason.clone()))
+							.collect::<Vec<_>>(),
+						m.discovery_error_overflow,
+						m.discovery_depth_overflow,
+					)
+				});
+			assert_eq!(
+				rows,
+				vec![(
+					"3 more depth-limited directories omitted".to_string(),
+					Reason::DepthLimitedOmitted { count: 3 }
+				)]
+			);
+			assert_eq!((error_overflow, depth_overflow), (0, 0));
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::new(
+					"error_repo_status",
+					["3 more depth-limited directories omitted".to_string()]
+				)))
+			);
+
+			model.update(cx, |m, cx| {
+				m.discovery_errors.clear();
+				m.discovery_error_overflow = 2;
+				m.discovery_depth_overflow = 1;
+				m.finish_discovery(cx);
+			});
+			let reasons = model.read_with(cx, |m, _| {
+				m.discovery_errors
+					.iter()
+					.map(|(_, f)| f.reason.clone())
+					.collect::<Vec<_>>()
+			});
+			assert_eq!(
+				reasons,
+				vec![
+					Reason::ScanErrorsOmitted { count: 2 },
+					Reason::DepthLimitedOmitted { count: 1 }
+				]
 			);
 		}
 

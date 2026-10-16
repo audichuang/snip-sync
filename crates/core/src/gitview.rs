@@ -111,7 +111,7 @@ pub enum FoundKind {
 /// An error row of a git read: the text the CLI prints and the reason a
 /// front end words.
 fn git_failure(e: &GitError) -> Failure {
-	Failure::new(e.to_string(), e.reason())
+	Failure::git("", e)
 }
 
 /// One repository a workspace scan found; a failed read stays an error row.
@@ -738,9 +738,9 @@ pub fn identify_repos_stopped(
 								name,
 								kind: FoundKind::Main,
 								identity: None,
-								summary: Err(Failure::new(
-									format!("repository identity: {err}"),
-									err.reason(),
+								summary: Err(Failure::git(
+									"repository identity: ",
+									&err,
 								)),
 							});
 						}
@@ -797,10 +797,7 @@ pub fn identify_repos_stopped(
 		let submodules = match declared_submodules(&git, opts) {
 			Ok(submodules) => submodules,
 			Err(err) => {
-				errors.push((
-					root,
-					Failure::new(format!("submodules: {err}"), err.reason()),
-				));
+				errors.push((root, Failure::git("submodules: ", &err)));
 				Vec::new()
 			}
 		};
@@ -912,10 +909,7 @@ pub fn identify_repo(
 						root,
 						FoundKind::Main,
 						None,
-						Err(Failure::new(
-							format!("repository identity: {err}"),
-							err.reason(),
-						)),
+						Err(Failure::git("repository identity: ", &err)),
 					),
 				}
 			}
