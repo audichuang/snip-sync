@@ -101,18 +101,25 @@ impl FolderId {
 	}
 
 	fn child(&self, name: &OsStr) -> Self {
-		let name = name.to_string_lossy();
 		let mut tail = self.tail.clone();
-		tail.push(if self.folds {
-			name.to_lowercase()
-		} else {
-			name.into_owned()
-		});
+		tail.push(name_key(&name.to_string_lossy(), self.folds));
 		Self {
 			anchor: self.anchor.clone(),
 			folds: self.folds,
 			tail,
 		}
+	}
+}
+
+/// The key a new name is told by below an existing folder: two names with
+/// one key are one folder or file. `folds` is whether that folder's
+/// filesystem folds case. Every identity in this module (and so every
+/// [`FolderId`] and [`TargetId`]) takes its names from here only.
+pub(crate) fn name_key(name: &str, folds: bool) -> String {
+	if folds {
+		name.to_lowercase()
+	} else {
+		name.to_string()
 	}
 }
 
@@ -500,6 +507,59 @@ mod tests {
 
 	fn tail(names: &[&str]) -> Vec<String> {
 		names.iter().map(|n| (*n).to_string()).collect()
+	}
+
+	/// One name in Unicode's two forms (`é` composed, and `e` with a
+	/// combining accent) is one name: macOS stores and looks up either as
+	/// the same folder. On every filesystem, folding or not, so a folder the
+	/// user named is never taken for another one.
+	#[test]
+	fn name_key_merges_the_composed_and_decomposed_forms() {
+		for folds in [true, false] {
+			assert_eq!(
+				name_key("\u{e9}", folds),
+				name_key("e\u{301}", folds),
+				"folds: {folds}"
+			);
+			assert_eq!(
+				name_key("caf\u{e9}/\u{c5}", folds),
+				name_key("cafe\u{301}/A\u{30a}", folds),
+				"folds: {folds}"
+			);
+		}
+	}
+
+	/// Case folds only where the filesystem does.
+	#[test]
+	fn name_key_folds_case_only_when_the_filesystem_does() {
+		assert_eq!(name_key("New", true), name_key("NEW", true));
+		assert_ne!(name_key("New", false), name_key("NEW", false));
+		// A decomposed capital is the composed small letter.
+		assert_eq!(name_key("E\u{301}", true), name_key("\u{e9}", true));
+		assert_ne!(name_key("E\u{301}", false), name_key("\u{e9}", false));
+	}
+
+	/// The final sigma is the small sigma once case folds, as APFS has it
+	/// (`to_lowercase` keeps the two apart), wherever it stands.
+	#[test]
+	fn name_key_folds_the_final_sigma_into_sigma() {
+		assert_eq!(name_key("\u{3c2}", true), name_key("\u{3c3}", true));
+		assert_eq!(name_key("\u{3c3}", true), name_key("\u{3a3}", true));
+		assert_eq!(
+			name_key("\u{3b1}\u{3c2}", true),
+			name_key("\u{391}\u{3a3}", true)
+		);
+		assert_ne!(name_key("\u{3c2}", false), name_key("\u{3c3}", false));
+	}
+
+	/// `ß` takes full case folding, `ss`: it merges with `ss` and `SS` (and
+	/// the capital `ẞ`). More than some filesystems merge, which only asks
+	/// once more or refuses one more pair; never less.
+	#[test]
+	fn name_key_folds_sharp_s_fully() {
+		assert_eq!(name_key("stra\u{df}e", true), name_key("STRASSE", true));
+		assert_eq!(name_key("\u{1e9e}", true), name_key("ss", true));
+		assert_ne!(name_key("\u{df}", false), name_key("ss", false));
 	}
 
 	/// Two folders under two existing folders are two folders, however the

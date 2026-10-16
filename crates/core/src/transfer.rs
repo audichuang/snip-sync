@@ -7186,3 +7186,171 @@ mod placed_consent_tests {
 		assert!(ws.join("new").is_dir());
 	}
 }
+
+/// One name spelled in Unicode's two forms (`é` composed, `e` with a
+/// combining accent) is one folder to macOS, and to the plan on every
+/// filesystem: a folder the user named is not made without consent, and
+/// two writes to it are refused, however the payload spells it.
+#[cfg(test)]
+mod unicode_name_tests {
+	use super::*;
+
+	const COMPOSED: &str = "\u{e9}";
+	const DECOMPOSED: &str = "e\u{301}";
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		let mut out: Vec<PathBuf> = fs::read_dir(dir)
+			.unwrap()
+			.map(|e| e.unwrap().path())
+			.collect();
+		out.sort();
+		out
+	}
+
+	/// The primary destination is the new folder `ws/é` (composed); `q`
+	/// is `ws` itself, and the payload reaches the same folder through
+	/// `q/é` decomposed.
+	fn plan_named_through_the_other_form(ws: &Path) -> TransferImportPlan {
+		let mut mapping = ImportMapping::with_primary(
+			PlacedRoot::resolve(None, &ws.join(COMPOSED)).unwrap(),
+		);
+		mapping.map_prefix("q", CanonicalRootId::new(ws).unwrap());
+		plan_import(
+			&format!("// file: q/{DECOMPOSED}/a.txt\nA\n"),
+			"",
+			&[ws.to_path_buf()],
+			&mapping,
+		)
+		.unwrap()
+	}
+
+	/// Planning lists the folder as named, and Apply makes nothing without
+	/// consent.
+	#[test]
+	fn the_named_folder_reached_in_the_other_form_needs_consent() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_named_through_the_other_form(&ws);
+		assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs.len(), 1, "{dirs:?}");
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// A plan that lists nothing as named, its create spelled decomposed
+	/// under the composed placed tail (a peer's plan, `from_parts`): Apply
+	/// tells the two forms as one folder itself, and asks.
+	#[test]
+	fn apply_asks_for_the_named_folder_reached_in_the_other_form() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_named_through_the_other_form(&ws);
+		let mut freshness = plan.destination_freshness().clone();
+		freshness.requested_dirs = None;
+		let mut restore_plan = plan.restore_plan().clone();
+		let op = &mut restore_plan.create_operations[0];
+		op.absolute_path = ws.join(DECOMPOSED).join("a.txt");
+		op.relative_path = format!("{DECOMPOSED}/a.txt");
+		op.root_path.clone_from(&ws);
+		freshness.new_dirs = Some(PlannedNewDirs {
+			dirs: vec![ws.join(DECOMPOSED)],
+			needs: vec![vec![0]],
+		});
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			restore_plan,
+			freshness,
+		);
+		assert!(plan.new_dirs().requested.is_empty());
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs, vec![ws.join(COMPOSED)]);
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	fn two_forms_mapping(ws: &Path) -> ImportMapping {
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed(COMPOSED));
+		mapping.map_prefix("q", placed(DECOMPOSED));
+		mapping
+	}
+
+	fn agree_to_everything(ws: &Path) -> RestoreSelection {
+		RestoreSelection {
+			overwrite_existing: true,
+			confirmed_new_dirs: [
+				ws.join(COMPOSED),
+				ws.join(DECOMPOSED),
+				ws.join("other"),
+			]
+			.into(),
+			..Default::default()
+		}
+	}
+
+	/// Two routes to the two forms of one new folder, each writing `a.txt`:
+	/// one file written twice, refused by planning.
+	#[test]
+	fn two_routes_to_the_two_forms_of_one_folder_collide() {
+		let (_tmp, ws) = tmp();
+		let result = plan_import(
+			"// file: p/a.txt\nA\n// file: q/a.txt\nB\n",
+			"",
+			std::slice::from_ref(&ws),
+			&two_forms_mapping(&ws),
+		);
+		assert!(
+			matches!(result, Err(TransferError::TargetCollision { .. })),
+			"{result:?}"
+		);
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// The same two writes in a plan that did not come from planning here
+	/// (`from_parts`): Apply refuses them itself, before writing anything.
+	#[test]
+	fn apply_refuses_two_writes_to_the_two_forms_of_one_file() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_import(
+			"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+			"",
+			std::slice::from_ref(&ws),
+			&two_forms_mapping(&ws),
+		)
+		.unwrap();
+		let mut restore_plan = plan.restore_plan().clone();
+		for op in &mut restore_plan.create_operations {
+			let form = if op.content.starts_with('A') {
+				COMPOSED
+			} else {
+				DECOMPOSED
+			};
+			op.absolute_path = ws.join(form).join("a.txt");
+			op.relative_path = "a.txt".to_string();
+			op.root_path = ws.join(form);
+		}
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			restore_plan,
+			plan.destination_freshness().clone(),
+		);
+		match plan.apply(&agree_to_everything(&ws)) {
+			Err(TransferError::TargetCollision { .. }) => {}
+			other => panic!("expected TargetCollision, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+}
