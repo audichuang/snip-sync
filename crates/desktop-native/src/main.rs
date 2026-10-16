@@ -28802,6 +28802,45 @@ mod tests {
 				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
 			}
 
+			/// The typed field is an inline layer of the overlay stack
+			/// (#226): its field is drawn exactly while the layer is open,
+			/// it outlives no preview, and a new preview opens without it.
+			#[gpui::test]
+			fn the_typed_destination_is_an_inline_layer_that_ends_with_its_preview(
+				cx: &mut TestAppContext,
+			) {
+				use super::overlays::{
+					assert_overlay_panels_match, settle_checked,
+				};
+				use crate::overlay::OverlayKind;
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| m
+					.overlays
+					.is_open(OverlayKind::PasteDestField)));
+				assert_overlay_panels_match(cx, &model);
+				assert!(editor_focused(&model, cx));
+
+				// Cancel with the field open: the layer goes with the panel.
+				click_probed(&model, cx, "btn-cancel");
+				settle_checked(cx, &model);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(!editor_open(&model, cx));
+				assert_overlay_panels_match(cx, &model);
+
+				// The next preview starts on the folder, not in the field.
+				preview(&model, cx, "// FILE: y.txt\nY\n");
+				landed(&model, cx);
+				settle_checked(cx, &model);
+				assert!(!editor_open(&model, cx));
+				assert!(!probed(&model, cx, "paste-dest-input"));
+				assert!(paste_focused(&model, cx));
+				assert_overlay_panels_match(cx, &model);
+			}
+
 			/// Refused folders stay in the editor, and the open plan stays
 			/// ready for the folder it already had.
 			#[gpui::test]

@@ -21,7 +21,7 @@ _Avoid_: tab、分頁
 _Avoid_: popover、popup、dropdown（泛指時）、menu（單獨使用，易與右鍵選單混淆）
 
 **內嵌層**（inline layer）:
-屬於某個窗格的一塊介面：閱讀器的搜尋／跳行列、Project 窗格的加入 repo 輸入框。開浮層不會關它，分頁切走時它留著，它開著時 tooltip 照常顯示。
+屬於某個窗格的一塊介面：閱讀器的搜尋／跳行列、Project 窗格的加入 repo 輸入框、貼上預覽面板的目的資料夾輸入框。開浮層不會關它，分頁切走時它留著，它開著時 tooltip 照常顯示。
 _Avoid_: 工具列、bar（泛指時）
 
 **可辨識下限**（readable floor）:

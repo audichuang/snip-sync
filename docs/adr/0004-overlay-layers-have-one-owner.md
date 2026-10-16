@@ -1,6 +1,6 @@
 # 浮層與內嵌層只有一個擁有者
 
-桌面 App 的浮層（工作區選單、Log 下拉選單、repo／ref 選擇器、右鍵選單）與內嵌層（搜尋／跳行列、加入 repo 輸入框）的開關狀態，只存在 `overlay::OverlayStack`；它的欄位是私有的，唯一的入口是 `open_overlay`、`toggle_overlay`、`close_overlay`、`drop_overlays`。共用的規則寫在那一個模組，不再由每個開啟點、關閉點各自重複。
+桌面 App 的浮層（工作區選單、Log 下拉選單、repo／ref 選擇器、右鍵選單）與內嵌層（搜尋／跳行列、加入 repo 輸入框、貼上面板的目的資料夾輸入框）的開關狀態，只存在 `overlay::OverlayStack`；它的欄位是私有的，唯一的入口是 `open_overlay`、`toggle_overlay`、`close_overlay`、`drop_overlays`。共用的規則寫在那一個模組，不再由每個開啟點、關閉點各自重複。
 
 ## 規則
 
