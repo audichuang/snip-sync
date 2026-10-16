@@ -265,6 +265,7 @@ fn ready_marker(name: &str) {
 }
 
 mod dirtree;
+mod gen;
 mod githost;
 pub mod graph_view;
 mod history;
