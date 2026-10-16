@@ -116,6 +116,9 @@ struct State {
 	hello_hold: (Mutex<bool>, Condvar),
 	active_hellos: AtomicUsize,
 	max_hellos: AtomicUsize,
+	/// Faults a test injected ([`crate::fault`]); only read while `armed`.
+	faults: Mutex<crate::fault::FaultBook>,
+	armed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -154,6 +157,8 @@ impl Worker {
 				hello_hold: (Mutex::new(false), Condvar::new()),
 				active_hellos: AtomicUsize::new(0),
 				max_hellos: AtomicUsize::new(0),
+				faults: Mutex::default(),
+				armed: AtomicBool::new(false),
 			}),
 		}
 	}
@@ -209,6 +214,32 @@ impl Worker {
 	#[doc(hidden)]
 	pub fn prepared_cache_usage_for_tests(&self) -> (usize, usize) {
 		self.state.prepared.usage_for_tests()
+	}
+
+	/// Arms a fault for the requests `rule` names ([`crate::fault`]). For
+	/// tests: nothing else arms one.
+	#[doc(hidden)]
+	pub fn inject_fault_for_tests(&self, rule: crate::fault::FaultRule) {
+		lock(&self.state.faults).add(rule);
+		self.state.armed.store(true, Ordering::SeqCst);
+	}
+
+	/// Drops every injected fault and disarms the book.
+	#[doc(hidden)]
+	pub fn clear_faults_for_tests(&self) {
+		lock(&self.state.faults).clear();
+		self.state.armed.store(false, Ordering::SeqCst);
+	}
+
+	/// Requests of `kind` the dispatch has seen while a fault was armed
+	/// (counting starts at the first [`Self::inject_fault_for_tests`]). A
+	/// hello is answered before dispatch and is not counted.
+	#[doc(hidden)]
+	pub fn requests_seen_for_tests(
+		&self,
+		kind: crate::fault::RequestKind,
+	) -> usize {
+		lock(&self.state.faults).seen(kind)
 	}
 
 	#[doc(hidden)]
@@ -495,6 +526,12 @@ fn serve(
 				}
 			}
 		}
+		let fault = if state.armed.load(Ordering::SeqCst) {
+			lock(&state.faults).take(&request)
+		} else {
+			None
+		};
+		let mut answer = crate::jobs::Answer::new(&mut writer, fault);
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
@@ -513,28 +550,24 @@ fn serve(
 				match fault {
 					Some(Err(())) => return Ok(()),
 					Some(Ok(Some(code))) => {
-						crate::jobs::write_response(
-							&mut writer,
-							&error(code, "injected scan refusal".into()),
-						)?;
+						answer.reply(&error(
+							code,
+							"injected scan refusal".into(),
+						))?;
 						continue;
 					}
 					_ => {}
 				}
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut writer,
-						&error(
-							ErrorCode::Unsupported,
-							"Git views are not available on this worker yet"
-								.into(),
-						),
-					)?;
+					answer.reply(&error(
+						ErrorCode::Unsupported,
+						"Git views are not available on this worker yet".into(),
+					))?;
 				} else {
 					let (_, scan_deadline) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut writer,
+						&mut answer,
 						scan_deadline,
 						cancel,
 						|job_cancel, job_deadline| match state.jobs.admit(
@@ -575,26 +608,19 @@ fn serve(
 			} => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut writer,
-						&error(
-							ErrorCode::Unsupported,
-							"Git views are not available on this worker yet"
-								.into(),
-						),
-					)?;
+					answer.reply(&error(
+						ErrorCode::Unsupported,
+						"Git views are not available on this worker yet".into(),
+					))?;
 				} else if let Err(msg) =
 					crate::gitserve::validate(&repo, &query)
 				{
-					crate::jobs::write_response(
-						&mut writer,
-						&error(ErrorCode::BadRequest, msg),
-					)?;
+					answer.reply(&error(ErrorCode::BadRequest, msg))?;
 				} else {
 					let (view_deadline, _) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut writer,
+						&mut answer,
 						view_deadline,
 						cancel,
 						|job_cancel, _job_deadline| match state.jobs.admit(
@@ -638,7 +664,7 @@ fn serve(
 				file_limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -658,7 +684,7 @@ fn serve(
 				selected,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -679,7 +705,7 @@ fn serve(
 				file_limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -700,7 +726,7 @@ fn serve(
 				retain,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -727,7 +753,7 @@ fn serve(
 				expect,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -753,7 +779,7 @@ fn serve(
 				mapping,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -775,7 +801,7 @@ fn serve(
 				expect,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -795,7 +821,7 @@ fn serve(
 				limit,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -814,7 +840,7 @@ fn serve(
 				text,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -834,7 +860,7 @@ fn serve(
 				retain,
 			} => {
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -865,7 +891,7 @@ fn serve(
 					Job::PasteApply
 				};
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -897,7 +923,7 @@ fn serve(
 					Job::PasteApply
 				};
 				serve_copy(
-					&mut writer,
+					&mut answer,
 					state,
 					negotiated,
 					&workspace,
@@ -911,8 +937,11 @@ fn serve(
 				)?;
 			}
 			other => {
+				if let Some(d) = answer.work_delay() {
+					std::thread::sleep(d);
+				}
 				let response = state.handle(other);
-				crate::jobs::write_response(&mut writer, &response)?;
+				answer.reply(&response)?;
 			}
 		}
 	}
@@ -935,7 +964,7 @@ enum Job {
 /// old cannot even parse never reaches dispatch (the master gates on its
 /// `needs_version`), so this is the semantic gate beside it.
 fn serve_copy(
-	writer: &mut impl Write,
+	answer: &mut crate::jobs::Answer<'_, impl Write>,
 	state: &State,
 	negotiated: u32,
 	workspace: &str,
@@ -948,13 +977,10 @@ fn serve_copy(
 		Job::PastePlan | Job::PasteApply => "paste",
 	};
 	if negotiated < need {
-		return crate::jobs::write_response(
-			writer,
-			&error(
-				ErrorCode::Unsupported,
-				format!("{what} is not available on this worker yet"),
-			),
-		);
+		return answer.reply(&error(
+			ErrorCode::Unsupported,
+			format!("{what} is not available on this worker yet"),
+		));
 	}
 	let (view_deadline, _) = *lock(&state.deadlines);
 	let deadline = if job == Job::PasteApply {
@@ -971,7 +997,7 @@ fn serve_copy(
 		crate::jobs::DeadlineReply::Fail
 	};
 	crate::jobs::run_job_with(
-		writer,
+		answer,
 		crate::jobs::HEARTBEAT,
 		deadline,
 		cancel,

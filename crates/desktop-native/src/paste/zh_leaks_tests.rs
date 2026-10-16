@@ -16,7 +16,7 @@ use crate::PreviewErr;
 use snip_core::commits::CommitError;
 use snip_core::gitsrc::{Condition, GitError, StartReason};
 use snip_core::reason::{Reason, StaleChange};
-use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError};
+use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError, WaitEnd};
 use std::collections::BTreeSet;
 
 /// Data the test passes in: it is user or worker text, shown as it is.
@@ -202,6 +202,16 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 				silent: 1.0,
 				received: 2,
 				elapsed: 3.0,
+				ended: WaitEnd::Silence,
+			},
+		),
+		(
+			"Stalled(Deadline)".into(),
+			RemoteError::Stalled {
+				silent: 1.0,
+				received: 2,
+				elapsed: 3.0,
+				ended: WaitEnd::Deadline,
 			},
 		),
 		(

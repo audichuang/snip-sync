@@ -241,6 +241,55 @@ impl Jobs {
 	}
 }
 
+/// Where one request's answer goes. A heartbeat and the answer are separate
+/// calls: work runs under heartbeats, and a test fault ([`crate::fault`])
+/// acts on the answer alone, never cutting into a heartbeat (#191, #230).
+pub(crate) struct Answer<'w, W: Write> {
+	out: &'w mut W,
+	fault: Option<crate::fault::Fault>,
+}
+
+impl<'w, W: Write> Answer<'w, W> {
+	pub(crate) fn new(
+		out: &'w mut W,
+		fault: Option<crate::fault::Fault>,
+	) -> Self {
+		Self { out, fault }
+	}
+
+	/// One `Pending` frame, flushed.
+	pub(crate) fn heartbeat(&mut self) -> io::Result<()> {
+		write_response(self.out, &Response::Pending)
+	}
+
+	/// The request's whole answer (its chunks and `Joined` included),
+	/// flushed. Once per request.
+	pub(crate) fn reply(&mut self, response: &Response) -> io::Result<()> {
+		write_response(self.out, response)
+	}
+
+	/// Extra time the work behind this request takes: a `Fault::Delay`.
+	pub(crate) fn work_delay(&self) -> Option<Duration> {
+		// An irrefutable pattern: a new `Fault` stops this compiling until
+		// it decides what it means here.
+		self.fault
+			.as_ref()
+			.map(|crate::fault::Fault::Delay(d)| *d)
+	}
+}
+
+/// Sleeps `d` in slices, or until `cancel` fires.
+fn pause(d: Duration, cancel: &CancelToken) {
+	let end = Instant::now() + d;
+	loop {
+		let left = end.saturating_duration_since(Instant::now());
+		if left.is_zero() || cancel.is_cancelled() {
+			return;
+		}
+		std::thread::sleep(left.min(Duration::from_millis(20)));
+	}
+}
+
 pub(crate) fn write_response<W: Write>(
 	w: &mut W,
 	response: &Response,
@@ -317,7 +366,7 @@ pub(crate) fn write_response<W: Write>(
 /// (std::thread::scope), so the connection slot is never freed while the
 /// job still runs. Converts write_frame InvalidData into TooLarge like serve().
 pub(crate) fn run_job<W: Write>(
-	w: &mut W,
+	w: &mut Answer<'_, W>,
 	deadline: Duration,
 	cancel: CancelToken,
 	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
@@ -342,7 +391,7 @@ pub(crate) enum DeadlineReply {
 }
 
 pub(crate) fn run_job_with<W: Write>(
-	w: &mut W,
+	w: &mut Answer<'_, W>,
 	heartbeat: Duration,
 	deadline: Duration,
 	cancel: CancelToken,
@@ -353,10 +402,16 @@ pub(crate) fn run_job_with<W: Write>(
 	let start = Instant::now();
 	let deadline_instant = start + deadline;
 	let write = reply == DeadlineReply::WriteOutcome;
+	let delay = w.work_delay();
 
 	std::thread::scope(|s| {
 		let op_cancel = cancel.clone();
 		s.spawn(move || {
+			// A test's delay runs where the work does, under the heartbeats
+			// and inside the job's deadline.
+			if let Some(d) = delay {
+				pause(d, &op_cancel);
+			}
 			let res = op(&op_cancel, deadline_instant);
 			let _ = tx.send(res);
 		});
@@ -373,14 +428,14 @@ pub(crate) fn run_job_with<W: Write>(
 
 			match rx.recv_timeout(wait_time) {
 				Ok(response) => {
-					return write_response(w, &response);
+					return w.reply(&response);
 				}
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					if Instant::now() >= deadline_instant {
 						cancel.cancel();
 						return past_deadline_reply(w, &rx, heartbeat, write);
 					}
-					if let Err(err) = write_response(w, &Response::Pending) {
+					if let Err(err) = w.heartbeat() {
 						cancel.cancel();
 						let _ = rx.recv();
 						return Err(err);
@@ -400,31 +455,28 @@ pub(crate) fn run_job_with<W: Write>(
 /// discarded and Timeout answered; a write's own response follows, with
 /// Pending covering the silence while it finishes.
 fn past_deadline_reply<W: Write>(
-	w: &mut W,
+	w: &mut Answer<'_, W>,
 	rx: &std::sync::mpsc::Receiver<Response>,
 	heartbeat: Duration,
 	write: bool,
 ) -> io::Result<()> {
 	if !write {
 		let _ = rx.recv();
-		return write_response(
-			w,
-			&Response::Error {
-				code: ErrorCode::Timeout,
-				message: "the job timed out".into(),
-				patch: false,
-				reason: None,
-			},
-		);
+		return w.reply(&Response::Error {
+			code: ErrorCode::Timeout,
+			message: "the job timed out".into(),
+			patch: false,
+			reason: None,
+		});
 	}
 	loop {
 		match rx.recv_timeout(heartbeat) {
-			Ok(response) => return write_response(w, &response),
+			Ok(response) => return w.reply(&response),
 			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 				// The master waits longer than the job's deadline; these
 				// heartbeats keep its per-frame idle timeout from firing
 				// while the write finishes.
-				if let Err(err) = write_response(w, &Response::Pending) {
+				if let Err(err) = w.heartbeat() {
 					let _ = rx.recv();
 					return Err(err);
 				}
@@ -668,7 +720,7 @@ mod tests {
 		// fixed sleep a slow machine can outlast with one heartbeat.
 		let seen = buf.clone();
 		run_job_with(
-			&mut buf.clone(),
+			&mut Answer::new(&mut buf.clone(), None),
 			heartbeat,
 			deadline,
 			cancel,
@@ -733,7 +785,7 @@ mod tests {
 		let op_cancelled_clone = op_cancelled.clone();
 
 		let res = run_job_with(
-			&mut writer,
+			&mut Answer::new(&mut writer, None),
 			heartbeat,
 			deadline,
 			cancel,
@@ -767,7 +819,7 @@ mod tests {
 		let op_cancelled_clone = op_cancelled.clone();
 
 		run_job_with(
-			&mut buf,
+			&mut Answer::new(&mut buf, None),
 			heartbeat,
 			deadline,
 			cancel,
@@ -823,7 +875,7 @@ mod tests {
 		// not counted during a fixed sleep).
 		let written = buf.0.clone();
 		run_job_with(
-			&mut buf.clone(),
+			&mut Answer::new(&mut buf.clone(), None),
 			heartbeat,
 			deadline,
 			cancel,
@@ -883,7 +935,7 @@ mod tests {
 		let huge_string = "x".repeat(crate::proto::MAX_FRAME + 1024);
 
 		run_job_with(
-			&mut buf,
+			&mut Answer::new(&mut buf, None),
 			heartbeat,
 			deadline,
 			cancel,

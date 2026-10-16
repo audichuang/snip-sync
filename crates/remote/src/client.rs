@@ -33,7 +33,7 @@ use crate::proto::{
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
-use crate::{ConnectFailureKind, RemoteError, StartReason};
+use crate::{ConnectFailureKind, RemoteError, StartReason, WaitEnd};
 
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
@@ -739,6 +739,7 @@ impl FrameIo for Connection {
 						.received()
 						.saturating_sub(self.call_base),
 					elapsed: self.call_started.elapsed().as_secs_f64(),
+					ended: WaitEnd::Silence,
 				});
 			}
 		}
@@ -4994,6 +4995,7 @@ mod tests {
 			silent: 5.0,
 			received: 1,
 			elapsed: 6.0,
+			ended: WaitEnd::Silence,
 		};
 		assert!(error.is_transient_read_failure());
 		assert!(error.outcome_unknown());

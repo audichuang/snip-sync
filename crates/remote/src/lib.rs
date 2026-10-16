@@ -18,6 +18,8 @@ use serde::{de::DeserializeOwned, Serialize};
 pub mod client;
 pub(crate) mod codeless;
 pub(crate) mod copyserve;
+#[doc(hidden)]
+pub mod fault;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
@@ -55,6 +57,34 @@ pub enum ConnectFailureKind {
 
 pub use snip_core::gitsrc::StartReason;
 
+/// How a wait for a worker's answer ended ([`RemoteError::Stalled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEnd {
+	/// No byte arrived for longer than the call tolerates.
+	Silence,
+	/// The call's absolute time limit passed, bytes flowing or not.
+	Deadline,
+}
+
+fn stalled_text(
+	ended: WaitEnd,
+	silent: f64,
+	received: u64,
+	elapsed: f64,
+) -> String {
+	match ended {
+		WaitEnd::Silence => format!(
+			"the worker did not answer in time: no data for {silent:.1} s; \
+			 {received} bytes of its reply arrived in {elapsed:.1} s"
+		),
+		WaitEnd::Deadline => format!(
+			"the worker did not answer in time: the call's time limit passed \
+			 after {elapsed:.1} s; {received} bytes of its reply arrived, the \
+			 last {silent:.1} s ago"
+		),
+	}
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
 	#[error(transparent)]
@@ -91,12 +121,16 @@ pub enum RemoteError {
 	Cancelled,
 	#[error("the worker did not answer in time")]
 	TimedOut,
-	/// The stream went silent mid-call past the idle bound: no byte for `silent` s; `received` bytes of the answer arrived in `elapsed` s since the request.
-	#[error("the worker did not answer in time: no data for {silent:.1} s; {received} bytes of its reply arrived in {elapsed:.1} s")]
+	/// A call that had started to be answered ended unanswered: the stream
+	/// went silent past its bound, or the call's time limit passed ([`WaitEnd`]).
+	/// `received` bytes of the answer arrived in `elapsed` s since the request,
+	/// the last of them `silent` s ago.
+	#[error("{}", stalled_text(*ended, *silent, *received, *elapsed))]
 	Stalled {
 		silent: f64,
 		received: u64,
 		elapsed: f64,
+		ended: WaitEnd,
 	},
 	#[error(
 		"snip-sync on {worker} is too old for this (it speaks protocol {have}, this needs {need}); update it there"

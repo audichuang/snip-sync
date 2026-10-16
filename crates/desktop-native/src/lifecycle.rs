@@ -263,6 +263,27 @@ impl Lifecycle {
 			.count()
 	}
 
+	/// The kinds of the jobs that have not finished.
+	#[cfg(test)]
+	pub fn live_kinds(&self) -> Vec<JobKind> {
+		self.jobs
+			.iter()
+			.filter(|job| !job.finished.load(Ordering::SeqCst))
+			.map(|job| job.kind)
+			.collect()
+	}
+
+	/// Unfinished jobs a close can cancel: those holding a token.
+	#[cfg(test)]
+	pub fn live_jobs_with_cancel(&self) -> usize {
+		self.jobs
+			.iter()
+			.filter(|job| {
+				!job.finished.load(Ordering::SeqCst) && job.cancel.is_some()
+			})
+			.count()
+	}
+
 	pub fn request(&mut self, intent: Intent, now: Instant) -> Request {
 		if self.has_mutating() {
 			return Request::RefusedApplying;
