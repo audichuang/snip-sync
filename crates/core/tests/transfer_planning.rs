@@ -8610,9 +8610,9 @@ fn confirmed(
 	selection: RestoreSelection,
 ) -> RestoreSelection {
 	RestoreSelection {
-		confirmed_new_dirs: plan
+		confirmed_placed: plan
 			.new_dirs_for(&selection)
-			.requested
+			.placed
 			.into_iter()
 			.collect(),
 		..selection
@@ -8689,12 +8689,21 @@ fn test_a_plan_without_a_tail_records_no_requested_dirs() {
 	let plan = plan_placed(&ws, "// file: sub/a.txt\nA\n", &mapping);
 	let fresh = plan.destination_freshness();
 	assert!(fresh.requested_dirs.is_none());
-	assert!(fresh.placed_tails.is_none());
+	assert!(fresh.placed.is_none());
 	assert!(fresh.new_dirs.is_none());
 	let wire = serde_json::to_string(fresh).unwrap();
 	assert!(!wire.contains("requested_dirs"));
-	assert!(!wire.contains("placed_tails"));
+	assert!(!wire.contains("placed"));
+	assert!(!wire.contains("routes"));
 	assert!(!wire.contains("new_dirs"));
+	assert_eq!(plan.new_dirs().placed, Vec::<usize>::new());
+	// Nor does a selection that agrees to no folder.
+	let selection =
+		serde_json::to_string(&RestoreSelection::default()).unwrap();
+	assert_eq!(
+		selection,
+		r#"{"overwrite_existing":false,"skip_existing":false,"unchecked_creates":[],"unchecked_deletes":[]}"#
+	);
 	assert_eq!(plan.new_dirs().requested, Vec::<PathBuf>::new());
 	assert_eq!(plan.new_dirs().incidental, vec![ws.join("sub")]);
 }
@@ -8789,10 +8798,11 @@ fn test_a_named_folder_reached_through_another_spelling_of_its_anchor_is_asked_f
 	assert!(!root.join("Sub/new").exists());
 }
 
-/// The same two spellings with a payload for both routes, agreed to: the
-/// folder is one folder, asked for once, made once, and both files are
+/// The same two spellings with a payload for both routes, agreed to: both
+/// spellings are listed, the folder is made once, and both files are
 /// written. (The second route's `mkdir` once met the folder the first had
-/// just made, took it for someone else's, and took the paste back.)
+/// just made, took it for someone else's, and took the paste back; it is
+/// this Apply's own object now.)
 #[cfg(target_os = "macos")]
 #[test]
 fn test_a_named_folder_reached_through_two_spellings_is_made_once() {
@@ -8812,10 +8822,14 @@ fn test_a_named_folder_reached_through_two_spellings_is_made_once() {
 		&mapping,
 	);
 	let new = plan.new_dirs();
-	assert_eq!(new.requested.len(), 1, "{new:?}");
+	assert_eq!(
+		new.requested,
+		vec![root.join("Sub/new"), spelled.join("Sub/new")],
+		"{new:?}"
+	);
 	assert_eq!(new.incidental, Vec::<PathBuf>::new());
 	let agreed = RestoreSelection {
-		confirmed_new_dirs: new.requested.into_iter().collect(),
+		confirmed_placed: new.placed.into_iter().collect(),
 		..Default::default()
 	};
 	let result = plan.apply(&agreed).unwrap();
@@ -8924,7 +8938,7 @@ fn test_apply_with_consent_to_only_one_of_two_folders_makes_neither() {
 		plan_placed(&ws, "// file: x.txt\nX\n// file: p/y.txt\nY\n", &mapping);
 	assert_eq!(plan.new_dirs().requested.len(), 2);
 	let sel = RestoreSelection {
-		confirmed_new_dirs: [ws.join("new")].into(),
+		confirmed_placed: [0].into(),
 		..Default::default()
 	};
 	let err = plan.apply(&sel).unwrap_err();
@@ -8945,7 +8959,7 @@ fn test_apply_makes_only_the_folders_the_kept_rows_need() {
 	// Agree to both, drop the row for one: only the other is made.
 	let drop_p = RestoreSelection {
 		unchecked_creates: [create_index(&plan, "y.txt")].into(),
-		confirmed_new_dirs: plan.new_dirs().requested.into_iter().collect(),
+		confirmed_placed: plan.new_dirs().placed.into_iter().collect(),
 		..Default::default()
 	};
 	let result = plan.apply(&drop_p).unwrap();
@@ -8960,7 +8974,7 @@ fn test_apply_makes_only_the_folders_the_kept_rows_need() {
 	let plan = plan_placed(&ws, "// file: a.txt\nA\n", &mapping);
 	let none = RestoreSelection {
 		unchecked_creates: [0].into(),
-		confirmed_new_dirs: [ws.join("new")].into(),
+		confirmed_placed: [0].into(),
 		..Default::default()
 	};
 	let result = plan.apply(&none).unwrap();
@@ -9209,10 +9223,10 @@ fn two_spellings(
 	(mapping, "// file: p/a.txt\nA\n// file: q/b.txt\nB\n")
 }
 
-/// P3: two names for one folder, on a filesystem that folds case, are one
-/// folder to agree to and to make. Before, both were asked for and made, and
-/// the second `create_dir` met the first's folder: the apply failed as an
-/// outside change, and failed again every time.
+/// P3: two names for one folder, on a filesystem that folds case: both are
+/// listed and agreed to, and the folder is made once. Before, the second
+/// `create_dir` met the first's folder: the apply failed as an outside
+/// change, and failed again every time. It is this Apply's own object.
 #[test]
 fn test_two_spellings_of_one_new_folder_are_made_once_and_both_files_land() {
 	let (_tmp, ws) = canonical_tmp();
@@ -9220,24 +9234,21 @@ fn test_two_spellings_of_one_new_folder_are_made_once_and_both_files_land() {
 	let (mapping, text) = two_spellings(&ws, "new", "NEW");
 	let plan = plan_placed(&ws, text, &mapping);
 	let nd = plan.new_dirs();
-	if ci {
-		assert_eq!(nd.requested.len(), 1, "{nd:?}");
-	} else {
-		assert_eq!(nd.requested.len(), 2, "{nd:?}");
-	}
+	assert_eq!(nd.requested.len(), 2, "{nd:?}");
 	let sel = confirmed(&plan, RestoreSelection::default());
 	let result = plan.apply(&sel).unwrap();
 	assert!(result.errors.is_empty(), "{:?}", result.errors);
 	assert_eq!(result.created_count, 2);
-	assert_eq!(result.created_dirs, nd.requested.len());
+	assert_eq!(result.created_dirs, if ci { 1 } else { 2 });
 	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
 	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
 	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");
 }
 
-/// P3b: one identity for a new folder in what is agreed to, what is
-/// recorded as named and what is made: a folder a prefix names under another
-/// spelling, and a path that implies it, are the folder the first one named.
+/// P3b: a folder a prefix names under another spelling, and a path that
+/// implies it: the folders the user named are listed, the agreement is to
+/// the placed folders, and what is one folder is made once, as the
+/// filesystem says.
 #[test]
 fn test_one_identity_for_new_folders_in_consent_requested_and_mkdir() {
 	let (_tmp, ws) = canonical_tmp();
@@ -9252,26 +9263,16 @@ fn test_one_identity_for_new_folders_in_consent_requested_and_mkdir() {
 	let missing = fresh.missing_dirs.as_ref().unwrap();
 	let requested = fresh.requested_dirs.as_ref().unwrap();
 	assert!(requested.is_subset(missing));
-	if ci {
-		// One spelling of each folder, in the snapshot and in the view.
-		let keys: std::collections::HashSet<String> = missing
-			.iter()
-			.map(|p| p.to_string_lossy().to_lowercase())
-			.collect();
-		assert_eq!(keys.len(), missing.len(), "{missing:?}");
-		assert_eq!(
-			nd.requested,
-			vec![ws.join("new"), ws.join("new/sub"), ws.join("new/sub/deep")]
-		);
-		assert_eq!(nd.incidental, vec![ws.join("new/other")]);
+	for level in plan.placed_folders().iter().flatten() {
+		assert!(nd.requested.contains(level), "{level:?} in {nd:?}");
 	}
+	assert_eq!(nd.placed, vec![0, 1]);
 	let sel = confirmed(&plan, RestoreSelection::default());
 	let result = plan.apply(&sel).unwrap();
 	assert!(result.errors.is_empty(), "{:?}", result.errors);
 	assert_eq!(result.created_count, 4);
-	assert_eq!(result.created_dirs, nd.requested.len());
+	assert_eq!(result.created_dirs, if ci { 3 } else { 5 });
 	if ci {
-		assert_eq!(result.created_dirs, 3);
 		for rel in [
 			"new/sub/x.txt",
 			"new/sub/deep/y.txt",
@@ -9546,10 +9547,11 @@ const WINDOWS_WORKER_PLAN: &str = r#"{
 		"missing_dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
 		"symlinked_dirs": {},
 		"requested_dirs": ["C:\\ws\\new"],
-		"placed_tails": ["C:\\ws\\new"],
+		"placed": [["C:\\ws\\new"]],
 		"new_dirs": {
 			"dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
-			"needs": [[0, 1], [0]]
+			"needs": [[0, 1], [0]],
+			"routes": [0, 0]
 		}
 	}
 }"#;
@@ -9570,6 +9572,7 @@ fn test_a_windows_workers_new_folders_are_listed_on_any_master() {
 		snip_core::transfer::NewDirs {
 			requested: vec![new.clone()],
 			incidental: vec![sub.clone()],
+			placed: vec![0],
 		}
 	);
 	// Only `new/b.txt` kept: `sub` is not needed.
@@ -9582,11 +9585,12 @@ fn test_a_windows_workers_new_folders_are_listed_on_any_master() {
 		snip_core::transfer::NewDirs {
 			requested: vec![new.clone()],
 			incidental: Vec::new(),
+			placed: vec![0],
 		}
 	);
 	// What `snip paste --create-dirs` agrees to.
 	let agreed = confirmed(&plan, RestoreSelection::default());
-	assert_eq!(agreed.confirmed_new_dirs, [new].into());
+	assert_eq!(agreed.confirmed_placed, [0].into());
 	let none = RestoreSelection {
 		unchecked_creates: [0, 1].into(),
 		..Default::default()
@@ -9618,6 +9622,7 @@ fn test_new_folders_without_the_workers_list_follow_the_paths() {
 	let want = snip_core::transfer::NewDirs {
 		requested: vec![ws.join("new")],
 		incidental: vec![ws.join("new/sub")],
+		placed: vec![0],
 	};
 	assert_eq!(plan.new_dirs(), want);
 	assert_eq!(older.new_dirs(), want);

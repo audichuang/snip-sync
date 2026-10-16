@@ -1196,17 +1196,21 @@ fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
 		client.call_with(&req, None, Duration::from_secs(3))
 	});
 	// The worker's first write is on disk before the cut: the pause sits
-	// between the two files, not before the first.
+	// between the two files, not before the first. Both files are there
+	// from before the first write (made empty, `create_new`); only the
+	// first has its content.
+	let content = |name: &str| fs::read(ws.join(name)).unwrap_or_default();
 	let deadline = Instant::now() + Duration::from_secs(10);
-	while !ws.join("a.txt").exists() && Instant::now() < deadline {
+	while content("a.txt") != b"first" && Instant::now() < deadline {
 		std::thread::sleep(Duration::from_millis(10));
 	}
-	assert!(
-		ws.join("a.txt").exists(),
+	assert_eq!(
+		content("a.txt"),
+		b"first",
 		"the worker must commit its first write"
 	);
 	assert!(
-		!ws.join("b.txt").exists(),
+		content("b.txt").is_empty(),
 		"the hold sits between the two writes"
 	);
 
@@ -1227,11 +1231,12 @@ fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
 	);
 	// Lifted, the worker finishes the apply it already started.
 	let resume = Instant::now() + Duration::from_secs(10);
-	while !ws.join("b.txt").exists() && Instant::now() < resume {
+	while content("b.txt") != b"second" && Instant::now() < resume {
 		std::thread::sleep(Duration::from_millis(10));
 	}
-	assert!(
-		ws.join("b.txt").exists(),
+	assert_eq!(
+		content("b.txt"),
+		b"second",
 		"the worker finishes after the hold lifts"
 	);
 }
@@ -2242,9 +2247,9 @@ fn remote_target(client: Client, id: String, dest: &str) -> PasteTarget {
 
 fn confirm(plan: &FilePastePlan) -> RestoreSelection {
 	RestoreSelection {
-		confirmed_new_dirs: plan
+		confirmed_placed: plan
 			.new_dirs_for(&RestoreSelection::default())
-			.requested
+			.placed
 			.into_iter()
 			.collect(),
 		..Default::default()
@@ -2332,12 +2337,7 @@ fn a_worker_plans_a_missing_destination_and_makes_it_only_when_agreed() {
 	assert_eq!(refused(none), ErrorCode::BadRequest);
 	assert!(tree(&ws).is_empty());
 	let agreed = RestoreSelection {
-		confirmed_new_dirs: planned
-			.plan
-			.new_dirs()
-			.requested
-			.into_iter()
-			.collect(),
+		confirmed_placed: planned.plan.new_dirs().placed.into_iter().collect(),
 		..Default::default()
 	};
 	let result = client
@@ -2600,7 +2600,7 @@ fn consent_is_checked_against_the_rows_that_are_kept() {
 			.unwrap();
 		// Agreed to the destination only, the prefix row kept: refused.
 		let only_dest = RestoreSelection {
-			confirmed_new_dirs: [real.join("not")].into(),
+			confirmed_placed: [0].into(),
 			..Default::default()
 		};
 		not_confirmed(apply(&only_dest).unwrap_err(), 1);
@@ -2636,7 +2636,7 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 		.import_plan(&id, "not", &text, &mapping, None)
 		.unwrap();
 	let agreed = RestoreSelection {
-		confirmed_new_dirs: [real.join("not")].into(),
+		confirmed_placed: [0].into(),
 		..Default::default()
 	};
 	let send = |expect: &snip_remote::ImportExpect, sel: &RestoreSelection| {
@@ -2651,12 +2651,12 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 
 	// So is a placed tail outside it.
 	let mut forged = planned.expect();
-	forged.freshness.placed_tails = Some(vec![evil.join("x")]);
+	forged.freshness.placed = Some(vec![vec![evil.join("x")]]);
 	assert_eq!(refused(send(&forged, &agreed)), ErrorCode::BadRequest);
 
 	// A tail that is not the one the worker places again is stale.
 	let mut moved = planned.expect();
-	moved.freshness.placed_tails = Some(vec![real.join("other")]);
+	moved.freshness.placed = Some(vec![vec![real.join("other")]]);
 	assert_eq!(refused(send(&moved, &agreed)), ErrorCode::Stale);
 
 	// A shrunken list is not the plan the worker makes again.
@@ -2665,10 +2665,10 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 	assert_eq!(refused(send(&shrunk, &agreed)), ErrorCode::Stale);
 	assert!(tree(&ws).is_empty());
 
-	// An agreement naming a folder outside the workspace is only an
+	// An agreement naming a place the plan does not have is only an
 	// agreement: the worker makes what it plans, nothing the master names.
 	let wide = RestoreSelection {
-		confirmed_new_dirs: [real.join("not"), evil.clone()].into(),
+		confirmed_placed: [0, 7].into(),
 		..Default::default()
 	};
 	let result = send(&planned.expect(), &wide).unwrap();
@@ -2830,8 +2830,9 @@ fn a_worker_plans_a_missing_destination_without_touching_its_anchor() {
 	assert!(tree(&ws).is_empty());
 }
 
-/// R9: two spellings of one new folder are one folder on a worker too: it
-/// asks for it once, makes it once, and both files land.
+/// R9: two spellings of one new folder on a worker: both are listed and
+/// agreed to, the folder is made once (the second `mkdir` meets the
+/// worker's own folder), and both files land.
 #[test]
 fn a_worker_makes_one_folder_of_two_spellings_of_it() {
 	let _serial = serial();
@@ -2854,12 +2855,12 @@ fn a_worker_makes_one_folder_of_two_spellings_of_it() {
 		.plan_files(&text, &route, &RunOptions::default(), None)
 		.unwrap();
 	let asked = plan.new_dirs().requested;
-	assert_eq!(asked.len(), if ci { 1 } else { 2 }, "{asked:?}");
+	assert_eq!(asked.len(), 2, "{asked:?}");
 	let result = target
 		.apply_files(&text, &route, &plan, &confirm(&plan))
 		.unwrap();
 	assert_eq!(result.created_count, 2);
-	assert_eq!(result.created_dirs, asked.len());
+	assert_eq!(result.created_dirs, if ci { 1 } else { 2 });
 	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
 	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
 	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");

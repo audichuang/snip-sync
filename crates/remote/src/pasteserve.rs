@@ -196,7 +196,12 @@ fn check_snapshot(
 			.all(|(p, t)| inside(p) && inside(t.root.path()))
 		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p))
 		&& freshness.requested_dirs.iter().flatten().all(|p| inside(p))
-		&& freshness.placed_tails.iter().flatten().all(|p| inside(p))
+		&& freshness
+			.placed
+			.iter()
+			.flatten()
+			.flatten()
+			.all(|p| inside(p))
 		&& freshness
 			.new_dirs
 			.iter()

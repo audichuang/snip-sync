@@ -141,7 +141,7 @@ pub struct PasteRoute {
 	/// The settings' header format ("" is the default).
 	pub header_format: String,
 	/// Planning may accept a destination and prefix folders that do not
-	/// exist yet; Apply still needs `RestoreSelection::confirmed_new_dirs`
+	/// exist yet; Apply still needs `RestoreSelection::confirmed_placed`
 	/// for the ones the user named. False: both must exist, as before.
 	pub allow_new_dirs: bool,
 }
@@ -197,7 +197,8 @@ impl FilePastePlan {
 		self.plan.new_dirs()
 	}
 	/// The folders the creates `selection` keeps need. `requested` are the
-	/// ones the user must agree to (`RestoreSelection::confirmed_new_dirs`).
+	/// ones the user named; `placed` is what the agreement names
+	/// (`RestoreSelection::confirmed_placed`).
 	pub fn new_dirs_for(&self, selection: &RestoreSelection) -> NewDirs {
 		self.plan.new_dirs_for(selection)
 	}

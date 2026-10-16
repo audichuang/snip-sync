@@ -860,13 +860,11 @@ fn paste_files(
 		..Default::default()
 	};
 	if opts.create_dirs {
-		// The agreement is to the folders the rows kept need, as the plan
-		// lists them.
-		selection.confirmed_new_dirs = import
-			.new_dirs_for(&selection)
-			.requested
-			.into_iter()
-			.collect();
+		// The agreement is to every folder the command line placed (each
+		// `--repo`, `--in` and `--map` folder not made yet), by its place
+		// in the plan: whichever name a row reaches one by.
+		selection.confirmed_placed =
+			(0..import.import_plan().placed_folders().len()).collect();
 	}
 	let result = target
 		.apply_files(text, &route, &import, &selection)

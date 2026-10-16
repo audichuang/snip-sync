@@ -29,7 +29,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::fscase::fs_is_case_insensitive;
-use crate::restore;
 
 /// Which existing folder: the filesystem's object, not a spelling of it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -234,63 +233,6 @@ fn target_id(at: FolderId, names: &[OsString]) -> TargetId {
 	TargetId(names.iter().fold(at, |id, name| id.child(name)))
 }
 
-/// Which folder to make a path is, read off the disk as it is now: Apply's
-/// own answer, apart from what planning recorded. The nearest existing
-/// folder above the path is the anchor, told by its object; the names below
-/// it fold when its filesystem does (one answer per object).
-#[derive(Default)]
-pub(crate) struct LiveFolders {
-	folds: HashMap<DirKey, bool>,
-}
-
-impl LiveFolders {
-	/// `None` when `path` exists, or when no folder above it can be found.
-	pub(crate) fn id_of(&mut self, path: &Path) -> Option<FolderId> {
-		let mut names: Vec<&OsStr> = Vec::new();
-		let mut cur = path;
-		loop {
-			match fs::symlink_metadata(cur) {
-				Err(e)
-					if matches!(
-						e.kind(),
-						std::io::ErrorKind::NotFound
-							| std::io::ErrorKind::NotADirectory
-					) =>
-				{
-					names.push(cur.file_name()?);
-					cur = cur.parent()?;
-				}
-				_ => break,
-			}
-		}
-		if names.is_empty() {
-			return None;
-		}
-		let mut id = self.at(cur);
-		for name in names.into_iter().rev() {
-			id = id.child(name);
-		}
-		Some(id)
-	}
-
-	/// Which file `path` writes, as the disk is now ([`TargetId`]).
-	pub(crate) fn target_id(&mut self, path: &Path) -> TargetId {
-		let (anchor, names) = target_anchor(path);
-		target_id(self.at(&anchor), &names)
-	}
-
-	/// The existing folder `dir`, with whether names below it fold.
-	fn at(&mut self, dir: &Path) -> FolderId {
-		let key = DirKey::of(dir);
-		let folds = *self.folds.entry(key.clone()).or_insert_with(|| {
-			fs_is_case_insensitive(
-				&dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
-			)
-		});
-		FolderId::at(key, folds)
-	}
-}
-
 /// An existing folder as the filesystem has it.
 #[derive(Clone)]
 struct Anchor {
@@ -336,25 +278,6 @@ impl NewFolderNames {
 			spelled: HashMap::new(),
 			named: HashSet::new(),
 		}
-	}
-
-	/// The destination root `absolute` lies under, for an op whose own root
-	/// (`op_root`) is another spelling of the folders above it: the root
-	/// that is the same folder as `op_root` if one is, else the deepest.
-	/// `root_folds` holds every destination root.
-	fn root_holding(&self, absolute: &Path, op_root: &Path) -> Option<PathBuf> {
-		let own = (self.identify)(op_root);
-		let mut under: Vec<&PathBuf> = self
-			.root_folds
-			.keys()
-			.filter(|root| absolute.starts_with(root) && absolute != *root)
-			.collect();
-		under.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
-		under
-			.iter()
-			.find(|root| (self.identify)(root) == own)
-			.or_else(|| under.first())
-			.map(|root| (*root).clone())
 	}
 
 	/// Whether names below `canonical` fold: what its destination root
@@ -418,88 +341,6 @@ impl NewFolderNames {
 			chain.push(cur.clone());
 		}
 		chain
-	}
-
-	/// Moves `op` into the spellings of the folders it needs made: the
-	/// folders on its path below the first one that does not exist. Only
-	/// when one of them is a folder the user named: a plan that names none
-	/// keeps the payload's spellings, as ClipCode does.
-	pub(crate) fn unify(&mut self, op: &mut restore::CreateOperation) {
-		if self.named.is_empty() {
-			return;
-		}
-		let Some(parent) = op.absolute_path.parent() else {
-			return;
-		};
-		if fs::symlink_metadata(parent).is_ok() {
-			return;
-		}
-		let (Ok(below), Some(file)) = (
-			parent.strip_prefix(&op.root_path),
-			op.absolute_path.file_name(),
-		) else {
-			return;
-		};
-		let mut base = op.root_path.clone();
-		let mut missing = Vec::new();
-		for name in below.components() {
-			if missing.is_empty() {
-				let next = base.join(name);
-				if fs::symlink_metadata(&next).is_ok() {
-					base = next;
-					continue;
-				}
-			}
-			missing.push(name.as_os_str());
-		}
-		let a = self.anchor(&base);
-		let mut id = FolderId::at(a.key, a.folds);
-		let mut ids = Vec::with_capacity(missing.len());
-		let mut names_one = false;
-		for name in &missing {
-			id = id.child(name);
-			names_one |= self.named.contains(&id);
-			ids.push(id.clone());
-		}
-		if !names_one {
-			return;
-		}
-		let depth = missing.len();
-		let mut cur = base.clone();
-		for (name, id) in missing.into_iter().zip(ids) {
-			let next = cur.join(name);
-			cur = self.spelled.entry(id).or_insert(next).clone();
-		}
-		let mut absolute = cur.join(file);
-		// The folder's first spelling may lie under another spelling of the
-		// folders above it (`/private/x` and `/System/Volumes/Data/private/x`
-		// on macOS): the op moves to the destination root that spelling is
-		// under, so one folder is one path in the plan, asked for and made
-		// once. Without such a root, the op keeps its own spelling of the
-		// existing folders and takes the unified names below them.
-		let root = if absolute.starts_with(&op.root_path) {
-			op.root_path.clone()
-		} else if let Some(root) = self.root_holding(&absolute, &op.root_path) {
-			root
-		} else {
-			let names: Vec<_> = cur.components().rev().take(depth).collect();
-			absolute = base;
-			for name in names.into_iter().rev() {
-				absolute.push(name);
-			}
-			absolute.push(file);
-			op.root_path.clone()
-		};
-		let Ok(rel) = absolute.strip_prefix(&root) else {
-			return;
-		};
-		op.relative_path = rel
-			.components()
-			.map(|c| c.as_os_str().to_string_lossy())
-			.collect::<Vec<_>>()
-			.join("/");
-		op.root_path = root;
-		op.absolute_path = absolute;
 	}
 
 	/// The folders of `missing` (those a planned create has to make, as

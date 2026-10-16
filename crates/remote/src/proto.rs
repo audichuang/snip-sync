@@ -31,7 +31,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 7 = compact file previews and one-use prepared file payloads;
 /// 8 = prepared commit replays ([`Request::PrepareReplay`]);
 /// 9 = file pastes into folders that do not exist yet
-/// ([`PasteMapping::allow_new_dirs`], `RestoreSelection::confirmed_new_dirs`).
+/// ([`PasteMapping::allow_new_dirs`], `RestoreSelection::confirmed_placed`).
 pub const PROTOCOL_MAX: u32 = 9;
 pub const PREPARED_IMPORT_VERSION: u32 = 7;
 /// The first protocol where a worker plans a paste into folders that do not
@@ -2588,10 +2588,11 @@ mod prepared_metadata_tests {
 					"target_files": {},
 					"missing_dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
 					"requested_dirs": ["C:\\ws\\new"],
-					"placed_tails": ["C:\\ws\\new"],
+					"placed": [["C:\\ws\\new"]],
 					"new_dirs": {
 						"dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
-						"needs": [[0, 1], [0]]
+						"needs": [[0, 1], [0]],
+						"routes": [0, 0]
 					}
 				}
 			}))
@@ -2626,11 +2627,11 @@ mod prepared_metadata_tests {
 			snip_core::transfer::NewDirs {
 				requested: vec![new.clone()],
 				incidental: vec![sub],
+				placed: vec![0],
 			}
 		);
-		// The agreement `--create-dirs` sends with every row kept.
-		let all = snip_core::restore::RestoreSelection::default();
-		assert_eq!(planned.plan.new_dirs_for(&all).requested, vec![new]);
+		// The placed folder `--create-dirs` agrees to, by its place.
+		assert_eq!(planned.plan.placed_folders(), [vec![new]]);
 		// The worker gets the list back with the preview it checks.
 		let expect = planned.expect();
 		assert!(serde_json::to_string(&expect).unwrap().contains("new_dirs"));

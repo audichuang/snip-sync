@@ -59,14 +59,7 @@ fn plan(text: &str, mapping: &ImportMapping) -> TransferImportPlan {
 fn agree_to_all(plan: &TransferImportPlan) -> RestoreSelection {
 	RestoreSelection {
 		overwrite_existing: true,
-		confirmed_new_dirs: plan
-			.destination_freshness()
-			.placed_tails
-			.iter()
-			.flatten()
-			.cloned()
-			.chain(plan.new_dirs().requested)
-			.collect(),
+		confirmed_placed: (0..plan.placed_folders().len()).collect(),
 		..Default::default()
 	}
 }
@@ -169,9 +162,57 @@ impl Drop for Hfs {
 	}
 }
 
+#[cfg(target_os = "macos")]
 const ZWNJ: &str = "\u{200C}";
+#[cfg(target_os = "macos")]
 const COMPOSED: &str = "\u{e9}";
+#[cfg(target_os = "macos")]
 const DECOMPOSED: &str = "e\u{301}";
+
+// ---------------------------------------------------------------------------
+// (b) on every filesystem: with the key off, even one name twice is two
+// ---------------------------------------------------------------------------
+
+/// The key off tells a name from itself: planning sees two files where the
+/// payload names one twice. `create_new` meets the second.
+#[test]
+fn without_the_key_one_name_twice_cannot_write_one_file_twice() {
+	let (_tmp, ws) = tmp();
+	let _keys = test_hooks::distinct_name_keys();
+	let mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(&ws).unwrap());
+	let plan = plan(
+		"// file: sub/a.txt\nFIRST\n// file: sub/a.txt\nSECOND\n",
+		&mapping,
+	);
+	assert_eq!(plan.create_operations().len(), 2);
+	expect_collision(plan.apply(&agree_to_all(&plan)));
+	assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+}
+
+/// The destination `ws/new` reached through `q` (`ws` itself) as
+/// `q/new`, spelled exactly as placed: with the key off, planning cannot
+/// tell the row's folder is the one the user named. The row is not routed
+/// through the placed folder, so nothing asks before the folders are made;
+/// the placed folder existing after them does.
+#[test]
+fn without_the_key_another_route_does_not_make_the_named_folder() {
+	let (_tmp, ws) = tmp();
+	let _keys = test_hooks::distinct_name_keys();
+	let mut mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	mapping.map_prefix("q", CanonicalRootId::new(&ws).unwrap());
+	let plan = plan("// file: q/new/a.txt\nA\n", &mapping);
+	assert_eq!(plan.new_dirs().placed, Vec::<usize>::new());
+	expect_not_confirmed(plan.apply(&RestoreSelection::default()));
+	assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	// Agreed to, the same paste lands.
+	let agreed = RestoreSelection {
+		confirmed_placed: [0].into(),
+		..Default::default()
+	};
+	plan.apply(&agreed).unwrap();
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
+}
 
 // ---------------------------------------------------------------------------
 // (a) HFS+: a character the filesystem ignores

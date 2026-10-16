@@ -3,7 +3,7 @@
 //! Port of ClipCodeVSCode `src/restore.ts` and `src/restoreBase.ts`
 //! (commit 0aa24c8).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -140,11 +140,14 @@ pub struct RestoreSelection {
 	pub skip_existing: bool,
 	pub unchecked_creates: BTreeSet<usize>,
 	pub unchecked_deletes: BTreeSet<usize>,
-	/// The new folders the user agreed to make (absolute; a worker's own
-	/// paths for a remote plan). Apply refuses when the rows kept need one
-	/// that is not here.
+	/// The placed folders (a destination or an import path not made yet)
+	/// the user agreed to make, by their place in the plan's list
+	/// (`DestinationFreshnessSnapshot::placed`): the agreement is to a
+	/// destination, never to a spelling of a path. Apply refuses when a row
+	/// it keeps is routed to one that is not here, and when one that is not
+	/// here exists once this Apply made its folders.
 	#[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-	pub confirmed_new_dirs: BTreeSet<PathBuf>,
+	pub confirmed_placed: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,17 +345,65 @@ pub fn execute_restore_plan_observed(
 	selection: &RestoreSelection,
 	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
 ) -> RestoreExecutionResult {
+	execute_restore_plan_reserved(plan, selection, &HashMap::new(), after_write)
+		.0
+}
+
+/// What an Apply did for a new file before any content was written.
+#[derive(Debug)]
+pub(crate) enum Reservation {
+	/// An empty file of this Apply's own is there (`create_new`): the row
+	/// writes into it.
+	Made,
+	/// Making it failed: the row fails with this, and writes nothing.
+	Failed(std::io::Error),
+}
+
+/// Whether the shared write path refuses `op` before writing anything.
+pub(crate) fn create_is_refused(
+	roots: &[PathBuf],
+	op: &CreateOperation,
+) -> bool {
+	escapes_all_roots(roots, &op.absolute_path)
+		|| has_git_segment(&op.relative_path)
+		|| lands_in_git_dir(&op.absolute_path)
+}
+
+/// [`execute_restore_plan_observed`] with the new files `reserved` made
+/// already, by create index. Returns, besides the result, the indices
+/// of the files made that no content reached.
+pub(crate) fn execute_restore_plan_reserved(
+	plan: &RestorePlan,
+	selection: &RestoreSelection,
+	reserved: &HashMap<usize, Reservation>,
+	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
+) -> (RestoreExecutionResult, Vec<usize>) {
 	let mut result = RestoreExecutionResult {
 		planned_skipped_count: plan.skipped_operations.len(),
 		..Default::default()
 	};
+	let mut unwritten = Vec::new();
 
 	for (i, op) in plan.create_operations.iter().enumerate() {
 		if selection.unchecked_creates.contains(&i) {
 			continue;
 		}
-		// The plan's FULL root set, not only the op's own root.
-		match run_create(&plan.roots, selection, op) {
+		let run = match reserved.get(&i) {
+			Some(Reservation::Failed(e)) => Err(CreateFailure {
+				text: e.to_string(),
+				reason: io_reason(e, &op.relative_path),
+			}),
+			Some(Reservation::Made) => {
+				let run = run_reserved_create(&plan.roots, op);
+				if run.is_err() {
+					unwritten.push(i);
+				}
+				run
+			}
+			// The plan's FULL root set, not only the op's own root.
+			None => run_create(&plan.roots, selection, op),
+		};
+		match run {
 			Ok(
 				outcome @ (CreateOutcome::Created | CreateOutcome::Overwritten),
 			) => {
@@ -399,7 +450,7 @@ pub fn execute_restore_plan_observed(
 		}
 	}
 
-	result
+	(result, unwritten)
 }
 
 /// What one create operation ended in. A skipped row wrote nothing.
@@ -415,15 +466,35 @@ struct CreateFailure {
 	reason: Reason,
 }
 
+/// A new file whose empty file this Apply made: it is the one written,
+/// as a file that was not there would be.
+fn run_reserved_create(
+	roots: &[PathBuf],
+	op: &CreateOperation,
+) -> Result<CreateOutcome, CreateFailure> {
+	if create_is_refused(roots, op) {
+		return Err(CreateFailure {
+			text: "unsafe path".into(),
+			reason: Reason::UnsafePath {
+				path: op.relative_path.clone(),
+			},
+		});
+	}
+	write_text_file(&op.absolute_path, &op.content).map_err(|e| {
+		CreateFailure {
+			text: e.to_string(),
+			reason: io_reason(&e, &op.relative_path),
+		}
+	})?;
+	Ok(CreateOutcome::Created)
+}
+
 fn run_create(
 	roots: &[PathBuf],
 	selection: &RestoreSelection,
 	op: &CreateOperation,
 ) -> Result<CreateOutcome, CreateFailure> {
-	if escapes_all_roots(roots, &op.absolute_path)
-		|| has_git_segment(&op.relative_path)
-		|| lands_in_git_dir(&op.absolute_path)
-	{
+	if create_is_refused(roots, op) {
 		return Err(CreateFailure {
 			text: "unsafe path".into(),
 			reason: Reason::UnsafePath {
