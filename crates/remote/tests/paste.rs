@@ -2864,3 +2864,84 @@ fn a_worker_makes_one_folder_of_two_spellings_of_it() {
 	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
 	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");
 }
+
+// ---------------------------------------------------------------------------
+// #241: the worker's Apply asks the filesystem, not the name key
+// ---------------------------------------------------------------------------
+
+/// Asserts that the filesystem under `dir` folds case.
+#[cfg(any(target_os = "macos", windows))]
+fn assert_folds_case(dir: &Path) {
+	let probe = dir.join("probe_x");
+	fs::write(&probe, "x").unwrap();
+	assert!(
+		dir.join("PROBE_X").exists(),
+		"needs a filesystem that folds case"
+	);
+	fs::remove_file(&probe).unwrap();
+}
+
+/// The destination `new` is not made yet; `q` is the workspace itself,
+/// and the payload reaches `new` as `q/NEW`. With the name key switched
+/// off the worker cannot tell the two names apart, and still makes
+/// nothing without consent: the folder that exists after its own folders
+/// are made is the filesystem's answer.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_worker_does_not_make_the_named_folder_through_a_case_alias_without_the_key(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	assert_folds_case(&ws);
+	let _keys = snip_core::transfer::test_hooks::distinct_name_keys();
+	let text = entry("q/NEW/a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "new");
+	let route = new_dirs_route(&[("q", "")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let err = target
+		.apply_files(&text, &route, &plan, &RestoreSelection::default())
+		.unwrap_err();
+	not_confirmed(err, 1);
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// Two rows that are one file on the worker's filesystem (`a.txt` and
+/// `A.txt` where case folds), with the name key switched off: the worker
+/// meets the second at `create_new` and writes neither.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_worker_does_not_write_one_file_twice_without_the_key() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	assert_folds_case(&ws);
+	let _keys = snip_core::transfer::test_hooks::distinct_name_keys();
+	let text =
+		[entry("sub/a.txt", "FIRST"), entry("SUB/A.txt", "SECOND")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "");
+	let route = new_dirs_route(&[]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let sel = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	match target.apply_files(&text, &route, &plan, &sel) {
+		Err(PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Collision,
+			..
+		})) => {}
+		other => panic!("expected a collision, got {other:?}"),
+	}
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}

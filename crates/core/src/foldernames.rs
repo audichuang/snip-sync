@@ -137,6 +137,10 @@ impl FolderId {
 /// key, or its lowercase where case folds.
 pub(crate) fn name_key(name: &str, folds: bool) -> String {
 	use unicode_normalization::UnicodeNormalization;
+	#[cfg(any(test, feature = "test-support"))]
+	if let Some(key) = distinct_key(name) {
+		return key;
+	}
 	if name.is_ascii() {
 		return if folds {
 			name.to_ascii_lowercase()
@@ -153,6 +157,28 @@ pub(crate) fn name_key(name: &str, folds: bool) -> String {
 	} else {
 		decomposed
 	}
+}
+
+/// While set, [`name_key`] gives every call a key of its own, even for one
+/// name twice: a test proves that no safety check rests on it. Process-wide
+/// (a worker in a test plans on its own thread); a test runs in its own
+/// process under nextest.
+#[cfg(any(test, feature = "test-support"))]
+static DISTINCT_NAME_KEYS: std::sync::atomic::AtomicBool =
+	std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_distinct_name_keys(on: bool) {
+	DISTINCT_NAME_KEYS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn distinct_key(name: &str) -> Option<String> {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	static NEXT: AtomicUsize = AtomicUsize::new(0);
+	DISTINCT_NAME_KEYS
+		.load(Ordering::SeqCst)
+		.then(|| format!("{name}\u{0}{}", NEXT.fetch_add(1, Ordering::SeqCst)))
 }
 
 /// Which file a target path writes: the folder that exists nearest above

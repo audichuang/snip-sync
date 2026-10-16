@@ -4077,6 +4077,24 @@ pub mod test_hooks {
 		HookGuard
 	}
 
+	/// Removes the switch below when dropped.
+	pub struct NameKeyGuard;
+
+	impl Drop for NameKeyGuard {
+		fn drop(&mut self) {
+			crate::foldernames::set_distinct_name_keys(false);
+		}
+	}
+
+	/// Until the guard drops, every name is told from every other one,
+	/// even from itself (`foldernames::name_key` gives each call its own
+	/// key): what a filesystem merges that the key does not know. A safety
+	/// check that still holds with this on does not rest on the key.
+	pub fn distinct_name_keys() -> NameKeyGuard {
+		crate::foldernames::set_distinct_name_keys(true);
+		NameKeyGuard
+	}
+
 	pub(super) fn run_after_tail_check() {
 		if let Some(hook) = AFTER_TAIL_CHECK
 			.lock()
@@ -7354,3 +7372,6 @@ mod unicode_name_tests {
 		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
 	}
 }
+
+#[cfg(test)]
+mod fs_decides_tests;
