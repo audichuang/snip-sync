@@ -400,3 +400,52 @@ fn fuzz_regression_the_repo_left_while_loading_is_read_by_the_changes_queue(
 		invariants::assert_holds(m, cx, &[R6]);
 	});
 }
+
+/// O7: the reader's find bar is drawn exactly when the reader is. The paste
+/// preview takes the reader's place, so the find bar is open and not drawn
+/// while a preview is open, and comes back as it was when the preview closes:
+/// not a stray layer. The check assumed the reader is always there (found by
+/// `fuzz_paste_preview_follows_the_repo_set`: Ctrl+F, then a paste).
+#[gpui::test]
+fn fuzz_regression_a_paste_preview_hides_the_reader_and_keeps_its_find_bar_open(
+	cx: &mut TestAppContext,
+) {
+	use crate::overlay::OverlayKind;
+	let ws = tempfile::tempdir().unwrap();
+	repo(ws.path(), "alpha", &[]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle(cx);
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("base.txt", crate::SourceKind::File, cx)
+	});
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	cx.simulate_keystrokes("ctrl-f");
+	settle(cx);
+	let open = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| m.overlays.is_open(OverlayKind::FindBar))
+	};
+	assert!(open(cx), "the find bar opens");
+	assert!(cx.debug_bounds("find-bar").is_some());
+	overlays::assert_overlay_panels_match(cx, &model);
+
+	model.update(cx, |m, _| {
+		m.test_clipboard = Some("// FILE: x.txt\nx\n".into())
+	});
+	// The find field has the keyboard, and Ctrl+V there pastes into it.
+	click_probed(&model, cx, "btn-paste");
+	settle_until(cx, "the preview", |cx| {
+		model.read_with(cx, |m, _| m.paste.plan().is_some())
+	});
+	assert!(open(cx), "the preview leaves the find bar open");
+	assert!(cx.debug_bounds("find-bar").is_none(), "the reader is gone");
+	overlays::assert_overlay_panels_match(cx, &model);
+
+	model.update_in(cx, |m, _, cx| m.cancel_paste_preview(cx));
+	settle(cx);
+	assert!(open(cx));
+	assert!(cx.debug_bounds("find-bar").is_some(), "the reader is back");
+	overlays::assert_overlay_panels_match(cx, &model);
+}
