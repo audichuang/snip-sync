@@ -2204,10 +2204,11 @@ impl PastePreviewPlan {
 				};
 			target.plan_files(&self.raw_payload, &route, opts, note)
 		};
-		// A refusal that carried no suggestion (a worker's does not) keeps
-		// the last one: the hint row must stay so [Use as-is] can undo an
-		// adjustment the engine refused. A local engine hears the suggestion
-		// before it resolves the destination, so its refusal updates it.
+		// A refusal that carried no suggestion (the destination did not
+		// resolve, the worker was unreachable) keeps the last one: the hint
+		// row must stay so [Use as-is] can undo an adjustment the engine
+		// refused. An engine that refused the plan, locally or on a worker,
+		// said what it suggested first, so its refusal updates it.
 		if planned.is_ok() || heard.is_some() {
 			self.restore_base = heard;
 		}
@@ -3382,6 +3383,7 @@ pub(crate) mod tests {
 			reason: Some(Box::new(snip_remote::Reason::DestinationChanged {
 				change: snip_remote::StaleChange::Created { rel: "a".into() },
 			})),
+			suggestion: None,
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
@@ -3396,6 +3398,7 @@ pub(crate) mod tests {
 			          externally after preview"
 				.into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(old)).key,
@@ -3481,6 +3484,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: busy_git().paste_message(),
 					reason: Some(Box::new(snip_remote::Reason::RepoBusy)),
+					suggestion: None,
 				})
 			),
 			"paste_repo_busy"
@@ -3494,6 +3498,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: busy_git().paste_message(),
 					reason: None,
+					suggestion: None,
 				})
 			),
 			"paste_err_destination"
@@ -3505,6 +3510,7 @@ pub(crate) mod tests {
 					code: ErrorCode::Busy,
 					message: "too many callers".into(),
 					reason: None,
+					suggestion: None,
 				})
 			),
 			"paste_err_destination"
@@ -3564,6 +3570,7 @@ pub(crate) mod tests {
 				code,
 				message,
 				reason: None,
+				suggestion: None,
 			})
 		};
 		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
@@ -3591,6 +3598,7 @@ pub(crate) mod tests {
 							}
 						}
 					)),
+					suggestion: None,
 				}),
 				false
 			),
@@ -3696,6 +3704,7 @@ pub(crate) mod tests {
 			code,
 			message: raw.into(),
 			reason: None,
+			suggestion: None,
 		};
 		for code in all {
 			if !worded(code) {
@@ -5768,6 +5777,7 @@ pub(crate) mod tests {
 				code: snip_remote::ErrorCode::Stale,
 				message: "english".into(),
 				reason: Some(Box::new(Reason::DestinationChanged { change })),
+				suggestion: None,
 			})
 		};
 		let file = |e| file_apply_refusal(None, &dest, e).token;
@@ -5801,6 +5811,7 @@ pub(crate) mod tests {
 					code: snip_remote::ErrorCode::Busy,
 					message: "english".into(),
 					reason: None,
+					suggestion: None,
 				}),
 				true
 			),

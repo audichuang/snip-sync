@@ -980,6 +980,7 @@ mod tests {
 			code,
 			message: message.into(),
 			reason: None,
+			suggestion: None,
 		};
 		const COLLISION: &str =
 			"target collision: multiple operations target 'a.txt': two entries";
@@ -1031,6 +1032,7 @@ mod tests {
 			code: ErrorCode::Busy,
 			message: BUSY.into(),
 			reason: Some(Box::new(snip_core::reason::Reason::RepoBusy)),
+			suggestion: None,
 		};
 		assert_eq!(
 			remote(repo_busy),

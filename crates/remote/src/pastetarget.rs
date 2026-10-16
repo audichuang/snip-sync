@@ -418,20 +418,27 @@ impl PasteTarget {
 				workspace,
 				dest,
 			} => {
-				let (planned, prepared) = client
-					.prepare_import(
-						workspace,
-						dest,
-						text,
-						&route.mapping(),
-						opts.cancel.as_ref(),
-					)
-					.map_err(PasteError::Remote)?;
-				if let (Some(note), Some(s)) =
-					(note, planned.suggestion.as_ref())
-				{
+				let answered = client.prepare_import(
+					workspace,
+					dest,
+					text,
+					&route.mapping(),
+					opts.cancel.as_ref(),
+				);
+				// A refused plan carries the worker's suggestion too, so
+				// the hint outlives the refusal as a local paste's does.
+				let heard = match &answered {
+					Ok((planned, _)) => planned.suggestion.as_ref(),
+					Err(RemoteError::Refused { suggestion, .. }) => {
+						suggestion.as_deref()
+					}
+					Err(_) => None,
+				};
+				if let (Some(note), Some(s)) = (note, heard) {
 					note(s);
 				}
+				let (planned, prepared) =
+					answered.map_err(PasteError::Remote)?;
 				Ok(FilePastePlan {
 					plan: planned.plan,
 					digest: Some(planned.digest),
@@ -746,6 +753,7 @@ mod tests {
 				code: ErrorCode::Stale,
 				message: "x".into(),
 				reason: None,
+				suggestion: None,
 			},
 			RemoteError::Start {
 				kind: crate::ConnectFailureKind::Other,
@@ -787,6 +795,7 @@ mod tests {
 			reason: Some(Box::new(Reason::DestinationChanged {
 				change: StaleChange::Created { rel: "a".into() },
 			})),
+			suggestion: None,
 		});
 		assert!(remote_stale.is_stale());
 		assert_eq!(remote_stale.reason(), local_stale.reason());
@@ -794,6 +803,7 @@ mod tests {
 			code: ErrorCode::Stale,
 			message: "odd".into(),
 			reason: None,
+			suggestion: None,
 		});
 		assert!(old_stale.is_stale());
 		assert_eq!(
@@ -806,6 +816,7 @@ mod tests {
 			code: ErrorCode::Busy,
 			message: "m".into(),
 			reason: None,
+			suggestion: None,
 		})
 		.is_stale());
 
@@ -827,18 +838,21 @@ mod tests {
 			code: ErrorCode::Busy,
 			message: "m".into(),
 			reason: Some(Box::new(Reason::RepoBusy)),
+			suggestion: None,
 		})
 		.is_repo_busy());
 		assert!(!PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Busy,
 			message: busy,
 			reason: None,
+			suggestion: None,
 		})
 		.is_repo_busy());
 		assert!(!PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Busy,
 			message: "too many callers".into(),
 			reason: Some(Box::new(Reason::GitBusy)),
+			suggestion: None,
 		})
 		.is_repo_busy());
 
@@ -846,6 +860,7 @@ mod tests {
 			code: ErrorCode::Collision,
 			message: "c".into(),
 			reason: None,
+			suggestion: None,
 		})
 		.is_collision());
 		assert!(PasteError::Local(TransferError::TargetCollision {

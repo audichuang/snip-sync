@@ -1045,6 +1045,7 @@ pub(crate) fn error_with(
 		message,
 		patch: false,
 		reason,
+		suggestion: None,
 	}
 }
 

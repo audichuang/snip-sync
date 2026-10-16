@@ -1307,6 +1307,71 @@ fn a_paste_target_writes_the_same_files_locally_and_on_a_worker() {
 	}
 }
 
+/// What a paste says about the restore base, as the CLI and the app hear it,
+/// is the same wherever the engine runs, also when it refuses the plan.
+#[test]
+fn a_refused_plan_notes_the_same_restore_base_locally_and_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let remote_dest = ws.join("proj");
+	let local_dest = tmp.path().join("local").join("proj");
+	fs::create_dir_all(&remote_dest).unwrap();
+	fs::create_dir_all(&local_dest).unwrap();
+	// Adjusted, `proj/a.txt` and `a.txt` are one file; as they stand the two
+	// are not.
+	let text = format!(
+		"// clipcode-root: work\n{}{}",
+		entry("proj/a.txt", "A"),
+		entry("a.txt", "B")
+	);
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let local = PasteTarget::Local { dest: local_dest };
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: "proj".into(),
+	};
+	let opts = RunOptions::default();
+	let strip = snip_core::restore::RestoreBase::Strip {
+		segment: "proj".into(),
+	};
+	for adjust_paths in [true, false] {
+		let route = PasteRoute {
+			adjust_paths,
+			..Default::default()
+		};
+		let mut answers = Vec::new();
+		for target in [&local, &remote] {
+			let mut heard = Vec::new();
+			let mut note = |s: &snip_core::restore::RestoreBaseSuggestion| {
+				heard.push(s.base.clone())
+			};
+			let planned =
+				target.plan_files(&text, &route, &opts, Some(&mut note));
+			answers.push((heard, planned.map(|_| ())));
+		}
+		let [(local_heard, local_planned), (remote_heard, remote_planned)] =
+			<[_; 2]>::try_from(answers).unwrap();
+		assert_eq!(local_heard, vec![strip.clone()], "adjust={adjust_paths}");
+		assert_eq!(remote_heard, local_heard, "adjust={adjust_paths}");
+		if adjust_paths {
+			assert!(
+				local_planned.as_ref().is_err_and(PasteError::is_collision),
+				"{local_planned:?}"
+			);
+			assert!(
+				remote_planned.as_ref().is_err_and(PasteError::is_collision),
+				"{remote_planned:?}"
+			);
+		} else {
+			assert!(local_planned.is_ok(), "{local_planned:?}");
+			assert!(remote_planned.is_ok(), "{remote_planned:?}");
+		}
+	}
+}
+
 #[test]
 fn a_paste_target_replays_the_same_commits_locally_and_on_a_worker() {
 	let _serial = serial();

@@ -6825,6 +6825,7 @@ mod tests {
 						"the result is too large to send; narrow the request"
 							.into(),
 					reason: None,
+					suggestion: None,
 				}
 			),),
 			PreviewErr::TooLarge
@@ -7175,6 +7176,41 @@ mod tests {
 				folders.sort();
 				(listing.path.clone(), folders)
 			})
+		}
+
+		/// Settles until the one repo of the opened remote workspace has its
+		/// changes loaded. Fails with a message when it never does, rather
+		/// than leaving the test to a confusing panic further on.
+		fn wait_remote_repo_loaded(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let loaded = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				})
+			};
+			for _ in 0..50 {
+				settle(cx);
+				if loaded(cx) {
+					return;
+				}
+			}
+			let (repos, states) = model.read_with(cx, |m, _| {
+				(
+					m.repos.len(),
+					m.change_repos
+						.iter()
+						.map(|r| r.state.clone())
+						.collect::<Vec<_>>(),
+				)
+			});
+			panic!(
+				"the remote repo never loaded: {repos} repo(s), states {states:?}"
+			);
 		}
 
 		/// Lists an in-process worker as the only ssh host, opens `shared`
@@ -10163,18 +10199,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 			let real = dunce::canonicalize(&alpha).unwrap();
@@ -10484,18 +10509,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -10554,18 +10568,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -15523,18 +15526,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -15615,7 +15607,7 @@ mod tests {
 			});
 		}
 
-		/// The same on a worker, whose refusal carries no suggestion.
+		/// The same on a worker, whose refusal carries its suggestion.
 		#[gpui::test]
 		fn a_remote_refused_adjusted_plan_keeps_the_hint_and_as_is_recovers(
 			cx: &mut TestAppContext,
@@ -15639,18 +15631,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -15693,6 +15674,93 @@ mod tests {
 					plan.items.iter().map(|i| i.path.as_str()).collect();
 				assert_eq!(paths, ["a.ts", "sub/a.ts"]);
 			});
+		}
+
+		/// The same path twice: the engine refuses the plan as it stands,
+		/// before any adjustment is chosen.
+		const RESTORE_BASE_REFUSED_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/a.ts\ny\n";
+
+		/// A first plan the engine refuses opens no preview, so there is no
+		/// hint row to leave behind (#240): the panel needs a plan to hang
+		/// the hint on, and it says why on the status line.
+		fn assert_first_plan_refused_without_a_panel(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let (open, loading, status) = model.read_with(cx, |m, _| {
+				(
+					m.paste.plan().is_some(),
+					m.paste.is_loading(),
+					m.status.clone(),
+				)
+			});
+			assert!(!open, "a refused first plan opened a preview");
+			assert!(!loading, "the refused first plan is still loading");
+			assert_eq!(
+				status.key, "paste_err_plan",
+				"the status does not say the plan was refused: {status:?}"
+			);
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_none(),
+				"a hint row without a preview"
+			);
+		}
+
+		/// A first plan the engine refuses says the same on a worker as in
+		/// the folder itself: neither opens a preview or a hint row.
+		#[gpui::test]
+		fn a_first_plan_the_engine_refuses_opens_no_preview(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			clip::write_text(RESTORE_BASE_REFUSED_PAYLOAD).unwrap();
+			cx.simulate_keystrokes("ctrl-v");
+			settle(cx);
+			assert_first_plan_refused_without_a_panel(&model, cx);
+		}
+
+		#[gpui::test]
+		fn a_remote_first_plan_the_worker_refuses_opens_no_preview(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			wait_remote_repo_loaded(&model, cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			clip::write_text(RESTORE_BASE_REFUSED_PAYLOAD).unwrap();
+			model.update(cx, |m, cx| m.trigger_paste_preview(cx));
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert_first_plan_refused_without_a_panel(&model, cx);
 		}
 
 		/// Click the centre of the rendered control `id`, the way a user

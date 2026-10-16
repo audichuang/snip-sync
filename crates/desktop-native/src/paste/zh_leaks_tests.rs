@@ -239,6 +239,7 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 				code,
 				message: refusal_text(code).into(),
 				reason: None,
+				suggestion: None,
 			},
 		));
 	}

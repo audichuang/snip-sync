@@ -26,6 +26,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Response {
 		message: message.into(),
 		patch: false,
 		reason: None,
+		suggestion: None,
 	}
 }
 
@@ -47,6 +48,7 @@ fn refused_err(
 		} else {
 			reason.beside_code()
 		},
+		suggestion: None,
 	}
 }
 

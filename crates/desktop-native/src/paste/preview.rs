@@ -924,6 +924,7 @@ mod tests {
 				code: ErrorCode::Busy,
 				message: "the worker is busy".into(),
 				reason: None,
+				suggestion: None,
 			},
 			|| nav = Some(s.select(1, Some(&o))),
 		);
