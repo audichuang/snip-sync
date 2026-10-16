@@ -6,6 +6,7 @@ pub mod clip;
 pub mod commits;
 pub mod copy;
 pub mod filter;
+mod foldernames;
 pub mod format;
 mod fscase;
 pub mod fsutil;

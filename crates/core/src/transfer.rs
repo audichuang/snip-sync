@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
+use crate::foldernames::NewFolderNames;
 use crate::format::{
 	self, BorrowedPayloadOptions, ChangeType, ParsedEntry, PayloadFile,
 };
@@ -1866,6 +1867,15 @@ impl TransferImportPlan {
 			});
 		}
 		let made = self.make_requested_dirs(&new.requested)?;
+		// The agreement covers every folder the user named that is made: a
+		// gap in how folders are told apart must end as a refusal above,
+		// never as a folder made with no consent.
+		debug_assert!(
+			made.iter()
+				.all(|dir| selection.confirmed_new_dirs.contains(dir)),
+			"made {made:?} without consent to {:?}",
+			selection.confirmed_new_dirs
+		);
 
 		let mut result = restore::execute_restore_plan_observed(
 			&self.restore_plan,
@@ -3906,92 +3916,13 @@ fn route_candidates(
 	out
 }
 
-/// One spelling for each folder a plan has to make, on a filesystem that
-/// folds case: the first spelling asked for. The keys fold case the way the
-/// target-collision check does (`to_lowercase`); a difference only Unicode
-/// normalization makes is out of scope (porting-notes).
-#[derive(Default)]
-struct NewFolderNames {
-	spelled: HashMap<String, PathBuf>,
-	/// Keys of the folders the user named (a placed folder's tail).
-	named: HashSet<String>,
-}
-
-impl NewFolderNames {
-	/// `folder` as it is spelled for good.
-	fn spell(&mut self, folder: PathBuf) -> PathBuf {
-		let key = folder.to_string_lossy().to_lowercase();
-		self.spelled.entry(key).or_insert(folder).clone()
-	}
-
-	/// `folder`, a folder the user named, as it is spelled for good.
-	fn spell_named(&mut self, folder: PathBuf) -> PathBuf {
-		self.named.insert(folder.to_string_lossy().to_lowercase());
-		self.spell(folder)
-	}
-
-	/// Moves `op` into the spellings of the folders it needs made: the
-	/// folders on its path below the first one that does not exist. Only
-	/// when one of them is a folder the user named: a plan that names none
-	/// keeps the payload's spellings, as ClipCode does.
-	fn unify(&mut self, op: &mut restore::CreateOperation) {
-		let Some(parent) = op.absolute_path.parent() else {
-			return;
-		};
-		if fs::symlink_metadata(parent).is_ok() {
-			return;
-		}
-		let (Ok(below), Some(file)) = (
-			parent.strip_prefix(&op.root_path),
-			op.absolute_path.file_name(),
-		) else {
-			return;
-		};
-		let mut base = op.root_path.clone();
-		let mut missing = Vec::new();
-		for name in below.components() {
-			if missing.is_empty() {
-				let next = base.join(name);
-				if fs::symlink_metadata(&next).is_ok() {
-					base = next;
-					continue;
-				}
-			}
-			missing.push(name);
-		}
-		let mut chain = base.clone();
-		let names_one = missing.iter().any(|name| {
-			chain.push(name);
-			self.named.contains(&chain.to_string_lossy().to_lowercase())
-		});
-		if !names_one {
-			return;
-		}
-		let mut cur = base;
-		for name in missing {
-			cur = self.spell(cur.join(name));
-		}
-		let absolute = cur.join(file);
-		let Ok(rel) = absolute.strip_prefix(&op.root_path) else {
-			return;
-		};
-		op.relative_path = rel
-			.components()
-			.map(|c| c.as_os_str().to_string_lossy())
-			.collect::<Vec<_>>()
-			.join("/");
-		op.absolute_path = absolute;
-	}
-}
-
 /// The folders each destination (the primary one, then the prefixes in the
 /// order of their names) names below its anchor, shallow to deep, under the
-/// spellings in `names` where the anchor's filesystem folds case.
+/// spellings in `names`: the first spelling met, the named folders first.
 fn named_folder_chains(
 	mapping: &ImportMapping,
-	root_case_insensitive: &HashMap<PathBuf, bool>,
 	names: &mut NewFolderNames,
-) -> Vec<Vec<PathBuf>> {
+) -> Vec<PathBuf> {
 	let mut prefixes: Vec<(&String, &PlacedRoot)> =
 		mapping.prefix_destinations.iter().collect();
 	prefixes.sort_by_key(|(prefix, _)| *prefix);
@@ -3999,23 +3930,8 @@ fn named_folder_chains(
 		.primary_destination
 		.iter()
 		.chain(prefixes.into_iter().map(|(_, placed)| placed))
-		.map(|placed| {
-			let folds = root_case_insensitive
-				.get(placed.anchor().path())
-				.copied()
-				.unwrap_or(true);
-			if !folds {
-				return placed.new_chain();
-			}
-			let mut cur = placed.anchor().path().to_path_buf();
-			placed
-				.tail()
-				.iter()
-				.map(|name| {
-					cur = names.spell_named(cur.join(name));
-					cur.clone()
-				})
-				.collect()
+		.flat_map(|placed| {
+			names.name_chain(placed.anchor().path(), placed.tail())
 		})
 		.collect()
 }
@@ -4109,9 +4025,8 @@ pub fn plan_import_parsed_with(
 	// tells folders apart (what is agreed to, what is recorded as named,
 	// what is made) goes by this one: the first spelling met, the named
 	// folders first.
-	let mut folder_names = NewFolderNames::default();
-	let named_chains =
-		named_folder_chains(mapping, &root_case_insensitive, &mut folder_names);
+	let mut folder_names = NewFolderNames::new(root_case_insensitive.clone());
+	let named_paths = named_folder_chains(mapping, &mut folder_names);
 
 	let route_candidates = route_candidates(&canonical_dest_roots, mapping);
 	let dest_root_paths: Vec<&Path> =
@@ -4414,17 +4329,7 @@ pub fn plan_import_parsed_with(
 	// the collision checks, so a refusal still names the paths as written.
 	for op in &mut combined_creates {
 		cancelled_err(opts, "plan-import")?;
-		if op.existed {
-			continue;
-		}
-		let is_ci = op_is_case_insensitive(
-			Some(&op.root_path),
-			&op.absolute_path,
-			&canonical_dest_roots,
-			&root_case_insensitive,
-			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
-		);
-		if is_ci {
+		if !op.existed {
 			folder_names.unify(op);
 		}
 	}
@@ -4445,12 +4350,7 @@ pub fn plan_import_parsed_with(
 	// The folders the user named: a tail's names that a create's path needs.
 	// Only when there are some, so a plan without a tail is what it was.
 	if let Some(missing) = &destination_freshness.missing_dirs {
-		let mut requested = HashSet::new();
-		for dir in named_chains.into_iter().flatten() {
-			if missing.contains(&dir) {
-				requested.insert(dir);
-			}
-		}
+		let requested = folder_names.requested(missing, &named_paths);
 		if !requested.is_empty() {
 			destination_freshness.requested_dirs = Some(requested);
 		}
@@ -6788,19 +6688,6 @@ mod case_policy_tests {
 		assert_eq!(plan.new_dirs().requested.len(), 2, "{:?}", plan.new_dirs());
 	}
 
-	/// Two folders that differ only in the case of an existing ancestor are
-	/// two folders, however the new names below them fold: `Α/new` is not
-	/// `α/new` when `Α` and `α` are two folders. Pure logic, so it runs on
-	/// a filesystem that folds case too.
-	#[test]
-	fn a_new_folder_under_one_existing_folder_is_not_one_under_another() {
-		let mut names = NewFolderNames::default();
-		let upper = PathBuf::from("/ws/\u{391}/new");
-		let lower = PathBuf::from("/ws/\u{3b1}/new");
-		assert_eq!(names.spell_named(upper.clone()), upper);
-		assert_eq!(names.spell(lower.clone()), lower);
-	}
-
 	/// Two destination roots that are two folders though their paths read
 	/// alike in lower case (`\u{391}` and `\u{3b1}`), each with a new folder
 	/// of the same name. When case cannot be told both fold, and the folder
@@ -6815,10 +6702,9 @@ mod case_policy_tests {
 		if fs::create_dir(&lower).is_err() {
 			// One folder on a filesystem that folds case (macOS, Windows):
 			// the scenario cannot be built there. Linux must build it.
-			assert!(
-				!cfg!(target_os = "linux"),
-				"cannot make two folders that differ in case on Linux"
-			);
+			if cfg!(target_os = "linux") {
+				panic!("cannot make two folders that differ in case on Linux");
+			}
 			return;
 		}
 		let placed =
