@@ -15790,7 +15790,7 @@ mod tests {
 					None,
 					"2025-12-21T15:30:00Z",
 				);
-				git(&r, &["tag", "v0.3.0"]);
+				git(&r, &["tag", "release-0.3.0-candidate-2"]);
 				git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
 				git(
 					&r,
