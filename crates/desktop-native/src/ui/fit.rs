@@ -78,6 +78,11 @@ pub(crate) const LABEL_ICON_W: f32 = 14.;
 pub(crate) const LABEL_ICON_GAP: f32 = 3.;
 /// A chip's padding (6 + 6), the gap (3) and the 12px icon around its text.
 pub(crate) const CHIP_CHROME_W: f32 = 27.;
+/// The overflow chip's padding (4 + 4) and its 10px icon; the gap before the
+/// icon is [`LABEL_ICON_GAP`]. A hidden filter with a value adds a dot in
+/// front of the icon, which is not part of [`FitRole::chrome`].
+pub(crate) const MORE_PAD_W: f32 = 8.;
+pub(crate) const MORE_ICON_W: f32 = 10.;
 /// What gpui's ellipsis needs beyond the shaped width: it adds up the
 /// characters one by one, which can come out a hair wider than the shaped
 /// line, and cuts the line when that sum, rounded down, exceeds the box
@@ -215,7 +220,8 @@ impl FitRole {
 	}
 
 	/// The width around the text inside the role's box: a label's icon and
-	/// gap, a chip's padding, gap and icon.
+	/// gap, a chip's padding, gap and icon (the More chip's without its
+	/// dot).
 	pub(crate) fn chrome(self) -> f32 {
 		match self {
 			FitRole::BranchLabel | FitRole::TagLabel => {
@@ -225,13 +231,13 @@ impl FitRole {
 			| FitRole::ChipBranch
 			| FitRole::ChipUser
 			| FitRole::ChipDate => CHIP_CHROME_W,
+			FitRole::ChipMore => MORE_PAD_W + LABEL_ICON_GAP + MORE_ICON_W,
 			FitRole::Subject
 			| FitRole::RefMore
 			| FitRole::Collapsed
 			| FitRole::Author
 			| FitRole::Date
 			| FitRole::Hash
-			| FitRole::ChipMore
 			| FitRole::RefHint
 			| FitRole::PaneGroup
 			| FitRole::PaneRefName

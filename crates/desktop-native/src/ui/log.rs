@@ -3,7 +3,7 @@
 use super::fit::{
 	fit_row, floor_px, natural_px, record_dropped, role_measure, text_width_in,
 	Claim, FitCell, FitId, FitRole, Part, RowFit, CHIP_CHROME_W, FIT_MARGIN,
-	LABEL_ICON_GAP,
+	MORE_ICON_W,
 };
 use super::*;
 
@@ -55,11 +55,9 @@ pub(crate) const ALL_LOG_FILTER_MENUS: [LogMenu; 4] =
 pub(crate) const LOG_FILTER_GAP: f32 = 4.0;
 /// The widest chip text; a longer one is cut with an ellipsis.
 pub(crate) const CHIP_TEXT_MAX_W: f32 = 180.0;
-/// An overflow chip's padding (4 + 4), the gap before its icon, the icon;
-/// a hidden filter with a value adds a 5px dot and its gap in front of the
-/// icon, and a 1px border on each side.
-const MORE_PAD_W: f32 = 8.;
-const MORE_ICON_W: f32 = 10.;
+/// An overflow chip's padding, gap and icon are [`FitRole::ChipMore`]'s
+/// chrome; a hidden filter with a value adds a 5px dot and its gap in front
+/// of the icon, and a 1px border on each side.
 const MORE_DOT_W: f32 = 5. + 2.;
 const MORE_BORDER_W: f32 = 2.;
 
@@ -1165,11 +1163,11 @@ impl WorkbenchModel {
 				valued,
 			}
 		});
-		let more = MORE_PAD_W
-			+ LABEL_ICON_GAP
-			+ role_measure(window, FitRole::ChipMore)(t("log_chip_more", loc))
-			+ MORE_ICON_W
-			+ FIT_MARGIN;
+		let more = natural_px(
+			FitRole::ChipMore,
+			&t("log_chip_more", loc),
+			&role_measure(window, FitRole::ChipMore),
+		);
 		let more_dot = more + MORE_DOT_W + MORE_BORDER_W;
 		let avail = self.log_chips_available_width();
 		layout.used_w.set(avail);
@@ -3434,6 +3432,35 @@ mod row_fit_tests {
 			"{} violations:\n{}",
 			bad.len(),
 			bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+		);
+	}
+
+	/// The collapsed chip only explains the gutter's `+`, so one collapsed
+	/// merge row's chip never hides the author column of the whole list:
+	/// the column is there exactly when it would be without the chip.
+	#[test]
+	fn a_collapsed_chip_never_hides_the_author_column() {
+		let mut bad = Vec::new();
+		let mut seen = 0;
+		for s in shapes((300..=1400).step_by(20).map(|w| w as f32)) {
+			if s.collapsed.is_none() {
+				continue;
+			}
+			let without = Shape {
+				collapsed: None,
+				..s.clone()
+			};
+			let (with, plain) = (solve(&s).cols, solve(&without).cols);
+			if plain.author.is_some() && with.author.is_none() {
+				seen += 1;
+				bad.push(tag(&s));
+			}
+		}
+		assert!(
+			bad.is_empty(),
+			"{} lists lose the author to the chip (of {seen}):\n{}",
+			bad.len(),
+			bad.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
 		);
 	}
 
