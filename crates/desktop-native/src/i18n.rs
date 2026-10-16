@@ -172,6 +172,24 @@ impl Msg {
 	}
 
 	pub fn render(&self, loc: Locale) -> String {
+		self.render_with(loc, &|s| s.to_string())
+	}
+
+	/// This message's wording alone, as `loc` draws it: every plain argument
+	/// (a path, a name, a number, the datum of [`Self::detail`]) is `◇`, so
+	/// only the dictionary's words are left to read. Arguments that are keys
+	/// are worded and nested messages and lists recurse, as `render` does.
+	/// A message that puts an English sentence in a plain argument is read
+	/// as data here: `check_msg_raw.sh` is what keeps those out.
+	pub fn render_shape(&self, loc: Locale) -> String {
+		self.render_with(loc, &|_| "\u{25c7}".to_string())
+	}
+
+	fn render_with(
+		&self,
+		loc: Locale,
+		plain: &dyn Fn(&str) -> String,
+	) -> String {
 		let arg_strs: Vec<String> = self
 			.args
 			.iter()
@@ -180,7 +198,7 @@ impl Msg {
 				if let Some((_, inner)) =
 					self.inner.as_deref().filter(|(at, _)| *at == i)
 				{
-					inner.render(loc)
+					inner.render_with(loc, plain)
 				} else if let Some((_, list)) =
 					self.list.as_deref().filter(|(at, _)| *at == i)
 				{
@@ -191,7 +209,7 @@ impl Msg {
 						.map_or("; ", |(sep, _)| sep)
 						.to_string();
 					list.iter()
-						.map(|m| m.render(loc))
+						.map(|m| m.render_with(loc, plain))
 						.collect::<Vec<_>>()
 						.join(&sep)
 				} else if self.key_args.contains(&i) {
@@ -202,7 +220,7 @@ impl Msg {
 						s.clone()
 					}
 				} else {
-					s.clone()
+					plain(s)
 				}
 			})
 			.collect();
@@ -1391,6 +1409,47 @@ mod tests {
 			assert!(!s.starts_with("paste_err_"), "raw key leaked: {s}");
 			assert!(s.contains("/t/newdir/x") && s.contains("Not a directory"));
 		}
+	}
+
+	/// `render_shape` keeps the dictionary's words and replaces everything
+	/// the caller passed in, however deep it sits: plain arguments and the
+	/// datum of a detail, but not key arguments, which are words.
+	#[test]
+	fn render_shape_keeps_the_words_and_hides_the_data() {
+		let plain = Msg::new(
+			"paste_err_destination",
+			["/a b/newdir".to_string(), "Not a directory".to_string()],
+		);
+		for loc in [Locale::ZhTw, Locale::En] {
+			let shape = plain.render_shape(loc);
+			assert!(!shape.contains("newdir"), "{shape}");
+			assert!(!shape.contains("Not a directory"), "{shape}");
+			assert!(shape.contains('\u{25c7}'), "{shape}");
+		}
+		// A detail: the headline is worded, the datum is hidden.
+		let detail = Msg::detail(
+			Msg::new("status_history_loaded", ["4".to_string()]),
+			"some user path",
+		);
+		let shape = detail.render_shape(Locale::ZhTw);
+		assert!(!shape.contains("some user path"), "{shape}");
+		assert!(!shape.contains('4'), "{shape}");
+		assert!(shape.contains("已載入"), "{shape}");
+		// A key argument is still worded.
+		let keyed = Msg::with_key_arg(
+			"reason_detail",
+			["status_history_loaded".to_string(), "data".to_string()],
+			0,
+		);
+		assert_eq!(
+			keyed.render_shape(Locale::ZhTw),
+			format!("{}：\u{25c7}", t("status_history_loaded", Locale::ZhTw))
+		);
+		// What `render` shows is unchanged.
+		assert_eq!(
+			keyed.render(Locale::En),
+			format!("{}: data", t("status_history_loaded", Locale::En))
+		);
 	}
 
 	/// Every `Msg::new("key", ..)` in this crate must have both translations,

@@ -270,6 +270,34 @@ impl Browse {
 	pub fn seq(&self) -> u64 {
 		self.seq
 	}
+
+	/// Whether this browse keeps its Client across hops (M2 of
+	/// `invariants`): the field is private, and the test accessor above is
+	/// not compiled into the product.
+	pub(crate) fn has_client(&self) -> bool {
+		self.client.is_some()
+	}
+
+	/// A browse of host `host` that listed nothing yet, for the breakers of
+	/// `invariants`.
+	#[cfg(test)]
+	pub(crate) fn for_tests(host: usize) -> Self {
+		Self {
+			host,
+			path: String::new(),
+			listing: None,
+			seq: 0,
+			client: None,
+			cancel: snip_core::gitrun::CancelToken::new(),
+			prefill: String::new(),
+		}
+	}
+
+	/// What this code last wrote into the path field (M3 of `invariants`).
+	#[cfg(test)]
+	pub(crate) fn prefill(&self) -> &str {
+		&self.prefill
+	}
 }
 
 /// `name` inside `dir`, as the worker resolves it (`..` included).

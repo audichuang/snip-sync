@@ -185,6 +185,18 @@ impl PastePreview {
 		self.plan.as_mut()
 	}
 
+	/// A test marks a preview as being read.
+	#[cfg(test)]
+	pub fn mark_loading_for_tests(&mut self) {
+		self.loading = true;
+	}
+
+	/// A test drops the destination folder under an open plan.
+	#[cfg(test)]
+	pub fn unset_folder_for_tests(&mut self) {
+		self.folder = None;
+	}
+
 	/// A test holds retained bytes the way a running apply does, so a
 	/// refusal needs neither a worker nor a clock to race.
 	#[cfg(test)]

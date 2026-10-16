@@ -203,7 +203,6 @@ impl LayerState {
 	}
 
 	/// The state a kind's layer must have (invariant O1).
-	#[allow(dead_code)] // the checker of #230 reaches it through `eval`
 	fn fits(&self, kind: OverlayKind) -> bool {
 		matches!(
 			(kind, self),
@@ -452,7 +451,6 @@ impl OverlayStack {
 
 	/// A pending return of the keyboard exists (it is applied at the next
 	/// frame).
-	#[allow(dead_code)] // the checker of #230 reaches it through `eval`
 	pub(crate) fn has_pending_return(&self) -> bool {
 		self.pending_return.is_some()
 	}
@@ -510,7 +508,6 @@ impl OverlayStack {
 	}
 
 	/// Whether every open layer's state belongs to its kind (O1).
-	#[allow(dead_code)] // the checker of #230 reaches it through `eval`
 	fn states_fit(&self) -> Option<OverlayKind> {
 		[
 			&self.floating,
@@ -527,11 +524,9 @@ impl OverlayStack {
 
 // ───────────────────────── invariants ─────────────────────────
 
-/// The properties of the layers that hold at any time they are asked
-/// (a test after `settle`, or the fuzz harness of #230).
-// #230's invariant catalog calls these from production code at the end of a
-// frame; until it lands only the tests do.
-#[allow(dead_code)]
+/// The properties of the layers that hold at any time they are asked, except
+/// the ones `quiescent_only` names. `invariants` (the catalog of #230) wraps
+/// them as its `O` family; the E2E log and the fuzz lanes read them there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OverlayInvariant {
 	/// Every layer's state belongs to its kind.
@@ -549,7 +544,6 @@ pub(crate) enum OverlayInvariant {
 	O6,
 }
 
-#[allow(dead_code)]
 impl OverlayInvariant {
 	pub(crate) const ALL: &'static [OverlayInvariant] = &[
 		OverlayInvariant::O1,
@@ -594,7 +588,6 @@ impl OverlayInvariant {
 	}
 }
 
-#[allow(dead_code)]
 impl OverlayStack {
 	/// One invariant; `None` means it holds. O5 is only meaningful after
 	/// the tab has rendered.
@@ -650,15 +643,12 @@ impl OverlayStack {
 		}
 	}
 
-	/// Every invariant that does not hold, with what is wrong.
-	///
-	/// Hand-over to #230's `check_invariants` (its §3.1 signature is
-	/// `(&self, WindowId, &TooltipGate, &dyn Fn(OverlayKind) -> bool)`; this
-	/// one reads the model and the app instead, so #230 adapts in place):
-	/// its O1 (two floating layers) cannot happen here, the type has one
-	/// floating slot, so it has no breaker; its O2 is `O6` below; its O3
-	/// (open layer iff its panel is drawn) is the test-side
-	/// `assert_overlay_panels_match`.
+	/// Every invariant that does not hold, with what is wrong. The catalog
+	/// of #230 (`invariants.rs`) reads the same members one by one; its `O7`
+	/// (an open layer iff its panel is drawn) is the test-side
+	/// `assert_overlay_panels_match`, and a second floating layer cannot
+	/// happen here: the type has one floating slot.
+	#[cfg(test)]
 	pub(crate) fn check_invariants(
 		m: &WorkbenchModel,
 		cx: &App,
@@ -667,6 +657,78 @@ impl OverlayStack {
 			.iter()
 			.filter_map(|&id| Self::eval(id, m, cx).map(|d| (id, d)))
 			.collect()
+	}
+}
+
+impl OverlayStack {
+	/// Opens `kind` with no trigger and nothing to give the keyboard back
+	/// to, whatever the model looks like: for the breakers of `invariants`.
+	#[cfg(test)]
+	pub(crate) fn force_open_for_tests(&mut self, kind: OverlayKind) {
+		let state = match kind {
+			OverlayKind::ContextMenu => LayerState::None,
+			other => LayerState::initial(other),
+		};
+		let layer = Layer {
+			kind,
+			return_to: ReturnFocus::Root,
+			trigger: None,
+			owned: Vec::new(),
+			state,
+		};
+		self.install(layer);
+	}
+}
+
+/// Puts the model in a state that breaks `id`, for the test that checks the
+/// checker sees it (T1 of #230).
+#[cfg(test)]
+pub(crate) fn break_for_tests(m: &mut WorkbenchModel, id: OverlayInvariant) {
+	use crate::Popover;
+	let layer = |kind, state| Layer {
+		kind,
+		return_to: ReturnFocus::Root,
+		trigger: None,
+		owned: Vec::new(),
+		state,
+	};
+	match id {
+		// A layer holding another kind's state.
+		OverlayInvariant::O1 => {
+			m.overlays.floating =
+				Some(layer(OverlayKind::WorkspaceMenu, LayerState::None));
+		}
+		// A host browse with the workspace menu closed.
+		OverlayInvariant::O2 => {
+			m.overlays.floating = None;
+			m.remote.browse = Some(crate::remote::Browse::for_tests(0));
+		}
+		// A floating layer in a workspace tab that is not the shown one.
+		OverlayInvariant::O3 => {
+			m.overlays.floating = Some(layer(
+				OverlayKind::WorkspaceMenu,
+				LayerState::WorkspaceMenu { picker: false },
+			));
+			m.ws_tab = Some(u32::MAX);
+		}
+		// A selector cursor far past any candidate.
+		OverlayInvariant::O4 => {
+			m.overlays.floating = Some(layer(
+				OverlayKind::Selector(Popover::Repo),
+				LayerState::Selector { cursor: 10_000 },
+			));
+		}
+		// A return of the keyboard nobody applied.
+		OverlayInvariant::O5 => {
+			m.overlays.pending_return = Some((ReturnFocus::Root, Vec::new()));
+		}
+		// The tooltip gate published closed-layers-open with no layer open.
+		OverlayInvariant::O6 => {
+			m.overlays.floating = None;
+			m.overlays
+				.published_gate
+				.set(Some((WindowId::from(1), true)));
+		}
 	}
 }
 

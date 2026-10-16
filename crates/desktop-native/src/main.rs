@@ -270,6 +270,7 @@ pub mod graph_view;
 mod history;
 pub mod i18n;
 mod icons;
+mod invariants;
 pub mod lifecycle;
 mod menu;
 mod multi_log;
@@ -526,6 +527,11 @@ impl<T: PartialEq> ReadQueue<T> {
 
 	pub fn in_flight(&self) -> usize {
 		self.in_flight
+	}
+
+	/// Nothing is running and nothing waits.
+	pub fn is_idle(&self) -> bool {
+		self.in_flight == 0 && self.pending.is_empty()
 	}
 }
 
@@ -1048,6 +1054,10 @@ pub struct WorkbenchModel {
 	/// Test-only: the same hold for a paste row's diff read.
 	#[cfg(test)]
 	pub(crate) e2e_paste_diff_hold: Option<std::time::Duration>,
+	/// Test-only: the text a paste reads in place of the OS clipboard, so a
+	/// test or a fuzz lane drives the real `ctrl-v` without display or lock.
+	#[cfg(test)]
+	pub(crate) test_clipboard: Option<String>,
 	pub workspace_open: bool,
 	pub workspace_path_input: Entity<TextInput>,
 	/// The paste panel's typed destination folder. Open or closed is its
@@ -1072,6 +1082,9 @@ pub struct WorkbenchModel {
 	pub changes_generation: u64,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
+	/// The current branch the branches pane drew its HEAD marker from this
+	/// frame; `None` when the pane was not drawn (B1 of `invariants`).
+	pub(crate) last_branch_current: std::cell::Cell<Option<Option<String>>>,
 	/// Repo of the failed preview load when `preview_error` is Some.
 	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1559,6 +1572,8 @@ impl WorkbenchModel {
 			e2e_copy_hold: None,
 			#[cfg(test)]
 			e2e_paste_diff_hold: None,
+			#[cfg(test)]
+			test_clipboard: None,
 			workspace_open: workspace.is_some(),
 			workspace_path_input,
 			paste_dest_input,
@@ -1575,6 +1590,7 @@ impl WorkbenchModel {
 			changes_generation: 0,
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
+			last_branch_current: std::cell::Cell::new(None),
 			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
@@ -5388,6 +5404,15 @@ impl WorkbenchModel {
 		self.trigger_paste_preview_into(None, cx);
 	}
 
+	/// What a paste reads: the OS clipboard, or in a test the text it set.
+	fn clipboard_text(&self) -> snip_core::clip::Result<String> {
+		#[cfg(test)]
+		if let Some(text) = &self.test_clipboard {
+			return Ok(text.clone());
+		}
+		clip::read_text()
+	}
+
 	/// Opens the paste preview from the clipboard: into `folder`, or, when
 	/// none is named, the default destination (`--restore-dir`, else the
 	/// pinned repo, else the workspace folder).
@@ -5416,7 +5441,7 @@ impl WorkbenchModel {
 		}
 		self.paste.clear(self.preview.as_ref());
 		self.drop_paste_dest_edit();
-		let text = match clip::read_text() {
+		let text = match self.clipboard_text() {
 			Ok(t) => t,
 			Err(e) => {
 				app_log!("[APP:PASTE_ERR: clipboard]");
@@ -20069,8 +20094,9 @@ mod tests {
 		/// and leaves the consumers settled: a scan page and a rescan, a repo
 		/// added by hand, a vanished repo dropped, the workspace released.
 		/// A remote scan's failure (`Clear`) needs a fault injected into the
-		/// worker, and is covered by the type: a change that is not handed
-		/// to `repos_changed` does not build, and panics when dropped.
+		/// worker: `a_refused_remote_scan_clears_the_repo_set_and_its_consumers`.
+		/// The type covers the rest: a change that is not handed to
+		/// `repos_changed` does not build, and panics when dropped.
 		#[gpui::test]
 		fn every_repo_set_source_fans_out(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
@@ -20082,43 +20108,91 @@ mod tests {
 			let c = scanned_entry(&repo(ws.path(), "c", &[]));
 			let c_key = crate::repo_key(&c);
 			let ext_entry = scanned_entry(&ext);
+			use crate::invariants::Invariant::{R1, R2, R4};
+			const SETTLED: &[crate::invariants::Invariant] = &[R1, R2, R4];
 			let rev = |m: &WorkbenchModel| m.repos.rev();
 			let mut last = model.read_with(cx, |m, _| rev(m));
 			let mut advanced = |cx: &mut VisualTestContext, what: &str| {
 				settle(cx);
-				model.read_with(cx, |m, _| {
+				model.read_with(cx, |m, cx| {
 					assert!(rev(m) > last, "{what} advances the revision");
 					last = rev(m);
 					assert!(!m.is_loading);
-					m.assert_repo_consumers_settled();
+					crate::invariants::assert_holds(m, cx, SETTLED);
 				});
 			};
 
 			model.update_in(cx, |m, _, cx| {
 				m.apply_scan_page(false, vec![b], cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a scan page");
 			model.update_in(cx, |m, _, cx| {
 				m.apply_scan_page(true, vec![c], cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a rescan");
 			model.update_in(cx, |m, _, cx| {
 				m.install_added_repo(Ok(ext_entry), cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a repo added by hand");
 			model.update_in(cx, |m, _, cx| {
 				assert!(m.drop_vanished_repo(&c_key, cx).is_none());
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a vanished repo");
 			model.update_in(cx, |m, _, cx| m.release_workspace_state(cx));
-			model.read_with(cx, |m, _| {
+			model.read_with(cx, |m, cx| {
 				assert!(rev(m) > last, "the release advances the revision");
 				assert!(m.repos.is_empty());
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
+			});
+		}
+
+		/// The source `every_repo_set_source_fans_out` could not reach
+		/// without a fault: a remote scan the worker refuses clears the repo
+		/// set, and every consumer follows it (#227, #230).
+		#[gpui::test]
+		fn a_refused_remote_scan_clears_the_repo_set_and_its_consumers(
+			cx: &mut TestAppContext,
+		) {
+			use crate::invariants::Invariant::{R1, R2, R4};
+			let _remote = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			repo(tmp.path(), "a", &[]);
+			let path = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx, worker) = open_remote(
+				cx,
+				tmp.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			wait_remote_repo_loaded(&model, cx);
+			let before = model.read_with(cx, |m, cx| {
+				crate::invariants::assert_holds(m, cx, &[R1, R2, R4]);
+				m.repos.rev()
+			});
+			worker.set_scan_failures_for_tests(
+				&path,
+				0,
+				Some(snip_remote::proto::ErrorCode::Forbidden),
+			);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			settle_until(cx, "the refused scan", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote.scan_error.is_some() && !m.is_loading
+				})
+			});
+			model.read_with(cx, |m, cx| {
+				assert!(
+					m.repos.rev() > before,
+					"the refusal advances the revision"
+				);
+				assert!(m.repos.is_empty(), "the refused scan left repos");
+				crate::invariants::assert_holds(m, cx, &[R1, R2, R4]);
 			});
 		}
 
@@ -30305,6 +30379,11 @@ mod tests {
 				})
 			}
 		}
+
+		/// The invariant registry's tests and the random-gesture lanes that
+		/// drive it (#230): `src/tests/in_process/invariant_tests.rs`, a file
+		/// of its own as `paste/zh_leaks_tests.rs` is.
+		mod invariant_tests;
 	}
 
 	mod folder_copy {

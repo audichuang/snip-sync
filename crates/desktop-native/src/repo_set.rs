@@ -279,54 +279,6 @@ impl WorkbenchModel {
 		self.sync_list_row();
 		self.sync_log_scope(cx);
 	}
-
-	/// The state every consumer of the repo list is in once a change is
-	/// settled; a test calls it after each source of change.
-	#[cfg(test)]
-	pub(crate) fn assert_repo_consumers_settled(&self) {
-		let mut have: Vec<&Path> =
-			self.change_repos.iter().map(|s| s.root.as_path()).collect();
-		let mut want: Vec<&Path> =
-			self.repos.iter().map(|r| r.root.as_path()).collect();
-		have.sort();
-		want.sort();
-		assert_eq!(have, want, "the Changes nodes are the repos");
-		for slot in &self.change_repos {
-			let repo = self.repos.iter().find(|r| r.root == slot.root);
-			assert_eq!(
-				Some(slot.name.as_str()),
-				repo.map(|r| r.name.as_str()),
-				"a Changes node keeps the name of its repo"
-			);
-		}
-		let order: Vec<_> = self
-			.change_repos
-			.iter()
-			.map(|s| (s.name.as_str(), s.root.as_path()))
-			.collect();
-		assert!(order.is_sorted(), "the Changes nodes are in order");
-		if let Some(idx) = self.selected_repo_idx {
-			let entry = self.repos.get(idx).expect("the open repo exists");
-			if let Some(key) = &self.pinned_repo {
-				assert!(
-					crate::repo_key_matches(entry, key),
-					"the index names the pinned repo"
-				);
-			}
-		}
-		if let Some(plan) = self.paste.plan() {
-			if !self.paste.is_loading()
-				&& !self.paste.is_applying()
-				&& !plan.prefix_choices.is_empty()
-			{
-				assert_eq!(
-					plan.seen_roots(),
-					crate::paste::roots_digest(&self.repos.roots()),
-					"an idle preview has seen every repo"
-				);
-			}
-		}
-	}
 }
 
 #[cfg(test)]

@@ -1757,6 +1757,8 @@ impl Render for WorkbenchModel {
 		self.publish_gate(window, cx);
 		// Triggers are written again as this frame draws them.
 		self.overlays.clear_trigger_slots();
+		// Written again by the branches pane if this frame draws it.
+		self.last_branch_current.set(None);
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}

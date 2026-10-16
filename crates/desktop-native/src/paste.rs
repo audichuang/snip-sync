@@ -1956,7 +1956,6 @@ impl PastePreviewPlan {
 	}
 
 	/// The digest of the repo roots this plan last saw.
-	#[cfg(test)]
 	pub(crate) fn seen_roots(&self) -> u64 {
 		self.seen_roots
 	}
@@ -3830,6 +3829,45 @@ impl PastePreviewPlan {
 			},
 			created_commits: replay_res.created,
 		})
+	}
+
+	/// Makes the plan forget the repo set it last saw (a breaker of R4).
+	#[cfg(test)]
+	pub(crate) fn forget_roots_for_tests(&mut self) {
+		self.seen_roots = !self.seen_roots;
+	}
+
+	/// Whether the cursor stands on a row that is drawn (P5 of
+	/// `invariants`): the one question `normalize_cursor` settles.
+	pub(crate) fn cursor_visible(&self) -> bool {
+		let cursor = self.cursor();
+		self.cursor_rows().iter().any(|(c, ..)| *c == cursor)
+	}
+
+	/// How many folded folders no longer name a row (P6 of `invariants`).
+	/// The set of folders that exist is the one `normalize_cursor` keeps.
+	pub(crate) fn stale_folds(&self) -> usize {
+		if self.whole_commit {
+			return 0;
+		}
+		let mut exists: BTreeSet<DirKey> = self
+			.all_dirs()
+			.into_iter()
+			.map(|(root, path, _)| DirKey {
+				commit: None,
+				root,
+				path,
+			})
+			.collect();
+		exists.extend(self.root_groups().into_iter().map(|g| DirKey {
+			commit: None,
+			root: g.root,
+			path: String::new(),
+		}));
+		self.collapsed_dirs
+			.iter()
+			.filter(|k| !exists.contains(*k))
+			.count()
 	}
 }
 

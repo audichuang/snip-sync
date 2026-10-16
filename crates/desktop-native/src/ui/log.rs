@@ -2542,6 +2542,7 @@ impl WorkbenchModel {
 			.trim()
 			.to_lowercase();
 		let current = self.log_branch_list_current();
+		self.last_branch_current.set(Some(current.clone()));
 		let mut rows: Vec<AnyElement> = Vec::new();
 		let entry = |id: String,
 		             label: String,
