@@ -977,6 +977,61 @@ mod tests {
 		);
 	}
 
+	/// A read past its deadline is cancelled, but a call that cannot be
+	/// interrupted (a slow filesystem) keeps the worker busy: the master
+	/// hears Pending while it ends, then the Timeout, which stays the last
+	/// frame. Silence there reads as a dead worker (#191).
+	#[test]
+	fn a_read_job_past_its_deadline_keeps_heartbeating_until_it_ends() {
+		let buf = SharedBuf::default();
+		let heartbeat = scaled(Duration::from_millis(100));
+		let deadline = scaled(Duration::from_millis(30));
+
+		run_job_with(
+			&mut Answer::new(&mut buf.clone(), None),
+			heartbeat,
+			deadline,
+			CancelToken::new(),
+			DeadlineReply::Fail,
+			|_, _| {
+				// Ignores its cancel, as a blocked call does.
+				std::thread::sleep(scaled(Duration::from_millis(450)));
+				Response::Text {
+					content: Some("finished late".into()),
+				}
+			},
+		)
+		.unwrap();
+
+		let mut cursor = std::io::Cursor::new(buf.0.lock().unwrap().clone());
+		let mut pending = 0usize;
+		let last = loop {
+			match read_frame::<Response>(&mut cursor).unwrap() {
+				Some(Response::Pending) => pending += 1,
+				Some(frame) => break frame,
+				None => panic!("no reply"),
+			}
+		};
+		assert!(
+			matches!(
+				last,
+				Response::Error {
+					code: ErrorCode::Timeout,
+					..
+				}
+			),
+			"{last:?}"
+		);
+		assert!(
+			read_frame::<Response>(&mut cursor).unwrap().is_none(),
+			"the Timeout is the last frame"
+		);
+		assert!(
+			pending >= 1,
+			"no heartbeat while the job ran past its deadline"
+		);
+	}
+
 	#[test]
 	fn run_job_turns_an_oversized_reply_into_too_large() {
 		let mut buf = Vec::new();

@@ -496,3 +496,102 @@ fn a_delayed_job_request_still_heartbeats() {
 	assert!(started.elapsed() >= SLOW_WORK);
 	assert!(conn.frames_seen() >= 2, "{}", conn.frames_seen());
 }
+
+fn page_delay_rule(kind: RequestKind, d: Duration) -> FaultRule {
+	FaultRule {
+		on: Match::Kind(kind),
+		workspace: None,
+		skip: 0,
+		times: 1,
+		fault: Fault::PageDelay(d),
+	}
+}
+
+fn scaled(d: Duration) -> Duration {
+	let scale = std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+		.ok()
+		.and_then(|v| v.parse::<u32>().ok())
+		.unwrap_or(1)
+		.max(1);
+	d.saturating_mul(scale)
+}
+
+/// A listing that outlives its deadline stops walking the folder: the pages
+/// after the deadline are never read, and the Timeout comes back about when
+/// the page in hand ends, not when the whole folder was read (#191).
+#[test]
+fn a_folder_listing_stops_walking_at_its_deadline() {
+	let tmp = tempfile::tempdir().unwrap();
+	let root = tmp.path().join("ws");
+	fs::create_dir_all(&root).unwrap();
+	// 11 pages of 256 visited entries.
+	for i in 0..2800 {
+		fs::write(root.join(format!("f{i:05}")), "").unwrap();
+	}
+	let w = worker();
+	let ws = open_ws(&w, &root);
+	let deadline = scaled(Duration::from_millis(300));
+	let page = scaled(Duration::from_millis(100));
+	w.set_deadlines_for_tests(deadline, Duration::from_secs(60));
+	w.inject_fault_for_tests(FaultRule {
+		times: usize::MAX,
+		..page_delay_rule(RequestKind::ListDir, page)
+	});
+	let mut conn =
+		Connection::open(&Transport::InProcess(w.clone()), "t").unwrap();
+	let started = Instant::now();
+	let reply = conn.call(
+		&inline_request(RequestKind::ListDir, &ws, &root),
+		None,
+		Duration::from_secs(30),
+	);
+	let took = started.elapsed();
+	assert_eq!(refused(reply), ErrorCode::Timeout);
+	assert!(
+		took < deadline + page * 5,
+		"the listing read on after its deadline: {took:?}"
+	);
+}
+
+/// Whatever an inline request is doing when its deadline passes, a call
+/// that cannot be interrupted (a slow disk) keeps the master hearing from
+/// the worker until it ends, and the answer is the Timeout (#191).
+#[test]
+fn every_inline_request_past_its_deadline_heartbeats_then_times_out() {
+	let tmp = tempfile::tempdir().unwrap();
+	let root = tmp.path().join("ws");
+	fs::create_dir_all(&root).unwrap();
+	fs::write(root.join("a.txt"), "hello").unwrap();
+	let w = worker();
+	let ws = open_ws(&w, &root);
+	w.set_deadlines_for_tests(
+		scaled(Duration::from_millis(400)),
+		Duration::from_secs(60),
+	);
+	let kinds: Vec<RequestKind> = ALL_REQUEST_KINDS
+		.into_iter()
+		.filter(|k| served_inline(*k))
+		.collect();
+	assert_eq!(kinds.len(), 4, "{kinds:?}");
+	for kind in &kinds {
+		w.inject_fault_for_tests(page_delay_rule(*kind, SLOW_WORK));
+	}
+	std::thread::scope(|scope| {
+		for kind in &kinds {
+			let mut conn =
+				Connection::open(&Transport::InProcess(w.clone()), "t")
+					.unwrap();
+			let request = inline_request(*kind, &ws, &root);
+			let kind = *kind;
+			scope.spawn(move || {
+				let reply = conn.call(&request, None, Duration::from_secs(30));
+				assert_eq!(refused(reply), ErrorCode::Timeout, "{kind:?}");
+				assert!(
+					conn.frames_seen() >= 2,
+					"{kind:?} went silent after its deadline: {} frame(s)",
+					conn.frames_seen()
+				);
+			});
+		}
+	});
+}
