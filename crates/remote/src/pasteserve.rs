@@ -29,6 +29,17 @@ use crate::worker::{io_error, SharedRoot};
 
 type Refusal = Box<Response>;
 
+/// A write result for the wire: a failure's reason loses the OS text and
+/// the machine's paths, like every other reason a worker sends.
+fn wire_result(
+	mut result: snip_core::restore::RestoreExecutionResult,
+) -> snip_core::restore::RestoreExecutionResult {
+	for f in &mut result.failures {
+		f.reason = f.reason.take().map(snip_core::reason::Reason::scrubbed);
+	}
+	result
+}
+
 fn refused(code: ErrorCode, message: impl Into<String>) -> Refusal {
 	refused_with(code, message, None)
 }
@@ -424,7 +435,7 @@ pub(crate) fn import_apply(
 				}
 			})
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Imported(result))
+		Ok(Response::Imported(wire_result(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }

@@ -1793,6 +1793,22 @@ mod tests {
 		};
 		assert_eq!(result.planned_skipped_count, 0);
 		assert_eq!(result.total_skipped(), 2);
+		assert!(result.failures.is_empty());
+		// A failure carries its reason; one a newer peer added costs that
+		// reason, not the frame.
+		let new: Response = serde_json::from_str(r#"{"reply":"imported","createdCount":0,"overwrittenCount":0,"skippedExistingCount":0,"deletedCount":0,"errors":["a: x","b: y"],"failures":[{"path":"a","reason":{"r":"unsafe_path","path":""}},{"path":"b","reason":{"r":"from_the_future"}}]}"#).unwrap();
+		let Response::Imported(result) = new else {
+			panic!("wrong result")
+		};
+		assert_eq!(result.failures.len(), 2);
+		assert_eq!(
+			result.failures[0].reason,
+			Some(snip_core::reason::Reason::UnsafePath {
+				path: String::new()
+			})
+		);
+		assert_eq!(result.failures[1].reason, None);
+		round_trip_check(&Response::Imported(result));
 	}
 
 	#[test]

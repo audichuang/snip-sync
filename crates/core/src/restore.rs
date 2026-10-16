@@ -16,6 +16,7 @@ use crate::paths::{
 	escapes_all_roots, has_git_segment, lands_in_git_dir,
 	resolve_delete_target, resolve_write_target, RejectReason,
 };
+use crate::reason::{io_reason, Reason};
 
 /// One file from the payload; `parse_clipboard` produces these.
 pub type RestoreEntry = ParsedEntry;
@@ -151,7 +152,35 @@ pub struct RestoreExecutionResult {
 	#[serde(default)]
 	pub planned_skipped_count: usize,
 	pub deleted_count: usize,
+	/// The CLI's lines, `path: text`. Never parsed: `failures` is the same
+	/// list as data.
 	pub errors: Vec<String>,
+	/// Why each entry of `errors` failed, in the same order, for a front
+	/// end to word. Empty from a peer that predates it.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub failures: Vec<RestoreFailure>,
+}
+
+/// One failed entry: the plan's relative path and why, as a [`Reason`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreFailure {
+	pub path: String,
+	/// `None` when a newer peer's reason is not understood.
+	#[serde(default, deserialize_with = "crate::reason::lenient")]
+	pub reason: Option<Reason>,
+}
+
+impl RestoreExecutionResult {
+	/// Record a failure in both forms, so the CLI's line and the typed
+	/// reason cannot drift apart.
+	fn fail(&mut self, path: &str, text: &str, reason: Reason) {
+		self.errors.push(format!("{path}: {text}"));
+		self.failures.push(RestoreFailure {
+			path: path.to_string(),
+			reason: Some(reason),
+		});
+	}
 }
 
 impl RestoreExecutionResult {
@@ -321,7 +350,7 @@ pub fn execute_restore_plan_observed(
 				after_write(op, &outcome);
 			}
 			Ok(CreateOutcome::Skipped) => result.skipped_existing_count += 1,
-			Err(message) => result.errors.push(message),
+			Err(f) => result.fail(&op.relative_path, &f.text, f.reason),
 		}
 	}
 
@@ -335,17 +364,23 @@ pub fn execute_restore_plan_observed(
 			|| has_git_segment(&op.relative_path)
 			|| lands_in_git_dir(&op.absolute_path)
 		{
-			result
-				.errors
-				.push(format!("{}: unsafe path", op.relative_path));
+			result.fail(
+				&op.relative_path,
+				"unsafe path",
+				Reason::UnsafePath {
+					path: op.relative_path.clone(),
+				},
+			);
 			continue;
 		}
 		if op.absolute_path.exists() {
 			match delete_file(&op.absolute_path) {
 				Ok(()) => result.deleted_count += 1,
-				Err(e) => {
-					result.errors.push(format!("{}: {e}", op.relative_path))
-				}
+				Err(e) => result.fail(
+					&op.relative_path,
+					&e.to_string(),
+					io_reason(&e, &op.relative_path),
+				),
 			}
 		}
 	}
@@ -360,16 +395,27 @@ pub enum CreateOutcome {
 	Skipped,
 }
 
+/// Why one create operation failed: the CLI's text and the reason.
+struct CreateFailure {
+	text: String,
+	reason: Reason,
+}
+
 fn run_create(
 	roots: &[PathBuf],
 	selection: &RestoreSelection,
 	op: &CreateOperation,
-) -> Result<CreateOutcome, String> {
+) -> Result<CreateOutcome, CreateFailure> {
 	if escapes_all_roots(roots, &op.absolute_path)
 		|| has_git_segment(&op.relative_path)
 		|| lands_in_git_dir(&op.absolute_path)
 	{
-		return Err(format!("{}: unsafe path", op.relative_path));
+		return Err(CreateFailure {
+			text: "unsafe path".into(),
+			reason: Reason::UnsafePath {
+				path: op.relative_path.clone(),
+			},
+		});
 	}
 	if must_not_overwrite(&op.absolute_path) {
 		return Ok(CreateOutcome::Skipped);
@@ -384,8 +430,12 @@ fn run_create(
 		Ok(_) => CreateOutcome::Overwritten,
 		Err(_) => CreateOutcome::Created,
 	};
-	write_text_file(&op.absolute_path, &op.content)
-		.map_err(|e| format!("{}: {e}", op.relative_path))?;
+	write_text_file(&op.absolute_path, &op.content).map_err(|e| {
+		CreateFailure {
+			text: e.to_string(),
+			reason: io_reason(&e, &op.relative_path),
+		}
+	})?;
 	Ok(outcome)
 }
 
@@ -807,6 +857,15 @@ mod tests {
 		let result = execute_restore_plan(&plan, &overwrite());
 		assert_eq!(result.created_count, 1);
 		assert_eq!(result.errors, ["sub/pre-commit: unsafe path"]);
+		assert_eq!(
+			result.failures,
+			[RestoreFailure {
+				path: "sub/pre-commit".into(),
+				reason: Some(Reason::UnsafePath {
+					path: "sub/pre-commit".into()
+				}),
+			}]
+		);
 		assert!(!root.join(".git/hooks/pre-commit").exists());
 		assert_eq!(read(root.join("ok.txt")), "x");
 	}
@@ -1573,6 +1632,7 @@ mod tests {
 		assert_eq!(result.created_count, 0);
 		assert_eq!(result.deleted_count, 0);
 		assert_eq!(result.errors.len(), 2);
+		assert_eq!(result.failures.len(), result.errors.len());
 		assert!(result.errors[0].contains(".git/config: unsafe path"));
 		assert!(result.errors[1].contains(".git/config: unsafe path"));
 	}

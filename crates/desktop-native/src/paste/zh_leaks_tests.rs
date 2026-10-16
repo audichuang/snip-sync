@@ -1112,6 +1112,31 @@ fn every_reason_is_worded_in_both_languages() {
 			}
 		}
 	}
+	// A failed file of a restore is worded through the same reasons, alone
+	// and in the result card.
+	for (label, reason) in &samples {
+		let failure = |path: &str| snip_core::restore::RestoreFailure {
+			path: path.into(),
+			reason: Some(reason.clone()),
+		};
+		let files = |n: usize| snip_core::restore::RestoreExecutionResult {
+			errors: vec!["english".into(); n],
+			failures: (0..n).map(|i| failure(&format!("f{i}.txt"))).collect(),
+			..Default::default()
+		};
+		for n in [1, 2] {
+			let status = PasteApplyResult {
+				files: files(n),
+				created_commits: Vec::new(),
+			}
+			.status();
+			check(format!("restore/{label}/{n}"), &zh(&status), &mut found);
+			let en = status.render(Locale::En).replace(D, "x");
+			assert!(!has_empty_slot(&en), "{label}: empty slot in {en}");
+			assert!(!en.contains("english"), "{label}: {en}");
+		}
+	}
+
 	assert!(found.leaks.is_empty(), "English leaks: {:#?}", found.leaks);
 	assert!(
 		found.no_wording.is_empty(),

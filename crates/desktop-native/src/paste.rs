@@ -773,10 +773,59 @@ impl PasteApplyResult {
 			}
 			return Msg::new("status_paste_done", counts);
 		}
+		let failures = self.failures();
+		let first = restore_failure_msg(&failures[0]);
 		let mut args = counts.to_vec();
-		args.push(f.errors.join("; "));
-		Msg::new("status_paste_partial", args)
+		args.push(String::new());
+		if failures.len() == 1 {
+			return Msg::with_msg_arg("status_paste_partial", args, 5, first);
+		}
+		// The first is worded in full; the others are named, so every path
+		// that did not land is on screen.
+		args.push(
+			failures[1..]
+				.iter()
+				.map(|f| f.path.as_str())
+				.collect::<Vec<_>>()
+				.join(", "),
+		);
+		Msg::with_msg_arg("status_paste_partial_more", args, 5, first)
 	}
+
+	/// The failures as data. A worker that predates typed failures sent
+	/// only its text, kept here as the data trailing a generic headline.
+	fn failures(&self) -> Vec<snip_core::restore::RestoreFailure> {
+		let f = &self.files;
+		if f.failures.len() == f.errors.len() {
+			return f.failures.clone();
+		}
+		f.errors
+			.iter()
+			.map(|text| snip_core::restore::RestoreFailure {
+				path: String::new(),
+				reason: Some(snip_core::reason::Reason::Io {
+					detail: text.clone(),
+				}),
+			})
+			.collect()
+	}
+}
+
+/// One failed file: its path, then why.
+fn restore_failure_msg(f: &snip_core::restore::RestoreFailure) -> Msg {
+	let why = f
+		.reason
+		.as_ref()
+		.map_or_else(|| Msg::new("restore_err_unknown", []), reason_msg);
+	if f.path.is_empty() {
+		return why;
+	}
+	Msg::with_msg_arg(
+		"restore_err_file",
+		[f.path.clone(), String::new()],
+		1,
+		why,
+	)
 }
 
 /// A paste into a remote workspace: its worker plans and writes through
@@ -850,6 +899,11 @@ fn destination_msg(
 	path: &Path,
 	err: PasteError,
 ) -> Msg {
+	// A local folder that did not resolve is named by its own path: a
+	// prefix's folder is not the destination.
+	if let PasteError::Destination { path, source } = &err {
+		return destination_error(path, source);
+	}
 	let shown =
 		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
 	Msg::with_msg_arg(
@@ -2567,6 +2621,7 @@ impl PastePreviewPlan {
 				skipped_existing_count: 0,
 				planned_skipped_count: 0,
 				errors: Vec::new(),
+				failures: Vec::new(),
 			},
 			created_commits: replay_res.created,
 		})
@@ -2599,14 +2654,26 @@ pub(crate) mod tests {
 
 	#[test]
 	fn apply_status_lists_each_failed_path_not_only_the_count() {
-		let result = |errors: Vec<String>| PasteApplyResult {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		let result = |failures: Vec<(&str, Reason)>| PasteApplyResult {
 			files: RestoreExecutionResult {
 				created_count: 2,
 				overwritten_count: 1,
 				skipped_existing_count: 0,
 				planned_skipped_count: 0,
 				deleted_count: 0,
-				errors,
+				errors: failures
+					.iter()
+					.map(|(p, _)| format!("{p}: english"))
+					.collect(),
+				failures: failures
+					.into_iter()
+					.map(|(path, r)| RestoreFailure {
+						path: path.into(),
+						reason: Some(r),
+					})
+					.collect(),
 			},
 			created_commits: Vec::new(),
 		};
@@ -2614,20 +2681,68 @@ pub(crate) mod tests {
 		assert_eq!(ok.key, "status_paste_done");
 
 		let partial = result(vec![
-			"a/x.txt: Permission denied".into(),
-			"b/y.txt: unsafe path".into(),
+			(
+				"a/x.txt",
+				Reason::PermissionDenied {
+					path: "a/x.txt".into(),
+				},
+			),
+			(
+				"b/y.txt",
+				Reason::UnsafePath {
+					path: "b/y.txt".into(),
+				},
+			),
 		])
 		.status();
-		assert_eq!(partial.key, "status_paste_partial");
-		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
-			let text = partial.render(loc);
-			assert!(
-				text.contains(
-					"a/x.txt: Permission denied; b/y.txt: unsafe path"
-				),
-				"{text}"
-			);
+		assert_eq!(partial.key, "status_paste_partial_more");
+		let zh = partial.render(crate::i18n::Locale::ZhTw);
+		let en = partial.render(crate::i18n::Locale::En);
+		for text in [&zh, &en] {
+			assert!(text.contains("a/x.txt"), "{text}");
+			assert!(text.contains("b/y.txt"), "{text}");
 			assert!(!text.contains("{}"), "{text}");
+			assert!(!text.contains("english"), "{text}");
+		}
+		assert!(zh.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)));
+
+		let one = result(vec![(
+			"a/x.txt",
+			Reason::UnsafePath {
+				path: "a/x.txt".into(),
+			},
+		)])
+		.status();
+		assert_eq!(one.key, "status_paste_partial");
+		assert!(one.render(crate::i18n::Locale::ZhTw).contains("a/x.txt"));
+	}
+
+	#[test]
+	fn a_missing_prefix_folder_is_named_not_the_destination() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("dest");
+		std::fs::create_dir(&dest).unwrap();
+		let bad = tmp.path().join("gone-prefix");
+		{
+			let route = PasteRoute {
+				prefixes: vec![("src".into(), bad.clone())],
+				..Default::default()
+			};
+			let err = PasteTarget::Local { dest: dest.clone() }
+				.plan_files(
+					"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
+					&route,
+					&RunOptions::default(),
+					None,
+				)
+				.expect_err("the prefix folder does not resolve");
+			let msg = destination_msg(None, &dest, err);
+			assert_eq!(msg.args[0], bad.display().to_string(), "{msg:?}");
+			for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+				let text = msg.render(loc);
+				assert!(text.contains(&bad.display().to_string()), "{text}");
+				assert!(!text.contains(&dest.display().to_string()), "{text}");
+			}
 		}
 	}
 
