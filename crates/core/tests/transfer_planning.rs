@@ -9504,3 +9504,132 @@ fn test_apply_refuses_a_plan_that_writes_one_target_twice() {
 	);
 	assert_eq!(scan_tree(&ws), Vec::<PathBuf>::new());
 }
+
+// ---------------------------------------------------------------------------
+// A master reads a worker's paths as they are, not as its own
+// ---------------------------------------------------------------------------
+
+/// What a Windows worker sends for a paste into `C:\ws\new` (a folder to
+/// make) with `new/sub/a.txt` and `new/b.txt`: the folders each create
+/// needs, worked out there.
+const WINDOWS_WORKER_PLAN: &str = r#"{
+	"roots": ["C:\\ws"],
+	"restore_plan": {
+		"roots": ["C:\\ws"],
+		"createOperations": [
+			{
+				"relativePath": "new/sub/a.txt",
+				"absolutePath": "C:\\ws\\new\\sub\\a.txt",
+				"content": "A",
+				"existed": false,
+				"rootPath": "C:\\ws"
+			},
+			{
+				"relativePath": "new/b.txt",
+				"absolutePath": "C:\\ws\\new\\b.txt",
+				"content": "B",
+				"existed": false,
+				"rootPath": "C:\\ws"
+			}
+		],
+		"deleteOperations": [],
+		"skippedOperations": []
+	},
+	"destination_freshness": {
+		"roots": {
+			"C:\\ws": {"head_commit": null, "head_ref": null, "index_hash": null}
+		},
+		"target_files": {},
+		"repos": {},
+		"missing_dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+		"symlinked_dirs": {},
+		"requested_dirs": ["C:\\ws\\new"],
+		"placed_tails": ["C:\\ws\\new"],
+		"new_dirs": {
+			"dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+			"needs": [[0, 1], [0]]
+		}
+	}
+}"#;
+
+/// A master on any OS lists the folders a Windows worker's plan makes, and
+/// agrees to the ones the rows it keeps need: it does not take the worker's
+/// paths apart by its own rules (on Unix `\` is part of a name, so every
+/// path was one name, no folder was listed, and `--create-dirs` sent an
+/// empty agreement).
+#[test]
+fn test_a_windows_workers_new_folders_are_listed_on_any_master() {
+	let plan: snip_core::transfer::TransferImportPlan =
+		serde_json::from_str(WINDOWS_WORKER_PLAN).unwrap();
+	let (new, sub) =
+		(PathBuf::from(r"C:\ws\new"), PathBuf::from(r"C:\ws\new\sub"));
+	assert_eq!(
+		plan.new_dirs(),
+		snip_core::transfer::NewDirs {
+			requested: vec![new.clone()],
+			incidental: vec![sub.clone()],
+		}
+	);
+	// Only `new/b.txt` kept: `sub` is not needed.
+	let keep_b = RestoreSelection {
+		unchecked_creates: [0].into(),
+		..Default::default()
+	};
+	assert_eq!(
+		plan.new_dirs_for(&keep_b),
+		snip_core::transfer::NewDirs {
+			requested: vec![new.clone()],
+			incidental: Vec::new(),
+		}
+	);
+	// What `snip paste --create-dirs` agrees to.
+	let agreed = confirmed(&plan, RestoreSelection::default());
+	assert_eq!(agreed.confirmed_new_dirs, [new].into());
+	let none = RestoreSelection {
+		unchecked_creates: [0, 1].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&none), Default::default());
+}
+
+/// A plan from a worker that does not send the folders (an older one) is
+/// read as before: by this machine's path rules, right when both are the
+/// same OS. A local plan with a folder to make lists the same folders
+/// either way.
+#[test]
+fn test_new_folders_without_the_workers_list_follow_the_paths() {
+	let (_tmp, ws) = canonical_tmp();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let plan = plan_placed(
+		&ws,
+		"// file: sub/a.txt\nA\n// file: b.txt\nB\n",
+		&mapping,
+	);
+	let mut json = serde_json::to_value(plan.destination_freshness()).unwrap();
+	assert!(json.get("new_dirs").is_some(), "{json}");
+	json.as_object_mut().unwrap().remove("new_dirs");
+	let older = snip_core::transfer::TransferImportPlan::from_parts(
+		plan.roots().to_vec(),
+		plan.restore_plan().clone(),
+		serde_json::from_value(json).unwrap(),
+	);
+	let want = snip_core::transfer::NewDirs {
+		requested: vec![ws.join("new")],
+		incidental: vec![ws.join("new/sub")],
+	};
+	assert_eq!(plan.new_dirs(), want);
+	assert_eq!(older.new_dirs(), want);
+	let keep_b = RestoreSelection {
+		unchecked_creates: [create_index(&plan, "sub/a.txt")].into(),
+		..Default::default()
+	};
+	assert_eq!(plan.new_dirs_for(&keep_b), older.new_dirs_for(&keep_b));
+	// The list is derived from the plan: a worker does not hold an older
+	// master's preview, which lacks it, to it.
+	assert!(older
+		.destination_freshness()
+		.matches_preview(plan.destination_freshness()));
+	assert!(plan
+		.destination_freshness()
+		.matches_preview(older.destination_freshness()));
+}

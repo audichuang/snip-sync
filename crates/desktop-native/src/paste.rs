@@ -4361,6 +4361,26 @@ pub(crate) mod tests {
 		assert_eq!(of("/elsewhere/x"), None);
 	}
 
+	/// A Windows worker's roots, on a master of any OS: a delete's root and
+	/// a root's label are read from the worker's spelling, not taken apart
+	/// by this machine's path rules (on Unix `\` is part of a name).
+	#[test]
+	fn a_windows_workers_roots_are_named_and_matched_on_any_master() {
+		let roots: Vec<PathBuf> =
+			[r"C:\w\dest", r"C:\w\dest\sub", r"C:\w\other"]
+				.map(Into::into)
+				.into();
+		let of = |p: &str| innermost_root(&roots, Path::new(p));
+		assert_eq!(of(r"C:\w\dest\a.txt"), Some(&roots[0]));
+		assert_eq!(of(r"C:\w\dest\sub\a.txt"), Some(&roots[1]));
+		assert_eq!(of(r"C:\w\dest\subway\a.txt"), Some(&roots[0]));
+		assert_eq!(of(r"C:\w\other\x"), Some(&roots[2]));
+		assert_eq!(of(r"C:\elsewhere\x"), None);
+		assert_eq!(root_name(Path::new(r"C:\w\dest")), "dest");
+		assert_eq!(root_name(Path::new(r"C:\w\dest\")), "dest");
+		assert_eq!(root_name(Path::new("/w/dest")), "dest");
+	}
+
 	/// A row's place in the tree is the place Apply acts on: its root joined
 	/// with its path is its destination file, for a create, an overwrite and a
 	/// delete alike, even where one destination root lies inside another.
