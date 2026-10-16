@@ -4062,11 +4062,14 @@ impl WorkbenchModel {
 		self.log_selected.clear();
 		self.compare = None;
 		// The same commit stays selected while the repo is read again, so
-		// its details stay; everything else of the view is read anew.
+		// its details and its repository stay (the Log may be pinned to
+		// another repo than the one now open); the rest is read anew.
 		let details = self.commit_view.commit_details.take();
+		let root = self.commit_view.log_commit_root.take();
 		self.reset_commit_view();
 		if self.selected_commit.is_some() {
 			self.commit_view.commit_details = details;
+			self.commit_view.log_commit_root = root;
 		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
@@ -19182,11 +19185,10 @@ mod tests {
 					.iter()
 					.map(|c| crate::multi_log::split_id(&c.sha).1)
 					.collect();
-				let i = 0;
-				let j = (1..feeds.len())
-					.find(|&j| feeds[j] == feeds[i])
-					.expect("two rows of one repository");
-				(i, j)
+				(0..feeds.len())
+					.flat_map(|i| (i + 1..feeds.len()).map(move |j| (i, j)))
+					.find(|&(i, j)| feeds[i] == feeds[j])
+					.expect("two rows of one repository")
 			});
 			let at = |cx: &mut VisualTestContext,
 			          ix: usize,
