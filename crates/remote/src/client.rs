@@ -2002,6 +2002,32 @@ impl Client {
 			}
 			Ok(_) => return Err(unexpected()),
 			Err(error) => {
+				// A worker that does not know folders to make refuses a missing
+				// one as it would any: it is "too old" only when the folder the
+				// master asked for is in fact missing, never for another reason.
+				if connection.version() < crate::proto::CREATE_DIRS_VERSION
+					&& mapping.allow_new_dirs
+					&& matches!(
+						&error,
+						RemoteError::Refused {
+							code: ErrorCode::BadRequest | ErrorCode::NotFound,
+							..
+						}
+					) && Self::names_a_missing_folder(
+					&mut connection,
+					workspace,
+					dest,
+					mapping,
+					cancel,
+					start + GIT_CALL_LIMIT,
+				) {
+					let too_old = too_old_error(
+						&connection,
+						crate::proto::CREATE_DIRS_VERSION,
+					);
+					self.keep(connection);
+					return Err(too_old);
+				}
 				self.keep(connection);
 				return Err(error);
 			}
@@ -2041,6 +2067,42 @@ impl Client {
 				"worker retained a paste without a client lease".into(),
 			)),
 		}
+	}
+
+	/// Whether the destination or a prefix folder of `mapping` is missing on
+	/// the worker, asked of the worker itself on the connection that was just
+	/// refused. The workspace root (`""`) always exists and is not asked.
+	fn names_a_missing_folder(
+		connection: &mut Connection,
+		workspace: &str,
+		dest: &str,
+		mapping: &PasteMapping,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> bool {
+		let folders = std::iter::once(dest)
+			.chain(mapping.prefixes.iter().map(|(_, folder)| folder.as_str()))
+			.filter(|folder| !folder.is_empty());
+		for folder in folders {
+			let reply = connection.call(
+				&Request::Stat {
+					workspace: workspace.into(),
+					path: folder.into(),
+				},
+				cancel,
+				deadline.saturating_duration_since(Instant::now()),
+			);
+			if matches!(
+				reply,
+				Err(RemoteError::Refused {
+					code: ErrorCode::NotFound,
+					..
+				})
+			) {
+				return true;
+			}
+		}
+		false
 	}
 
 	/// Applies a token on its original connection. The lease returns to

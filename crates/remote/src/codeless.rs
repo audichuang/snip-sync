@@ -133,6 +133,7 @@ impl CarriesReasons for RestoreExecutionResult {
 			deleted_count,
 			errors,
 			failures,
+			created_dirs,
 		} = self;
 		RestoreExecutionResult {
 			created_count,
@@ -141,6 +142,7 @@ impl CarriesReasons for RestoreExecutionResult {
 			planned_skipped_count,
 			deleted_count,
 			errors,
+			created_dirs,
 			failures: failures
 				.into_iter()
 				.map(|failure| {

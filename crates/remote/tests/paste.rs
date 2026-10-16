@@ -145,6 +145,7 @@ fn unchecked(creates: &[usize]) -> RestoreSelection {
 		skip_existing: false,
 		unchecked_creates: creates.iter().copied().collect::<BTreeSet<_>>(),
 		unchecked_deletes: BTreeSet::new(),
+		..Default::default()
 	}
 }
 
@@ -515,7 +516,10 @@ fn paste_targets_keep_protected_reasons_and_count_all_skips_once() {
 				)
 			} else {
 				(
-					PasteTarget::Local { dest: ws.clone() },
+					PasteTarget::Local {
+						dest: ws.clone(),
+						bound: None,
+					},
 					PasteRoute {
 						prefixes: vec![("target".into(), repo.clone())],
 						..Default::default()
@@ -596,7 +600,10 @@ fn commit_file_previews_match_local_virtual_baselines_without_writing() {
 	let w = worker(None);
 	let (client, workspace) = open(&w, &dst);
 	let targets = [
-		PasteTarget::Local { dest: dst.clone() },
+		PasteTarget::Local {
+			dest: dst.clone(),
+			bound: None,
+		},
 		PasteTarget::Remote {
 			client: Arc::new(client),
 			workspace,
@@ -1265,6 +1272,7 @@ fn a_paste_target_writes_the_same_files_locally_and_on_a_worker() {
 	let (client, id) = open(&w, &ws);
 	let local = PasteTarget::Local {
 		dest: local_dest.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1327,7 +1335,10 @@ fn a_refused_plan_notes_the_same_restore_base_locally_and_on_a_worker() {
 	);
 	let w = worker(None);
 	let (client, id) = open(&w, &ws);
-	let local = PasteTarget::Local { dest: local_dest };
+	let local = PasteTarget::Local {
+		dest: local_dest,
+		bound: None,
+	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
 		workspace: id,
@@ -1404,6 +1415,7 @@ fn a_paste_target_replays_the_same_commits_locally_and_on_a_worker() {
 	init_repo(&local);
 	let local_target = PasteTarget::Local {
 		dest: local.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1442,6 +1454,7 @@ fn a_paste_target_refuses_a_changed_destination_as_stale_on_both_sides() {
 	let (client, id) = open(&w, &ws);
 	let local = PasteTarget::Local {
 		dest: local_dest.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1508,7 +1521,10 @@ fn a_local_target_never_applies_a_workers_plan() {
 	let plan = remote
 		.plan_files(&text, &route, &RunOptions::default(), None)
 		.unwrap();
-	let local = PasteTarget::Local { dest: ws.clone() };
+	let local = PasteTarget::Local {
+		dest: ws.clone(),
+		bound: None,
+	};
 	let err = local
 		.apply_files(&text, &route, &plan, &unchecked(&[]))
 		.expect_err("a local target applied a worker's plan");
@@ -1656,7 +1672,10 @@ fn a_paste_target_refuses_a_changed_repo_under_a_non_repo_destination_on_both_si
 	let opts = RunOptions::default();
 	let w = worker(None);
 	let (client, id) = open(&w, &ws);
-	let local = PasteTarget::Local { dest: local_dest };
+	let local = PasteTarget::Local {
+		dest: local_dest,
+		bound: None,
+	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
 		workspace: id,

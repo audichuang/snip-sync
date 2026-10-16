@@ -29,9 +29,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// export (an empty [`ExportTarget::path`]), and chunked requests;
 /// 6 = typed, bounded destination reads for commit paste previews;
 /// 7 = compact file previews and one-use prepared file payloads;
-/// 8 = prepared commit replays ([`Request::PrepareReplay`]).
-pub const PROTOCOL_MAX: u32 = 8;
+/// 8 = prepared commit replays ([`Request::PrepareReplay`]);
+/// 9 = file pastes into folders that do not exist yet
+/// ([`PasteMapping::allow_new_dirs`], `RestoreSelection::confirmed_new_dirs`).
+pub const PROTOCOL_MAX: u32 = 9;
 pub const PREPARED_IMPORT_VERSION: u32 = 7;
+/// The first protocol where a worker plans a paste into folders that do not
+/// exist yet and makes them once the master has the user's agreement.
+pub const CREATE_DIRS_VERSION: u32 = 9;
 /// The first protocol with a retained commit-replay preview.
 pub const PREPARED_REPLAY_VERSION: u32 = 8;
 /// The first protocol with Git views.
@@ -260,6 +265,11 @@ pub struct PasteMapping {
 	/// The settings' header format ("" is the default).
 	#[serde(default)]
 	pub header_format: String,
+	/// The destination and every prefix folder may not exist yet (the CLI):
+	/// a worker on [`CREATE_DIRS_VERSION`] or newer plans them as folders to
+	/// make. False: they must exist, as before. Never on the wire when false.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub allow_new_dirs: bool,
 }
 
 /// What a master previewed: an import Apply refuses when the plan made

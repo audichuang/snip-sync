@@ -120,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		let target = if config.oracle {
 			PasteTarget::Local {
 				dest: PathBuf::from(&config.workspace),
+				bound: None,
 			}
 		} else {
 			let workspace = match warm {

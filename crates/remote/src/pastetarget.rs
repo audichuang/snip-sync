@@ -22,9 +22,9 @@ use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
 use snip_core::transfer::{
-	plan_import_with, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, ImportMapping, ReplayFilePreview,
-	ReplayFileSide, TransferError, TransferImportPlan,
+	plan_import_with, CanonicalRootId, CommitReplayPreview, DestinationError,
+	DestinationFreshnessSnapshot, ImportMapping, NewDirs, PlacedRoot,
+	ReplayFilePreview, ReplayFileSide, TransferError, TransferImportPlan,
 };
 
 use crate::proto::{ErrorCode, ImportExpect, PasteMapping};
@@ -48,28 +48,38 @@ pub(crate) fn suggest(
 /// worker. Entries land in `primary`, or under it adjusted by
 /// `restore_base`. Entries under `prefix/` land in that prefix's folder.
 /// Returns the mapping and the destination roots `plan_import_with` needs:
-/// `primary` first, then each folder once. The prefixes are read in order,
-/// so a caller that validates and resolves each one meets its errors in
-/// order.
+/// `primary`'s anchor first, then each prefix's anchor once. A folder that
+/// does not exist yet is a [`PlacedRoot`]: its anchor is the root and the
+/// names below it are the routing's to put back in front of every path. The
+/// prefixes are read in order, so a caller that validates and resolves each
+/// one meets its errors in order.
+///
+/// A folder that exists is listed as the caller spelled it (`spelled_primary`,
+/// and the third of each prefix), so a plan keeps the spelling the user gave;
+/// one still to be made is listed by its anchor.
 pub(crate) fn import_mapping<E>(
-	primary: PathBuf,
-	primary_id: CanonicalRootId,
+	primary: PlacedRoot,
+	spelled_primary: Option<PathBuf>,
 	restore_base: Option<&RestoreBaseSuggestion>,
-	prefixes: impl IntoIterator<Item = Result<(String, PathBuf), E>>,
-	root_id: impl Fn(&Path) -> Result<CanonicalRootId, E>,
+	prefixes: impl IntoIterator<Item = Result<(String, PlacedRoot, PathBuf), E>>,
 ) -> Result<(ImportMapping, Vec<PathBuf>), E> {
+	let root_path =
+		|placed: &PlacedRoot, spelled: Option<PathBuf>| match spelled {
+			Some(spelled) if placed.tail().is_empty() => spelled,
+			_ => placed.anchor().path().to_path_buf(),
+		};
+	let mut roots = vec![root_path(&primary, spelled_primary)];
 	let mut mapping = match restore_base {
-		Some(s) => ImportMapping::from_restore_base(s, primary_id),
-		None => ImportMapping::with_primary(primary_id),
+		Some(s) => ImportMapping::from_restore_base(s, primary),
+		None => ImportMapping::with_primary(primary),
 	};
-	let mut roots = vec![primary];
 	for prefix in prefixes {
-		let (prefix, folder) = prefix?;
-		let id = root_id(&folder)?;
-		if !roots.contains(&folder) {
-			roots.push(folder);
+		let (prefix, placed, spelled) = prefix?;
+		let root = root_path(&placed, Some(spelled));
+		if !roots.contains(&root) {
+			roots.push(root);
 		}
-		mapping.map_prefix(prefix, id);
+		mapping.map_prefix(prefix, placed);
 	}
 	Ok((mapping, roots))
 }
@@ -100,8 +110,13 @@ impl PreparedReplay {
 /// Where a paste plans and writes.
 #[derive(Clone)]
 pub enum PasteTarget {
-	/// This machine. `dest` is the folder pasted into, as the caller spells it.
-	Local { dest: PathBuf },
+	/// This machine. `dest` is the folder pasted into, as the caller spells
+	/// it. `bound`: a folder every folder to be made must lie in (the
+	/// workspace); read only when the route allows folders that do not exist.
+	Local {
+		dest: PathBuf,
+		bound: Option<PathBuf>,
+	},
 	/// A folder of a worker's workspace.
 	Remote {
 		client: Arc<Client>,
@@ -125,6 +140,10 @@ pub struct PasteRoute {
 	pub adjust_paths: bool,
 	/// The settings' header format ("" is the default).
 	pub header_format: String,
+	/// Planning may accept a destination and prefix folders that do not
+	/// exist yet; Apply still needs `RestoreSelection::confirmed_new_dirs`
+	/// for the ones the user named. False: both must exist, as before.
+	pub allow_new_dirs: bool,
 }
 
 impl PasteRoute {
@@ -141,6 +160,7 @@ impl PasteRoute {
 				.collect(),
 			adjust_paths: self.adjust_paths,
 			header_format: self.header_format.clone(),
+			allow_new_dirs: self.allow_new_dirs,
 		}
 	}
 }
@@ -170,6 +190,16 @@ impl FilePastePlan {
 	}
 	pub fn destination_freshness(&self) -> &DestinationFreshnessSnapshot {
 		self.plan.destination_freshness()
+	}
+	/// Every folder an Apply would make (what `--dry-run` lists), absolute:
+	/// a remote plan's are the worker's paths.
+	pub fn new_dirs(&self) -> NewDirs {
+		self.plan.new_dirs()
+	}
+	/// The folders the creates `selection` keeps need. `requested` are the
+	/// ones the user must agree to (`RestoreSelection::confirmed_new_dirs`).
+	pub fn new_dirs_for(&self, selection: &RestoreSelection) -> NewDirs {
+		self.plan.new_dirs_for(selection)
 	}
 	/// Owned buffer capacities: the plan's plus the digest's.
 	pub fn retained_heap_bytes(&self) -> usize {
@@ -249,9 +279,20 @@ impl PasteError {
 	/// (an old worker) is worded by its code.
 	pub fn reason(&self) -> Reason {
 		match self {
-			Self::Destination { path, source } => {
-				snip_core::reason::io_reason(source, &path.to_string_lossy())
-			}
+			// The engine's own refusal of a folder (a file, outside the
+			// workspace, a name that cannot be made) keeps its variant.
+			Self::Destination { path, source } => source
+				.get_ref()
+				.and_then(|e| e.downcast_ref::<DestinationError>())
+				.map_or_else(
+					|| {
+						snip_core::reason::io_reason(
+							source,
+							&path.to_string_lossy(),
+						)
+					},
+					DestinationError::reason,
+				),
 			Self::Local(err) => err.reason(),
 			Self::Remote(err) | Self::OutcomeUnknown(err) => err.reason(),
 			Self::NoReplayResult => Reason::Protocol,
@@ -364,7 +405,7 @@ impl PasteTarget {
 		note: Option<&mut dyn FnMut(&RestoreBaseSuggestion)>,
 	) -> Result<FilePastePlan, PasteError> {
 		match self {
-			PasteTarget::Local { dest } => {
+			PasteTarget::Local { dest, bound } => {
 				let suggestion = if note.is_some() || route.adjust_paths {
 					let paths: Vec<String> =
 						snip_core::format::parse_clipboard(
@@ -381,23 +422,33 @@ impl PasteTarget {
 				if let (Some(note), Some(s)) = (note, suggestion.as_ref()) {
 					note(s);
 				}
-				let destination = |path: &Path| {
-					CanonicalRootId::new(path).map_err(|source| {
-						PasteError::Destination {
+				// Without `allow_new_dirs` a folder must exist, as it always
+				// had to: the plan then has no tail anywhere.
+				let destination =
+					|path: &Path| -> Result<PlacedRoot, PasteError> {
+						let placed = if route.allow_new_dirs {
+							PlacedRoot::resolve(bound.as_deref(), path)
+								.map_err(io::Error::from)
+						} else {
+							CanonicalRootId::new(path).map(PlacedRoot::from)
+						};
+						placed.map_err(|source| PasteError::Destination {
 							path: path.to_path_buf(),
 							source,
-						}
-					})
-				};
-				let primary_id = destination(dest)?;
+						})
+					};
+				let primary = destination(dest)?;
 				let (mapping, roots) = import_mapping(
-					dest.clone(),
-					primary_id,
+					primary,
+					Some(dest.clone()),
 					suggestion.as_ref().filter(|_| route.adjust_paths),
 					route.prefixes.iter().map(|(p, f)| {
-						Ok::<_, PasteError>((p.clone(), f.clone()))
+						Ok::<_, PasteError>((
+							p.clone(),
+							destination(f)?,
+							f.clone(),
+						))
 					}),
-					destination,
 				)?;
 				let plan = plan_import_with(
 					text,
@@ -536,7 +587,7 @@ impl PasteTarget {
 		opts: &RunOptions,
 	) -> Result<(CommitReplayPreview, PreparedReplay), PasteError> {
 		match self {
-			PasteTarget::Local { dest } => {
+			PasteTarget::Local { dest, .. } => {
 				CommitReplayPreview::capture_in(dest, dest, &payload, opts)
 					.map(|preview| (preview, PreparedReplay::default()))
 					.map_err(PasteError::Local)
@@ -636,22 +687,28 @@ mod tests {
 		CanonicalRootId::new(dir).unwrap()
 	}
 
+	fn placed(dir: &Path) -> PlacedRoot {
+		id(dir).into()
+	}
+
 	#[test]
 	fn import_mapping_puts_the_destination_first_and_each_folder_once() {
 		let p = tempfile::tempdir().unwrap();
 		let a = tempfile::tempdir().unwrap();
 		let b = tempfile::tempdir().unwrap();
 		let (p, a, b) = (p.path(), a.path(), b.path());
+		let prefix = |name: &str, dir: &Path| {
+			Ok::<_, std::io::Error>((
+				name.to_string(),
+				placed(dir),
+				dir.to_path_buf(),
+			))
+		};
 		let (mapping, roots) = import_mapping(
-			p.to_path_buf(),
-			id(p),
+			placed(p),
+			Some(p.to_path_buf()),
 			None,
-			[
-				Ok(("x".to_string(), a.to_path_buf())),
-				Ok(("y".into(), b.to_path_buf())),
-				Ok(("z".into(), a.to_path_buf())),
-			],
-			|f: &Path| CanonicalRootId::new(f),
+			[prefix("x", a), prefix("y", b), prefix("z", a)],
 		)
 		.unwrap();
 		assert_eq!(
@@ -661,8 +718,39 @@ mod tests {
 		assert!(mapping.prefix_destinations.contains_key("x"));
 		assert!(mapping.prefix_destinations.contains_key("y"));
 		assert!(mapping.prefix_destinations.contains_key("z"));
-		assert_eq!(mapping.primary_destination, Some(id(p)));
+		assert_eq!(mapping.primary_destination, Some(placed(p)));
 		assert!(mapping.primary_prefix.is_none());
+	}
+
+	/// A folder that exists is listed as the caller spelled it; one still to
+	/// be made is listed by its anchor, once however many names hang from it.
+	#[test]
+	fn import_mapping_lists_a_missing_folder_by_its_anchor() {
+		let tmp = tempfile::tempdir().unwrap();
+		let base = dunce::canonicalize(tmp.path()).unwrap();
+		let spelled = base.join("spelled");
+		let missing = PlacedRoot::resolve(None, &base.join("new")).unwrap();
+		let other =
+			PlacedRoot::resolve(None, &base.join("other/deep")).unwrap();
+		assert_eq!(missing.anchor(), other.anchor());
+		let (mapping, roots) = import_mapping(
+			missing.clone(),
+			Some(spelled.clone()),
+			None,
+			[Ok::<_, std::io::Error>((
+				"p".to_string(),
+				other.clone(),
+				spelled.clone(),
+			))],
+		)
+		.unwrap();
+		assert_eq!(
+			roots,
+			vec![base.clone()],
+			"the spelling is for folders that exist"
+		);
+		assert_eq!(mapping.primary_destination, Some(missing));
+		assert_eq!(mapping.prefix_destinations["p"], other);
 	}
 
 	#[test]
@@ -677,14 +765,13 @@ mod tests {
 			matched: 1,
 			total: 1,
 		};
-		let (mapping, _) = import_mapping(
-			p.to_path_buf(),
-			id(p),
-			Some(&add),
-			std::iter::empty::<Result<(String, PathBuf), std::io::Error>>(),
-			|f: &Path| CanonicalRootId::new(f),
-		)
-		.unwrap();
+		let none = || {
+			std::iter::empty::<
+				Result<(String, PlacedRoot, PathBuf), std::io::Error>,
+			>()
+		};
+		let (mapping, _) =
+			import_mapping(placed(p), None, Some(&add), none()).unwrap();
 		assert_eq!(mapping.primary_prefix, Some("src".into()));
 
 		let strip = RestoreBaseSuggestion {
@@ -695,15 +782,9 @@ mod tests {
 			matched: 1,
 			total: 1,
 		};
-		let (mapping, _) = import_mapping(
-			p.to_path_buf(),
-			id(p),
-			Some(&strip),
-			std::iter::empty::<Result<(String, PathBuf), std::io::Error>>(),
-			|f: &Path| CanonicalRootId::new(f),
-		)
-		.unwrap();
-		assert_eq!(mapping.prefix_destinations["proj"], id(p));
+		let (mapping, _) =
+			import_mapping(placed(p), None, Some(&strip), none()).unwrap();
+		assert_eq!(mapping.prefix_destinations["proj"], placed(p));
 	}
 
 	#[test]
@@ -713,19 +794,22 @@ mod tests {
 		let b = tempfile::tempdir().unwrap();
 		let (p, a, b) = (p.path(), a.path(), b.path());
 		let seen: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+		let items: [Result<(String, PathBuf), &'static str>; 3] = [
+			Ok(("x".to_string(), a.to_path_buf())),
+			Err("boom"),
+			Ok(("y".into(), b.to_path_buf())),
+		];
 		let result = import_mapping(
-			p.to_path_buf(),
-			id(p),
+			placed(p),
 			None,
-			[
-				Ok(("x".to_string(), a.to_path_buf())),
-				Err("boom"),
-				Ok(("y".into(), b.to_path_buf())),
-			],
-			|f: &Path| -> Result<CanonicalRootId, &'static str> {
-				seen.borrow_mut().push(f.to_path_buf());
-				Ok(id(f))
-			},
+			None,
+			items.into_iter().map(|item| {
+				// The caller resolves each folder as the iterator is read.
+				item.map(|(name, folder)| {
+					seen.borrow_mut().push(folder.clone());
+					(name, placed(&folder), folder)
+				})
+			}),
 		);
 		match result {
 			Err(e) => assert_eq!(e, "boom"),
@@ -915,7 +999,11 @@ mod tests {
 	fn a_local_target_names_a_missing_destination() {
 		let tmp = tempfile::tempdir().unwrap();
 		let dest = tmp.path().join("nope");
-		let result = PasteTarget::Local { dest: dest.clone() }.plan_files(
+		let result = PasteTarget::Local {
+			dest: dest.clone(),
+			bound: None,
+		}
+		.plan_files(
 			"// file: a.txt\nx\n",
 			&PasteRoute::default(),
 			&RunOptions::default(),
@@ -934,7 +1022,11 @@ mod tests {
 		let text = "// clipcode-root: src\n// file: proj/x/y.txt\nbody\n";
 		let mut heard = Vec::new();
 		let mut note = |s: &RestoreBaseSuggestion| heard.push(s.base.clone());
-		let result = PasteTarget::Local { dest: dest.clone() }.plan_files(
+		let result = PasteTarget::Local {
+			dest: dest.clone(),
+			bound: None,
+		}
+		.plan_files(
 			text,
 			&PasteRoute::default(),
 			&RunOptions::default(),
