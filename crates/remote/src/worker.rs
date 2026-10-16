@@ -1303,8 +1303,12 @@ fn list_dir(
 				truncated = true;
 				break;
 			}
-			// Ended the job: returned above.
-			ScanStatus::Cancelled | ScanStatus::TimedOut => break,
+			// Ended the job: returned above. Should that ever change, a
+			// half-read folder still says so rather than pass as whole.
+			ScanStatus::Cancelled | ScanStatus::TimedOut => {
+				truncated = true;
+				break;
+			}
 			ScanStatus::More => {}
 		}
 	}
