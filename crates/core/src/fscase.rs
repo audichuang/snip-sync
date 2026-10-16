@@ -97,7 +97,7 @@ fn query_filesystem(_root: &Path) -> CaseSensitivity {
 }
 
 /// Linux: the `statfs` magic, and for the filesystems that fold case in a
-/// folder that carries `FS_CASEFOLD_FL` (ext4, f2fs, tmpfs) that folder's
+/// folder that carries `FS_CASEFOLD_FL` (ext4, f2fs, tmpfs, bcachefs) that folder's
 /// flags.
 #[cfg(target_os = "linux")]
 fn query_filesystem(root: &Path) -> CaseSensitivity {
@@ -161,15 +161,18 @@ pub(crate) fn classify_f_type(raw: u64) -> MagicClass {
 		// vfat, exfat, ntfs3, ntfs, cifs, smb2, sdcardfs
 		0x4d44 | 0x2011_BAB0 | 0x7366_746e | 0x5346_544e | 0xFF53_4D42
 		| 0xFE53_4D42 | 0x5dca_2df5 => MagicClass::Insensitive,
-		// ext2/3/4, f2fs, tmpfs
-		0xEF53 | 0xF2F5_2010 | 0x0102_1994 => MagicClass::CasefoldCapable,
-		// xfs, btrfs, zfs, ramfs, squashfs, erofs, jfs, reiserfs, bcachefs
-		0x5846_5342 | 0x9123_683E | 0x2FC1_2FC1 | 0x8584_58f6 | 0x7371_7368
-		| 0xE0F5_E1E2 | 0x3153_464a | 0x5265_4973 | 0xca45_1a4e => {
+		// ext2/3/4, f2fs, tmpfs, and bcachefs (casefold per folder from
+		// Linux 6.13; an older kernel answers ENOTTY and reads as sensitive).
+		0xEF53 | 0xF2F5_2010 | 0x0102_1994 | 0xca45_1a4e => {
+			MagicClass::CasefoldCapable
+		}
+		// btrfs, ramfs, squashfs, erofs, reiserfs: no case folding mode.
+		0x9123_683E | 0x8584_58f6 | 0x7371_7368 | 0xE0F5_E1E2 | 0x5265_4973 => {
 			MagicClass::Sensitive
 		}
-		// fuse and fuseblk, overlayfs, nfs, 9p, virtiofs, hfs, hfsplus and
-		// the rest: what is underneath is not known from the type.
+		// zfs (per dataset `casesensitivity`), xfs (`-n version=ci`), jfs
+		// (OS/2 mode), fuse and fuseblk, overlayfs, nfs, 9p, virtiofs, hfs,
+		// hfsplus and the rest: the type does not say.
 		_ => MagicClass::Unknown,
 	}
 }
@@ -346,22 +349,25 @@ mod tests {
 	#[test]
 	fn linux_magics_that_do_not_fold_case() {
 		for (name, magic) in [
-			("xfs", 0x5846_5342u64),
-			("btrfs", 0x9123_683E),
-			("zfs", 0x2FC1_2FC1),
+			("btrfs", 0x9123_683Eu64),
 			("ramfs", 0x8584_58f6),
+			("squashfs", 0x7371_7368),
+			("erofs", 0xE0F5_E1E2),
+			("reiserfs", 0x5265_4973),
 		] {
 			assert_eq!(classify_f_type(magic), MagicClass::Sensitive, "{name}");
 		}
 	}
 
-	/// ext4, f2fs and tmpfs fold case only in a folder that carries the flag.
+	/// ext4, f2fs, tmpfs and bcachefs fold case only in a folder that
+	/// carries the flag.
 	#[test]
 	fn linux_magics_that_fold_case_per_folder() {
 		for (name, magic) in [
 			("ext4", 0xEF53u64),
 			("f2fs", 0xF2F5_2010),
 			("tmpfs", 0x0102_1994),
+			("bcachefs", 0xca45_1a4e),
 		] {
 			assert_eq!(
 				classify_f_type(magic),
@@ -372,11 +378,16 @@ mod tests {
 	}
 
 	/// Nothing is known of what a FUSE volume, a network share or a stacked
-	/// filesystem holds underneath.
+	/// filesystem holds underneath, and these fold case by a setting the
+	/// magic does not show: a ZFS dataset's `casesensitivity` (TrueNAS makes
+	/// SMB datasets `insensitive`), `mkfs.xfs -n version=ci`, JFS's OS/2 mode.
 	#[test]
 	fn linux_magics_that_cannot_be_told() {
 		for (name, magic) in [
-			("fuse", 0x6573_5546u64),
+			("zfs", 0x2FC1_2FC1u64),
+			("xfs", 0x5846_5342),
+			("jfs", 0x3153_464a),
+			("fuse", 0x6573_5546),
 			("overlayfs", 0x794c_7630),
 			("nfs", 0x6969),
 			("9p", 0x0102_1997),
