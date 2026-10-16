@@ -394,6 +394,9 @@ mod tests {
 			"row: id=x ws_tab=2",
 			"row ends in by=",
 			"row 100% ] done",
+			"a\tb",
+			"a\u{a0}b",
+			"a\u{3000}b",
 		];
 		for tag in TAGS {
 			for id in ODD_IDS {

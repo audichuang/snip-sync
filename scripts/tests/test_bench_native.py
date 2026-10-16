@@ -270,6 +270,17 @@ class TestBoundsOfOddIds(unittest.TestCase):
                         line = f"[APP:CTRL_COVERED: {tab}by={encode_by(by)} id={control}]"
                         self.assertEqual(parse_covered(line), (control, by))
 
+    def test_a_covering_name_with_other_whitespace_is_read_whole(self) -> None:
+        """The app encodes only `%`, ` `, `]` and line breaks, so a Tab, a no-break space and U+3000
+        stay in `by`; the Rust reader cuts `by` at ' ' only, and so must this one."""
+        from bench_native_memory import parse_covered
+
+        for by in ("a\tb", "a\u00a0b", "a\u3000b", "\u3000", "x\ty\u00a0z\u3000"):
+            for tab in ("", "ws_tab=2 "):
+                with self.subTest(by=by, tab=tab):
+                    line = f"[APP:CTRL_COVERED: {tab}by={encode_by(by)} id=row:id]"
+                    self.assertEqual(parse_covered(line), ("row:id", by))
+
     def test_a_shown_tab_line_whose_id_ends_in_a_tab_tag_is_a_shown_line(self) -> None:
         self.assertTrue(shown_tab_line("[APP:CTRL_GONE: id=change-row:report ws_tab=2]"))
         self.assertTrue(shown_tab_line("[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=row:ws_tab=2 id=x]"))

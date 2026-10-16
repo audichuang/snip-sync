@@ -123,4 +123,34 @@ mod tests {
 			}
 		}
 	}
+
+	/// `encode_by` writes `by` without an ASCII space, `]`, `%` or line
+	/// break and leaves every other character (a Tab, a no-break space,
+	/// U+3000) as it is, so both drivers cut `by` at the first ` ` and read
+	/// the same name back.
+	#[test]
+	fn a_covering_name_with_other_whitespace_reads_back_whole() {
+		for by in [
+			"a\tb",
+			"a\u{a0}b",
+			"a\u{3000}b",
+			"\u{3000}",
+			"x\ty\u{a0}z\u{3000}",
+		] {
+			for tab in [None, Some(2)] {
+				let line = printed(tab, covered("row:id", by));
+				assert_eq!(
+					e2e::parse_covered(&line),
+					Some(("row:id".to_string(), by.to_string())),
+					"{line:?}"
+				);
+			}
+			let line = covered("row:id", by);
+			let field = line
+				.strip_prefix("[APP:CTRL_COVERED: by=")
+				.and_then(|rest| rest.split(' ').next())
+				.unwrap();
+			assert_eq!(field, by, "the by field ends at the first ASCII space");
+		}
+	}
 }
