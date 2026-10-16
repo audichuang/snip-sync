@@ -172,7 +172,7 @@ impl FitRole {
 			FitRole::Subject => Presence::Always,
 			FitRole::BranchLabel | FitRole::TagLabel => Presence::Group,
 			FitRole::RefMore => Presence::Group,
-			FitRole::Collapsed => Presence::Always,
+			FitRole::Collapsed => Presence::Optional,
 			FitRole::Author => Presence::Column,
 			FitRole::Date => Presence::Always,
 			FitRole::Hash => Presence::Always,
@@ -1013,7 +1013,7 @@ mod tests {
 			FitRole::Collapsed,
 			"collapsed",
 			FitRule::Whole,
-			Presence::Always,
+			Presence::Optional,
 		),
 		(
 			FitRole::Author,

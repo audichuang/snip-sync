@@ -855,7 +855,14 @@ impl WorkbenchModel {
 				.selector(format!("log-subject:{ix}"))
 				.solved(&fit, LogCell::Subject)
 				.render(probes, window)
-				.ml(px(CELL_GAP))
+				// The solver pays the gap only for a subject it places: on a
+				// list too narrow for one, a margin would push the fixed
+				// columns after it out of the row.
+				.ml(px(if fit.shown(LogCell::Subject) {
+					CELL_GAP
+				} else {
+					0.
+				}))
 				.id(SharedString::from(format!("subject:{key}")))
 				.when(truncated, |d| d.tip(c.subject.clone()))
 				.into_any_element(),

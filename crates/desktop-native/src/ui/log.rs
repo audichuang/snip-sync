@@ -781,11 +781,11 @@ pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
 	claims.push(Claim::Atomic(vec![LogCell::Date]));
 	claims.push(Claim::Grow(LogCell::Gutter, i.gutter.min(MIN_GUTTER_W)));
 	claims.push(Claim::Grow(LogCell::Subject, i.subject_floor_bound));
-	if i.collapsed.is_some() {
-		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
-	}
 	if !label_cells.is_empty() {
 		claims.push(Claim::Atomic(label_cells));
+	}
+	if i.collapsed.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
 	}
 	if i.author_floor.is_some() {
 		claims.push(Claim::Atomic(vec![LogCell::Author]));
@@ -861,11 +861,11 @@ pub(super) fn fit_log_row(
 		claims.push(Claim::Atomic(vec![LogCell::Author]));
 	}
 	claims.push(Claim::Grow(LogCell::Subject, row.subject_floor));
-	if row.collapsed.is_some() {
-		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
-	}
 	if !label_cells.is_empty() {
 		claims.push(Claim::Atomic(label_cells));
+	}
+	if row.collapsed.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
 	}
 	if !kinds.is_empty() {
 		claims.push(Claim::ShortestFirst(kinds));
