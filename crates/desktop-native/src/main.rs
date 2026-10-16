@@ -24353,6 +24353,39 @@ mod tests {
 					focus_name(&model, cx),
 					"tree",
 				);
+
+				// 7: a layer opened over another's keyboard keeps its own
+				// place to give it back: the find bar's is the reader, not
+				// the pane the selector under it was opened from.
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check(
+					"7 find bar over a selector, Escape",
+					focus_name(&model, cx),
+					"reader",
+				);
+				// 8: the same for a Log dropdown opened over a selector.
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				Opener::Click("log-filter-user", "log-menu:User")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["log-menu:User"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check(
+					"8 Log dropdown over a selector, Escape",
+					focus_name(&model, cx),
+					"log",
+				);
 				assert!(
 					failures.is_empty(),
 					"the focus after a layer closes:\n{}",
