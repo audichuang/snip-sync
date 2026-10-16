@@ -449,8 +449,13 @@ fn replay_root(
 }
 
 fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
-	commits::parse_commit_payload(text)
-		.map_err(|e| refused(ErrorCode::BadRequest, e.to_string()))
+	commits::parse_commit_payload(text).map_err(|e| {
+		refused_with(
+			ErrorCode::BadRequest,
+			e.to_string(),
+			e.reason().for_wire(),
+		)
+	})
 }
 
 /// A selected preview's original destination. The shared reader preserves

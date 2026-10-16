@@ -2929,6 +2929,10 @@ pub(crate) fn refusal(
 	}
 }
 
+// The code-keyed arms below decide from the code alone, which is sound only
+// while the worker sends no reason for those codes (`Reason::for_wire`
+// answers `None` for InvalidRevision, Cancelled and Timeout). TooLarge is
+// the one code a reason refines (VerifyLimit), so its arm checks the reason.
 impl From<RemoteError> for GitError {
 	fn from(err: RemoteError) -> Self {
 		match err {
@@ -2945,11 +2949,17 @@ impl From<RemoteError> for GitError {
 			},
 			RemoteError::Refused {
 				code: ErrorCode::TooLarge,
+				ref reason,
 				..
-			} => GitError::OutputLimit {
-				args: "remote view".into(),
-				limit: 0,
-			},
+			} if reason
+				.as_deref()
+				.is_none_or(|r| matches!(r, Reason::TooLarge)) =>
+			{
+				GitError::OutputLimit {
+					args: "remote view".into(),
+					limit: 0,
+				}
+			}
 			RemoteError::Refused {
 				code: ErrorCode::Cancelled,
 				..
@@ -4230,6 +4240,29 @@ mod tests {
 			GitError::from(err_too_large),
 			GitError::OutputLimit { ref args, limit }
 				if args == "remote view" && limit == 0
+		));
+		// TooLarge with a reason that refines it is not the output limit:
+		// the worker's "repository too large to verify" keeps its sentence.
+		let verify = refusal(
+			ErrorCode::TooLarge,
+			"repository too large to verify".into(),
+			false,
+			Some(Reason::VerifyLimit),
+		);
+		assert!(matches!(
+			GitError::from(verify),
+			GitError::Remote { reason, .. }
+				if *reason == Reason::VerifyLimit
+		));
+		let plain = refusal(
+			ErrorCode::TooLarge,
+			"m".into(),
+			false,
+			Some(Reason::TooLarge),
+		);
+		assert!(matches!(
+			GitError::from(plain),
+			GitError::OutputLimit { .. }
 		));
 	}
 
