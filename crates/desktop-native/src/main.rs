@@ -23101,7 +23101,7 @@ mod tests {
 		/// pinned over every layer, not over the one that last broke.
 		mod overlays {
 			use super::workspace_tabs::{
-				active, hover_id, sel, tab, tooltip_shown, two_tabs,
+				active, click_id, hover_id, sel, tab, tooltip_shown, two_tabs,
 				wait_scaled,
 			};
 			use super::*;
@@ -24492,6 +24492,110 @@ mod tests {
 						"a press where the chip used to be is an outside press"
 					);
 				}
+			}
+
+			/// A layer closed by a focusable control inside its own panel
+			/// still gives the keyboard back: the press put the focus on
+			/// the control, which is the layer's, not "somewhere else".
+			#[gpui::test]
+			fn the_find_bar_close_button_returns_to_the_reader(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["find-bar"]);
+				let at = probed_center(&model, cx, "btn-find-close");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				assert_eq!(
+					focus_name(&model, cx),
+					"reader",
+					"the find bar's close button hands the keyboard to the reader"
+				);
+			}
+
+			#[gpui::test]
+			fn the_log_date_apply_button_returns_to_the_log(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-date", "log-menu:Date")
+					.fire(&model, cx);
+				model.update(cx, |m, cx| {
+					m.log_since_input
+						.update(cx, |i, cx| i.set_text("2020-01-01", cx));
+					m.log_until_input
+						.update(cx, |i, cx| i.set_text("2030-01-01", cx));
+				});
+				settle_checked(cx, &model);
+				let at = probed_center(&model, cx, "log-date-apply");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(
+					floating_now(&model, cx).is_empty(),
+					"a valid range closes the menu"
+				);
+				assert_eq!(
+					focus_name(&model, cx),
+					"log",
+					"the Log keeps the keyboard after Apply"
+				);
+			}
+
+			/// A press on a find-bar control (not a field) leaves the bar
+			/// under the one Escape rule: Escape closes it.
+			#[gpui::test]
+			fn escape_after_a_find_bar_control_closes_the_find_bar(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				for id in ["btn-find-regex", "btn-find-case"] {
+					cx.simulate_keystrokes("ctrl-f");
+					settle_checked(cx, &model);
+					let at = probed_center(&model, cx, id);
+					cx.simulate_click(at, Modifiers::none());
+					settle_checked(cx, &model);
+					cx.simulate_keystrokes("escape");
+					settle_checked(cx, &model);
+					assert!(
+						model.read_with(cx, |m, _| inline(m).is_empty()),
+						"Escape after a press on {id} closes the find bar"
+					);
+					reset(&model, cx);
+				}
+			}
+
+			/// The tooltip gate invariant (O6) is the shown tab's: a tab that
+			/// went to the background with a layer open drew its last frame
+			/// with the gate closed, and that is not a mismatch.
+			#[gpui::test]
+			fn a_background_tab_holds_every_overlay_invariant(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let shown = tab(&root, cx, 1);
+				let at = cx
+					.debug_bounds("btn-repo-selector")
+					.expect("the shown tab draws its selector button")
+					.center();
+				cx.simulate_click(at, Modifiers::none());
+				settle(cx);
+				assert_eq!(floating_now(&shown, cx), ["selector:Repo"]);
+				click_id(cx, "ws-tab:0".into());
+				assert_eq!(active(&root, cx), Some(0));
+				shown.read_with(cx, |m, cx| {
+					assert!(m.overlays.floating().is_none());
+					let broken =
+						crate::overlay::OverlayStack::check_invariants(m, cx);
+					assert!(
+						broken.is_empty(),
+						"a background tab breaks {broken:?}"
+					);
+				});
 			}
 
 			/// A selector opened by a press on its header button gives the
