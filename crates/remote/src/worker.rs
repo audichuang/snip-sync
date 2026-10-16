@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use snip_core::reason::{io_reason, Reason};
-use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
+use snip_core::workspace::{DirectoryScan, ScanError, ScanStatus};
 
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
@@ -942,7 +942,7 @@ fn serve(
 					&mut answer,
 					negotiated,
 					view_deadline,
-					|covered| state.handle(other, covered),
+					|ctx| state.handle(other, ctx),
 				)?;
 			}
 		}
@@ -1110,17 +1110,15 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 
 impl State {
 	#[allow(clippy::result_large_err)]
-	fn handle(
-		&self,
-		request: Request,
-		covered: crate::jobs::Covered,
-	) -> Response {
+	fn handle(&self, request: Request, ctx: &crate::jobs::JobCtx) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
 			}
 			Request::OpenWorkspace { path } => {
-				covered.unit();
+				if let Err(stop) = ctx.unit() {
+					return stop;
+				}
 				match SharedRoot::open(&path) {
 					Ok(root) => {
 						if let Some(fault) =
@@ -1148,17 +1146,21 @@ impl State {
 				.resolve(&workspace, &path)
 				.and_then(|(root, dir)| {
 					let cap = self.dir_cap.load(Ordering::SeqCst);
-					list_dir(&root, &dir, cap, folders_only, &covered)
+					list_dir(&root, &dir, cap, folders_only, ctx)
 				})
 				.unwrap_or_else(|e| e),
 			Request::Stat { workspace, path } => {
-				covered.unit();
+				if let Err(stop) = ctx.unit() {
+					return stop;
+				}
 				self.resolve(&workspace, &path)
 					.and_then(|(_, p)| stat(&p))
 					.unwrap_or_else(|e| e)
 			}
 			Request::Read { workspace, path } => {
-				covered.unit();
+				if let Err(stop) = ctx.unit() {
+					return stop;
+				}
 				match self.root(&workspace) {
 					Ok(root) => {
 						match snip_core::browser::file_preview(&root, &path) {
@@ -1240,14 +1242,14 @@ fn list_dir(
 	dir: &Path,
 	cap: usize,
 	folders_only: bool,
-	covered: &crate::jobs::Covered,
+	ctx: &crate::jobs::JobCtx,
 ) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
 	'scan: loop {
-		covered.unit();
-		let page = match scan.next_page(&ScanBudget::visits(256)) {
+		ctx.unit()?;
+		let page = match scan.next_page(&ctx.budget(256)) {
 			Ok(page) => page,
 			Err(ScanError::Changed) => {
 				return Err(error(
@@ -1257,20 +1259,32 @@ fn list_dir(
 			}
 			Err(ScanError::Io(err)) => return Err(io_error(err)),
 		};
+		// A page cut short by the job's end is no result: the listing must
+		// not pass for the whole folder, and nothing is read after it.
+		if let Some(stop) = crate::jobs::JobCtx::refusal_for(page.status) {
+			return Err(stop);
+		}
 		for entry in page.entries {
+			// A page holds up to 256 entries, each one a stat or two on a
+			// slow disk: the job's end is looked at for every one.
+			if let Some(stop) = ctx.stop() {
+				return Err(stop);
+			}
 			if entries.len() >= cap {
 				truncated = true;
 				break 'scan;
+			}
+			// The filter runs before the push, so the cap above counts only
+			// the entries a folder picker is shown. A hidden name is out
+			// whatever it is, so it is not looked into.
+			if folders_only && entry.name.to_string_lossy().starts_with('.') {
+				continue;
 			}
 			let path = dir.join(&entry.name);
 			let directory = entry.directory
 				|| (entry.symlink
 					&& snip_core::transfer::is_safe_dir_symlink(root, &path));
-			// The filter runs before the push, so the cap above counts only
-			// the entries a folder picker is shown.
-			if folders_only
-				&& (!directory || entry.name.to_string_lossy().starts_with('.'))
-			{
+			if folders_only && !directory {
 				continue;
 			}
 			let nested_repo =
@@ -1285,13 +1299,12 @@ fn list_dir(
 		}
 		match page.status {
 			ScanStatus::Complete => break,
-			ScanStatus::Incomplete
-			| ScanStatus::LimitReached
-			| ScanStatus::Cancelled
-			| ScanStatus::TimedOut => {
+			ScanStatus::Incomplete | ScanStatus::LimitReached => {
 				truncated = true;
 				break;
 			}
+			// Ended the job: returned above.
+			ScanStatus::Cancelled | ScanStatus::TimedOut => break,
 			ScanStatus::More => {}
 		}
 	}
@@ -1374,6 +1387,105 @@ mod tests {
 		}
 		assert_eq!(a.name, "real");
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
+	}
+
+	/// Whether `State::handle` does work for this kind, so a job's end must
+	/// reach it. Every kind is named, so a new request has to decide.
+	fn handled_inline(kind: crate::fault::RequestKind) -> bool {
+		use crate::fault::RequestKind as K;
+		match kind {
+			K::OpenWorkspace | K::ListDir | K::Stat | K::Read => true,
+			// Answered at once, with no work behind them, or served as jobs.
+			K::Hello
+			| K::ReplayRead
+			| K::Write
+			| K::Rename
+			| K::ScanRepos
+			| K::GitView
+			| K::Export
+			| K::ExportCommits
+			| K::ExportChanges
+			| K::ImportPlan
+			| K::PrepareImport
+			| K::ApplyPrepared
+			| K::ImportApply
+			| K::ReplayPlan
+			| K::ReplayApply
+			| K::PrepareReplay
+			| K::ApplyPreparedReplay
+			| K::Chunk
+			| K::FrameChunk
+			| K::FrameJoin => false,
+		}
+	}
+
+	/// An op that is handed a cancel and a deadline must use them: a job
+	/// that must stop gets its refusal back, and the work is not started.
+	/// The folder has a file, so a listing that ignored the job would be
+	/// seen answering with it.
+	#[test]
+	fn every_inline_op_refuses_a_stopped_job() {
+		use crate::fault::RequestKind as K;
+		use snip_core::gitrun::CancelToken;
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a.txt"), "hello").unwrap();
+		let root = dir.path().display().to_string();
+		let worker = Worker::new(WorkerOptions::default());
+		let state = &worker.state;
+		let request = |kind: K| match kind {
+			K::OpenWorkspace => Request::OpenWorkspace { path: root.clone() },
+			K::ListDir => Request::ListDir {
+				workspace: root.clone(),
+				path: String::new(),
+				folders_only: false,
+			},
+			K::Stat => Request::Stat {
+				workspace: root.clone(),
+				path: "a.txt".into(),
+			},
+			K::Read => Request::Read {
+				workspace: root.clone(),
+				path: "a.txt".into(),
+			},
+			other => panic!("{other:?} is not an inline op"),
+		};
+		let live = || crate::jobs::JobCtx::for_tests(CancelToken::new(), None);
+		let cancelled = || {
+			let cancel = CancelToken::new();
+			cancel.cancel();
+			crate::jobs::JobCtx::for_tests(cancel, None)
+		};
+		let expired = || {
+			crate::jobs::JobCtx::for_tests(
+				CancelToken::new(),
+				Some(Instant::now()),
+			)
+		};
+		let kinds: Vec<K> = crate::fault::ALL_REQUEST_KINDS
+			.into_iter()
+			.filter(|k| handled_inline(*k))
+			.collect();
+		assert_eq!(kinds.len(), 4, "{kinds:?}");
+		for kind in kinds {
+			let answer = state.handle(request(kind), &live());
+			assert!(
+				!matches!(answer, Response::Error { .. }),
+				"{kind:?} fails with a live job: {answer:?}"
+			);
+			for (ctx, want) in [
+				(cancelled(), ErrorCode::Cancelled),
+				(expired(), ErrorCode::Timeout),
+			] {
+				match state.handle(request(kind), &ctx) {
+					Response::Error { code, .. } => {
+						assert_eq!(code, want, "{kind:?}")
+					}
+					other => {
+						panic!("{kind:?} worked for a stopped job: {other:?}")
+					}
+				}
+			}
+		}
 	}
 
 	#[test]

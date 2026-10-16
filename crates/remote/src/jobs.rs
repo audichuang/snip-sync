@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use snip_core::gitrun::CancelToken;
+use snip_core::workspace::{ScanBudget, ScanStatus};
 
 use crate::proto::{chunks, write_frame, ErrorCode, Response, CHUNK_BYTES};
 
@@ -369,17 +370,90 @@ pub(crate) fn write_response<W: Write>(
 	}
 }
 
-/// Proof that a request is answered under [`run_inline`]: only this module
-/// makes one.
-pub(crate) struct Covered {
+/// What an inline request is handed to run under: the job's cancel token and
+/// deadline, with the one way to start a unit of work. Only this module
+/// makes one, so `State::handle` cannot run a request outside
+/// [`run_inline`]; and an op that did work without asking it would be
+/// caught by `every_inline_op_refuses_a_stopped_job` (worker.rs).
+pub(crate) struct JobCtx {
+	cancel: CancelToken,
+	/// None only for a master that does not know `Timeout` (protocol 1).
+	deadline: Option<Instant>,
 	page_delay: Option<Duration>,
 }
 
-impl Covered {
-	/// Starts one unit of work: a test's `Fault::PageDelay` passes here.
-	pub(crate) fn unit(&self) {
+impl JobCtx {
+	/// The reply for a job that must stop: the deadline's `Timeout` or a
+	/// cancel's `Cancelled`; none while it may go on.
+	pub(crate) fn stop(&self) -> Option<Response> {
+		if self.deadline.is_some_and(|d| Instant::now() >= d) {
+			Some(Self::refusal(ErrorCode::Timeout))
+		} else if self.cancel.is_cancelled() {
+			Some(Self::refusal(ErrorCode::Cancelled))
+		} else {
+			None
+		}
+	}
+
+	/// The reply for a scan that ended on `status`, if it ended because the
+	/// job must stop. A listing cut short that way is never a result.
+	pub(crate) fn refusal_for(status: ScanStatus) -> Option<Response> {
+		match status {
+			ScanStatus::TimedOut => Some(Self::refusal(ErrorCode::Timeout)),
+			ScanStatus::Cancelled => Some(Self::refusal(ErrorCode::Cancelled)),
+			ScanStatus::Complete
+			| ScanStatus::More
+			| ScanStatus::LimitReached
+			| ScanStatus::Incomplete => None,
+		}
+	}
+
+	fn refusal(code: ErrorCode) -> Response {
+		let message = match code {
+			ErrorCode::Timeout => "the job timed out",
+			_ => "cancelled",
+		};
+		Response::Error {
+			code,
+			message: message.into(),
+			patch: false,
+			reason: None,
+		}
+	}
+
+	/// Starts one unit of work (a page of a folder, or the one call of a
+	/// single-call request): refused with the reply to send when the job
+	/// must stop. A test's `Fault::PageDelay` passes here, as a slow disk
+	/// would hold the call.
+	#[allow(clippy::result_large_err)]
+	pub(crate) fn unit(&self) -> Result<(), Response> {
+		if let Some(reply) = self.stop() {
+			return Err(reply);
+		}
 		if let Some(d) = self.page_delay {
 			std::thread::sleep(d);
+		}
+		Ok(())
+	}
+
+	/// A scan call's budget: the job's cancel and deadline, and `visits`.
+	pub(crate) fn budget(&self, visits: usize) -> ScanBudget {
+		ScanBudget {
+			max_visited: visits,
+			deadline: self.deadline,
+			cancel: Some(self.cancel.clone()),
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn for_tests(
+		cancel: CancelToken,
+		deadline: Option<Instant>,
+	) -> Self {
+		Self {
+			cancel,
+			deadline,
+			page_delay: None,
 		}
 	}
 }
@@ -392,16 +466,20 @@ pub(crate) fn run_inline<W: Write>(
 	answer: &mut Answer<'_, W>,
 	negotiated: u32,
 	deadline: Duration,
-	op: impl FnOnce(Covered) -> Response + Send,
+	op: impl FnOnce(&JobCtx) -> Response + Send,
 ) -> io::Result<()> {
-	let covered = Covered {
-		page_delay: answer.page_delay(),
-	};
+	let page_delay = answer.page_delay();
 	if negotiated < crate::proto::GIT_VIEWS_VERSION {
+		// A master that does not know `Pending` does not know `Timeout`
+		// either: its request runs to its end, as it always did.
 		if let Some(d) = answer.work_delay() {
 			std::thread::sleep(d);
 		}
-		return answer.reply(&op(covered));
+		return answer.reply(&op(&JobCtx {
+			cancel: CancelToken::new(),
+			deadline: None,
+			page_delay,
+		}));
 	}
 	run_job_with(
 		answer,
@@ -409,7 +487,13 @@ pub(crate) fn run_inline<W: Write>(
 		deadline,
 		CancelToken::new(),
 		DeadlineReply::Fail,
-		|_, _| op(covered),
+		|cancel, end| {
+			op(&JobCtx {
+				cancel: cancel.clone(),
+				deadline: Some(end),
+				page_delay,
+			})
+		},
 	)
 }
 
@@ -443,6 +527,12 @@ pub(crate) enum DeadlineReply {
 	WriteOutcome,
 }
 
+/// The job's `op` is handed the cancel token and the deadline instant. The
+/// token is cancelled at the deadline, so an op that polls it keeps the
+/// deadline; the instant is for an op that budgets its own time (a scan).
+/// An op that polls neither only delays the Timeout, which the master hears
+/// as Pending until the op ends. Inline requests get both through
+/// [`JobCtx`], which `State::handle` cannot do without.
 pub(crate) fn run_job_with<W: Write>(
 	w: &mut Answer<'_, W>,
 	heartbeat: Duration,
@@ -505,30 +595,25 @@ pub(crate) fn run_job_with<W: Write>(
 }
 
 /// The answer once a job is past its deadline. A read's response is
-/// discarded and Timeout answered; a write's own response follows, with
-/// Pending covering the silence while it finishes.
+/// discarded and Timeout answered; a write's own response follows. Either
+/// way the job may still be running, so Pending covers the silence until it
+/// ends: a master tells a worker busy with a slow disk from a dead one by
+/// the frames it hears, and the Timeout is the last of them.
 fn past_deadline_reply<W: Write>(
 	w: &mut Answer<'_, W>,
 	rx: &std::sync::mpsc::Receiver<Response>,
 	heartbeat: Duration,
 	write: bool,
 ) -> io::Result<()> {
-	if !write {
-		let _ = rx.recv();
-		return w.reply(&Response::Error {
-			code: ErrorCode::Timeout,
-			message: "the job timed out".into(),
-			patch: false,
-			reason: None,
-		});
-	}
 	loop {
 		match rx.recv_timeout(heartbeat) {
-			Ok(response) => return w.reply(&response),
+			Ok(response) if write => return w.reply(&response),
+			Ok(_) => return w.reply(&timeout_reply()),
 			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-				// The master waits longer than the job's deadline; these
-				// heartbeats keep its per-frame idle timeout from firing
-				// while the write finishes.
+				// A write's master waits longer than the job's deadline;
+				// these heartbeats keep its per-frame idle timeout from
+				// firing while the write finishes, and a read's master
+				// hears that the worker is alive.
 				if let Err(err) = w.heartbeat() {
 					let _ = rx.recv();
 					return Err(err);
@@ -536,10 +621,18 @@ fn past_deadline_reply<W: Write>(
 			}
 			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
 				// op panicked; thread::scope joins and rethrows.
-				return Ok(());
+				return if write {
+					Ok(())
+				} else {
+					w.reply(&timeout_reply())
+				};
 			}
 		}
 	}
+}
+
+fn timeout_reply() -> Response {
+	JobCtx::refusal(ErrorCode::Timeout)
 }
 
 #[cfg(test)]
