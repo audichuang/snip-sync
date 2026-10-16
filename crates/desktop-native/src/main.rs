@@ -264,6 +264,7 @@ fn ready_marker(name: &str) {
 	let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+mod dirtree;
 mod githost;
 pub mod graph_view;
 mod history;
@@ -331,6 +332,8 @@ actions!(
 		NavUp,
 		NavDown,
 		NavToggle,
+		NavCollapse,
+		NavExpand,
 		SelectRepo1,
 		SelectRepo2,
 		ToggleTab,
@@ -5131,9 +5134,16 @@ impl WorkbenchModel {
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
 				self.show_landed_plan(remap);
-				let selected_idx =
-					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
-				self.load_paste_diff(selected_idx, cx);
+				// A folder under the cursor has no file to read.
+				let on_item =
+					self.paste.plan().and_then(|p| match p.cursor() {
+						paste::PasteCursor::Item(ix) => Some(ix),
+						paste::PasteCursor::Dir(_) => None,
+					});
+				match on_item {
+					Some(ix) => self.load_paste_diff(ix, cx),
+					None => self.cancel_paste_diff(),
+				}
 				cx.notify();
 			}
 			Some(paste::preview::Landed::Refused { err, closed }) => {
@@ -5400,6 +5410,17 @@ impl WorkbenchModel {
 				app_log!("[APP:PASTE_NAV: idx={}]", idx);
 				cx.notify();
 			}
+			paste::preview::Nav::MovedDir => {
+				// A folder has no file to read; one still loading is dropped.
+				self.cancel_paste_diff();
+				if let Some(dir) = self.paste.plan().and_then(|p| {
+					let key = p.cursor_dir.as_ref()?;
+					Some(p.dir_label(key))
+				}) {
+					app_log!("[APP:PASTE_NAV_DIR: dir={}]", dir);
+				}
+				cx.notify();
+			}
 			paste::preview::Nav::Refused(err) => {
 				self.set_status_msg(err);
 				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
@@ -5435,7 +5456,8 @@ impl WorkbenchModel {
 
 	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
 		match self.paste.toggle_fold(c, self.preview.as_ref()) {
-			paste::preview::Folded::NoPlan => {}
+			paste::preview::Folded::NoPlan
+			| paste::preview::Folded::Ignored => {}
 			paste::preview::Folded::Kept => {
 				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
 				cx.notify();
@@ -5455,15 +5477,126 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Drops the diff read in flight: its answer is for a row the cursor has
+	/// left.
+	fn cancel_paste_diff(&mut self) {
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+	}
+
+	/// A click on a folder or root row puts the cursor on it.
+	pub fn select_paste_dir(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		let nav = self.paste.select_dir(key, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	/// Folds or unfolds a folder; a fold that hides the cursor moves it
+	/// onto the folder.
+	pub fn toggle_paste_dir(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		let before = self
+			.paste
+			.plan()
+			.map(|p| (p.dir_label(&key), p.collapsed_dirs.contains(&key)));
+		let folded = self
+			.paste
+			.toggle_dir_fold(key.clone(), self.preview.as_ref());
+		let (Some((label, was)), Some(plan)) = (before, self.paste.plan())
+		else {
+			return;
+		};
+		if matches!(folded, paste::preview::Folded::Ignored) {
+			return;
+		}
+		// A refused fold is undone: nothing toggled, nothing to report.
+		let now = plan.collapsed_dirs.contains(&key);
+		if now != was {
+			app_log!(
+				"[APP:PASTE_DIR_TOGGLED: dir={} collapsed={}]",
+				label,
+				now
+			);
+		}
+		if let paste::preview::Folded::Reselected(nav) = folded {
+			let moved = match nav {
+				paste::preview::Nav::Moved(idx) => Some(idx),
+				_ => None,
+			};
+			self.report_paste_nav(nav, cx);
+			if let Some(idx) = moved {
+				self.load_paste_diff(idx, cx);
+			}
+		}
+		cx.notify();
+	}
+
+	/// The include box of a folder or root row.
+	pub fn toggle_paste_dir_selected(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("include", cx) || self.paste.is_loading()
+		{
+			return;
+		}
+		if let Some(state) = self.paste.toggle_dir_selected(&key) {
+			if let Some(plan) = self.paste.plan() {
+				app_log!(
+					"[APP:PASTE_DIR_SEL_TOGGLED: dir={} state={}]",
+					plan.dir_label(&key),
+					state
+				);
+			}
+			cx.notify();
+		}
+	}
+
+	/// Left and Right in the paste tree: fold, unfold or walk to the parent
+	/// or first child.
+	pub fn paste_tree_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+		let Some(plan) = self.paste.plan() else {
+			return;
+		};
+		let step = if forward {
+			plan.nav_right()
+		} else {
+			plan.nav_left()
+		};
+		match step {
+			paste::TreeStep::Nothing => {}
+			paste::TreeStep::Fold(key) | paste::TreeStep::Unfold(key) => {
+				self.toggle_paste_dir(key, cx)
+			}
+			paste::TreeStep::Move(cursor) => {
+				let nav = self.paste.move_to(cursor, self.preview.as_ref());
+				let moved = match nav {
+					paste::preview::Nav::Moved(idx) => Some(idx),
+					_ => None,
+				};
+				self.report_paste_nav(nav, cx);
+				if let Some(idx) = moved {
+					self.load_paste_diff(idx, cx);
+				}
+			}
+		}
+	}
+
 	pub(crate) fn load_paste_diff(
 		&mut self,
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if let Some(token) = self.paste_diff_cancel.take() {
-			token.cancel();
-		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.cancel_paste_diff();
 
 		let Some(plan) = self.paste.plan() else {
 			return;
@@ -5630,7 +5763,9 @@ impl WorkbenchModel {
 				let Some(plan) = model.paste.plan() else {
 					return;
 				};
-				if plan.selected_item_idx != selected_idx {
+				if plan.selected_item_idx != selected_idx
+					|| plan.cursor_dir.is_some()
+				{
 					return;
 				}
 				let Some(item) = plan.items.get(selected_idx) else {
@@ -6470,6 +6605,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("up", NavUp, Some("PastePanel")),
 		KeyBinding::new("down", NavDown, Some("PastePanel")),
 		KeyBinding::new("space", NavToggle, Some("PastePanel")),
+		KeyBinding::new("left", NavCollapse, Some("PastePanel")),
+		KeyBinding::new("right", NavExpand, Some("PastePanel")),
 		// Reader.
 		KeyBinding::new("ctrl-c", ReaderCopy, Some("Reader")),
 		KeyBinding::new("cmd-c", ReaderCopy, Some("Reader")),
@@ -15378,6 +15515,356 @@ mod tests {
 				.unwrap_or_else(|| panic!("no rendered control {id}"));
 			cx.simulate_click(bounds.center(), gpui::Modifiers::none());
 			cx.run_until_parked();
+		}
+
+		const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
+
+		/// `click` for an id built at run time.
+		fn click_dyn(cx: &mut VisualTestContext, id: String) {
+			click(cx, Box::leak(id.into_boxed_str()));
+		}
+
+		fn paste_ix(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> usize {
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.position(|i| i.path == path)
+					.unwrap()
+			})
+		}
+
+		fn paste_dir(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> crate::paste::DirKey {
+			model.read_with(cx, |m, _| crate::paste::DirKey {
+				commit: None,
+				root: m.paste.plan().unwrap().items[0].dest_root.clone(),
+				path: path.into(),
+			})
+		}
+
+		fn paste_cursor(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> crate::paste::PasteCursor {
+			model.read_with(cx, |m, _| m.paste.plan().unwrap().cursor())
+		}
+
+		fn paste_tick(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			path: &str,
+		) -> crate::paste::Tick {
+			use crate::paste::PasteNode;
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.tree_rows()
+					.into_iter()
+					.find_map(|n| match n {
+						PasteNode::Root { key, sum, .. }
+						| PasteNode::Dir { key, sum, .. }
+							if key.path == path =>
+						{
+							Some(sum.tick())
+						}
+						_ => None,
+					})
+					.unwrap_or_else(|| panic!("no folder row {path:?}"))
+			})
+		}
+
+		fn paste_selected(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> Vec<bool> {
+			model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.map(|i| i.selected)
+					.collect()
+			})
+		}
+
+		/// #239: folders of the paste preview are rows of their own, driven
+		/// by the keyboard and the mouse like the Changes tree.
+		#[gpui::test]
+		fn paste_folders_fold_with_arrows_and_toggle_with_space_and_clicks(
+			cx: &mut TestAppContext,
+		) {
+			use crate::paste::{PasteCursor, Tick};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, SRC_TREE);
+			let a = paste_ix(&model, cx, "src/app/a.ts");
+			let row_a = crate::paste::RowControl::Row.id(a, "src/app/a.ts");
+			let app = paste_dir(&model, cx, "src/app");
+
+			// A click on the folder row selects it: no file detail.
+			click(cx, "paste-dir:0:src/app");
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+			model.read_with(cx, |m, _| assert!(m.paste.detail().is_none()));
+
+			cx.simulate_keystrokes("left");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.contains(&app))
+			});
+			assert!(cx
+				.debug_bounds(Box::leak(row_a.clone().into_boxed_str()))
+				.is_none());
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+
+			cx.simulate_keystrokes("right");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.is_empty())
+			});
+			assert!(cx
+				.debug_bounds(Box::leak(row_a.clone().into_boxed_str()))
+				.is_some());
+			cx.simulate_keystrokes("right");
+			cx.run_until_parked();
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Item(a));
+			cx.simulate_keystrokes("left");
+			cx.run_until_parked();
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+
+			// Space on a folder takes its files out, then puts them back.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(paste_selected(&model, cx), [false, false, true]);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.paste.plan().unwrap().counts().creates, 1)
+			});
+			assert_eq!(paste_tick(&model, cx, "src/app"), Tick::Empty);
+			assert_eq!(paste_tick(&model, cx, "src"), Tick::Partial);
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(paste_selected(&model, cx), [true, true, true]);
+
+			// The folder checkbox: all out, one file back (partial), then all.
+			click(cx, "paste-dir-include:0:src");
+			assert_eq!(paste_selected(&model, cx), [false, false, false]);
+			click_dyn(
+				cx,
+				crate::paste::RowControl::Include.id(a, "src/app/a.ts"),
+			);
+			assert_eq!(paste_tick(&model, cx, "src"), Tick::Partial);
+			click(cx, "paste-dir-include:0:src");
+			assert_eq!(paste_selected(&model, cx), [true, true, true]);
+
+			// A folder under the cursor does not stop Apply.
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			for (path, body) in [
+				("src/app/a.ts", "A"),
+				("src/app/b.ts", "B"),
+				("src/lib/c.ts", "C"),
+			] {
+				assert_eq!(fs::read_to_string(dest.join(path)).unwrap(), body);
+			}
+		}
+
+		#[gpui::test]
+		fn folder_chevron_folds_and_moves_a_hidden_cursor_onto_the_folder(
+			cx: &mut TestAppContext,
+		) {
+			use crate::paste::PasteCursor;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, SRC_TREE);
+			let b = paste_ix(&model, cx, "src/app/b.ts");
+			let (app, lib) = (
+				paste_dir(&model, cx, "src/app"),
+				paste_dir(&model, cx, "src/lib"),
+			);
+			click_dyn(cx, crate::paste::RowControl::Row.id(b, "src/app/b.ts"));
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Item(b));
+
+			click(cx, "paste-dir-toggle:0:src/app");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.collapsed_dirs.contains(&app));
+				assert!(plan.items[b].selected, "folding is not a selection");
+			});
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app.clone()));
+			model.read_with(cx, |m, _| assert!(m.paste.detail().is_none()));
+
+			click(cx, "paste-dir-toggle:0:src/lib");
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().unwrap().collapsed_dirs.contains(&lib))
+			});
+			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app));
+		}
+
+		/// While a remap plans again the rows are gone; a folder cursor the
+		/// plan keeps for the next landing must not draw the old folder's
+		/// detail (title and all-zero counts) over an empty list.
+		#[gpui::test]
+		fn a_cleared_preview_draws_no_folder_detail(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, SRC_TREE);
+			click(cx, "paste-dir:0:src/app");
+			assert!(cx.debug_bounds("paste-dir-detail").is_some());
+
+			// A prefix this paste does not have: the remap is refused after
+			// the plan was cleared, and the empty plan stays on screen.
+			model.update(cx, |m, cx| {
+				m.rebuild_paste_plan("nope".into(), None, cx)
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items.is_empty());
+				assert!(plan.cursor_dir.is_some(), "kept for the landing");
+			});
+			assert!(cx.debug_bounds("paste-dir-detail").is_none());
+		}
+
+		/// Two commits that both touch `src/`: a fold of the folder under one
+		/// commit must not touch the other's.
+		fn shared_folder_commits_payload() -> String {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let added = |path: &str| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some(format!("{path}\n")),
+				not_copied: None,
+			};
+			let record = |message: &str, author: &str, files| CommitRecord {
+				message: message.into(),
+				author_name: author.into(),
+				author_email: format!("{author}@example.invalid"),
+				author_date: "2026-09-25T12:34:56+00:00".into(),
+				files,
+			};
+			snip_core::commits::to_clipboard_text(&CommitsPayload {
+				commits: vec![
+					record(
+						"first",
+						"ann",
+						vec![
+							added("src/a.txt"),
+							added("src/b.txt"),
+							added("top.txt"),
+						],
+					),
+					record("second", "bob", vec![added("src/c.txt")]),
+				],
+			})
+		}
+
+		/// #239: a commit replay shows the same nested folders as a file
+		/// paste, and each commit folds its own folders.
+		#[gpui::test]
+		fn commit_folders_fold_per_commit_and_header_folds_still_work(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, &shared_folder_commits_payload());
+			let (a, b, top, c) = (
+				paste_ix(&model, cx, "src/a.txt"),
+				paste_ix(&model, cx, "src/b.txt"),
+				paste_ix(&model, cx, "top.txt"),
+				paste_ix(&model, cx, "src/c.txt"),
+			);
+			let row = |ix: usize, path: &str| {
+				crate::paste::RowControl::Row.id(ix, path)
+			};
+			let drawn = |cx: &mut VisualTestContext, id: &str| {
+				cx.debug_bounds(Box::leak(id.to_string().into_boxed_str()))
+					.is_some()
+			};
+
+			// Both commits draw their own `src` folder, rows nested in it.
+			cx.run_until_parked();
+			for id in ["paste-dir:0:src", "paste-dir:1:src"] {
+				assert!(drawn(cx, id), "{id} is drawn");
+			}
+			assert!(drawn(cx, &row(a, "src/a.txt")));
+
+			// Folding commit #1's `src` leaves commit #2's `src` open.
+			click(cx, "paste-dir-toggle:0:src");
+			assert!(!drawn(cx, &row(a, "src/a.txt")));
+			assert!(!drawn(cx, &row(b, "src/b.txt")));
+			assert!(drawn(cx, &row(top, "top.txt")), "outside the folder");
+			assert!(drawn(cx, &row(c, "src/c.txt")), "the other commit");
+			click(cx, "paste-dir-toggle:1:src");
+			assert!(!drawn(cx, &row(c, "src/c.txt")));
+			click(cx, "paste-dir-toggle:0:src");
+			assert!(drawn(cx, &row(a, "src/a.txt")));
+			assert!(!drawn(cx, &row(c, "src/c.txt")), "#2 is still folded");
+			click(cx, "paste-dir-toggle:1:src");
+
+			// A folder's include box is locked: a replay is all or nothing.
+			click(cx, "paste-dir-include:0:src");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items.iter().all(|i| i.selected));
+				assert!(plan.error.is_none());
+			});
+
+			// Folding the folder that holds the selected row moves the
+			// selection to a row that is still shown.
+			click_dyn(cx, row(a, "src/a.txt"));
+			click(cx, "paste-dir-toggle:0:src");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, top);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.clone()).as_deref(),
+					Some("top.txt")
+				);
+			});
+			click(cx, "paste-dir-toggle:0:src");
+
+			// Folding the header hides its folders too, and its own state
+			// survives the round trip.
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			cx.run_until_parked();
+			assert!(!drawn(cx, "paste-dir:0:src"));
+			assert!(drawn(cx, "paste-dir:1:src"));
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			cx.run_until_parked();
+			assert!(drawn(cx, "paste-dir:0:src"));
+			assert!(drawn(cx, &row(a, "src/a.txt")));
 		}
 
 		/// The branch name keeps its width before the repo count gives way

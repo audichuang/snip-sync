@@ -1,7 +1,11 @@
 //! Paste preview in the editor area.
 
+use super::changes::{change_pad, tree_chevron};
 use super::*;
-use crate::paste::{commit_header_id, PasteCounts, RowControl};
+use crate::paste::{
+	commit_header_id, dir_control_id, DirControl, DirKey, DirSummary,
+	PasteCounts, RowControl, Tick,
+};
 
 impl WorkbenchModel {
 	// ───────────────────────── paste ─────────────────────────
@@ -289,6 +293,113 @@ impl WorkbenchModel {
 			.children(probe(log, id))
 	}
 
+	/// A destination root's or a folder's row: chevron, a three-state
+	/// include box, the folder icon, its name and how many of its rows are
+	/// written. A click selects it, the chevron folds it.
+	#[allow(clippy::too_many_arguments)]
+	fn paste_dir_row(
+		&self,
+		plan: &PastePreviewPlan,
+		key: DirKey,
+		ord: usize,
+		name: String,
+		sum: DirSummary,
+		collapsed: bool,
+		root: bool,
+		row: Div,
+		cx: &Context<Self>,
+	) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let applying = plan.is_applying;
+		let rel = key.path.clone();
+		let row_id = dir_control_id(DirControl::Row, ord, &rel);
+		let toggle_id = dir_control_id(DirControl::Toggle, ord, &rel);
+		let inc_id = dir_control_id(DirControl::Include, ord, &rel);
+		let tick = sum.tick();
+		let on_cursor = plan.cursor_dir.as_ref() == Some(&key);
+		// A replay's folders fold like its headers: a click anywhere on the
+		// row, and its include box is locked (all or nothing is written).
+		let by_commit = plan.whole_commit;
+		let written = if sum.included == sum.files {
+			sum.files.to_string()
+		} else {
+			format!("{}/{}", sum.included, sum.files)
+		};
+		let (on_row, on_fold, on_box) = (key.clone(), key.clone(), key);
+		row.id(SharedString::from(row_id.clone()))
+			.debug_selector(|| row_id.clone())
+			.relative()
+			.cursor_pointer()
+			.when(on_cursor, |d| d.bg(rgb(pal().selection_bg)))
+			.when(!on_cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_click(cx.listener(move |this, _, _, cx| {
+				if by_commit {
+					this.toggle_paste_dir(on_row.clone(), cx)
+				} else {
+					this.select_paste_dir(on_row.clone(), cx)
+				}
+			}))
+			.child(
+				tree_chevron(toggle_id.clone(), collapsed)
+					.debug_selector(|| toggle_id.clone())
+					.cursor_pointer()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.toggle_paste_dir(on_fold.clone(), cx);
+					}))
+					.children(probe(log, toggle_id)),
+			)
+			.child(
+				div()
+					.id(SharedString::from(inc_id.clone()))
+					.debug_selector(|| inc_id.clone())
+					.relative()
+					.flex_shrink_0()
+					.size(px(16.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.when(applying, |d| {
+						d.opacity(0.4)
+							.tooltip(tip(t("paste_busy_refused", loc)))
+					})
+					.when(tick == Tick::Locked, |d| d.opacity(0.4))
+					// A locked box does not fold the row it sits on.
+					.when(by_commit, |d| {
+						d.on_click(|_, _, cx| cx.stop_propagation())
+					})
+					.when(by_commit && !applying, |d| {
+						d.tooltip(tip(t("commit_subset_rejected", loc)))
+					})
+					// Still routed to the model while applying so the refusal
+					// is explicit, like a file's box.
+					.when(tick != Tick::Locked, |d| {
+						d.on_click(cx.listener(move |this, _, _, cx| {
+							cx.stop_propagation();
+							this.toggle_paste_dir_selected(on_box.clone(), cx);
+						}))
+					})
+					.child(checkbox_tri(tick))
+					.children(probe(log, inc_id)),
+			)
+			.child(icon(Icon::Folder, 14.))
+			.child(
+				clip_text(name)
+					.flex_shrink()
+					.when(root, |d| d.font_weight(FontWeight::SEMIBOLD)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_size(px(SMALL_TEXT))
+					.text_color(rgb(pal().text_muted))
+					.child(written),
+			)
+			.children(probe(log, row_id))
+			.into_any_element()
+	}
+
 	pub(super) fn render_paste(
 		&self,
 		plan: &PastePreviewPlan,
@@ -307,7 +418,20 @@ impl WorkbenchModel {
 		let dest = plan.shown(&plan.destination);
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();
-		let selected = plan.items.get(plan.selected_item_idx);
+		// A cursor on a folder row has no file to show.
+		let selected = plan
+			.cursor_dir
+			.is_none()
+			.then(|| plan.items.get(plan.selected_item_idx))
+			.flatten();
+		let folder_detail = plan.detail_dir().map(|key| {
+			let title = if key.path.is_empty() {
+				plan.shown(&key.root)
+			} else {
+				key.path.clone()
+			};
+			(title, plan.counts_under(key))
+		});
 
 		let loading = self.paste.is_loading();
 		let action_bar = self.paste_action_bar(
@@ -389,7 +513,7 @@ impl WorkbenchModel {
 				.items_center()
 				.flex_shrink_0()
 				.h(px(24.))
-				.pl(px(8. + 18. * depth as f32))
+				.pl(px(change_pad(depth)))
 				.pr(px(8.))
 				.gap(px(6.))
 		};
@@ -398,34 +522,86 @@ impl WorkbenchModel {
 		} else {
 			plan.tree_rows()
 		};
+		// Roots that share a name tell themselves apart by their folders.
+		let root_labels: Vec<String> = {
+			let labels: Vec<&str> = nodes
+				.iter()
+				.filter_map(|n| match n {
+					PasteNode::Root { label, .. } => Some(label.as_str()),
+					_ => None,
+				})
+				.collect();
+			let repeated = labels
+				.iter()
+				.enumerate()
+				.any(|(i, l)| labels[..i].contains(l));
+			if repeated {
+				let shown: Vec<PathBuf> = nodes
+					.iter()
+					.filter_map(|n| match n {
+						PasteNode::Root { key, .. } => {
+							Some(PathBuf::from(plan.shown(&key.root)))
+						}
+						_ => None,
+					})
+					.collect();
+				Self::disambiguate_candidate_labels(&shown)
+			} else {
+				labels.into_iter().map(str::to_string).collect()
+			}
+		};
 		let rows = nodes.into_iter().map(|node| {
 			let (ix, depth) = match node {
 				PasteNode::Commit(c) => {
 					return Self::commit_header(plan, c, loc, log, cx)
 						.into_any_element();
 				}
-				PasteNode::Root(ref name, n) | PasteNode::Dir(ref name, n) => {
-					let root = matches!(node, PasteNode::Root(..));
-					let name = name.clone();
-					return node_row(usize::from(!root))
-						.child(icon(Icon::Folder, 14.))
-						.child(clip_text(name).flex_shrink().when(root, |d| {
-							d.font_weight(FontWeight::SEMIBOLD)
-						}))
-						.child(
-							div()
-								.flex_shrink_0()
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted))
-								.child(n.to_string()),
-						)
-						.into_any_element();
+				PasteNode::Root {
+					key,
+					ord,
+					label,
+					sum,
+					collapsed,
+				} => {
+					let label = root_labels.get(ord).cloned().unwrap_or(label);
+					return self.paste_dir_row(
+						plan,
+						key,
+						ord,
+						label,
+						sum,
+						collapsed,
+						true,
+						node_row(0),
+						cx,
+					);
+				}
+				PasteNode::Dir {
+					key,
+					ord,
+					name,
+					depth,
+					sum,
+					collapsed,
+				} => {
+					return self.paste_dir_row(
+						plan,
+						key,
+						ord,
+						name,
+						sum,
+						collapsed,
+						false,
+						node_row(depth),
+						cx,
+					);
 				}
 				PasteNode::File(ix, depth) => (ix, depth),
 			};
 			let item = &plan.items[ix];
 			let (_, name_color, _) = paste_op(item);
-			let is_sel = ix == plan.selected_item_idx;
+			let is_sel =
+				plan.cursor_dir.is_none() && ix == plan.selected_item_idx;
 			let path = item.path.clone();
 			let row_id = RowControl::Row.id(ix, &path);
 			let inc_id = RowControl::Include.id(ix, &path);
@@ -434,9 +610,15 @@ impl WorkbenchModel {
 			let planned_skip = item.planned_skip();
 			let by_commit = item.commit.is_some();
 			let ow_on = item.overwrite_allowed;
-			// A commit's rows are in replay order, so they keep the full path.
 			let (_, base) = split_dir(&path);
-			let name = if by_commit { path.as_str() } else { base };
+			// A skipped row only has its raw path, which can be anything. A
+			// rename's deleted old path stands under the new path's folder,
+			// so it names its own.
+			let name = if planned_skip || item.is_rename_source() {
+				path.as_str()
+			} else {
+				split_dir(plan.place_path(ix)).1
+			};
 			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
 				.debug_selector(|| row_id.clone())
@@ -452,6 +634,9 @@ impl WorkbenchModel {
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.select_paste_item(ix, cx)
 				}))
+				// Under a folder, the file lines up with its siblings'
+				// checkboxes, past the folders' chevron column.
+				.child(div().flex_shrink_0().w(px(16.)))
 				.child(
 					div()
 						.id(SharedString::from(inc_id.clone()))
@@ -800,6 +985,68 @@ impl WorkbenchModel {
 					.children(rows)
 					.children(probe(log, "paste-items")),
 			)
+			.when_some(folder_detail, |d, (title, counts)| {
+				let PasteCounts {
+					creates,
+					overwrites,
+					existing,
+					deletes,
+					skips,
+				} = counts;
+				d.child(
+					div()
+						.id("paste-dir-detail")
+						.debug_selector(|| "paste-dir-detail".to_string())
+						.relative()
+						.flex()
+						.flex_row()
+						.items_center()
+						.flex_shrink_0()
+						.h(px(24.))
+						.px(px(12.))
+						.gap(px(12.))
+						.bg(rgb(pal().panel_bg))
+						.text_size(px(SMALL_TEXT))
+						.child(fill_text(title))
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_color(rgb(pal().git_added))
+								.child(format!(
+									"{} {creates}",
+									t("op_create", loc)
+								)),
+						)
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_color(rgb(pal().git_modified))
+								.child(format!(
+									"{} {overwrites}/{existing}",
+									t("op_overwrite", loc)
+								)),
+						)
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_color(rgb(pal().git_deleted))
+								.child(format!(
+									"{} {deletes}",
+									t("op_delete", loc)
+								)),
+						)
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_color(rgb(pal().text_muted))
+								.child(format!(
+									"{} {skips}",
+									t("op_skip", loc)
+								)),
+						)
+						.children(probe(log, "paste-dir-detail")),
+				)
+			})
 			.when(selected.is_some(), |d| {
 				d.child(
 					div()
