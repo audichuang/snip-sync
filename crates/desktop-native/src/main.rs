@@ -4103,8 +4103,11 @@ impl WorkbenchModel {
 		self.compare = None;
 		if self.selected_commit.is_none() {
 			// No selection is left, so the Log has no claim on the latest
-			// preview read (L6 of `invariants`).
+			// preview read, and the details read of the commit that was
+			// selected must not land (L6 and L8 of `invariants`).
 			self.preview_pending_from_log = false;
+			self.details_generation = self.details_generation.wrapping_add(1);
+			let _ = arm_cancel(&mut self.details_cancel);
 		}
 		// The same commit stays selected while the repo is read again, so
 		// its details and its repository stay (the Log may be pinned to
