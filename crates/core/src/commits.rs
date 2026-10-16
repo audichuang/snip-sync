@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
@@ -1270,10 +1271,11 @@ pub enum LayoutConflict {
 	DirectoryInTheWay,
 	FileInTheWayOfParent,
 	/// On a case-insensitive filesystem, the path or one of its folders
-	/// differs only in case from an entry on disk or in the index, or from
-	/// another path of the same commit. The disk
-	/// takes it for that entry, while `commit --only` matches the index
-	/// case-sensitively and would fail after the writes (#140).
+	/// differs only in case from an entry on disk (tracked, untracked or
+	/// ignored, an empty directory included) or in the index, or from
+	/// another path of the same commit. The disk takes it for that entry,
+	/// while `commit --only` matches the index case-sensitively and would
+	/// fail after the writes (#140).
 	CaseAlias,
 }
 
@@ -1694,6 +1696,23 @@ impl DirEntries {
 	}
 }
 
+/// Directory listings for one unchanged `PlannedLayout`, by `layout.key(dir)`.
+/// Valid only while that layout is not mutated: made fresh per
+/// `skip_layout_conflicts` call and per `replay_commit`. A directory is read
+/// at most once per listings, whichever spelling asks.
+#[derive(Default)]
+struct Listings(std::collections::HashMap<PathBuf, Rc<DirEntries>>);
+
+impl Listings {
+	fn get(&mut self, layout: &PlannedLayout, dir: &Path) -> Rc<DirEntries> {
+		Rc::clone(
+			self.0
+				.entry(layout.key(dir))
+				.or_insert_with(|| Rc::new(layout.read_entries(dir))),
+		)
+	}
+}
+
 /// The on-disk tree seen through the effects of the commits planned so far:
 /// a path answers from `overrides` first and from `fs::symlink_metadata`
 /// otherwise. Empty, it is the plain disk (what `replay_commit` plans against).
@@ -2095,29 +2114,33 @@ impl TrackedSpellings {
 /// deletions do not clear an alias: `commit --only` given both spellings
 /// leaves a case rename staged and uncommitted. Only asked on a
 /// case-insensitive filesystem.
+///
+/// Every disk entry counts, tracked or not, ignored or not, an empty
+/// directory included. Git commits through the other spelling of an
+/// untracked folder only when the common prefix of the commit's paths
+/// happens to cover that folder, and always fails for the file itself, since
+/// `rename(2)` on APFS keeps the old spelling (#146). Refusing all of them
+/// keeps the answer from changing with the other paths of the commit.
+///
+/// Each ancestor is one lookup in its parent's listing, never a scan of it.
 fn case_alias(
 	root: &Path,
 	abs: &Path,
 	rel: &str,
 	layout: &PlannedLayout,
-	children: &mut std::collections::HashMap<PathBuf, DirEntries>,
+	listings: &mut Listings,
 ) -> bool {
 	let on_disk = abs
 		.ancestors()
 		.take_while(|a| *a != root && a.starts_with(root))
-		.filter(|a| layout.node(a) != Node::Absent)
 		.any(|a| {
-			let Some(parent) = a.parent() else {
+			let (Some(parent), Some(name)) = (a.parent(), a.file_name()) else {
 				return false;
 			};
-			let entries = children
-				.entry(layout.key(parent))
-				.or_insert_with(|| layout.read_entries(parent));
-			let key = layout.key(a);
-			!entries.iter().any(|(n, _)| Some(n) == a.file_name())
-				&& entries
-					.iter()
-					.any(|(n, _)| layout.key(&parent.join(n)) == key)
+			listings
+				.get(layout, parent)
+				.name(&layout.key(a))
+				.is_some_and(|n| n != name)
 		});
 	on_disk || layout.tracked.aliases(rel)
 }
@@ -2133,6 +2156,7 @@ fn layout_conflicts(
 	root: &Path,
 	files: &[FilePlan],
 	layout: &PlannedLayout,
+	listings: &mut Listings,
 ) -> Vec<(usize, LayoutConflict)> {
 	let mut deleted = std::collections::HashSet::new();
 	for f in files.iter().filter(|f| f.action != ReplayAction::Skip) {
@@ -2147,18 +2171,18 @@ fn layout_conflicts(
 		dir: &Path,
 		deleted: &std::collections::HashSet<&Path>,
 		layout: &PlannedLayout,
+		listings: &mut Listings,
 	) -> bool {
-		let children = layout.read_entries(dir);
+		let children = listings.get(layout, dir);
 		!children.is_empty()
 			&& children.iter().all(|(name, node)| {
 				let path = dir.join(name);
 				match node {
-					Node::Dir => emptied(&path, deleted, layout),
+					Node::Dir => emptied(&path, deleted, layout, listings),
 					_ => deleted.contains(path.as_path()),
 				}
 			})
 	}
-	let mut children = std::collections::HashMap::new();
 	// This commit's own spellings: two that differ only in case are one
 	// entry on disk and two in `commit --only`.
 	let mut spellings: std::collections::HashMap<
@@ -2187,7 +2211,7 @@ fn layout_conflicts(
 				.is_dir(abs)
 				.then_some(LayoutConflict::DeleteTargetIsDirectory),
 			ReplayAction::Write if layout.is_dir(abs) => {
-				(!emptied(abs, &deleted, layout))
+				(!emptied(abs, &deleted, layout, listings))
 					.then_some(LayoutConflict::DirectoryInTheWay)
 			}
 			ReplayAction::Write => abs
@@ -2207,7 +2231,7 @@ fn layout_conflicts(
 							spellings
 								.get(&p.to_lowercase())
 								.is_some_and(|s| s.len() > 1)
-						}) || case_alias(root, abs, rel, layout, &mut children)
+						}) || case_alias(root, abs, rel, layout, listings)
 					},
 				);
 			alias.then_some(LayoutConflict::CaseAlias)
@@ -2229,8 +2253,11 @@ fn skip_layout_conflicts(
 	files: &mut [FilePlan],
 	layout: &PlannedLayout,
 ) {
+	// `layout` does not change in this loop, only the files' actions, so one
+	// listing per directory serves every round.
+	let mut listings = Listings::default();
 	loop {
-		let conflicts = layout_conflicts(root, files, layout);
+		let conflicts = layout_conflicts(root, files, layout, &mut listings);
 		if conflicts.is_empty() {
 			return;
 		}
@@ -2542,7 +2569,8 @@ fn replay_commit(
 	// The preview skips these; replay refuses the commit before touching
 	// anything rather than stop halfway with a half-staged worktree.
 	if let Some(&(i, conflict)) =
-		layout_conflicts(root, &plan.files, &layout).first()
+		layout_conflicts(root, &plan.files, &layout, &mut Listings::default())
+			.first()
 	{
 		return Err(ReplayCommitError {
 			error: format!("{}: {}", plan.files[i].path, conflict.describe()),
