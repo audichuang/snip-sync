@@ -9,10 +9,16 @@
 //! fallback. All matches are exhaustive: a new variant of any enum below does
 //! not compile until it has a wording.
 
+use snip_core::clip::ClipFault;
 use snip_core::gitsrc::{Condition, StartReason};
+use snip_core::graph::{
+	ContinuityFault, GraphError, InputFault, MAX_REF_NAME_LEN,
+};
 use snip_core::reason::{
 	ErrorCode, Failure, PayloadErrorKind, Reason, StaleChange,
 };
+
+use snip_remote::RemoteError;
 
 use crate::i18n::Msg;
 
@@ -108,56 +114,6 @@ fn destination_changed(change: &StaleChange) -> Msg {
 	}
 }
 
-/// The e2e token of a destination change: what drivers read on
-/// `PASTE_STALE_DETECTED`, independent of the dictionary's key names. A
-/// change that names no created or deleted file reads as modified.
-#[cfg(test)]
-pub fn stale_log_token(change: &StaleChange) -> &'static str {
-	match change {
-		StaleChange::Created { .. } => "stale_created",
-		StaleChange::Deleted { .. } => "stale_deleted",
-		StaleChange::Modified { .. }
-		| StaleChange::Repository
-		| StaleChange::Preview => "stale_modified",
-	}
-}
-
-/// The token of a failed Apply's message on the `PASTE_STALE_DETECTED`
-/// line: a stable e2e contract, never a dictionary key that a rename could
-/// change. A destination change reads as its `stale_*` token; any other
-/// reason a file apply failed for (a worker's stale refusal, an engine
-/// error) reads `stale_modified`; the paste messages of the app itself keep
-/// their own names.
-pub fn apply_log_token(msg: &Msg) -> &'static str {
-	match msg.key {
-		"stale_created" => "stale_created",
-		"stale_deleted" => "stale_deleted",
-		key => APP_APPLY_KEYS
-			.iter()
-			.copied()
-			.find(|app| *app == key)
-			.unwrap_or("stale_modified"),
-	}
-}
-
-/// Every message the app builds itself on the Apply path
-/// (`PasteApplyPlan::execute` and `execute_commit`). They keep their own
-/// names on `PASTE_STALE_DETECTED`; anything else is worded from a reason.
-pub const APP_APPLY_KEYS: [&str; 12] = [
-	"paste_repo_busy",
-	"paste_outcome_unknown",
-	"paste_err_destination",
-	"paste_err_destination_not_dir",
-	"paste_err_plan",
-	"error_open_repo",
-	"commit_replay_refused",
-	"commit_replay_partial",
-	"commit_replay_partial_refused",
-	"commit_subset_rejected",
-	"commit_overwrite_required",
-	"mapping_required",
-];
-
 /// A failure's wording, headline and trailing datum.
 fn headed(key: &'static str, datum: &str) -> Msg {
 	Msg::detail(Msg::new(key, []), datum)
@@ -231,12 +187,15 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::Start {
 			start: Some(start),
 			detail,
-		} => start_msg(*start, detail),
+		} => start_msg(*start, detail.as_str()),
 		Reason::Start {
 			start: None,
 			detail,
-		} => headed("err_start_failed", detail),
-		Reason::Disconnected { detail } => headed("err_disconnected", detail),
+		} => headed("err_start_failed", detail.as_str()),
+		Reason::Disconnected { detail } => {
+			headed("err_disconnected", detail.as_str())
+		}
+		Reason::WorkerClosed => Msg::new("err_worker_closed", []),
 		Reason::Protocol => Msg::new("err_protocol", []),
 		Reason::WorkerTooOld { worker, have, need } => Msg::new(
 			"err_worker_outdated",
@@ -245,7 +204,9 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::TimedOut => Msg::new("err_timed_out", []),
 		Reason::Cancelled => Msg::new("err_cancelled", []),
 		Reason::GitMissing => Msg::new("err_git_missing", []),
-		Reason::GitFailed { stderr } => headed("err_git_failed", stderr),
+		Reason::GitFailed { stderr } => {
+			headed("err_git_failed", stderr.as_str())
+		}
 		Reason::GitBusy => Msg::new("err_git_busy", []),
 		Reason::RepoBusy => Msg::new("paste_repo_busy", []),
 		Reason::WorkerNeedsRestart => Msg::new("err_worker_restart", []),
@@ -269,8 +230,8 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::Internal {
 			detail,
 			condition: None,
-		} => headed("err_internal", detail),
-		Reason::Io { detail } => headed("err_io", detail),
+		} => headed("err_internal", detail.as_str()),
+		Reason::Io { detail } => headed("err_io", detail.as_str()),
 		Reason::NotFound { path } => headed("err_not_found", path),
 		Reason::PermissionDenied { path } => {
 			headed("err_permission_denied", path)
@@ -335,7 +296,7 @@ pub fn reason_msg(r: &Reason) -> Msg {
 			Msg::new("err_submodule_not_checked_out", [])
 		}
 		Reason::SubmoduleUnreadable { detail } => {
-			headed("err_submodule_unreadable", detail)
+			headed("err_submodule_unreadable", detail.as_str())
 		}
 		Reason::ScanErrorsOmitted { count } => {
 			Msg::new("err_scan_errors_omitted", [count.to_string()])
@@ -346,49 +307,100 @@ pub fn reason_msg(r: &Reason) -> Msg {
 	}
 }
 
+/// A remote failure as a message for a failure of the user's `path`: a worded
+/// refusal keeps the path as the detail, so the status line says which path
+/// failed. Any other failure is worded by its reason alone.
+pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
+	let msg = reason_msg(&err.reason());
+	match err {
+		RemoteError::Refused { .. } => Msg::detail(msg, path),
+		_ => msg,
+	}
+}
+
 /// A scan row's wording. The row's English `message` is for the CLI and the
 /// log, never for the screen.
 pub fn failure_msg(f: &Failure) -> Msg {
 	reason_msg(&f.reason)
 }
 
-#[cfg(test)]
-mod log_token_tests {
-	use super::*;
-
-	/// `PASTE_STALE_DETECTED` is read by drivers: each destination change
-	/// prints the token develop printed, whatever the dictionary names the
-	/// sentence.
-	#[test]
-	fn stale_detected_token_is_stable_for_every_change() {
-		let cases = [
-			(StaleChange::Created { rel: "a".into() }, "stale_created"),
-			(StaleChange::Deleted { rel: "a".into() }, "stale_deleted"),
-			(StaleChange::Modified { rel: "a".into() }, "stale_modified"),
-			(StaleChange::Repository, "stale_modified"),
-			(StaleChange::Preview, "stale_modified"),
-		];
-		for (change, token) in cases {
-			assert_eq!(stale_log_token(&change), token);
-			let msg = reason_msg(&Reason::DestinationChanged {
-				change: change.clone(),
-			});
-			assert_eq!(apply_log_token(&msg), token, "{change:?}");
+/// A commit graph the layout refused, in words. The layout's own `Display`
+/// is an English diagnostic for the CLI and the log: it is never data here.
+/// A fault only a bug can cause (nothing a repository can make git hand us)
+/// trails the headline as a fixed label for a bug report. Exhaustive: a new
+/// error or fault does not compile until it has a wording.
+pub fn graph_error_msg(e: &GraphError) -> Msg {
+	let bug = |label: &'static str| {
+		Msg::detail(Msg::new("err_graph_layout", []), label)
+	};
+	match e {
+		GraphError::RowLimitExceeded { requested, limit } => Msg::new(
+			"graph_err_rows",
+			[requested.to_string(), limit.to_string()],
+		),
+		GraphError::RefLimitExceeded { requested, limit } => Msg::new(
+			"graph_err_refs",
+			[requested.to_string(), limit.to_string()],
+		),
+		GraphError::ByteLimitExceeded { total, limit } => {
+			Msg::new("graph_err_bytes", [total.to_string(), limit.to_string()])
 		}
+		// The history view steps down to a plain list before it gets here,
+		// but a message is owed all the same.
+		GraphError::FrontierLimitExceeded { current, limit } => Msg::new(
+			"graph_err_frontier",
+			[current.to_string(), limit.to_string()],
+		),
+		GraphError::InvalidInput { fault } => match fault {
+			InputFault::CommitSha { .. }
+			| InputFault::ParentSha { .. }
+			| InputFault::RefSha { .. } => Msg::new("graph_commit_id_too_long", []),
+			InputFault::RefNameTooLong { .. } => Msg::new(
+				"graph_err_ref_name_too_long",
+				[MAX_REF_NAME_LEN.to_string()],
+			),
+			InputFault::RefNameEmpty { .. } => bug("empty_ref_name"),
+			InputFault::FrontierSha => bug("frontier_sha"),
+			InputFault::CheckpointSha => bug("checkpoint_sha"),
+		},
+		GraphError::InvalidConfig { .. } => bug("invalid_config"),
+		GraphError::ContinuityError { fault } => match fault {
+			ContinuityFault::RepeatsLastCommit { .. } => bug("page_continuity"),
+		},
+		GraphError::DuplicateCommit { .. } => bug("duplicate_commit"),
 	}
+}
 
-	#[test]
-	fn other_apply_failures_print_stable_tokens() {
-		for key in APP_APPLY_KEYS {
-			assert_eq!(apply_log_token(&Msg::new(key, [])), key);
-		}
-		for msg in [
-			reason_msg(&Reason::Cancelled),
-			reason_msg(&Reason::Refused {
-				code: ErrorCode::Stale,
-			}),
-		] {
-			assert_eq!(apply_log_token(&msg), "stale_modified");
-		}
-	}
+/// What a clipboard library error means, in words.
+pub fn clip_fault_msg(f: ClipFault) -> Msg {
+	Msg::new(
+		match f {
+			ClipFault::Empty => "clip_err_empty",
+			ClipFault::Unsupported => "clip_err_unsupported",
+			ClipFault::Occupied => "clip_err_occupied",
+			ClipFault::Conversion => "clip_err_conversion",
+			ClipFault::Other => "clip_err_other",
+		},
+		[],
+	)
+}
+
+/// A failed clipboard write, with the cause in words.
+pub fn clipboard_failed(e: &arboard::Error) -> Msg {
+	Msg::with_msg_arg(
+		"status_clipboard_failed",
+		[String::new()],
+		0,
+		clip_fault_msg(snip_core::clip::fault(e)),
+	)
+}
+
+/// A failed clipboard read, with the cause in words.
+pub fn clipboard_read_failed(e: &arboard::Error) -> Msg {
+	Msg::with_msg_arg(
+		"status_clipboard_read_failed",
+		[String::new()],
+		0,
+		clip_fault_msg(snip_core::clip::fault(e)),
+	)
 }

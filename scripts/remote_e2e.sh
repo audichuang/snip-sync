@@ -62,10 +62,14 @@ pass=0
 fail=0
 ok() { pass=$((pass + 1)); echo "PASS  $*"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $*"; }
-check() { # name, command...
+check() { # name, command...; a failure shows the command's last lines
 	local name=$1
 	shift
-	if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi
+	# A file, not $(...): some checks print bytes a variable would drop.
+	if "$@" >"$MASTER/check.out" 2>&1; then ok "$name"; else
+		bad "$name"
+		tail -n 5 "$MASTER/check.out" | sed 's/^/      | /'
+	fi
 }
 skip() {
 	if [ -n "${SNIP_REQUIRE_ALL_TESTS:-}" ]; then

@@ -20,6 +20,7 @@ use snip_core::commits::{
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::GitError;
+use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{
 	RestoreBase, RestoreBaseSuggestion, RestoreExecutionResult, RestorePlan,
 	RestoreSelection,
@@ -506,7 +507,7 @@ impl PasteApplyWorker {
 			pool: pool.clone(),
 		}
 	}
-	pub fn execute(self) -> Result<PasteApplyResult, Msg> {
+	pub fn execute(self) -> Result<PasteApplyResult, ApplyRefusal> {
 		self.plan.as_ref().unwrap().execute()
 	}
 }
@@ -813,7 +814,9 @@ impl PasteApplyResult {
 			.map(|text| snip_core::restore::RestoreFailure {
 				path: String::new(),
 				reason: Some(snip_core::reason::Reason::Io {
-					detail: text.clone(),
+					detail: snip_core::reason::Datum::old_peer_text(
+						text.clone(),
+					),
 				}),
 			})
 			.collect()
@@ -868,6 +871,133 @@ impl RemotePaste {
 	/// A tree path as the user knows it: `host:/folder/…`.
 	pub fn shown(&self, path: &Path) -> String {
 		crate::remote::display_path(Some(&self.session), path)
+	}
+}
+
+/// A failed Apply: what the UI says, and the token `PASTE_STALE_DETECTED`
+/// prints (an e2e contract that no dictionary rename may change). Built only
+/// with a token, so a new refusal on the Apply path cannot fall back to
+/// `stale_modified` unnoticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyRefusal {
+	pub msg: Msg,
+	pub token: ApplyToken,
+}
+
+/// Every token an Apply failure prints on `PASTE_STALE_DETECTED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyToken {
+	StaleCreated,
+	StaleDeleted,
+	StaleModified,
+	PasteRepoBusy,
+	PasteOutcomeUnknown,
+	PasteErrDestination,
+	PasteErrPlan,
+	ErrorOpenRepo,
+	CommitReplayRefused,
+	CommitReplayPartial,
+	CommitReplayPartialRefused,
+	CommitSubsetRejected,
+	CommitOverwriteRequired,
+	MappingRequired,
+}
+
+impl ApplyToken {
+	/// The spelling drivers read. Never changes with the dictionary.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::StaleCreated => "stale_created",
+			Self::StaleDeleted => "stale_deleted",
+			Self::StaleModified => "stale_modified",
+			Self::PasteRepoBusy => "paste_repo_busy",
+			Self::PasteOutcomeUnknown => "paste_outcome_unknown",
+			Self::PasteErrDestination => "paste_err_destination",
+			Self::PasteErrPlan => "paste_err_plan",
+			Self::ErrorOpenRepo => "error_open_repo",
+			Self::CommitReplayRefused => "commit_replay_refused",
+			Self::CommitReplayPartial => "commit_replay_partial",
+			Self::CommitReplayPartialRefused => "commit_replay_partial_refused",
+			Self::CommitSubsetRejected => "commit_subset_rejected",
+			Self::CommitOverwriteRequired => "commit_overwrite_required",
+			Self::MappingRequired => "mapping_required",
+		}
+	}
+
+	/// A reason's own token: a created or deleted destination file names
+	/// itself, a busy repository is `paste_repo_busy`, anything else reads
+	/// `stale_modified`. Exhaustive over `Reason`, no `_`: a new reason
+	/// decides.
+	pub fn of_reason(r: &Reason) -> Self {
+		match r {
+			Reason::RepoBusy => Self::PasteRepoBusy,
+			Reason::DestinationChanged { change } => match change {
+				StaleChange::Created { .. } => Self::StaleCreated,
+				StaleChange::Deleted { .. } => Self::StaleDeleted,
+				StaleChange::Modified { .. }
+				| StaleChange::Repository
+				| StaleChange::Preview => Self::StaleModified,
+			},
+			Reason::Refused { .. }
+			| Reason::Start { .. }
+			| Reason::Disconnected { .. }
+			| Reason::WorkerClosed
+			| Reason::Protocol
+			| Reason::WorkerTooOld { .. }
+			| Reason::TimedOut
+			| Reason::Cancelled
+			| Reason::GitMissing
+			| Reason::GitFailed { .. }
+			| Reason::GitBusy
+			| Reason::WorkerNeedsRestart
+			| Reason::TooLarge
+			| Reason::PatchTooLarge
+			| Reason::VerifyLimit
+			| Reason::NotARepository { .. }
+			| Reason::InsideParentRepo { .. }
+			| Reason::InvalidRevision { .. }
+			| Reason::Shallow { .. }
+			| Reason::OutsideShare
+			| Reason::Internal { .. }
+			| Reason::Io { .. }
+			| Reason::NotFound { .. }
+			| Reason::PermissionDenied { .. }
+			| Reason::EmptySelection
+			| Reason::UnsafePath { .. }
+			| Reason::NotRegularFile { .. }
+			| Reason::OutsideRoot { .. }
+			| Reason::Collision { .. }
+			| Reason::StagedAndWorking { .. }
+			| Reason::AmbiguousRoots { .. }
+			| Reason::PayloadTooLarge { .. }
+			| Reason::SourceChanged { .. }
+			| Reason::CrossRepoCommits
+			| Reason::Discontinuous { .. }
+			| Reason::NotEnoughCommits { .. }
+			| Reason::NotCommitPayload
+			| Reason::InvalidPayload { .. }
+			| Reason::OutsideScope { .. }
+			| Reason::Unverifiable { .. }
+			| Reason::SubmoduleNotCheckedOut
+			| Reason::SubmoduleUnreadable { .. }
+			| Reason::ScanErrorsOmitted { .. }
+			| Reason::DepthLimitedOmitted { .. } => Self::StaleModified,
+		}
+	}
+}
+
+impl ApplyRefusal {
+	/// A refusal worded from a reason, with the reason's own token.
+	fn of_reason(r: &Reason) -> Self {
+		Self {
+			msg: reason_msg(r),
+			token: ApplyToken::of_reason(r),
+		}
+	}
+
+	/// A refusal the app words itself, under the token of that wording.
+	fn app(msg: Msg, token: ApplyToken) -> Self {
+		Self { msg, token }
 	}
 }
 
@@ -929,14 +1059,29 @@ fn file_apply_msg(
 	dest: &Path,
 	err: PasteError,
 ) -> Msg {
+	file_apply_refusal(remote, dest, err).msg
+}
+
+/// [`file_apply_msg`] with the token the failure prints.
+fn file_apply_refusal(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+) -> ApplyRefusal {
 	if err.is_repo_busy() {
-		return repo_busy();
+		return ApplyRefusal::app(repo_busy(), ApplyToken::PasteRepoBusy);
 	}
 	match err {
-		PasteError::OutcomeUnknown(_) => outcome_unknown(),
-		PasteError::Local(e) => reason_msg(&e.reason()),
-		other if other.is_stale() => reason_msg(&other.reason()),
-		other => destination_msg(remote, dest, other),
+		PasteError::OutcomeUnknown(_) => ApplyRefusal::app(
+			outcome_unknown(),
+			ApplyToken::PasteOutcomeUnknown,
+		),
+		PasteError::Local(e) => ApplyRefusal::of_reason(&e.reason()),
+		other if other.is_stale() => ApplyRefusal::of_reason(&other.reason()),
+		other => ApplyRefusal::app(
+			destination_msg(remote, dest, other),
+			ApplyToken::PasteErrDestination,
+		),
 	}
 }
 
@@ -947,40 +1092,57 @@ fn commit_msg(
 	err: PasteError,
 	applying: bool,
 ) -> Msg {
+	commit_refusal(remote, dest, err, applying).msg
+}
+
+/// [`commit_msg`] with the token the failure prints.
+fn commit_refusal(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+	applying: bool,
+) -> ApplyRefusal {
 	if err.is_stale() {
-		return reason_msg(&err.reason());
+		return ApplyRefusal::of_reason(&err.reason());
 	}
-	match err {
-		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
-			..
-		})) => repo_busy(),
-		PasteError::Local(TransferError::Git(e)) if applying => {
+	let open_repo = |reason: &Reason| {
+		ApplyRefusal::app(
 			Msg::with_msg_arg(
 				"error_open_repo",
 				[String::new()],
 				0,
-				reason_msg(&e.reason()),
-			)
+				reason_msg(reason),
+			),
+			ApplyToken::ErrorOpenRepo,
+		)
+	};
+	match err {
+		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
+			..
+		})) => ApplyRefusal::app(repo_busy(), ApplyToken::PasteRepoBusy),
+		PasteError::Local(TransferError::Git(e)) if applying => {
+			open_repo(&e.reason())
 		}
-		PasteError::Local(e) => reason_msg(&e.reason()),
+		PasteError::Local(e) => ApplyRefusal::of_reason(&e.reason()),
 		// Kept on purpose (design Risk 1): any other worker refusal of a
 		// replay, Busy included, reads as a repository error, not as
 		// paste_repo_busy. A refusal is worded by its reason, never by the
 		// worker's text.
 		PasteError::Remote(e @ RemoteError::Refused { .. }) => {
-			Msg::with_msg_arg(
-				"error_open_repo",
-				[String::new()],
-				0,
-				reason_msg(&e.reason()),
-			)
+			open_repo(&e.reason())
 		}
-		PasteError::OutcomeUnknown(_) => outcome_unknown(),
-		other => destination_msg(remote, dest, other),
+		PasteError::OutcomeUnknown(_) => ApplyRefusal::app(
+			outcome_unknown(),
+			ApplyToken::PasteOutcomeUnknown,
+		),
+		other => ApplyRefusal::app(
+			destination_msg(remote, dest, other),
+			ApplyToken::PasteErrDestination,
+		),
 	}
 }
 
-fn roots_digest(roots: &[PathBuf]) -> u64 {
+pub(crate) fn roots_digest(roots: &[PathBuf]) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	roots.hash(&mut hasher);
@@ -1403,7 +1565,9 @@ impl PastePreviewPlan {
 	}
 
 	/// Adds repos discovered after this preview opened to every prefix
-	/// choice's candidates. Existing candidates keep their index and made
+	/// choice's candidates. Called by `repos_changed` on every change of the
+	/// repo list, and on each transition that returns an open preview to
+	/// idle (a job landing, a failed Apply). Existing candidates keep their index and made
 	/// choices stay, so nothing the user did is invalidated. Returns whether
 	/// any candidate was added. Does nothing, and touches no file system,
 	/// when there is no mapping to extend or the repo set is the one the
@@ -1414,6 +1578,12 @@ impl PastePreviewPlan {
 			Some(found) => self.extend_candidates(&found).is_some(),
 			None => false,
 		}
+	}
+
+	/// The digest of the repo roots this plan last saw.
+	#[cfg(test)]
+	pub(crate) fn seen_roots(&self) -> u64 {
+		self.seen_roots
 	}
 
 	/// The repo roots this plan has not seen, canonical (or as the worker
@@ -2049,7 +2219,6 @@ impl PastePreviewPlan {
 				err @ (PasteError::Destination { .. }
 				| PasteError::Remote(
 					RemoteError::Io(_)
-					| RemoteError::Connect(_)
 					| RemoteError::Start { .. }
 					| RemoteError::PatchTooLarge { .. }
 					| RemoteError::Protocol(_)
@@ -2538,24 +2707,30 @@ impl PastePreviewPlan {
 		Ok(())
 	}
 
-	pub fn execute(&self) -> Result<PasteApplyResult, Msg> {
+	pub fn execute(&self) -> Result<PasteApplyResult, ApplyRefusal> {
 		if let Some(preview) = &self.commit_preview {
 			return self.execute_commit(preview);
 		}
 		if !self.mapping_ready() {
-			return Err(Msg::new("mapping_required", []));
+			return Err(ApplyRefusal::app(
+				Msg::new("mapping_required", []),
+				ApplyToken::MappingRequired,
+			));
 		}
 
 		let Some(ref import_plan) = self.import_plan else {
 			// An invariant break: Apply without a plan.
-			return Err(Msg::with_msg_arg(
-				"paste_err_plan",
-				[String::new()],
-				0,
-				reason_msg(&snip_core::reason::Reason::Internal {
-					detail: String::new(),
-					condition: None,
-				}),
+			return Err(ApplyRefusal::app(
+				Msg::with_msg_arg(
+					"paste_err_plan",
+					[String::new()],
+					0,
+					reason_msg(&snip_core::reason::Reason::Internal {
+						detail: snip_core::reason::Datum::default(),
+						condition: None,
+					}),
+				),
+				ApplyToken::PasteErrPlan,
 			));
 		};
 
@@ -2591,11 +2766,13 @@ impl PastePreviewPlan {
 		};
 
 		// Run confirmed plan directly through shared transfer engine with freshness check
-		let (target, route) = self.target_route()?;
+		let (target, route) = self.target_route().map_err(|m| {
+			ApplyRefusal::app(m, ApplyToken::PasteErrDestination)
+		})?;
 		let mut result = target
 			.apply_files(&self.raw_payload, &route, import_plan, &selection)
 			.map_err(|e| {
-				file_apply_msg(self.remote.as_ref(), &self.destination, e)
+				file_apply_refusal(self.remote.as_ref(), &self.destination, e)
 			})?;
 		result.skipped_existing_count += skipped_existing;
 		Ok(PasteApplyResult {
@@ -2607,11 +2784,17 @@ impl PastePreviewPlan {
 	fn execute_commit(
 		&self,
 		preview: &CommitReplayPreview,
-	) -> Result<PasteApplyResult, Msg> {
+	) -> Result<PasteApplyResult, ApplyRefusal> {
 		if self.items.iter().any(|item| !item.selected) {
-			return Err(Msg::new("commit_subset_rejected", []));
+			return Err(ApplyRefusal::app(
+				Msg::new("commit_subset_rejected", []),
+				ApplyToken::CommitSubsetRejected,
+			));
 		}
-		let target = paste_target(self.remote.as_ref(), &self.destination)?;
+		let target = paste_target(self.remote.as_ref(), &self.destination)
+			.map_err(|m| {
+				ApplyRefusal::app(m, ApplyToken::PasteErrDestination)
+			})?;
 		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
 			target
@@ -2621,19 +2804,22 @@ impl PastePreviewPlan {
 					&self.commit_prepared,
 				)
 				.map_err(|e| {
-					commit_msg(
+					commit_refusal(
 						self.remote.as_ref(),
 						&self.destination,
 						e,
 						false,
 					)
 				})?;
-			return Err(Msg::new("commit_overwrite_required", []));
+			return Err(ApplyRefusal::app(
+				Msg::new("commit_overwrite_required", []),
+				ApplyToken::CommitOverwriteRequired,
+			));
 		}
 		let replay_res = target
 			.apply_commits(&self.raw_payload, preview, &self.commit_prepared)
 			.map_err(|e| {
-				commit_msg(self.remote.as_ref(), &self.destination, e, true)
+				commit_refusal(self.remote.as_ref(), &self.destination, e, true)
 			})?;
 		if let Some(fail) = replay_res.failure {
 			if replay_res.created.is_empty() {
@@ -2669,10 +2855,13 @@ impl PastePreviewPlan {
 					],
 					key_args,
 				);
-				return Err(match cause {
-					Some(cause) => msg.nest(2, cause),
-					None => msg,
-				});
+				return Err(ApplyRefusal::app(
+					match cause {
+						Some(cause) => msg.nest(2, cause),
+						None => msg,
+					},
+					ApplyToken::CommitReplayRefused,
+				));
 			}
 			let created = short_shas(&replay_res.created, usize::MAX);
 			return Err(match fail.layout_conflict {
@@ -2680,22 +2869,28 @@ impl PastePreviewPlan {
 					let subject =
 						fail.message.lines().next().unwrap_or("").trim();
 					let path = fail.conflict_path.as_deref().unwrap_or(subject);
-					Msg::with_key_arg(
-						"commit_replay_partial_refused",
-						[
-							created,
-							(fail.index + 1).to_string(),
-							path.to_string(),
-							layout_conflict_cause_key(conflict).to_string(),
-						],
-						3,
+					ApplyRefusal::app(
+						Msg::with_key_arg(
+							"commit_replay_partial_refused",
+							[
+								created,
+								(fail.index + 1).to_string(),
+								path.to_string(),
+								layout_conflict_cause_key(conflict).to_string(),
+							],
+							3,
+						),
+						ApplyToken::CommitReplayPartialRefused,
 					)
 				}
-				None => Msg::with_msg_arg(
-					"commit_replay_partial",
-					[created, String::new()],
-					1,
-					reason_msg(&replay_failure_reason(&fail)),
+				None => ApplyRefusal::app(
+					Msg::with_msg_arg(
+						"commit_replay_partial",
+						[created, String::new()],
+						1,
+						reason_msg(&replay_failure_reason(&fail)),
+					),
+					ApplyToken::CommitReplayPartial,
 				),
 			});
 		}
@@ -2846,7 +3041,9 @@ pub(crate) mod tests {
 			RestoreFailure {
 				path: "b.txt".into(),
 				reason: Some(Reason::Io {
-					detail: "No space left on device".into(),
+					detail: snip_core::reason::Datum::for_test(
+						"No space left on device",
+					),
 				}),
 			},
 			RestoreFailure {
@@ -2893,7 +3090,9 @@ pub(crate) mod tests {
 			.map(|i| RestoreFailure {
 				path: format!("f{i}.txt"),
 				reason: Some(Reason::Io {
-					detail: "No space left on device".into(),
+					detail: snip_core::reason::Datum::for_test(
+						"No space left on device",
+					),
 				}),
 			})
 			.collect();
@@ -3207,7 +3406,12 @@ pub(crate) mod tests {
 			file_apply_msg(
 				Some(&remote),
 				&dest,
-				PasteError::Remote(RemoteError::Connect("no route".into()))
+				PasteError::Remote(RemoteError::Start {
+					kind: snip_remote::ConnectFailureKind::Other,
+					reason: None,
+					detail: snip_core::reason::Datum::for_test("no route"),
+					message: "no route".into(),
+				})
 			)
 			.key,
 			"paste_err_destination"
@@ -3227,7 +3431,7 @@ pub(crate) mod tests {
 				PasteError::Remote(RemoteError::Start {
 					kind: ConnectFailureKind::Other,
 					reason: Some(reason),
-					detail: detail.into(),
+					detail: snip_core::reason::Datum::for_test(detail),
 					message: "english".into(),
 				}),
 			)
@@ -3403,7 +3607,12 @@ pub(crate) mod tests {
 		assert_eq!(
 			key(
 				Some(&remote),
-				PasteError::Remote(RemoteError::Connect("no route".into())),
+				PasteError::Remote(RemoteError::Start {
+					kind: snip_remote::ConnectFailureKind::Other,
+					reason: None,
+					detail: snip_core::reason::Datum::for_test("no route"),
+					message: "no route".into(),
+				}),
 				false
 			),
 			"paste_err_destination"
@@ -3569,10 +3778,7 @@ pub(crate) mod tests {
 			.unwrap()
 			.unwrap();
 		let mut life = crate::lifecycle::Lifecycle::new(1);
-		let (id, held) = life.register(
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(token.clone()),
-		);
+		let (id, held) = life.register_read(Some(token.clone()));
 		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
 		token.cancel();
 		for n in 1..=100 {
@@ -4172,7 +4378,7 @@ pub(crate) mod tests {
 		.unwrap();
 
 		// Execute must fail with a meaningful stale destination error!
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		assert!(
 			err.key == "stale_modified",
 			"stale destination modification must block execution: {err}"
@@ -4249,7 +4455,7 @@ pub(crate) mod tests {
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
-		assert_eq!(plan.execute().unwrap_err().key, "mapping_required");
+		assert_eq!(plan.execute().unwrap_err().msg.key, "mapping_required");
 		assert!(!repo_a.join("file_a.txt").exists());
 		assert!(!repo_b.join("file_b.txt").exists());
 		plan.set_prefix_destination("repo-a", &repo_a).unwrap();
@@ -4474,7 +4680,7 @@ pub(crate) mod tests {
 		let before = count().unwrap();
 		// The existing a.txt is not skipped: Apply waits for the overwrite.
 		assert_eq!(
-			plan.execute().unwrap_err().key,
+			plan.execute().unwrap_err().msg.key,
 			"commit_overwrite_required"
 		);
 		assert_eq!(count().unwrap(), before);
@@ -4500,7 +4706,7 @@ pub(crate) mod tests {
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
-		assert_eq!(plan.execute().unwrap_err().key, "mapping_required");
+		assert_eq!(plan.execute().unwrap_err().msg.key, "mapping_required");
 		assert!(!dest.join("長路徑資料夾/新增.txt").exists());
 		plan.set_keep_relative("長路徑資料夾").unwrap();
 		assert!(plan.mapping_ready());
@@ -4703,7 +4909,7 @@ pub(crate) mod tests {
 		);
 
 		// Apply refuses the whole commit with commit_replay_refused
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		assert_eq!(err.key, "commit_replay_refused");
 		assert_eq!(err.args[0], "1");
 		assert_eq!(err.args[1], "incoming");
@@ -4790,7 +4996,7 @@ pub(crate) mod tests {
 		assert!(!banner_en.contains("\"\""), "{banner_en}");
 
 		// Apply refusal uses commit_no_message and translates cause
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		assert_eq!(err.key, "commit_replay_refused");
 		let err_zh = err.render(crate::i18n::Locale::ZhTw);
 		assert!(
@@ -4864,7 +5070,7 @@ pub(crate) mod tests {
 			1,
 		)
 		.unwrap();
-		let err = files.execute().unwrap_err();
+		let err = files.execute().unwrap_err().msg;
 		assert_eq!(err.key, "paste_repo_busy");
 		assert!(!repo.join("new.txt").exists());
 
@@ -4886,7 +5092,7 @@ pub(crate) mod tests {
 		let replay =
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
 				.unwrap();
-		let err = replay.execute().unwrap_err();
+		let err = replay.execute().unwrap_err().msg;
 		assert_eq!(err.key, "paste_repo_busy");
 		assert_eq!(
 			err.render(crate::i18n::Locale::ZhTw),
@@ -4933,7 +5139,7 @@ pub(crate) mod tests {
 				.unwrap();
 
 		let blocker = HeavyLockBlocker::fill(&repo);
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		blocker.release();
 
 		assert_eq!(err.key, "commit_replay_refused");
@@ -4988,7 +5194,7 @@ pub(crate) mod tests {
 				.unwrap();
 
 		let blocker = HeavyLockBlocker::fill(&repo);
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		blocker.release();
 
 		assert_eq!(err.key, "commit_replay_refused");
@@ -5082,7 +5288,7 @@ pub(crate) mod tests {
 			"{banner}"
 		);
 
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		assert_eq!(err.key, "commit_replay_partial_refused");
 		assert_eq!(err.args.len(), 4);
 		assert_eq!(err.args[1], "2");
@@ -5393,7 +5599,7 @@ pub(crate) mod tests {
 		unchecked.items[0].overwrite_allowed = false;
 		assert!(unchecked.check_stale_destination().is_ok());
 		assert_eq!(
-			unchecked.execute().unwrap_err().key,
+			unchecked.execute().unwrap_err().msg.key,
 			"commit_subset_rejected"
 		);
 		assert_eq!(fs::read_to_string(path.join("a.txt")).unwrap(), "base\n");
@@ -5407,11 +5613,204 @@ pub(crate) mod tests {
 			stale.check_stale_destination().unwrap_err().key,
 			"stale_modified"
 		);
-		assert_eq!(stale.execute().unwrap_err().key, "stale_modified");
+		assert_eq!(stale.execute().unwrap_err().msg.key, "stale_modified");
 		assert_eq!(
 			fs::read_to_string(path.join("a.txt")).unwrap(),
 			"external change\n"
 		);
+	}
+
+	/// `PASTE_STALE_DETECTED` prints these tokens, and e2e drivers read them:
+	/// the table is the contract, whatever the dictionary names its keys.
+	#[test]
+	fn apply_tokens_are_the_e2e_contract() {
+		fn index(t: ApplyToken) -> usize {
+			match t {
+				ApplyToken::StaleCreated => 0,
+				ApplyToken::StaleDeleted => 1,
+				ApplyToken::StaleModified => 2,
+				ApplyToken::PasteRepoBusy => 3,
+				ApplyToken::PasteOutcomeUnknown => 4,
+				ApplyToken::PasteErrDestination => 5,
+				ApplyToken::PasteErrPlan => 6,
+				ApplyToken::ErrorOpenRepo => 7,
+				ApplyToken::CommitReplayRefused => 8,
+				ApplyToken::CommitReplayPartial => 9,
+				ApplyToken::CommitReplayPartialRefused => 10,
+				ApplyToken::CommitSubsetRejected => 11,
+				ApplyToken::CommitOverwriteRequired => 12,
+				ApplyToken::MappingRequired => 13,
+			}
+		}
+		let table = [
+			(ApplyToken::StaleCreated, "stale_created"),
+			(ApplyToken::StaleDeleted, "stale_deleted"),
+			(ApplyToken::StaleModified, "stale_modified"),
+			(ApplyToken::PasteRepoBusy, "paste_repo_busy"),
+			(ApplyToken::PasteOutcomeUnknown, "paste_outcome_unknown"),
+			(ApplyToken::PasteErrDestination, "paste_err_destination"),
+			(ApplyToken::PasteErrPlan, "paste_err_plan"),
+			(ApplyToken::ErrorOpenRepo, "error_open_repo"),
+			(ApplyToken::CommitReplayRefused, "commit_replay_refused"),
+			(ApplyToken::CommitReplayPartial, "commit_replay_partial"),
+			(
+				ApplyToken::CommitReplayPartialRefused,
+				"commit_replay_partial_refused",
+			),
+			(ApplyToken::CommitSubsetRejected, "commit_subset_rejected"),
+			(
+				ApplyToken::CommitOverwriteRequired,
+				"commit_overwrite_required",
+			),
+			(ApplyToken::MappingRequired, "mapping_required"),
+		];
+		let seen: BTreeSet<_> = table.iter().map(|(t, _)| index(*t)).collect();
+		assert_eq!(seen.len(), 14, "a token has no row");
+		for (token, text) in table {
+			assert_eq!(token.as_str(), text);
+		}
+		// The rule of a reason's own token, as it read off the message.
+		for (label, reason) in super::zh_leaks_tests::reason_samples() {
+			let want = match reason_msg(&reason).key {
+				"stale_created" => ApplyToken::StaleCreated,
+				"stale_deleted" => ApplyToken::StaleDeleted,
+				"paste_repo_busy" => ApplyToken::PasteRepoBusy,
+				_ => ApplyToken::StaleModified,
+			};
+			assert_eq!(ApplyToken::of_reason(&reason), want, "{label}");
+		}
+	}
+
+	/// Every refusal an Apply can end in prints its own token, along the path
+	/// that produces it.
+	#[test]
+	fn every_apply_refusal_prints_its_token() {
+		// mapping_required: two repos, no destination chosen.
+		let tmp = tempfile::tempdir().unwrap();
+		let root = tmp.path().join("repos");
+		fs::create_dir(&root).unwrap();
+		let (repo_a, repo_b) = (root.join("repo-a"), root.join("repo-b"));
+		fs::create_dir(&repo_a).unwrap();
+		fs::create_dir(&repo_b).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: repo-a/a.txt\nA\n// FILE: repo-b/b.txt\nB\n",
+			&repo_a,
+			&[repo_a.clone(), repo_b.clone()],
+			1,
+		)
+		.unwrap();
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::MappingRequired);
+		assert_eq!(err.msg.key, "mapping_required");
+
+		// paste_err_plan: a file Apply without a plan.
+		let dest = tmp.path().join("dest");
+		fs::create_dir(&dest).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: a.txt\nA\n",
+			&dest,
+			std::slice::from_ref(&dest),
+			1,
+		)
+		.unwrap();
+		// stale_created: the file appeared after the preview.
+		fs::write(dest.join("a.txt"), "outside\n").unwrap();
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::StaleCreated, "{:?}", err.msg);
+		fs::remove_file(dest.join("a.txt")).unwrap();
+		plan.import_plan = None;
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::PasteErrPlan);
+		assert_eq!(err.msg.key, "paste_err_plan");
+
+		// commit_overwrite_required and commit_subset_rejected.
+		let repo = tmp.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("a.txt"), "base\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+		let text = commit_payload_modifying_a();
+		let mut plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.unwrap();
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::CommitOverwriteRequired);
+		plan.items[0].selected = false;
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::CommitSubsetRejected);
+		// stale_modified: the file changed after the preview.
+		let mut plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+		plan.items[0].overwrite_allowed = true;
+		fs::write(repo.join("a.txt"), "external change\n").unwrap();
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.token, ApplyToken::StaleModified);
+
+		// The rest, from the errors the paste engine gives them.
+		let lost = || {
+			RemoteError::Io(std::io::Error::from(
+				std::io::ErrorKind::BrokenPipe,
+			))
+		};
+		let busy = || {
+			PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
+				args: "x".into(),
+			}))
+		};
+		let missing = || PasteError::Destination {
+			path: dest.clone(),
+			source: std::io::Error::from(std::io::ErrorKind::NotFound),
+		};
+		let stale = |change| {
+			PasteError::Remote(RemoteError::Refused {
+				code: snip_remote::ErrorCode::Stale,
+				message: "english".into(),
+				reason: Some(Box::new(Reason::DestinationChanged { change })),
+			})
+		};
+		let file = |e| file_apply_refusal(None, &dest, e).token;
+		assert_eq!(file(busy()), ApplyToken::PasteRepoBusy);
+		assert_eq!(
+			file(PasteError::OutcomeUnknown(lost())),
+			ApplyToken::PasteOutcomeUnknown
+		);
+		assert_eq!(file(missing()), ApplyToken::PasteErrDestination);
+		assert_eq!(
+			file(stale(StaleChange::Deleted { rel: "a".into() })),
+			ApplyToken::StaleDeleted
+		);
+		assert_eq!(
+			file(stale(StaleChange::Created { rel: "a".into() })),
+			ApplyToken::StaleCreated
+		);
+		let commit =
+			|e, applying| commit_refusal(None, &dest, e, applying).token;
+		assert_eq!(commit(busy(), true), ApplyToken::PasteRepoBusy);
+		assert_eq!(
+			commit(
+				PasteError::Local(TransferError::Git(GitError::NotFound)),
+				true
+			),
+			ApplyToken::ErrorOpenRepo
+		);
+		assert_eq!(
+			commit(
+				PasteError::Remote(RemoteError::Refused {
+					code: snip_remote::ErrorCode::Busy,
+					message: "english".into(),
+					reason: None,
+				}),
+				true
+			),
+			ApplyToken::ErrorOpenRepo
+		);
+		assert_eq!(
+			commit(PasteError::OutcomeUnknown(lost()), true),
+			ApplyToken::PasteOutcomeUnknown
+		);
+		assert_eq!(commit(missing(), true), ApplyToken::PasteErrDestination);
 	}
 
 	#[test]
@@ -5440,7 +5839,7 @@ pub(crate) mod tests {
 			plan.check_stale_destination().unwrap_err().key,
 			"stale_modified"
 		);
-		assert_eq!(plan.execute().unwrap_err().key, "stale_modified");
+		assert_eq!(plan.execute().unwrap_err().msg.key, "stale_modified");
 		assert_eq!(
 			fs::read_to_string(path.join("a.txt")).unwrap(),
 			"external change\n"
@@ -5469,7 +5868,7 @@ pub(crate) mod tests {
 		)
 		.unwrap();
 		assert_eq!(
-			plan.execute().unwrap_err().key,
+			plan.execute().unwrap_err().msg.key,
 			"commit_overwrite_required"
 		);
 		assert_eq!(fs::read_to_string(path.join("a.txt")).unwrap(), "base\n");
@@ -5518,7 +5917,7 @@ pub(crate) mod tests {
 			2,
 		)
 		.unwrap();
-		let err = nested_plan.execute().unwrap_err();
+		let err = nested_plan.execute().unwrap_err().msg;
 		assert_eq!(err.key, "commit_replay_partial_refused");
 		assert_ne!(err.args[0], "(none)");
 		assert_eq!(err.args[1], "2");
@@ -5549,7 +5948,7 @@ pub(crate) mod tests {
 		.unwrap();
 
 		fs::write(path.join("a.txt"), "external\n").unwrap();
-		let err = plan.execute().unwrap_err();
+		let err = plan.execute().unwrap_err().msg;
 		assert_eq!(err.key, "stale_modified");
 		assert_eq!(fs::read(path.join("a.txt")).unwrap(), b"external\n");
 	}

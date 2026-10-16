@@ -22,6 +22,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tempfile = "3"
+snip-core = { path = "../core", features = ["test-support"] }
 snip-native-e2e = { path = "../native-e2e" }
 # In-process UI tests (TestAppContext, #[gpui::test]); no display needed.
 gpui = { version = "=0.2.2", features = ["test-support"] }

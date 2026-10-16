@@ -7,6 +7,34 @@ pub const COMMIT_MARKER: &str = "// snip-sync commits v1";
 
 pub type Result<T> = std::result::Result<T, arboard::Error>;
 
+/// What the clipboard library's error means, for a front end to word. The
+/// library's own text is English written for developers: it stays in the
+/// CLI and the log, and never reaches a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipFault {
+	/// Nothing, or nothing as text, is on the clipboard.
+	Empty,
+	/// This environment has no clipboard.
+	Unsupported,
+	/// Another program holds the clipboard.
+	Occupied,
+	/// The contents cannot be converted to text.
+	Conversion,
+	/// Anything else (`Unknown`'s description is for developers, and the
+	/// library's enum is `non_exhaustive`).
+	Other,
+}
+
+pub fn fault(e: &arboard::Error) -> ClipFault {
+	match e {
+		arboard::Error::ContentNotAvailable => ClipFault::Empty,
+		arboard::Error::ClipboardNotSupported => ClipFault::Unsupported,
+		arboard::Error::ClipboardOccupied => ClipFault::Occupied,
+		arboard::Error::ConversionFailure => ClipFault::Conversion,
+		_ => ClipFault::Other,
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
 	Commits,
@@ -70,6 +98,29 @@ pub fn write_text_and_wait(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Every library error means one fault, without touching the OS
+	/// clipboard.
+	#[test]
+	fn every_arboard_error_has_a_fault() {
+		for (e, want) in [
+			(arboard::Error::ContentNotAvailable, ClipFault::Empty),
+			(
+				arboard::Error::ClipboardNotSupported,
+				ClipFault::Unsupported,
+			),
+			(arboard::Error::ClipboardOccupied, ClipFault::Occupied),
+			(arboard::Error::ConversionFailure, ClipFault::Conversion),
+			(
+				arboard::Error::Unknown {
+					description: "developer words".into(),
+				},
+				ClipFault::Other,
+			),
+		] {
+			assert_eq!(fault(&e), want, "{e}");
+		}
+	}
 
 	#[test]
 	fn detect_mode_commits_marker() {

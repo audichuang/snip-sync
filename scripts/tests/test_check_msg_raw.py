@@ -8,10 +8,15 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "check_msg_raw.sh"
 
 
-def run_check(source: str, name: str = "lib.rs") -> subprocess.CompletedProcess:
+def run_check(
+    source: str, name: str = "lib.rs", crate: str = "desktop-native"
+) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "crates" / "desktop-native" / "src"
-        src.mkdir(parents=True)
+        # The desktop crate's source always exists (the script requires it);
+        # `crate` is where the file under test lives.
+        (Path(tmp) / "crates" / "desktop-native" / "src").mkdir(parents=True)
+        src = Path(tmp) / "crates" / crate / "src"
+        src.mkdir(parents=True, exist_ok=True)
         (src / name).write_text(source)
         return subprocess.run(
             ["bash", str(SCRIPT), tmp], capture_output=True, text=True, timeout=60
@@ -21,7 +26,7 @@ def run_check(source: str, name: str = "lib.rs") -> subprocess.CompletedProcess:
 class CheckMsgRaw(unittest.TestCase):
     def test_typed_messages_are_accepted(self):
         r = run_check(
-            "fn f() { Msg::new(\"error_open_repo\", [x]); Msg::detail(h, p) }\n"
+            "fn f() { Msg::new(\"error_open_repo\", [x]); Msg::with_msg_arg(k, a, 0, m) }\n"
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -79,6 +84,94 @@ class CheckMsgRaw(unittest.TestCase):
         r = run_check(
             "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { Msg::new(\"reason_detail\", [s]); }\n}\n"
         )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_msg_detail_belongs_to_reason_rs_and_i18n_rs(self):
+        # (a) anywhere else the datum could be a sentence of ours.
+        r = run_check('fn f() { Msg::detail(h, e) }\n', "history.rs")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("reason.rs", r.stderr)
+        # (b) reason.rs words data; i18n.rs defines the builder.
+        r = run_check('fn f() { Msg::detail(h, e) }\n', "reason.rs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_an_errors_display_does_not_reach_the_screen(self):
+        # (c)
+        r = run_check('fn f() { set_status("k", [e.to_string()]) }\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ALLOWED-ERR-TEXT", r.stderr)
+        # (d) the log marker, on the line or the one above.
+        r = run_check('fn f() { x(e.to_string()) } // ALLOWED-ERR-TEXT: log\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_check(
+            "fn f() {\n    // ALLOWED-ERR-TEXT: e2e contract\n    x(e.to_string())\n}\n"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # (h) an interpolated error in a message, not in a log line.
+        r = run_check('fn f() { Msg::new("k", [format!("{e}")]) }\n')
+        self.assertNotEqual(r.returncode, 0)
+        r = run_check('fn f() { app_log!("[APP:X: {err}]") }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # (m) a positional argument is the same Display.
+        for call in ('format!("failed: {}", e)', 'format!("{}: {:?}", name, err)',
+                     'format!("x {0}", error )'):
+            r = run_check(f'fn f() {{ Msg::new("k", [{call}]) }}\n')
+            self.assertNotEqual(r.returncode, 0, call)
+        r = run_check('fn f() { app_log!("[APP:X: {}]", e) }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # An argument that only starts with `e` is not an error value.
+        r = run_check('fn f() { Msg::new("k", [format!("{}", entry)]) }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A name that merely ends in `e` is not an error value.
+        r = run_check('fn f() { x(name.to_string()) }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_test_code_is_exempt_from_the_new_rules(self):
+        # (e) inside `#[cfg(test)] mod tests { .. }`; (f) a whole `*_tests.rs` file.
+        src = "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { x(e.to_string()); Msg::detail(h, d) }\n}\n"
+        r = run_check(src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_check("fn t() { x(e.to_string()); Msg::detail(h, d) }\n", "foo_tests.rs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_cfg_test_block_of_any_name_is_test_code(self):
+        # (j) the block `#[cfg(test)] mod foo_tests { .. }` is test code.
+        block = (
+            "#[cfg(test)]\nmod foo_tests {\n"
+            "    fn t() { x(e.to_string()); Msg::detail(h, d); Datum::git_stderr(\"x\") }\n}\n"
+        )
+        r = run_check(block, crate="core")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_check(block)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # (k) the product code after the block is not.
+        r = run_check(block + "fn f() { set_status(\"k\", [e.to_string()]) }\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ALLOWED-ERR-TEXT", r.stderr)
+        r = run_check(block + "fn f() { Datum::git_stderr(\"boom\") }\n", crate="core")
+        self.assertNotEqual(r.returncode, 0)
+        # (l) a one-line `#[cfg(test)]` block ends where it ends.
+        r = run_check("#[cfg(test)]\nmod m { }\nfn f() { x(e.to_string()) }\n")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_a_datum_from_outside_takes_no_literal(self):
+        # (g)
+        r = run_check('fn f() { Datum::git_stderr("boom") }\n', crate="remote")
+        self.assertNotEqual(r.returncode, 0)
+        r = run_check('fn f() { Datum::old_peer_text( "x") }\n', crate="core")
+        self.assertNotEqual(r.returncode, 0)
+        r = run_check('fn f() { Datum::git_stderr(stderr) }\n', crate="remote")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # `label` and `command` are the allowed spellings of fixed text.
+        r = run_check('fn f() { Datum::label("x") }\n', crate="remote")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_whole_file_test_module_is_named_tests(self):
+        # (i)
+        r = run_check("#[cfg(test)]\nmod helpers;\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("_tests.rs", r.stderr)
+        r = run_check("#[cfg(test)]\nmod helpers_tests;\n")
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_real_tree_passes(self):

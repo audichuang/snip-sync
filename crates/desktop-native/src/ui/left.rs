@@ -139,6 +139,7 @@ impl WorkbenchModel {
 						true,
 						12,
 					)
+					.debug_selector(|| "btn-add-repo".into())
 					.when(self.is_adding_repo, |b| {
 						b.bg(rgb(pal().rail_active_bg))
 					})
@@ -323,6 +324,7 @@ impl WorkbenchModel {
 							div()
 								.flex_1()
 								.id(SharedString::from("input-add-repo"))
+								.debug_selector(|| "input-add-repo".into())
 								.child(self.add_repo_input.clone())
 								.children(probe(
 									&self.probes,

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Condition, Git, GitError};
-use crate::reason::Failure;
+use crate::reason::{Datum, Failure};
 use crate::transfer::SourceKind;
 
 // ---------------------------------------------------------------------------
@@ -558,10 +558,22 @@ pub enum SubmoduleState {
 	CheckedOut,
 	/// Declared, with no `.git` at its path: not initialized or deinited.
 	NotCheckedOut,
-	/// Its path could not be examined; the reason, never a guess.
-	Unreadable(String),
+	/// Its path could not be examined. `detail` is the OS's own words (empty
+	/// when the error carries no OS code) and is what the screen shows;
+	/// `message` is the error's whole text, for the CLI only.
+	Unreadable { detail: Datum, message: String },
 	/// `.gitmodules` names a path that is not a safe relative path.
 	InvalidPath,
+}
+
+impl SubmoduleState {
+	/// The state of a path whose `.git` could not be examined for `e`.
+	pub fn unreadable(e: &io::Error) -> Self {
+		Self::Unreadable {
+			detail: Datum::os_error(e),
+			message: e.to_string(),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,7 +636,7 @@ pub fn declared_submodules(
 				Err(e) if e.kind() == io::ErrorKind::NotFound => {
 					SubmoduleState::NotCheckedOut
 				}
-				Err(e) => SubmoduleState::Unreadable(e.to_string()),
+				Err(e) => SubmoduleState::unreadable(&e),
 			}
 		};
 		list.push(DeclaredSubmodule {
@@ -1564,7 +1576,7 @@ mod tests {
 		assert_eq!(
 			err.reason(),
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(Condition::GitmodulesNotFile),
 			}
 		);
@@ -1628,11 +1640,34 @@ mod tests {
 				// An unreadable path is reported, never "not checked out".
 				for s in subs.unwrap() {
 					assert!(
-						matches!(s.state, SubmoduleState::Unreadable(_)),
+						matches!(s.state, SubmoduleState::Unreadable { .. }),
 						"{s:?}"
 					);
 				}
 			}
+		}
+	}
+
+	#[test]
+	fn unreadable_submodule_keeps_the_whole_error_for_the_cli() {
+		// An error with no OS code (std's own InvalidInput, say): the screen
+		// gets no detail, but the CLI's text is not cut to "…: ".
+		let e = io::Error::new(io::ErrorKind::InvalidInput, "nul in path");
+		match SubmoduleState::unreadable(&e) {
+			SubmoduleState::Unreadable { detail, message } => {
+				assert!(detail.is_empty());
+				assert_eq!(message, "nul in path");
+			}
+			other => panic!("{other:?}"),
+		}
+		// With an OS code both carry the OS's words.
+		let e = io::Error::from_raw_os_error(13);
+		match SubmoduleState::unreadable(&e) {
+			SubmoduleState::Unreadable { detail, message } => {
+				assert!(!detail.is_empty());
+				assert_eq!(detail.as_str(), message);
+			}
+			other => panic!("{other:?}"),
 		}
 	}
 
