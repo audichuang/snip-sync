@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError};
+use crate::reason::Failure;
 use crate::transfer::SourceKind;
 
 // ---------------------------------------------------------------------------
@@ -242,7 +243,7 @@ pub struct DiscoveredRepo {
 pub struct DiscoveryPage {
 	pub repos: Vec<DiscoveredRepo>,
 	/// Directories that could not be read. Reported, never skipped silently.
-	pub errors: Vec<(PathBuf, String)>,
+	pub errors: Vec<(PathBuf, Failure)>,
 	/// Directories not entered because they are deeper than `max_depth`.
 	/// Start a new [`Discovery`] at one to look inside.
 	pub depth_limited: Vec<PathBuf>,
@@ -381,7 +382,7 @@ impl Discovery {
 		e: &io::Error,
 	) {
 		self.left_out = true;
-		page.errors.push((path, e.to_string()));
+		page.errors.push((path, Failure::io(e, "")));
 	}
 
 	fn note_repo(&mut self, dir: &Path, page: &mut DiscoveryPage) {

@@ -475,11 +475,34 @@ pub(crate) fn scan_incomplete_msg(
 /// Repositories, notes, and pagination status produced by translating a worker RepoScan.
 pub(crate) struct RemoteScanEntries {
 	pub repos: Vec<RepoEntry>,
-	pub errors: Vec<(PathBuf, String)>,
+	pub errors: Vec<(PathBuf, snip_core::reason::Failure)>,
 	pub depth_limited: Vec<PathBuf>,
 	pub error_overflow: usize,
 	pub depth_overflow: usize,
 	pub status: ScanStatus,
+}
+
+/// A worker's scan row. A worker that sent no reason (an old one) is worded
+/// by its code alone: the row's text is the worker's English and kept only
+/// for the log.
+fn scan_failure(
+	text: String,
+	reason: Option<snip_core::reason::Reason>,
+) -> snip_core::reason::Failure {
+	snip_core::reason::Failure::new(
+		text,
+		reason.unwrap_or(snip_core::reason::Reason::Refused {
+			code: snip_remote::ErrorCode::Io,
+		}),
+	)
+}
+
+/// A path the worker sent that cannot be a path under the share.
+fn invalid_path() -> snip_core::reason::Failure {
+	snip_core::reason::Failure::new(
+		"worker returned an invalid path",
+		snip_core::reason::Reason::Protocol,
+	)
 }
 
 /// Translates and bounds a worker RepoScan onto the fake session root, dropping invalid paths.
@@ -489,14 +512,12 @@ pub(crate) fn remote_scan_entries(
 ) -> RemoteScanEntries {
 	let mut repos = Vec::with_capacity(scan.repos.len());
 	let mut errors = Vec::with_capacity(scan.errors.len());
+	let mut reasons = scan.error_reasons.into_iter();
 	let mut depth_limited = Vec::with_capacity(scan.depth_limited.len());
 
 	for scanned in scan.repos {
 		if !scanned.utf8 || !valid_rel(&scanned.rel) {
-			errors.push((
-				session_root.to_path_buf(),
-				"worker returned an invalid path".to_string(),
-			));
+			errors.push((session_root.to_path_buf(), invalid_path()));
 			continue;
 		}
 		let mut root = session_root.to_path_buf();
@@ -506,12 +527,16 @@ pub(crate) fn remote_scan_entries(
 			}
 		}
 		let kind = scanned.kind;
-		let summary = scanned.summary.map(|s| RepoSummary {
-			identity: key_identity(&root, kind),
-			head: s.head,
-			branch: s.branch,
-			changes: s.changes,
-		});
+		let reason = scanned.reason;
+		let summary = scanned
+			.summary
+			.map(|s| RepoSummary {
+				identity: key_identity(&root, kind),
+				head: s.head,
+				branch: s.branch,
+				changes: s.changes,
+			})
+			.map_err(|text| scan_failure(text, reason));
 		repos.push(RepoEntry {
 			root,
 			name: scanned.name,
@@ -522,12 +547,11 @@ pub(crate) fn remote_scan_entries(
 	}
 
 	for (raw_rel, msg) in scan.errors {
+		// Index-aligned with the rows; an old worker sends none.
+		let reason = reasons.next().flatten();
 		let rel = if raw_rel == "." { "" } else { raw_rel.as_str() };
 		if !valid_rel(rel) {
-			errors.push((
-				session_root.to_path_buf(),
-				"worker returned an invalid path".to_string(),
-			));
+			errors.push((session_root.to_path_buf(), invalid_path()));
 			continue;
 		}
 		let mut path = session_root.to_path_buf();
@@ -536,16 +560,13 @@ pub(crate) fn remote_scan_entries(
 				path.push(part);
 			}
 		}
-		errors.push((path, msg));
+		errors.push((path, scan_failure(msg, reason)));
 	}
 
 	for raw_rel in scan.depth_limited {
 		let rel = if raw_rel == "." { "" } else { raw_rel.as_str() };
 		if !valid_rel(rel) {
-			errors.push((
-				session_root.to_path_buf(),
-				"worker returned an invalid path".to_string(),
-			));
+			errors.push((session_root.to_path_buf(), invalid_path()));
 			continue;
 		}
 		let mut path = session_root.to_path_buf();
@@ -2097,6 +2118,7 @@ mod tests {
 
 		for inv in &invalid_rels {
 			repos.push(snip_remote::ScannedRepo {
+				reason: None,
 				rel: inv.clone(),
 				utf8: true,
 				name: "inv".into(),
@@ -2113,6 +2135,7 @@ mod tests {
 
 		// Non-UTF8 repo
 		repos.push(snip_remote::ScannedRepo {
+			reason: None,
 			rel: "valid_name".into(),
 			utf8: false,
 			name: "lossy".into(),
@@ -2126,6 +2149,7 @@ mod tests {
 
 		// Valid items: "" in repo, "." in error, "." in depth_limited, "a/b" in repo
 		repos.push(snip_remote::ScannedRepo {
+			reason: None,
 			rel: "".into(),
 			utf8: true,
 			name: "root_repo".into(),
@@ -2137,6 +2161,7 @@ mod tests {
 			}),
 		});
 		repos.push(snip_remote::ScannedRepo {
+			reason: None,
 			rel: "a/b".into(),
 			utf8: true,
 			name: "nested_repo".into(),
@@ -2153,6 +2178,7 @@ mod tests {
 		let scan = snip_remote::RepoScan {
 			repos,
 			errors,
+			error_reasons: Vec::new(),
 			error_overflow: 7,
 			depth_limited,
 			depth_overflow: 3,
@@ -2189,7 +2215,11 @@ mod tests {
 		let invalid_count = res
 			.errors
 			.iter()
-			.filter(|(p, msg)| p == session_root && msg == invalid_msg)
+			.filter(|(p, f)| {
+				p == session_root
+					&& f.message == invalid_msg
+					&& f.reason == snip_core::reason::Reason::Protocol
+			})
 			.count();
 		assert_eq!(
 			invalid_count,
@@ -2206,6 +2236,69 @@ mod tests {
 		for p in &res.depth_limited {
 			assert!(p.starts_with(session_root));
 		}
+	}
+
+	/// A scan row keeps the worker's reason; an old worker's, which sends
+	/// none, falls back to its code, and an invalid path in between does
+	/// not shift the reasons of the rows after it.
+	#[test]
+	fn remote_scan_rows_carry_the_workers_reason() {
+		use snip_core::reason::Reason;
+		let session_root = Path::new("/session");
+		let scanned =
+			|rel: &str, reason: Option<Reason>| snip_remote::ScannedRepo {
+				rel: rel.into(),
+				utf8: true,
+				name: rel.into(),
+				kind: snip_core::gitview::FoundKind::UninitializedSubmodule,
+				summary: Err("worker english".into()),
+				reason,
+			};
+		let scan = snip_remote::RepoScan {
+			repos: vec![
+				scanned("a", Some(Reason::SubmoduleNotCheckedOut)),
+				scanned("b", None),
+			],
+			errors: vec![
+				("x".into(), "one".into()),
+				("../escape".into(), "two".into()),
+				("y".into(), "three".into()),
+				("z".into(), "four".into()),
+			],
+			error_reasons: vec![
+				Some(Reason::TimedOut),
+				Some(Reason::GitBusy),
+				Some(Reason::Cancelled),
+			],
+			error_overflow: 0,
+			depth_limited: Vec::new(),
+			depth_overflow: 0,
+			status: ScanStatus::Complete,
+		};
+		let res = remote_scan_entries(session_root, scan);
+		let io = Reason::Refused {
+			code: snip_remote::ErrorCode::Io,
+		};
+		let reasons: Vec<_> = res
+			.repos
+			.iter()
+			.map(|r| r.summary.as_ref().unwrap_err().reason.clone())
+			.collect();
+		assert_eq!(reasons, vec![Reason::SubmoduleNotCheckedOut, io.clone()]);
+		let rows: Vec<_> = res
+			.errors
+			.iter()
+			.map(|(p, f)| (p.clone(), f.reason.clone()))
+			.collect();
+		assert_eq!(
+			rows,
+			vec![
+				(session_root.join("x"), Reason::TimedOut),
+				(session_root.to_path_buf(), Reason::Protocol),
+				(session_root.join("y"), Reason::Cancelled),
+				(session_root.join("z"), io),
+			]
+		);
 	}
 
 	#[test]

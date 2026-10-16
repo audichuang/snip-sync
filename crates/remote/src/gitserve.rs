@@ -12,7 +12,7 @@ use snip_core::gitview::{
 	LocalRepo, Read, ReadProfile, RepoView, StatusSummary, MAX_CHANGE_ROWS,
 	MAX_COMMIT_FILES, SERVED_MAX_STDOUT,
 };
-use snip_core::reason::Reason;
+use snip_core::reason::{Failure, Reason};
 use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
 use crate::proto::{
@@ -23,15 +23,20 @@ use crate::worker::{io_error, SharedRoot};
 
 pub(crate) static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn sanitize_scan_error(msg: &str, share: &Path) -> String {
-	let text = if let Some(idx) = msg.find(" failed:") {
-		format!("{} failed (details withheld)", &msg[..idx])
-	} else if msg.starts_with("failed:") {
-		"git failed (details withheld)".to_string()
-	} else {
-		msg.to_string()
+/// A scan row as the worker sends it: what git or the OS said is
+/// withheld by the row's reason, never by looking for words in its text.
+/// The text is the old masters' and the CLI's; the reason, emptied of every
+/// path and detail, is what a new master words.
+fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
+	let text = match failure.reason {
+		Reason::GitFailed { .. } => "git failed (details withheld)".to_string(),
+		// The text of an invariant break may be git's own output.
+		Reason::Internal { .. } => {
+			"unexpected git failure (details withheld)".to_string()
+		}
+		_ => scrub(&failure.message, share),
 	};
-	scrub(&text, share)
+	(text, failure.reason.clone().scrubbed())
 }
 
 /// Answers a ScanRepos request within the shared root.
@@ -86,6 +91,7 @@ pub(crate) fn scan(
 		return Response::Repos(RepoScan {
 			repos: Vec::new(),
 			errors: Vec::new(),
+			error_reasons: Vec::new(),
 			error_overflow: 0,
 			depth_limited: Vec::new(),
 			depth_overflow: 0,
@@ -113,6 +119,7 @@ pub(crate) fn scan(
 
 	let mut repos = Vec::with_capacity(ws_scan.repos.len());
 	let mut errors = Vec::with_capacity(ws_scan.errors.len());
+	let mut error_reasons = Vec::with_capacity(ws_scan.errors.len());
 
 	for r in ws_scan.repos {
 		let r_root = dunce::canonicalize(&r.root).unwrap_or(r.root);
@@ -128,13 +135,20 @@ pub(crate) fn scan(
 						.collect::<Vec<_>>()
 						.join("/")
 				};
-				let summary = match r.summary {
-					Ok(s) => Ok(StatusSummary {
-						head: s.head,
-						branch: s.branch,
-						changes: s.changes,
-					}),
-					Err(msg) => Err(sanitize_scan_error(&msg, &root.path)),
+				let (summary, reason) = match r.summary {
+					Ok(s) => (
+						Ok(StatusSummary {
+							head: s.head,
+							branch: s.branch,
+							changes: s.changes,
+						}),
+						None,
+					),
+					Err(failure) => {
+						let (text, reason) =
+							sanitize_scan_error(&failure, &root.path);
+						(Err(text), Some(reason))
+					}
 				};
 				repos.push(ScannedRepo {
 					rel,
@@ -142,6 +156,7 @@ pub(crate) fn scan(
 					name: r.name,
 					kind: r.kind,
 					summary,
+					reason,
 				});
 			}
 			Err(_) => {
@@ -153,11 +168,12 @@ pub(crate) fn scan(
 						&root.path,
 					),
 				));
+				error_reasons.push(Some(Reason::OutsideShare));
 			}
 		}
 	}
 
-	for (err_path, err_msg) in ws_scan.errors {
+	for (err_path, failure) in ws_scan.errors {
 		let canon_path = dunce::canonicalize(&err_path).unwrap_or(err_path);
 		let rel = match canon_path.strip_prefix(&canonical_share) {
 			Ok(rel_path) => {
@@ -173,7 +189,9 @@ pub(crate) fn scan(
 			}
 			Err(_) => ".".to_string(),
 		};
-		errors.push((rel, sanitize_scan_error(&err_msg, &root.path)));
+		let (text, reason) = sanitize_scan_error(&failure, &root.path);
+		errors.push((rel, text));
+		error_reasons.push(Some(reason));
 	}
 
 	let depth_limited: Vec<String> = ws_scan
@@ -201,6 +219,7 @@ pub(crate) fn scan(
 	Response::Repos(RepoScan {
 		repos,
 		errors,
+		error_reasons,
 		error_overflow: ws_scan.error_overflow,
 		depth_limited,
 		depth_overflow: ws_scan.depth_overflow,
@@ -981,10 +1000,37 @@ mod tests {
 	#[test]
 	fn sanitize_scan_error_withholds_failed_stderr() {
 		let share = Path::new("/var/workspace");
-		let msg = "git status failed: fatal: not a git repository: /Volumes/My Drive/secret/.git";
+		let failure = Failure::new(
+			"git status failed: fatal: not a git repository: /Volumes/My Drive/secret/.git",
+			Reason::GitFailed {
+				stderr: "fatal: /Volumes/My Drive/secret/.git".into(),
+			},
+		);
 		assert_eq!(
-			sanitize_scan_error(msg, share),
-			"git status failed (details withheld)"
+			sanitize_scan_error(&failure, share),
+			(
+				"git failed (details withheld)".to_string(),
+				Reason::GitFailed {
+					stderr: String::new()
+				}
+			)
+		);
+		// The row is withheld by its reason: the same words under another
+		// reason are only scrubbed.
+		let other = Failure::new(
+			"git status failed: x",
+			Reason::Io {
+				detail: "/Volumes/secret".into(),
+			},
+		);
+		assert_eq!(
+			sanitize_scan_error(&other, share),
+			(
+				"git status failed: x".to_string(),
+				Reason::Io {
+					detail: String::new()
+				}
+			)
 		);
 	}
 

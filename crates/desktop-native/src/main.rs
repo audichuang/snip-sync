@@ -223,6 +223,7 @@ use snip_core::format::ChangeType;
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
+use snip_core::reason::{Failure, Reason};
 use snip_core::settings::Settings;
 use snip_core::transfer::{
 	copy_selection_detailed, plan_commit_export_exact_with, CanonicalRootId,
@@ -613,7 +614,9 @@ pub struct RepoEntry {
 	pub name: String,
 	pub kind: RepoEntryKind,
 	pub identity: Option<RepoIdentity>,
-	pub summary: Result<RepoSummary, String>,
+	/// A failed read keeps the worker's or git's text for now and the
+	/// reason a front end words.
+	pub summary: Result<RepoSummary, Failure>,
 }
 
 impl From<snip_core::gitview::FoundRepo> for RepoEntry {
@@ -870,7 +873,7 @@ pub struct WorkbenchModel {
 	pub paste_diff_generation: u64,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
-	pub discovery_errors: Vec<(PathBuf, String)>,
+	pub discovery_errors: Vec<(PathBuf, Failure)>,
 	pub discovery_depth_limited: Vec<PathBuf>,
 	pub discovery_error_overflow: usize,
 	pub discovery_depth_overflow: usize,
@@ -1567,7 +1570,7 @@ impl WorkbenchModel {
 				path,
 				crate::i18n::t("counts_tip", self.locale)
 			),
-			Err(e) => format!("{}\n{}", path, e),
+			Err(e) => format!("{}\n{}", path, e.message),
 		}
 	}
 
@@ -1579,7 +1582,7 @@ impl WorkbenchModel {
 
 	pub(crate) fn discovery_error_msg(&self) -> Msg {
 		if let Some((_, err)) = self.discovery_errors.first() {
-			Msg::new("error_repo_status", [err.clone()])
+			Msg::new("error_repo_status", [err.message.clone()])
 		} else {
 			let key = match self.discovery_status {
 				Some(ScanStatus::Incomplete) => "discovery_incomplete",
@@ -2101,7 +2104,7 @@ impl WorkbenchModel {
 	pub fn process_discovery_repos(
 		discovered: Vec<DiscoveredRepo>,
 		opts: &RunOptions,
-	) -> (Vec<RepoEntry>, Vec<(PathBuf, String)>) {
+	) -> (Vec<RepoEntry>, Vec<(PathBuf, Failure)>) {
 		let (found, errors) = snip_core::gitview::identify_repos(
 			discovered,
 			None,
@@ -3094,7 +3097,10 @@ impl WorkbenchModel {
 							model.discovery = None;
 							model.discovery_status =
 								Some(ScanStatus::Incomplete);
-							model.push_discovery_error((root, err.to_string()));
+							model.push_discovery_error((
+								root.clone(),
+								Failure::io(&err, &root.display().to_string()),
+							));
 							model.finish_discovery(cx);
 						});
 						return;
@@ -3187,7 +3193,7 @@ impl WorkbenchModel {
 			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
 	}
 
-	fn push_discovery_error(&mut self, item: (PathBuf, String)) {
+	fn push_discovery_error(&mut self, item: (PathBuf, Failure)) {
 		if self.discovery_errors.len() < 64 {
 			self.discovery_errors.push(item);
 		} else {
@@ -3286,26 +3292,10 @@ impl WorkbenchModel {
 
 	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
 		self.is_loading = false;
-		if self.discovery_error_overflow > 0 {
-			self.discovery_errors.push((
-				self.workspace_root.clone(),
-				format!(
-					"{} more discovery errors omitted",
-					self.discovery_error_overflow
-				),
-			));
-			self.discovery_error_overflow = 0;
-		}
-		if self.discovery_depth_overflow > 0 {
-			self.discovery_errors.push((
-				self.workspace_root.clone(),
-				format!(
-					"{} more depth-limited directories omitted",
-					self.discovery_depth_overflow
-				),
-			));
-			self.discovery_depth_overflow = 0;
-		}
+		// The errors past the kept ones stay counted in
+		// `discovery_error_overflow` (and the directories past the depth
+		// limit in `discovery_depth_overflow`) until the next scan: they
+		// are numbers, not error rows with a reason of their own.
 		self.place_selection(cx);
 		self.ensure_ws_tree(cx);
 		// Only a complete walk proves the kept repo is gone; a capped or
@@ -3370,13 +3360,13 @@ impl WorkbenchModel {
 
 	fn install_added_repo(
 		&mut self,
-		outcome: Result<RepoEntry, String>,
+		outcome: Result<RepoEntry, Failure>,
 		cx: &mut Context<Self>,
 	) {
 		let entry = match outcome {
 			Ok(entry) => entry,
 			Err(err) => {
-				self.set_status("error_repo_status", [err]);
+				self.set_status("error_repo_status", [err.message]);
 				cx.notify();
 				return;
 			}
@@ -3993,7 +3983,7 @@ impl WorkbenchModel {
 			if let Err(e) = &self.repos[idx].summary {
 				self.show_preview_error(Msg::new(
 					"error_repo_status",
-					[e.clone()],
+					[e.message.clone()],
 				));
 			}
 		}
@@ -5951,14 +5941,26 @@ async fn drive_discovery(
 	}
 }
 
+/// A scan failure for a test: its text is all a test of the layout needs.
+#[cfg(test)]
+pub(crate) fn test_failure(text: &str) -> Failure {
+	Failure::new(
+		text,
+		Reason::Io {
+			detail: text.into(),
+		},
+	)
+}
+
 fn resolve_added_repo(
 	path: PathBuf,
 	cancel: &CancelToken,
-) -> Result<RepoEntry, String> {
+) -> Result<RepoEntry, Failure> {
 	if cancel.is_cancelled() {
-		return Err("cancelled".to_string());
+		return Err(Failure::new("cancelled", Reason::Cancelled));
 	}
-	let path = dunce::canonicalize(&path).map_err(|err| err.to_string())?;
+	let path = dunce::canonicalize(&path)
+		.map_err(|err| Failure::io(&err, &path.display().to_string()))?;
 	let opts = RunOptions {
 		cancel: Some(cancel.clone()),
 		..RunOptions::interactive(None)
@@ -16296,7 +16298,7 @@ mod tests {
 				name: name.into(),
 				kind: crate::RepoEntryKind::Main,
 				identity: None,
-				summary: Err("offline".into()),
+				summary: Err(crate::test_failure("offline")),
 			}
 		}
 
@@ -16640,8 +16642,10 @@ mod tests {
 				m.repos.clear();
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Incomplete);
-				m.discovery_errors =
-					vec![(tmp.path().join("sub"), "read failed".into())];
+				m.discovery_errors = vec![(
+					tmp.path().join("sub"),
+					crate::test_failure("read failed"),
+				)];
 				m.is_loading = false;
 			});
 			let state = model.read_with(cx, |m, _| m.changes_empty_state());
@@ -22399,21 +22403,21 @@ mod tests {
 				name: "core".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 			RepoEntry {
 				root: PathBuf::from("/workspace/b/core"),
 				name: "core".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 			RepoEntry {
 				root: PathBuf::from("/workspace/other"),
 				name: "other".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 		];
 		let ws = PathBuf::from("/workspace");
@@ -22431,21 +22435,21 @@ mod tests {
 				name: "app".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 			RepoEntry {
 				root: PathBuf::from("/real/y/svc/app"),
 				name: "app".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 			RepoEntry {
 				root: PathBuf::from("/real/z/other"),
 				name: "other".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 		];
 		let ws = PathBuf::from("/link");
@@ -22460,19 +22464,40 @@ mod tests {
 				name: "app".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 			RepoEntry {
 				root: PathBuf::from("/real/q/x/svc/app"),
 				name: "app".to_string(),
 				kind: RepoEntryKind::Main,
 				identity: None,
-				summary: Err("mock".into()),
+				summary: Err(crate::test_failure("mock")),
 			},
 		];
 		WorkbenchModel::disambiguate_repo_names(&mut repos2, &ws);
 		assert_eq!(repos2[0].name, "p/x/svc/app");
 		assert_eq!(repos2[1].name, "q/x/svc/app");
+	}
+
+	/// Adding a repository that cannot be added says why as data, not as
+	/// text to read.
+	#[test]
+	fn resolve_added_repo_failures_carry_a_reason() {
+		let temp = tempfile::tempdir().unwrap();
+		let cancel = CancelToken::new();
+		cancel.cancel();
+		let err =
+			resolve_added_repo(temp.path().to_path_buf(), &cancel).unwrap_err();
+		assert_eq!(err.reason, Reason::Cancelled);
+
+		let missing = temp.path().join("nope");
+		let err = resolve_added_repo(missing, &CancelToken::new()).unwrap_err();
+		assert!(
+			matches!(err.reason, Reason::NotFound { .. }),
+			"{:?}",
+			err.reason
+		);
+		assert!(!err.message.is_empty());
 	}
 
 	#[test]

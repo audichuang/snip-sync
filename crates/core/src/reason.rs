@@ -195,6 +195,43 @@ pub enum Reason {
 	Unverifiable {
 		path: String,
 	},
+	// workspace scan
+	/// A declared submodule with no `.git` at its path: not initialized, or
+	/// deinited.
+	SubmoduleNotCheckedOut,
+	/// A declared submodule whose path could not be examined; `detail` is
+	/// the OS's text, emptied on the wire.
+	SubmoduleUnreadable {
+		detail: String,
+	},
+}
+
+/// An error row of a scan: the English `message` the CLI prints, and the
+/// `reason` a front end words. The message is never parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+	pub message: String,
+	pub reason: Reason,
+}
+
+impl Failure {
+	pub fn new(message: impl Into<String>, reason: Reason) -> Self {
+		Self {
+			message: message.into(),
+			reason,
+		}
+	}
+
+	/// An I/O error, kept as its text and classified by kind.
+	pub fn io(e: &std::io::Error, path: &str) -> Self {
+		Self::new(e.to_string(), io_reason(e, path))
+	}
+}
+
+impl std::fmt::Display for Failure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.message)
+	}
 }
 
 /// A wire field: missing, null, or not understood (a newer peer's variant)
@@ -205,6 +242,21 @@ pub fn lenient<'de, D: Deserializer<'de>>(
 ) -> Result<Option<Reason>, D::Error> {
 	let v = Option::<serde_json::Value>::deserialize(d)?;
 	Ok(v.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// [`lenient`] for a list: each element is read on its own, so one reason a
+/// newer peer added costs that element, not the frame. A list that is not
+/// a list reads as empty.
+pub fn lenient_vec<'de, D: Deserializer<'de>>(
+	d: D,
+) -> Result<Vec<Option<Reason>>, D::Error> {
+	Ok(match Option::<serde_json::Value>::deserialize(d)? {
+		Some(serde_json::Value::Array(items)) => items
+			.into_iter()
+			.map(|v| serde_json::from_value(v).ok())
+			.collect(),
+		_ => Vec::new(),
+	})
 }
 
 /// The reason an I/O error stands for. `path` is echoed for the kinds that
@@ -256,61 +308,21 @@ impl Reason {
 			| Self::Io { .. }
 			| Self::NotFound { .. }
 			| Self::PermissionDenied { .. } => None,
-			Self::GitFailed { .. } => Some(Self::GitFailed {
-				stderr: String::new(),
-			}),
-			Self::Internal { .. } => Some(Self::Internal {
-				detail: String::new(),
-			}),
-			Self::InvalidPayload { .. } => Some(Self::InvalidPayload {
-				detail: String::new(),
-			}),
-			Self::UnsafePath { .. } => Some(Self::UnsafePath {
-				path: String::new(),
-			}),
-			Self::NotRegularFile { .. } => Some(Self::NotRegularFile {
-				path: String::new(),
-			}),
-			Self::OutsideRoot { .. } => Some(Self::OutsideRoot {
-				path: String::new(),
-			}),
-			Self::Collision { .. } => Some(Self::Collision {
-				path: String::new(),
-			}),
-			Self::StagedAndWorking { path } => Some(Self::StagedAndWorking {
-				path: if wire_relative(&path) {
-					path
-				} else {
-					String::new()
-				},
-			}),
-			Self::PayloadTooLarge {
-				limit,
-				actual,
-				path,
-			} => Some(Self::PayloadTooLarge {
-				limit,
-				actual,
-				path: path.filter(|p| wire_relative(p)),
-			}),
-			Self::Unverifiable { .. } => Some(Self::Unverifiable {
-				path: String::new(),
-			}),
-			Self::AmbiguousRoots { basename, .. } => {
-				Some(Self::AmbiguousRoots {
-					basename,
-					roots: Vec::new(),
-				})
-			}
-			Self::OutsideScope { path, .. } => Some(Self::OutsideScope {
-				path,
-				scope: String::new(),
-			}),
-			// `rel` is relative to the root, so it stays.
-			Self::SourceChanged { .. } | Self::DestinationChanged { .. } => {
-				Some(self)
-			}
-			Self::GitBusy
+			Self::GitFailed { .. }
+			| Self::Internal { .. }
+			| Self::InvalidPayload { .. }
+			| Self::UnsafePath { .. }
+			| Self::NotRegularFile { .. }
+			| Self::OutsideRoot { .. }
+			| Self::Collision { .. }
+			| Self::StagedAndWorking { .. }
+			| Self::PayloadTooLarge { .. }
+			| Self::Unverifiable { .. }
+			| Self::AmbiguousRoots { .. }
+			| Self::OutsideScope { .. }
+			| Self::SourceChanged { .. }
+			| Self::DestinationChanged { .. }
+			| Self::GitBusy
 			| Self::RepoBusy
 			| Self::WorkerNeedsRestart
 			| Self::TooLarge
@@ -322,7 +334,118 @@ impl Reason {
 			| Self::CrossRepoCommits
 			| Self::Discontinuous { .. }
 			| Self::NotEnoughCommits { .. }
-			| Self::NotCommitPayload => Some(self),
+			| Self::NotCommitPayload
+			| Self::SubmoduleNotCheckedOut
+			| Self::SubmoduleUnreadable { .. } => Some(self.scrubbed()),
+		}
+	}
+
+	/// This reason with every free-text or possibly-absolute field emptied
+	/// (path, scope, roots, detail, stderr), for a peer that must not learn
+	/// the machine's layout. Unlike [`for_wire`](Self::for_wire) it keeps
+	/// the variant whatever the code says: a scan row has no code. Only
+	/// repo-relative names, basenames, shas, revs, worker names and numbers
+	/// survive. An exhaustive match.
+	pub fn scrubbed(self) -> Reason {
+		match self {
+			Self::Start { start, .. } => Self::Start {
+				start,
+				detail: String::new(),
+			},
+			Self::Disconnected { .. } => Self::Disconnected {
+				detail: String::new(),
+			},
+			Self::NotARepository { .. } => Self::NotARepository {
+				path: String::new(),
+			},
+			Self::InsideParentRepo { .. } => Self::InsideParentRepo {
+				path: String::new(),
+			},
+			Self::GitFailed { .. } => Self::GitFailed {
+				stderr: String::new(),
+			},
+			Self::Internal { .. } => Self::Internal {
+				detail: String::new(),
+			},
+			Self::InvalidPayload { .. } => Self::InvalidPayload {
+				detail: String::new(),
+			},
+			Self::Io { .. } => Self::Io {
+				detail: String::new(),
+			},
+			Self::SubmoduleUnreadable { .. } => Self::SubmoduleUnreadable {
+				detail: String::new(),
+			},
+			Self::NotFound { .. } => Self::NotFound {
+				path: String::new(),
+			},
+			Self::PermissionDenied { .. } => Self::PermissionDenied {
+				path: String::new(),
+			},
+			Self::UnsafePath { .. } => Self::UnsafePath {
+				path: String::new(),
+			},
+			Self::NotRegularFile { .. } => Self::NotRegularFile {
+				path: String::new(),
+			},
+			Self::OutsideRoot { .. } => Self::OutsideRoot {
+				path: String::new(),
+			},
+			Self::Collision { .. } => Self::Collision {
+				path: String::new(),
+			},
+			Self::StagedAndWorking { path } => Self::StagedAndWorking {
+				path: if wire_relative(&path) {
+					path
+				} else {
+					String::new()
+				},
+			},
+			Self::PayloadTooLarge {
+				limit,
+				actual,
+				path,
+			} => Self::PayloadTooLarge {
+				limit,
+				actual,
+				path: path.filter(|p| wire_relative(p)),
+			},
+			Self::Unverifiable { .. } => Self::Unverifiable {
+				path: String::new(),
+			},
+			Self::AmbiguousRoots { basename, .. } => Self::AmbiguousRoots {
+				basename,
+				roots: Vec::new(),
+			},
+			Self::OutsideScope { path, .. } => Self::OutsideScope {
+				path,
+				scope: String::new(),
+			},
+			// `rel` is relative to the root, so it stays.
+			Self::SourceChanged { .. } | Self::DestinationChanged { .. } => {
+				self
+			}
+			Self::Refused { .. }
+			| Self::Protocol
+			| Self::WorkerTooOld { .. }
+			| Self::TimedOut
+			| Self::Cancelled
+			| Self::GitMissing
+			| Self::GitBusy
+			| Self::RepoBusy
+			| Self::WorkerNeedsRestart
+			| Self::TooLarge
+			| Self::PatchTooLarge
+			| Self::VerifyLimit
+			| Self::InvalidRevision { .. }
+			| Self::Shallow { .. }
+			| Self::OutsideShare
+			| Self::EmptySelection
+			| Self::CrossRepoCommits
+			| Self::Discontinuous { .. }
+			| Self::NotEnoughCommits { .. }
+			| Self::NotCommitPayload
+			| Self::SubmoduleNotCheckedOut => self,
 		}
 	}
 }
@@ -377,6 +500,8 @@ mod tests {
 			Reason::InvalidPayload { .. } => 37,
 			Reason::OutsideScope { .. } => 38,
 			Reason::Unverifiable { .. } => 39,
+			Reason::SubmoduleNotCheckedOut => 41,
+			Reason::SubmoduleUnreadable { .. } => 42,
 		}
 	}
 
@@ -458,6 +583,8 @@ mod tests {
 				scope: s(),
 			},
 			Reason::Unverifiable { path: s() },
+			Reason::SubmoduleNotCheckedOut,
+			Reason::SubmoduleUnreadable { detail: s() },
 		];
 		// A second sample for the variants whose nested type has its own
 		// shapes.
@@ -649,6 +776,49 @@ mod tests {
 		] {
 			assert_eq!(r.for_wire(), None);
 		}
+	}
+
+	#[test]
+	fn scrubbed_leaks_no_free_text_and_for_wire_is_scrubbed_or_nothing() {
+		for r in samples() {
+			let idx = reason_index(&r);
+			let scrubbed = r.clone().scrubbed();
+			let json = serde_json::to_string(&scrubbed).unwrap();
+			assert!(
+				!json.contains("secret"),
+				"variant {idx} keeps free text: {json}"
+			);
+			assert_eq!(reason_index(&scrubbed), idx, "the variant is kept");
+			assert_eq!(scrubbed.clone().scrubbed(), scrubbed, "idempotent");
+			match r.for_wire() {
+				None => {}
+				Some(w) => assert_eq!(w, scrubbed, "variant {idx}"),
+			}
+		}
+	}
+
+	#[derive(Deserialize)]
+	struct Rows {
+		#[serde(default, deserialize_with = "lenient_vec")]
+		reasons: Vec<Option<Reason>>,
+	}
+
+	#[test]
+	fn lenient_vec_reads_each_element_on_its_own() {
+		let rows = |json: &str| -> Vec<Option<Reason>> {
+			serde_json::from_str::<Rows>(json)
+				.unwrap_or_else(|e| panic!("frame must parse: {e}: {json}"))
+				.reasons
+		};
+		assert_eq!(rows("{}"), vec![]);
+		assert_eq!(rows(r#"{"reasons":null}"#), vec![]);
+		assert_eq!(rows(r#"{"reasons":7}"#), vec![]);
+		assert_eq!(
+			rows(
+				r#"{"reasons":[{"r":"git_busy"},null,{"r":"from_the_future"},{"r":"timed_out"}]}"#
+			),
+			vec![Some(Reason::GitBusy), None, None, Some(Reason::TimedOut)]
+		);
 	}
 
 	#[test]

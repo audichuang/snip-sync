@@ -755,6 +755,15 @@ pub enum GitReply {
 pub struct RepoScan {
 	pub repos: Vec<ScannedRepo>,
 	pub errors: Vec<(String, String)>,
+	/// Why each of `errors` failed, index-aligned with it. Shorter than
+	/// `errors` or absent (an old worker): the rows past its end have no
+	/// reason, and their text is all there is.
+	#[serde(
+		default,
+		deserialize_with = "snip_core::reason::lenient_vec",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub error_reasons: Vec<Option<Reason>>,
 	pub error_overflow: usize,
 	pub depth_limited: Vec<String>,
 	pub depth_overflow: usize,
@@ -768,6 +777,14 @@ pub struct ScannedRepo {
 	pub name: String,
 	pub kind: FoundKind,
 	pub summary: Result<StatusSummary, String>,
+	/// Why `summary` is an error, when it is. Absent from an old worker's
+	/// frame and omitted when `None`.
+	#[serde(
+		default,
+		deserialize_with = "snip_core::reason::lenient",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub reason: Option<Reason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1058,6 +1075,15 @@ mod tests {
 			created: Vec<String>,
 			failure: Option<OldFailure>,
 		},
+		Repos {
+			repos: Vec<OldScanned>,
+			errors: Vec<(String, String)>,
+		},
+	}
+	#[derive(Debug, PartialEq, Deserialize)]
+	struct OldScanned {
+		rel: String,
+		summary: Result<StatusSummary, String>,
 	}
 	#[derive(Debug, PartialEq, Deserialize)]
 	#[serde(rename_all = "camelCase")]
@@ -1203,6 +1229,89 @@ mod tests {
 				"{reason}"
 			);
 		}
+	}
+
+	fn scanned(
+		reason: Option<Reason>,
+		error_reasons: Vec<Option<Reason>>,
+	) -> Response {
+		Response::Repos(RepoScan {
+			repos: vec![ScannedRepo {
+				rel: "sub".into(),
+				utf8: true,
+				name: "sub".into(),
+				kind: FoundKind::UninitializedSubmodule,
+				summary: Err("Submodule not checked out".into()),
+				reason,
+			}],
+			errors: vec![
+				("a".into(), "first".into()),
+				("b".into(), "second".into()),
+			],
+			error_reasons,
+			error_overflow: 0,
+			depth_limited: Vec::new(),
+			depth_overflow: 0,
+			status: ScanStatus::Complete,
+		})
+	}
+
+	/// The scan rows' reasons are additive, through the real tagged
+	/// `Response`: an old master reads the same rows, an old worker's frame
+	/// has none, and a reason a newer worker added costs only its own row.
+	#[test]
+	fn scan_reasons_are_compatible_in_both_directions() {
+		let new = serde_json::to_string(&scanned(
+			Some(Reason::SubmoduleNotCheckedOut),
+			vec![Some(Reason::TimedOut), None],
+		))
+		.unwrap();
+		assert!(
+			new.contains("\"reason\"") && new.contains("\"error_reasons\""),
+			"{new}"
+		);
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Repos {
+				repos: vec![OldScanned {
+					rel: "sub".into(),
+					summary: Err("Submodule not checked out".into())
+				}],
+				errors: vec![
+					("a".into(), "first".into()),
+					("b".into(), "second".into())
+				],
+			}
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&new).unwrap(),
+			scanned(
+				Some(Reason::SubmoduleNotCheckedOut),
+				vec![Some(Reason::TimedOut), None]
+			)
+		);
+		// Without reasons the frame is the one an old worker wrote.
+		let old = serde_json::to_string(&scanned(None, Vec::new())).unwrap();
+		assert!(
+			!old.contains("reason") && !old.contains("error_reasons"),
+			"{old}"
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&old).unwrap(),
+			scanned(None, Vec::new())
+		);
+		// A reason the receiver does not know reads as none, per element.
+		let future = new
+			.replace(
+				r#""reason":{"r":"submodule_not_checked_out"}"#,
+				r#""reason":{"r":"from_the_future"}"#,
+			)
+			.replace(r#"{"r":"timed_out"}"#, r#"{"r":"from_the_future"}"#);
+		assert_ne!(future, new);
+		assert_eq!(
+			serde_json::from_str::<Response>(&future).unwrap(),
+			scanned(None, vec![None, None])
+		);
 	}
 
 	/// `folders_only` is an additive field: a request without it (every
@@ -1459,8 +1568,10 @@ mod tests {
 						branch: None,
 						changes: ChangeCounts::default(),
 					}),
+					reason: None,
 				}],
 				errors: vec![("err_path".into(), "error message".into())],
+				error_reasons: vec![Some(Reason::TimedOut)],
 				error_overflow: 0,
 				depth_limited: vec!["depth_path".into()],
 				depth_overflow: 0,
