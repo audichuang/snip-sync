@@ -303,6 +303,7 @@ pub(crate) fn import_plan(
 	run().unwrap_or_else(|reply| *reply)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_import(
 	root: &SharedRoot,
 	dest: &str,
@@ -383,6 +384,7 @@ fn cache_refusal(why: CacheError) -> Response {
 	*refused_with(code, message, reason)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_prepared(
 	root: &SharedRoot,
 	dest: &str,
@@ -458,6 +460,7 @@ fn hold_after_first_write() {
 /// Answers [`crate::proto::Request::ImportApply`]: the preview's snapshot
 /// is checked first, as a local Apply does, then the plan made again must
 /// be the one previewed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn import_apply(
 	root: &SharedRoot,
 	dest: &str,
