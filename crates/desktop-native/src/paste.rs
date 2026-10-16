@@ -2188,6 +2188,46 @@ impl PastePreviewPlan {
 		limit: usize,
 		remote: Option<RemotePaste>,
 	) -> Result<Self, Msg> {
+		let (plan, failed) = Self::plan_shared(
+			raw,
+			dest,
+			known_roots,
+			generation,
+			opts,
+			limit,
+			remote,
+		)?;
+		if let Some(err) = failed {
+			return Err(err);
+		}
+		// A replay has no file plan: its preview is the plan.
+		if !plan.whole_commit
+			&& plan.prefix_choices.is_empty()
+			&& plan.import_plan.is_none()
+		{
+			return Err(plan
+				.error
+				.unwrap_or_else(|| Msg::new("paste_err_nothing", [])));
+		}
+		Ok(plan)
+	}
+
+	/// [`Self::build_shared`] without judging what the engine answered: the
+	/// plan comes back whatever it said, a refusal as the plan's `error`
+	/// beside the restore-base suggestion the engine made while refusing it
+	/// (what [Adjust paths] recovers). The second value is the error of a
+	/// plan that could not be built at all (the destination did not resolve,
+	/// the worker was unreachable). Only what leaves no plan to keep (the
+	/// memory budget, a payload that is none, a replay) is an `Err`.
+	fn plan_shared(
+		raw: Arc<str>,
+		dest: &Path,
+		known_roots: &[PathBuf],
+		generation: u64,
+		opts: &RunOptions,
+		limit: usize,
+		remote: Option<RemotePaste>,
+	) -> Result<(Self, Option<Msg>), Msg> {
 		check_budget(raw.len(), limit)?;
 		let raw_text: &str = &raw;
 		if commits::is_commit_payload(raw_text) {
@@ -2198,7 +2238,8 @@ impl PastePreviewPlan {
 				opts,
 				limit,
 				remote,
-			);
+			)
+			.map(|plan| (plan, None));
 		}
 		if format::parse_clipboard(raw_text, "").is_empty() {
 			return Err(Msg::new("paste_err_not_payload", []));
@@ -2265,13 +2306,12 @@ impl PastePreviewPlan {
 				limit,
 			)?;
 		}
-		plan.rebuild_with_limit(opts, limit)?;
-		if plan.prefix_choices.is_empty() && plan.import_plan.is_none() {
-			return Err(plan
-				.error
-				.unwrap_or_else(|| Msg::new("paste_err_nothing", [])));
+		match plan.rebuild_with_limit(opts, limit) {
+			Ok(()) => Ok((plan, None)),
+			Err(err) if err.key == preview_budget_error().key => Err(err),
+			// `rebuild_with_limit` left the error on the plan.
+			Err(err) => Ok((plan, Some(err))),
 		}
-		Ok(plan)
 	}
 
 	fn build_commit(
@@ -2587,9 +2627,11 @@ impl PastePreviewPlan {
 
 	/// This disarmed shell's payload planned into `dest`. A destination the
 	/// engine cannot use (it does not exist, the worker refused it, a commit
-	/// replay has no repo there) is not a failure of the job: the shell
-	/// lands with the engine's own words, so the panel stays on the folder
-	/// the user picked. Only the memory budget refuses the landing.
+	/// replay has no repo there) or a plan it refuses is not a failure of
+	/// the job: the shell lands with the engine's own words, and with the
+	/// restore-base suggestion it made, so the panel stays on the folder the
+	/// user picked and can recover it. Only the memory budget refuses the
+	/// landing.
 	pub(crate) fn retarget_with(
 		mut self,
 		dest: &Path,
@@ -2598,7 +2640,7 @@ impl PastePreviewPlan {
 		opts: &RunOptions,
 		limit: usize,
 	) -> Result<Self, Msg> {
-		let planned = Self::build_shared(
+		let planned = Self::plan_shared(
 			self.raw_payload.clone(),
 			dest,
 			known_roots,
@@ -2608,7 +2650,9 @@ impl PastePreviewPlan {
 			self.remote.clone(),
 		);
 		match planned {
-			Ok(plan) => Ok(plan),
+			// A refused plan is the shell the panel stays on: it keeps the
+			// engine's words and the suggestion that recovers it.
+			Ok((plan, _)) => Ok(plan),
 			Err(err) if err.key == preview_budget_error().key => Err(err),
 			Err(err) => {
 				self.error = Some(err);
