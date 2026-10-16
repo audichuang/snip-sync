@@ -20,7 +20,7 @@ use snip_core::gitsrc::{GitError, GitSource};
 use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
-use snip_core::reason::{Reason, StaleChange};
+use snip_core::reason::{Datum, Reason, StaleChange};
 
 use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
@@ -215,7 +215,7 @@ impl HandshakeGate {
 				return Err(RemoteError::Start {
 					kind: ConnectFailureKind::TimedOut,
 					reason: None,
-					detail: String::new(),
+					detail: Datum::default(),
 					message: "timed out waiting for a connection slot to that \
 					          machine: other connections there are still \
 					          starting; try again"
@@ -573,7 +573,7 @@ impl Connection {
 		RemoteError::Start {
 			kind: start_failure_kind(&cause, code, &stderr),
 			reason: start_reason(&cause, code, &stderr),
-			detail: stderr.clone(),
+			detail: Datum::transport_stderr(stderr.clone()),
 			message: start_message(cause, code, &stderr),
 		}
 	}
@@ -922,7 +922,7 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 		RemoteError::Start {
 			kind: ConnectFailureKind::WorkerUnavailable,
 			reason: Some(StartReason::NoCommand),
-			detail: String::new(),
+			detail: Datum::default(),
 			message: "no command to start the worker".into(),
 		}
 	})?;
@@ -938,7 +938,7 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				kind: ConnectFailureKind::WorkerUnavailable,
 				reason: Some(StartReason::CannotRun),
 				// Data only: the program and what the OS said.
-				detail: format!("{program}: {err}"),
+				detail: Datum::spawn_failure(&program, &err),
 				message: format!("cannot run {program}: {err}"),
 			}
 		})?;
@@ -3037,7 +3037,7 @@ mod tests {
 			error.reason(),
 			Reason::Start {
 				start: Some(StartReason::NoCommand),
-				detail: String::new(),
+				detail: Datum::default(),
 			}
 		);
 		let missing = std::env::temp_dir().join("snip-no-such-program-225");
@@ -3055,7 +3055,10 @@ mod tests {
 			panic!("{error:?}")
 		};
 		assert_eq!(start, Some(StartReason::CannotRun));
-		assert!(detail.starts_with(&format!("{program}: ")), "{detail}");
+		assert!(
+			detail.as_str().starts_with(&format!("{program}: ")),
+			"{detail:?}"
+		);
 		assert!(!error.is_restore_retryable());
 	}
 
@@ -3752,7 +3755,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind: start_failure_kind(&cause, code, stderr),
 				reason: start_reason(&cause, code, stderr),
-				detail: stderr.to_string(),
+				detail: Datum::for_test(stderr),
 				message: start_message(cause.clone(), code, stderr),
 			};
 			assert_eq!(
@@ -3782,7 +3785,12 @@ mod tests {
 		}
 		for error in [
 			RemoteError::Cancelled,
-			RemoteError::Connect("Connection reset by peer".into()),
+			RemoteError::Start {
+				kind: ConnectFailureKind::Other,
+				reason: None,
+				detail: Datum::for_test("Connection reset by peer"),
+				message: "Connection reset by peer".into(),
+			},
 			RemoteError::Protocol("bad frame".into()),
 			RemoteError::WorkerTooOld {
 				worker: "old".into(),
@@ -3819,7 +3827,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind,
 				reason: None,
-				detail: stderr.to_string(),
+				detail: Datum::for_test(stderr),
 				message: start_message(StartCause::Ended, Some(255), stderr),
 			};
 			assert!(error.is_restore_retryable(), "{stderr}");
@@ -3832,7 +3840,7 @@ mod tests {
 				"user@box: Permission denied (publickey).",
 			),
 			reason: None,
-			detail: String::new(),
+			detail: Datum::default(),
 			message: String::new(),
 		};
 		assert!(!denied.is_restore_retryable(), "{denied:?}");
@@ -3845,7 +3853,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind,
 				reason: None,
-				detail: String::new(),
+				detail: Datum::default(),
 				message: String::new(),
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
@@ -4265,7 +4273,7 @@ mod tests {
 		let started = RemoteError::Start {
 			kind: ConnectFailureKind::WorkerUnavailable,
 			reason: Some(StartReason::NoWorker),
-			detail: "sh: snip: not found".into(),
+			detail: Datum::for_test("sh: snip: not found"),
 			message: "snip is not installed on that machine".into(),
 		};
 		let git = GitError::from(started);
@@ -4287,7 +4295,7 @@ mod tests {
 		let unknown = RemoteError::Start {
 			kind: ConnectFailureKind::Other,
 			reason: None,
-			detail: "boom".into(),
+			detail: Datum::for_test("boom"),
 			message: "boom".into(),
 		};
 		assert!(matches!(

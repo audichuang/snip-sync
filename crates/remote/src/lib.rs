@@ -39,7 +39,7 @@ pub use proto::{
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
-pub use snip_core::reason::{Reason, StaleChange};
+pub use snip_core::reason::{Datum, Reason, StaleChange};
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
 /// Typed reason a transport ended before the worker's hello. Keep this
@@ -89,16 +89,13 @@ fn stalled_text(
 pub enum RemoteError {
 	#[error(transparent)]
 	Io(#[from] io::Error),
-	/// The worker did not start: ssh's message, or a missing snip.
-	#[error("{0}")]
-	Connect(String),
 	#[error("{message}")]
 	Start {
 		kind: ConnectFailureKind,
 		/// The known cause, when the start failure is one of them.
 		reason: Option<StartReason>,
 		/// The transport's own stderr, unchanged; empty when it said nothing.
-		detail: String,
+		detail: Datum,
 		message: String,
 	},
 	/// The worker answered with an error.
@@ -151,11 +148,7 @@ impl RemoteError {
 				Reason::TimedOut
 			}
 			Self::Io(e) => Reason::Disconnected {
-				detail: e.to_string(),
-			},
-			Self::Connect(detail) => Reason::Start {
-				start: None,
-				detail: detail.clone(),
+				detail: Datum::os_error(e),
 			},
 			Self::Start { reason, detail, .. } => Reason::Start {
 				start: *reason,

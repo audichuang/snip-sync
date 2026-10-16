@@ -231,12 +231,14 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::Start {
 			start: Some(start),
 			detail,
-		} => start_msg(*start, detail),
+		} => start_msg(*start, detail.as_str()),
 		Reason::Start {
 			start: None,
 			detail,
-		} => headed("err_start_failed", detail),
-		Reason::Disconnected { detail } => headed("err_disconnected", detail),
+		} => headed("err_start_failed", detail.as_str()),
+		Reason::Disconnected { detail } => {
+			headed("err_disconnected", detail.as_str())
+		}
 		Reason::Protocol => Msg::new("err_protocol", []),
 		Reason::WorkerTooOld { worker, have, need } => Msg::new(
 			"err_worker_outdated",
@@ -245,7 +247,9 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::TimedOut => Msg::new("err_timed_out", []),
 		Reason::Cancelled => Msg::new("err_cancelled", []),
 		Reason::GitMissing => Msg::new("err_git_missing", []),
-		Reason::GitFailed { stderr } => headed("err_git_failed", stderr),
+		Reason::GitFailed { stderr } => {
+			headed("err_git_failed", stderr.as_str())
+		}
 		Reason::GitBusy => Msg::new("err_git_busy", []),
 		Reason::RepoBusy => Msg::new("paste_repo_busy", []),
 		Reason::WorkerNeedsRestart => Msg::new("err_worker_restart", []),
@@ -269,8 +273,8 @@ pub fn reason_msg(r: &Reason) -> Msg {
 		Reason::Internal {
 			detail,
 			condition: None,
-		} => headed("err_internal", detail),
-		Reason::Io { detail } => headed("err_io", detail),
+		} => headed("err_internal", detail.as_str()),
+		Reason::Io { detail } => headed("err_io", detail.as_str()),
 		Reason::NotFound { path } => headed("err_not_found", path),
 		Reason::PermissionDenied { path } => {
 			headed("err_permission_denied", path)
@@ -335,7 +339,7 @@ pub fn reason_msg(r: &Reason) -> Msg {
 			Msg::new("err_submodule_not_checked_out", [])
 		}
 		Reason::SubmoduleUnreadable { detail } => {
-			headed("err_submodule_unreadable", detail)
+			headed("err_submodule_unreadable", detail.as_str())
 		}
 		Reason::ScanErrorsOmitted { count } => {
 			Msg::new("err_scan_errors_omitted", [count.to_string()])

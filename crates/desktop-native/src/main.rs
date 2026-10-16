@@ -5036,7 +5036,7 @@ impl WorkbenchModel {
 					[String::new()],
 					0,
 					crate::reason::reason_msg(&Reason::Internal {
-						detail: String::new(),
+						detail: snip_core::reason::Datum::default(),
 						condition: None,
 					}),
 				));
@@ -5987,7 +5987,7 @@ pub(crate) fn test_failure(text: &str) -> Failure {
 	Failure::new(
 		text,
 		Reason::Io {
-			detail: text.into(),
+			detail: snip_core::reason::Datum::for_test(text),
 		},
 	)
 }

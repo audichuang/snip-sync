@@ -847,7 +847,10 @@ pub fn identify_repos_stopped(
 						kind: FoundKind::UninitializedSubmodule,
 						identity: None,
 						summary: Err(Failure::new(
-							format!("Submodule unreadable: {reason}"),
+							format!(
+								"Submodule unreadable: {}",
+								reason.as_str()
+							),
 							Reason::SubmoduleUnreadable { detail: reason },
 						)),
 					});

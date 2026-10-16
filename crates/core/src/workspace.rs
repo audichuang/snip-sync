@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Condition, Git, GitError};
-use crate::reason::Failure;
+use crate::reason::{Datum, Failure};
 use crate::transfer::SourceKind;
 
 // ---------------------------------------------------------------------------
@@ -559,7 +559,7 @@ pub enum SubmoduleState {
 	/// Declared, with no `.git` at its path: not initialized or deinited.
 	NotCheckedOut,
 	/// Its path could not be examined; the reason, never a guess.
-	Unreadable(String),
+	Unreadable(Datum),
 	/// `.gitmodules` names a path that is not a safe relative path.
 	InvalidPath,
 }
@@ -624,7 +624,7 @@ pub fn declared_submodules(
 				Err(e) if e.kind() == io::ErrorKind::NotFound => {
 					SubmoduleState::NotCheckedOut
 				}
-				Err(e) => SubmoduleState::Unreadable(e.to_string()),
+				Err(e) => SubmoduleState::Unreadable(Datum::os_error(&e)),
 			}
 		};
 		list.push(DeclaredSubmodule {
@@ -1564,7 +1564,7 @@ mod tests {
 		assert_eq!(
 			err.reason(),
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(Condition::GitmodulesNotFile),
 			}
 		);

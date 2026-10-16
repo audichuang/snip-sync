@@ -961,6 +961,7 @@ fn open_repo(
 mod tests {
 	use super::*;
 	use snip_core::browser::LogQuery;
+	use snip_core::reason::Datum;
 	use snip_core::workspace::RepoKind;
 	use std::path::{Path, PathBuf};
 
@@ -1072,7 +1073,7 @@ mod tests {
 		};
 		let gone = |f: &Failure| sanitize_scan_error(f, share);
 		let git_failed = Reason::GitFailed {
-			stderr: String::new(),
+			stderr: Datum::default(),
 		};
 		// The words the CLI and old masters saw, label and context kept.
 		for (context, text) in [
@@ -1146,7 +1147,7 @@ mod tests {
 		assert_eq!(
 			typed.reason.clone().scrubbed(),
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(
 					snip_core::gitsrc::Condition::GitmodulesNotFile
 				),
@@ -1156,14 +1157,14 @@ mod tests {
 		let bare = Failure::new(
 			secret,
 			Reason::GitFailed {
-				stderr: secret.into(),
+				stderr: Datum::for_test(secret),
 			},
 		);
 		assert_eq!(gone(&bare).0, "git failed (details withheld)");
 		let bare = Failure::new(
 			secret,
 			Reason::Internal {
-				detail: secret.into(),
+				detail: Datum::for_test(secret),
 				condition: None,
 			},
 		);
@@ -1173,7 +1174,7 @@ mod tests {
 		let other = Failure::new(
 			"git status failed: x",
 			Reason::Io {
-				detail: "/Volumes/secret".into(),
+				detail: Datum::for_test("/Volumes/secret"),
 			},
 		);
 		assert_eq!(
@@ -1181,7 +1182,7 @@ mod tests {
 			(
 				"git status failed: x".to_string(),
 				Reason::Io {
-					detail: String::new()
+					detail: Datum::default()
 				}
 			)
 		);
@@ -1546,7 +1547,7 @@ mod tests {
 					code: Some(128),
 				},
 				Some(Reason::GitFailed {
-					stderr: String::new(),
+					stderr: Datum::default(),
 				}),
 			),
 			(
@@ -1555,7 +1556,7 @@ mod tests {
 					output: format!("{secret} odd"),
 				},
 				Some(Reason::Internal {
-					detail: String::new(),
+					detail: Datum::default(),
 					condition: None,
 				}),
 			),
@@ -1565,7 +1566,7 @@ mod tests {
 					message: secret.into(),
 				},
 				Some(Reason::Internal {
-					detail: String::new(),
+					detail: Datum::default(),
 					condition: None,
 				}),
 			),

@@ -803,7 +803,9 @@ impl PasteApplyResult {
 			.map(|text| snip_core::restore::RestoreFailure {
 				path: String::new(),
 				reason: Some(snip_core::reason::Reason::Io {
-					detail: text.clone(),
+					detail: snip_core::reason::Datum::old_peer_text(
+						text.clone(),
+					),
 				}),
 			})
 			.collect()
@@ -1966,7 +1968,6 @@ impl PastePreviewPlan {
 					err @ (PasteError::Destination { .. }
 					| PasteError::Remote(
 						RemoteError::Io(_)
-						| RemoteError::Connect(_)
 						| RemoteError::Start { .. }
 						| RemoteError::PatchTooLarge { .. }
 						| RemoteError::Protocol(_)
@@ -2467,7 +2468,7 @@ impl PastePreviewPlan {
 				[String::new()],
 				0,
 				reason_msg(&snip_core::reason::Reason::Internal {
-					detail: String::new(),
+					detail: snip_core::reason::Datum::default(),
 					condition: None,
 				}),
 			));
@@ -2760,7 +2761,9 @@ pub(crate) mod tests {
 			RestoreFailure {
 				path: "b.txt".into(),
 				reason: Some(Reason::Io {
-					detail: "No space left on device".into(),
+					detail: snip_core::reason::Datum::for_test(
+						"No space left on device",
+					),
 				}),
 			},
 			RestoreFailure {
@@ -2807,7 +2810,9 @@ pub(crate) mod tests {
 			.map(|i| RestoreFailure {
 				path: format!("f{i}.txt"),
 				reason: Some(Reason::Io {
-					detail: "No space left on device".into(),
+					detail: snip_core::reason::Datum::for_test(
+						"No space left on device",
+					),
 				}),
 			})
 			.collect();
@@ -2992,7 +2997,12 @@ pub(crate) mod tests {
 			file_apply_msg(
 				Some(&remote),
 				&dest,
-				PasteError::Remote(RemoteError::Connect("no route".into()))
+				PasteError::Remote(RemoteError::Start {
+					kind: snip_remote::ConnectFailureKind::Other,
+					reason: None,
+					detail: snip_core::reason::Datum::for_test("no route"),
+					message: "no route".into(),
+				})
 			)
 			.key,
 			"paste_err_destination"
@@ -3012,7 +3022,7 @@ pub(crate) mod tests {
 				PasteError::Remote(RemoteError::Start {
 					kind: ConnectFailureKind::Other,
 					reason: Some(reason),
-					detail: detail.into(),
+					detail: snip_core::reason::Datum::for_test(detail),
 					message: "english".into(),
 				}),
 			)
@@ -3188,7 +3198,12 @@ pub(crate) mod tests {
 		assert_eq!(
 			key(
 				Some(&remote),
-				PasteError::Remote(RemoteError::Connect("no route".into())),
+				PasteError::Remote(RemoteError::Start {
+					kind: snip_remote::ConnectFailureKind::Other,
+					reason: None,
+					detail: snip_core::reason::Datum::for_test("no route"),
+					message: "no route".into(),
+				}),
 				false
 			),
 			"paste_err_destination"

@@ -1627,7 +1627,7 @@ mod tests {
 		RemoteError::Start {
 			kind: ConnectFailureKind::Other,
 			reason,
-			detail: detail.into(),
+			detail: snip_core::reason::Datum::for_test(detail),
 			message: "english text the CLI prints".into(),
 		}
 	}
@@ -1641,7 +1641,7 @@ mod tests {
 			GitError::remote(
 				snip_core::reason::Reason::Start {
 					start: Some(StartReason::NoWorker),
-					detail: String::new(),
+					detail: snip_core::reason::Datum::default(),
 				},
 				"snip is not installed",
 			)

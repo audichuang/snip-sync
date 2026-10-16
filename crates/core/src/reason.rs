@@ -96,9 +96,91 @@ pub enum StaleChange {
 	Preview,
 }
 
+/// Text a front end shows verbatim after a worded headline: what the OS,
+/// git or ssh wrote, or a bug-report label. Never a sentence of ours: there
+/// is no `From<String>`, and each constructor names where its text comes
+/// from. Serialized as a bare string, so the wire is unchanged; `Deserialize`
+/// is the master's one way to read a peer's text.
+///
+/// ```compile_fail
+/// let _ = snip_core::reason::Reason::Io { detail: "ours".into() };
+/// ```
+/// ```
+/// use snip_core::reason::{Datum, Reason};
+/// let _ = Reason::Io { detail: Datum::default() };
+/// assert!(Datum::os_error(&std::io::Error::other("ours")).is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Datum(String);
+
+impl Datum {
+	/// The OS's own words for `e` (`raw_os_error()` is set), else empty: a
+	/// message of ours, std's or a library's never becomes data.
+	pub fn os_error(e: &std::io::Error) -> Self {
+		if e.raw_os_error().is_some() {
+			Self(e.to_string())
+		} else {
+			Self::default()
+		}
+	}
+
+	/// What git wrote on stderr.
+	pub fn git_stderr(text: impl Into<String>) -> Self {
+		Self(text.into())
+	}
+
+	/// What git printed on stdout that did not parse.
+	pub fn git_output(text: impl Into<String>) -> Self {
+		Self(text.into())
+	}
+
+	/// What the transport (ssh) wrote on stderr.
+	pub fn transport_stderr(text: impl Into<String>) -> Self {
+		Self(text.into())
+	}
+
+	/// `program: <OS text>`, or `program` when the OS said nothing.
+	pub fn spawn_failure(program: &str, e: &std::io::Error) -> Self {
+		match Self::os_error(e).0 {
+			os if os.is_empty() => Self(program.to_string()),
+			os => Self(format!("{program}: {os}")),
+		}
+	}
+
+	/// A fixed technical label for a bug report.
+	pub fn label(label: &'static str) -> Self {
+		Self(label.to_string())
+	}
+
+	/// The git command a failure belongs to.
+	pub fn command(args: &str) -> Self {
+		Self(args.to_string())
+	}
+
+	/// A peer older than typed failures sent only its text (spec 版本相容).
+	pub fn old_peer_text(text: impl Into<String>) -> Self {
+		Self(text.into())
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	#[cfg(any(test, feature = "test-support"))]
+	pub fn for_test(text: impl Into<String>) -> Self {
+		Self(text.into())
+	}
+}
+
 /// Why something failed, as data. One variant per distinct user sentence.
 /// Never `Display`ed: the CLI keeps each error's thiserror text, and the
-/// desktop words a `Reason` in one place.
+/// desktop words a `Reason` in one place. Its free-text fields are
+/// [`Datum`]s, so a sentence of ours cannot be put in one by accident.
 ///
 /// ```compile_fail
 /// let _ = snip_core::reason::Reason::Io { detail: "ours".into() };
@@ -113,10 +195,10 @@ pub enum Reason {
 	},
 	Start {
 		start: Option<StartReason>,
-		detail: String,
+		detail: Datum,
 	},
 	Disconnected {
-		detail: String,
+		detail: Datum,
 	},
 	Protocol,
 	WorkerTooOld {
@@ -129,7 +211,7 @@ pub enum Reason {
 	// git
 	GitMissing,
 	GitFailed {
-		stderr: String,
+		stderr: Datum,
 	},
 	GitBusy,
 	RepoBusy,
@@ -156,13 +238,13 @@ pub enum Reason {
 	/// that a front end words itself (`detail` is then empty). `condition`
 	/// is additive on the wire: an old peer sends and reads none.
 	Internal {
-		detail: String,
+		detail: Datum,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		condition: Option<Condition>,
 	},
 	// filesystem
 	Io {
-		detail: String,
+		detail: Datum,
 	},
 	NotFound {
 		path: String,
@@ -246,7 +328,7 @@ pub enum Reason {
 	/// A declared submodule whose path could not be examined; `detail` is
 	/// the OS's text, emptied on the wire.
 	SubmoduleUnreadable {
-		detail: String,
+		detail: Datum,
 	},
 	/// A front end's own summary row: `count` scan errors past the kept
 	/// ones were dropped. Never produced by a worker.
@@ -340,7 +422,7 @@ pub fn io_reason(e: &std::io::Error, path: &str) -> Reason {
 		ErrorKind::TimedOut => Reason::TimedOut,
 		ErrorKind::FileTooLarge => Reason::TooLarge,
 		_ => Reason::Io {
-			detail: e.to_string(),
+			detail: Datum::os_error(e),
 		},
 	}
 }
@@ -427,10 +509,10 @@ impl Reason {
 		match self {
 			Self::Start { start, .. } => Self::Start {
 				start,
-				detail: String::new(),
+				detail: Datum::default(),
 			},
 			Self::Disconnected { .. } => Self::Disconnected {
-				detail: String::new(),
+				detail: Datum::default(),
 			},
 			Self::NotARepository { .. } => Self::NotARepository {
 				path: String::new(),
@@ -439,17 +521,17 @@ impl Reason {
 				path: String::new(),
 			},
 			Self::GitFailed { .. } => Self::GitFailed {
-				stderr: String::new(),
+				stderr: Datum::default(),
 			},
 			Self::Internal { condition, .. } => Self::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition,
 			},
 			Self::Io { .. } => Self::Io {
-				detail: String::new(),
+				detail: Datum::default(),
 			},
 			Self::SubmoduleUnreadable { .. } => Self::SubmoduleUnreadable {
-				detail: String::new(),
+				detail: Datum::default(),
 			},
 			Self::NotFound { .. } => Self::NotFound {
 				path: String::new(),
@@ -538,6 +620,7 @@ pub mod test_support {
 	/// that may carry "ok".
 	pub fn samples() -> Vec<Reason> {
 		let s = || "/abs/secret".to_string();
+		let ds = || Datum::for_test("/abs/secret");
 		let ok = || "ok".to_string();
 		let mut v = vec![
 			Reason::Refused {
@@ -545,9 +628,9 @@ pub mod test_support {
 			},
 			Reason::Start {
 				start: Some(StartReason::KeyLogin),
-				detail: s(),
+				detail: ds(),
 			},
-			Reason::Disconnected { detail: s() },
+			Reason::Disconnected { detail: ds() },
 			Reason::Protocol,
 			Reason::WorkerTooOld {
 				worker: ok(),
@@ -557,7 +640,7 @@ pub mod test_support {
 			Reason::TimedOut,
 			Reason::Cancelled,
 			Reason::GitMissing,
-			Reason::GitFailed { stderr: s() },
+			Reason::GitFailed { stderr: ds() },
 			Reason::GitBusy,
 			Reason::RepoBusy,
 			Reason::WorkerNeedsRestart,
@@ -570,10 +653,10 @@ pub mod test_support {
 			Reason::Shallow { sha: ok() },
 			Reason::OutsideShare,
 			Reason::Internal {
-				detail: s(),
+				detail: ds(),
 				condition: None,
 			},
-			Reason::Io { detail: s() },
+			Reason::Io { detail: ds() },
 			Reason::NotFound { path: s() },
 			Reason::PermissionDenied { path: s() },
 			Reason::EmptySelection,
@@ -620,7 +703,7 @@ pub mod test_support {
 			},
 			Reason::Unverifiable { path: s() },
 			Reason::SubmoduleNotCheckedOut,
-			Reason::SubmoduleUnreadable { detail: s() },
+			Reason::SubmoduleUnreadable { detail: ds() },
 			Reason::ScanErrorsOmitted { count: 3 },
 			Reason::DepthLimitedOmitted { count: 5 },
 		];
@@ -628,10 +711,10 @@ pub mod test_support {
 		// shapes.
 		v.push(Reason::Start {
 			start: None,
-			detail: String::new(),
+			detail: Datum::default(),
 		});
 		v.push(Reason::Internal {
-			detail: String::new(),
+			detail: Datum::default(),
 			condition: Some(Condition::GitmodulesNotFile),
 		});
 		for path in [Some(s()), Some(r"C:\abs\secret".to_string()), None] {
@@ -742,7 +825,7 @@ mod tests {
 		] {
 			let r = Reason::Start {
 				start: Some(start),
-				detail: "d".into(),
+				detail: Datum::for_test("d"),
 			};
 			let back: Reason =
 				serde_json::from_str(&serde_json::to_string(&r).unwrap())
@@ -760,7 +843,7 @@ mod tests {
 		assert_eq!(
 			old,
 			Reason::Internal {
-				detail: "x".into(),
+				detail: Datum::for_test("x"),
 				condition: None
 			}
 		);
@@ -769,7 +852,7 @@ mod tests {
 			r#"{"r":"internal","detail":"x"}"#
 		);
 		let typed = Reason::Internal {
-			detail: String::new(),
+			detail: Datum::default(),
 			condition: Some(Condition::PathNotInSource),
 		};
 		assert_eq!(
@@ -778,14 +861,14 @@ mod tests {
 		);
 		// A worker's scrub keeps the fixed condition, drops the detail.
 		let scrubbed = Reason::Internal {
-			detail: "/abs/secret".into(),
+			detail: Datum::for_test("/abs/secret"),
 			condition: Some(Condition::PathNotInSource),
 		}
 		.scrubbed();
 		assert_eq!(
 			scrubbed,
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(Condition::PathNotInSource)
 			}
 		);

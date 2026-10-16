@@ -15,7 +15,7 @@ use crate::reason::reason_msg;
 use crate::PreviewErr;
 use snip_core::commits::CommitError;
 use snip_core::gitsrc::{Condition, GitError, StartReason};
-use snip_core::reason::{Reason, StaleChange};
+use snip_core::reason::{Datum, Reason, StaleChange};
 use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError, WaitEnd};
 use std::collections::BTreeSet;
 
@@ -107,18 +107,17 @@ fn reason_index(reason: StartReason) -> usize {
 fn remote_variant(e: &RemoteError) -> usize {
 	match e {
 		RemoteError::Io(_) => 0,
-		RemoteError::Connect(_) => 1,
-		RemoteError::Start { .. } => 2,
-		RemoteError::Refused { .. } => 3,
-		RemoteError::PatchTooLarge { .. } => 4,
-		RemoteError::Protocol(_) => 5,
-		RemoteError::Cancelled => 6,
-		RemoteError::TimedOut => 7,
-		RemoteError::Stalled { .. } => 8,
-		RemoteError::WorkerTooOld { .. } => 9,
+		RemoteError::Start { .. } => 1,
+		RemoteError::Refused { .. } => 2,
+		RemoteError::PatchTooLarge { .. } => 3,
+		RemoteError::Protocol(_) => 4,
+		RemoteError::Cancelled => 5,
+		RemoteError::TimedOut => 6,
+		RemoteError::Stalled { .. } => 7,
+		RemoteError::WorkerTooOld { .. } => 8,
 	}
 }
-const REMOTE_VARIANTS: usize = 10;
+const REMOTE_VARIANTS: usize = 9;
 
 /// The variant of a `GitError`: exhaustive on purpose.
 fn git_variant(e: &GitError) -> usize {
@@ -179,13 +178,12 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 			"Io(Other)".into(),
 			RemoteError::Io(std::io::Error::other(D)),
 		),
-		("Connect".into(), RemoteError::Connect(D.into())),
 		(
 			"Start(None)".into(),
 			RemoteError::Start {
 				kind: ConnectFailureKind::Other,
 				reason: None,
-				detail: D.into(),
+				detail: Datum::for_test(D),
 				message: D.into(),
 			},
 		),
@@ -229,7 +227,7 @@ fn remote_samples() -> Vec<(String, RemoteError)> {
 			RemoteError::Start {
 				kind: ConnectFailureKind::Other,
 				reason: Some(reason),
-				detail: D.into(),
+				detail: Datum::for_test(D),
 				message: W.into(),
 			},
 		));
@@ -405,7 +403,7 @@ fn git_samples() -> Vec<(String, GitError)> {
 			GitError::remote(
 				Reason::Start {
 					start: Some(reason),
-					detail: a(),
+					detail: Datum::for_test(D),
 				},
 				W,
 			),
@@ -589,10 +587,15 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 			"Start(None)".into(),
 			Reason::Start {
 				start: None,
-				detail: d(),
+				detail: Datum::for_test(D),
 			},
 		),
-		("Disconnected".into(), Reason::Disconnected { detail: d() }),
+		(
+			"Disconnected".into(),
+			Reason::Disconnected {
+				detail: Datum::for_test(D),
+			},
+		),
 		("Protocol".into(), Reason::Protocol),
 		(
 			"WorkerTooOld".into(),
@@ -605,7 +608,12 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		("TimedOut".into(), Reason::TimedOut),
 		("Cancelled".into(), Reason::Cancelled),
 		("GitMissing".into(), Reason::GitMissing),
-		("GitFailed".into(), Reason::GitFailed { stderr: d() }),
+		(
+			"GitFailed".into(),
+			Reason::GitFailed {
+				stderr: Datum::for_test(D),
+			},
+		),
 		("GitBusy".into(), Reason::GitBusy),
 		("RepoBusy".into(), Reason::RepoBusy),
 		("WorkerNeedsRestart".into(), Reason::WorkerNeedsRestart),
@@ -629,11 +637,16 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		(
 			"Internal".into(),
 			Reason::Internal {
-				detail: d(),
+				detail: Datum::for_test(D),
 				condition: None,
 			},
 		),
-		("Io".into(), Reason::Io { detail: d() }),
+		(
+			"Io".into(),
+			Reason::Io {
+				detail: Datum::for_test(D),
+			},
+		),
 		("NotFound".into(), Reason::NotFound { path: d() }),
 		(
 			"PermissionDenied".into(),
@@ -721,7 +734,9 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		),
 		(
 			"SubmoduleUnreadable".into(),
-			Reason::SubmoduleUnreadable { detail: d() },
+			Reason::SubmoduleUnreadable {
+				detail: Datum::for_test(D),
+			},
 		),
 		(
 			"ScanErrorsOmitted".into(),
@@ -736,7 +751,7 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 		v.push((
 			format!("Internal({condition:?})"),
 			Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(condition),
 			},
 		));
@@ -752,7 +767,7 @@ pub(crate) fn reason_samples() -> Vec<(String, Reason)> {
 			format!("Start(Some#{})", reason_index(start)),
 			Reason::Start {
 				start: Some(start),
-				detail: d(),
+				detail: Datum::for_test(D),
 			},
 		));
 	}
@@ -1585,7 +1600,7 @@ fn product_text_never_reaches_a_data_field() {
 		let error = RemoteError::Start {
 			kind: ConnectFailureKind::WorkerUnavailable,
 			reason: Some(start),
-			detail: D.into(),
+			detail: Datum::for_test(D),
 			message: "cannot run ssh: the sentence of the CLI".into(),
 		};
 		let msg = crate::remote::describe_msg(error);

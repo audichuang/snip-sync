@@ -26,7 +26,7 @@ use crate::format::{
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
 use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
-use crate::reason::{io_reason, Reason};
+use crate::reason::{io_reason, Datum, Reason};
 use crate::settings::Settings;
 use crate::workspace::RepoIdentity;
 
@@ -281,7 +281,7 @@ impl GitError {
 		match self {
 			Self::NotFound => Reason::GitMissing,
 			Self::Failed { stderr, .. } => Reason::GitFailed {
-				stderr: stderr.clone(),
+				stderr: Datum::git_stderr(stderr.clone()),
 			},
 			Self::Timeout { .. } => Reason::TimedOut,
 			Self::Cancelled { .. } => Reason::Cancelled,
@@ -296,27 +296,27 @@ impl GitError {
 			// sentence.
 			Self::OutputHeldOpen { args } | Self::NestedProcess { args } => {
 				Reason::Internal {
-					detail: args.clone(),
+					detail: Datum::command(args),
 					condition: None,
 				}
 			}
 			Self::Cleanup { args, message } => Reason::Internal {
-				detail: format!("{args}: {message}"),
+				detail: Datum::command(&format!("{args}: {message}")),
 				condition: None,
 			},
 			Self::Malformed { output, .. } => Reason::Internal {
-				detail: output.clone(),
+				detail: Datum::git_output(output.clone()),
 				condition: None,
 			},
 			Self::NotAFile { spec, .. } => {
 				Reason::NotRegularFile { path: spec.clone() }
 			}
 			Self::Diagnostic(text) => Reason::Internal {
-				detail: (*text).to_string(),
+				detail: Datum::label(text),
 				condition: None,
 			},
 			Self::Condition(condition) => Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: Some(*condition),
 			},
 			Self::NotARepository(p) => Reason::NotARepository {
@@ -1908,7 +1908,7 @@ mod tests {
 		assert_eq!(
 			e.reason(),
 			Reason::Internal {
-				detail: "zzz".into(),
+				detail: Datum::for_test("zzz"),
 				condition: None
 			}
 		);
@@ -1923,7 +1923,7 @@ mod tests {
 		assert_eq!(
 			e.reason(),
 			Reason::Internal {
-				detail: "sha512".into(),
+				detail: Datum::for_test("sha512"),
 				condition: None
 			}
 		);

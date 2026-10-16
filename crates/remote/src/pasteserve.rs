@@ -691,6 +691,7 @@ pub(crate) fn replay_apply(
 mod reason_tests {
 	use super::*;
 	use snip_core::commits::{CommitError, ReplayFailure, ReplayResult};
+	use snip_core::reason::Datum;
 
 	fn reason_of(refusal: Refusal) -> (ErrorCode, Option<Reason>, String) {
 		let Response::Error {
@@ -828,10 +829,10 @@ mod reason_tests {
 		// directory from a generic I/O error otherwise).
 		assert_eq!(
 			sent(Reason::Io {
-				detail: "/opt/secret".into()
+				detail: Datum::for_test("/opt/secret")
 			}),
 			Some(Reason::Io {
-				detail: String::new()
+				detail: Datum::default()
 			})
 		);
 		for r in [
