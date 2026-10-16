@@ -4405,12 +4405,16 @@ impl WorkbenchModel {
 			self.selected_file_source.replace(source.clone()),
 			self.selected_file_root.clone(),
 			self.selected_commit.take(),
-			// Taking the view resets it; it goes back with the selection.
+			// Taking the view resets it; it goes back with the selection,
+			// whole: the file list and its origins index `log_selected`,
+			// and a compare's list belongs to its endpoints.
 			std::mem::take(&mut self.commit_view),
+			std::mem::take(&mut self.log_selected),
+			self.range_head.take(),
+			self.compare.take(),
+			std::mem::take(&mut self.log_selection_expanded),
+			std::mem::take(&mut self.log_branches_all),
 		);
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
@@ -4506,6 +4510,11 @@ impl WorkbenchModel {
 						model.selected_file_root,
 						model.selected_commit,
 						model.commit_view,
+						model.log_selected,
+						model.range_head,
+						model.compare,
+						model.log_selection_expanded,
+						model.log_branches_all,
 					) = shown_selection;
 				} else {
 					model.preview_error_root = Some(shown_root);
@@ -19364,9 +19373,8 @@ mod tests {
 				})
 			};
 			let (i2, i1) = (row_of(cx, "b2"), row_of(cx, "b1"));
-			let b2_id = model.read_with(cx, |m, _| {
-				m.display_commits()[i2].sha.clone()
-			});
+			let b2_id =
+				model.read_with(cx, |m, _| m.display_commits()[i2].sha.clone());
 			let at = |cx: &mut VisualTestContext,
 			          ix: usize,
 			          mods: gpui::Modifiers| {
