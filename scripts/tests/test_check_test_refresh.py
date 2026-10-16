@@ -32,12 +32,33 @@ class CheckTestRefresh(unittest.TestCase):
         self.assertIn("ALLOWED-TEST-REFRESH", r.stderr)
 
     def test_a_pub_crate_tests_block_is_test_code(self):
-        src = "fn f() {}\npub(crate) mod tests {\n    fn t() { window.refresh(); }\n}\n"
+        src = "fn f() {}\n#[cfg(test)]\npub(crate) mod tests {\n    fn t() { window.refresh(); }\n}\n"
         self.assertNotEqual(run_check(src, "lib.rs").returncode, 0)
+
+    def test_a_cfg_test_block_of_any_name_is_test_code(self):
+        # The block, not the rest of the file: a test module named otherwise
+        # than `tests` is test code, and the product code after it is not.
+        src = (
+            "#[cfg(test)]\nmod foo_tests {\n    fn t() { window.refresh(); }\n}\n"
+            "fn product() { window.refresh(); }\n"
+        )
+        r = run_check(src, "lib.rs")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("lib.rs:3", r.stderr)
+        self.assertNotIn("lib.rs:5", r.stderr)
+
+    def test_product_code_after_a_test_block_may_refresh(self):
+        src = (
+            "#[cfg(test)]\npub(crate) mod helper {\n    fn h() {}\n}\n"
+            "fn product() { window.refresh(); }\n"
+            "#[cfg(test)]\nmod tests {\n    // ALLOWED-TEST-REFRESH: x\n    fn t() { window.refresh(); }\n}\n"
+        )
+        r = run_check(src, "lib.rs")
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_the_allowance_comment_is_honoured(self):
         src = (
-            "mod tests {\n    fn t() {\n"
+            "#[cfg(test)]\nmod tests {\n    fn t() {\n"
             "        // ALLOWED-TEST-REFRESH: a reason\n"
             "        window.refresh();\n    }\n}\n"
         )

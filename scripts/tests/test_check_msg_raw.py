@@ -112,17 +112,47 @@ class CheckMsgRaw(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         r = run_check('fn f() { app_log!("[APP:X: {err}]") }\n')
         self.assertEqual(r.returncode, 0, r.stderr)
+        # (m) a positional argument is the same Display.
+        for call in ('format!("failed: {}", e)', 'format!("{}: {:?}", name, err)',
+                     'format!("x {0}", error )'):
+            r = run_check(f'fn f() {{ Msg::new("k", [{call}]) }}\n')
+            self.assertNotEqual(r.returncode, 0, call)
+        r = run_check('fn f() { app_log!("[APP:X: {}]", e) }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # An argument that only starts with `e` is not an error value.
+        r = run_check('fn f() { Msg::new("k", [format!("{}", entry)]) }\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
         # A name that merely ends in `e` is not an error value.
         r = run_check('fn f() { x(name.to_string()) }\n')
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_test_code_is_exempt_from_the_new_rules(self):
-        # (e) after `mod tests {`; (f) a whole `*_tests.rs` file.
-        src = "fn f() {}\nmod tests {\n    fn t() { x(e.to_string()); Msg::detail(h, d) }\n}\n"
+        # (e) inside `#[cfg(test)] mod tests { .. }`; (f) a whole `*_tests.rs` file.
+        src = "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { x(e.to_string()); Msg::detail(h, d) }\n}\n"
         r = run_check(src)
         self.assertEqual(r.returncode, 0, r.stderr)
         r = run_check("fn t() { x(e.to_string()); Msg::detail(h, d) }\n", "foo_tests.rs")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_cfg_test_block_of_any_name_is_test_code(self):
+        # (j) the block `#[cfg(test)] mod foo_tests { .. }` is test code.
+        block = (
+            "#[cfg(test)]\nmod foo_tests {\n"
+            "    fn t() { x(e.to_string()); Msg::detail(h, d); Datum::git_stderr(\"x\") }\n}\n"
+        )
+        r = run_check(block, crate="core")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run_check(block)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # (k) the product code after the block is not.
+        r = run_check(block + "fn f() { set_status(\"k\", [e.to_string()]) }\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ALLOWED-ERR-TEXT", r.stderr)
+        r = run_check(block + "fn f() { Datum::git_stderr(\"boom\") }\n", crate="core")
+        self.assertNotEqual(r.returncode, 0)
+        # (l) a one-line `#[cfg(test)]` block ends where it ends.
+        r = run_check("#[cfg(test)]\nmod m { }\nfn f() { x(e.to_string()) }\n")
+        self.assertNotEqual(r.returncode, 0)
 
     def test_a_datum_from_outside_takes_no_literal(self):
         # (g)
