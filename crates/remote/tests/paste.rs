@@ -2355,6 +2355,56 @@ fn a_worker_plans_a_missing_destination_and_makes_it_only_when_agreed() {
 	assert_eq!(fs::read_to_string(ws.join("not/yet/a.txt")).unwrap(), "A");
 }
 
+/// A worker's preview raced: `new` is made after planning checked the
+/// tails and before it told the named folders from the others (primary
+/// `new/sub`, prefix `q` at `NEW/SUB` on a filesystem that folds case, so
+/// planning took `SUB` for an incidental folder). The Apply that follows is
+/// refused, unagreed, and makes nothing: the master's snapshot carries the
+/// tails as they were placed, and the worker's own plan checks its own.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_folder_made_while_a_worker_plans_does_not_take_consent_away() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let real = dunce::canonicalize(&ws).unwrap();
+	fs::write(real.join(".case-probe"), "").unwrap();
+	assert!(
+		real.join(".CASE-PROBE").exists(),
+		"needs a filesystem that folds case"
+	);
+	fs::remove_file(real.join(".case-probe")).unwrap();
+	let text = entry("q/b.txt", "B");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = new_dirs_route(&[("q", "NEW/SUB")]).mapping();
+	let planned = {
+		let new = real.join("new");
+		let _hook =
+			snip_core::transfer::test_hooks::after_tail_check(move || {
+				fs::create_dir_all(&new).unwrap()
+			});
+		client
+			.import_plan(&id, "new/sub", &text, &mapping, None)
+			.unwrap()
+	};
+	let result = client.import_apply(
+		&id,
+		"new/sub",
+		&text,
+		&mapping,
+		&RestoreSelection::default(),
+		&planned.expect(),
+		None,
+	);
+	assert!(
+		matches!(refused(result), ErrorCode::Stale | ErrorCode::BadRequest),
+		"an unagreed Apply must be refused"
+	);
+	assert_eq!(tree(&ws), vec![ws.join("new")]);
+}
+
 /// R2: the same payload into the same missing folder writes the same bytes
 /// locally and on a worker.
 #[test]

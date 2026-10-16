@@ -8786,6 +8786,42 @@ fn test_a_named_folder_reached_through_another_spelling_of_its_anchor_is_asked_f
 	assert!(!root.join("Sub/new").exists());
 }
 
+/// The same two spellings with a payload for both routes, agreed to: the
+/// folder is one folder, asked for once, made once, and both files are
+/// written. (The second route's `mkdir` once met the folder the first had
+/// just made, took it for someone else's, and took the paste back.)
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_named_folder_reached_through_two_spellings_is_made_once() {
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	fs::metadata(&spelled).expect("the data volume's firmlink is there");
+
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let plan = plan_placed(
+		&ws,
+		"// file: a.txt\nA\n// file: q/Sub/new/b.txt\nB\n",
+		&mapping,
+	);
+	let new = plan.new_dirs();
+	assert_eq!(new.requested.len(), 1, "{new:?}");
+	assert_eq!(new.incidental, Vec::<PathBuf>::new());
+	let agreed = RestoreSelection {
+		confirmed_new_dirs: new.requested.into_iter().collect(),
+		..Default::default()
+	};
+	let result = plan.apply(&agreed).unwrap();
+	assert_eq!(result.created_count, 2);
+	assert_eq!(result.created_dirs, 1);
+	assert_eq!(fs::read_to_string(root.join("Sub/new/a.txt")).unwrap(), "A");
+	assert_eq!(fs::read_to_string(root.join("Sub/new/b.txt")).unwrap(), "B");
+}
+
 /// A1c: the anchor the two spellings lead to cannot be read (a drop box,
 /// `-wx`). It is still one object, so the folder named under it still asks:
 /// told by a canonical path it was two folders, and the named one was made

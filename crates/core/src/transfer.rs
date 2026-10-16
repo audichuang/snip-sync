@@ -3851,6 +3851,47 @@ pub fn plan_import_with(
 		.map(|(plan, _)| plan)
 }
 
+/// Points in planning where a test changes the disk, deterministically:
+/// what another process could do in between, in this order.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks {
+	use std::sync::Mutex;
+
+	type Hook = Box<dyn Fn() + Send>;
+
+	/// Process-wide: a worker in a test plans on its own thread. A test runs
+	/// in its own process under nextest.
+	static AFTER_TAIL_CHECK: Mutex<Option<Hook>> = Mutex::new(None);
+
+	/// Removes the hook when dropped.
+	pub struct HookGuard;
+
+	impl Drop for HookGuard {
+		fn drop(&mut self) {
+			*AFTER_TAIL_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		}
+	}
+
+	/// Runs `f` each time planning has checked that no level of a placed
+	/// folder's tail exists, before it tells the folders the user named
+	/// from the others.
+	pub fn after_tail_check(f: impl Fn() + Send + 'static) -> HookGuard {
+		*AFTER_TAIL_CHECK.lock().unwrap_or_else(|e| e.into_inner()) =
+			Some(Box::new(f));
+		HookGuard
+	}
+
+	pub(super) fn run_after_tail_check() {
+		if let Some(hook) = AFTER_TAIL_CHECK
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
+			hook();
+		}
+	}
+}
+
 /// A folder an absolute entry path may name, with the anchor it is planned
 /// against and the names below that anchor still to be made.
 struct RouteCandidate {
@@ -4028,6 +4069,9 @@ pub fn plan_import_parsed_with(
 			}
 		}
 	}
+
+	#[cfg(any(test, feature = "test-support"))]
+	test_hooks::run_after_tail_check();
 
 	let mut root_case_insensitive: HashMap<PathBuf, bool> = HashMap::new();
 	for root in &canonical_dest_roots {
@@ -6742,5 +6786,154 @@ mod case_policy_tests {
 		}
 		assert!(!lower.join("new").exists());
 		assert!(!upper.join("new").exists());
+	}
+}
+
+/// The folders the user named are made only with consent, whatever planning
+/// made of them: Apply checks each placed folder's tail itself.
+#[cfg(test)]
+mod placed_consent_tests {
+	use super::*;
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let path = entry.unwrap().path();
+				out.push(path.clone());
+				if path.is_dir() && !path.is_symlink() {
+					walk(&path, out);
+				}
+			}
+		}
+		let mut out = Vec::new();
+		walk(dir, &mut out);
+		out.sort();
+		out
+	}
+
+	/// Primary `new/sub` and prefix `q` at `NEW/SUB`, a payload for `q`
+	/// only, with `new` made by someone else after planning checked the
+	/// tails and before it told the named folders from the others. On a
+	/// filesystem that folds case `NEW/SUB` is then `sub` below an existing
+	/// folder, and planning took it for an incidental one.
+	#[cfg(any(target_os = "macos", windows))]
+	fn plan_raced(ws: &Path) -> TransferImportPlan {
+		let probe = ws.join(".case-probe");
+		fs::write(&probe, "").unwrap();
+		assert!(
+			ws.join(".CASE-PROBE").exists(),
+			"needs a filesystem that folds case"
+		);
+		fs::remove_file(&probe).unwrap();
+		let placed =
+			|rel: &str| PlacedRoot::resolve(None, &ws.join(rel)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("new/sub"));
+		mapping.map_prefix("q", placed("NEW/SUB"));
+		let new = ws.join("new");
+		let _hook = test_hooks::after_tail_check(move || {
+			fs::create_dir_all(&new).unwrap();
+		});
+		plan_import("// file: q/b.txt\nB\n", "", &[ws.to_path_buf()], &mapping)
+			.unwrap()
+	}
+
+	/// The folder made in between is gone again by Apply: every level of
+	/// the tail is missing, as the preview had it, and the folder the user
+	/// named is made only with consent, though planning listed none.
+	#[cfg(any(target_os = "macos", windows))]
+	#[test]
+	fn a_folder_made_while_planning_does_not_take_consent_away() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_raced(&ws);
+		fs::remove_dir(ws.join("new")).unwrap();
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert!(!dirs.is_empty())
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// The folder made in between is still there: a level of the tail
+	/// exists that did not when the folder was placed, so the plan is stale.
+	#[cfg(any(target_os = "macos", windows))]
+	#[test]
+	fn a_folder_made_while_planning_makes_the_plan_stale() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_raced(&ws);
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::StaleDestination { .. }) => {}
+			other => panic!("expected StaleDestination, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), vec![ws.join("new")]);
+	}
+
+	/// A plan that lists no folder as named (what a planning mistake would
+	/// leave) still makes the placed folder only with consent: Apply reads
+	/// the tail itself.
+	#[test]
+	fn apply_asks_for_a_placed_tail_the_plan_does_not_list() {
+		let (_tmp, ws) = tmp();
+		let placed = PlacedRoot::resolve(None, &ws.join("new/sub")).unwrap();
+		let plan = plan_import(
+			"// file: a.txt\nA\n",
+			"",
+			&[ws.clone()],
+			&ImportMapping::with_primary(placed),
+		)
+		.unwrap();
+		let mut freshness = plan.destination_freshness().clone();
+		freshness.requested_dirs = None;
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			plan.restore_plan().clone(),
+			freshness,
+		);
+		assert!(plan.new_dirs().requested.is_empty());
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert!(!dirs.is_empty())
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+
+		// With the tail agreed to, it is made and the file written.
+		let agreed = RestoreSelection {
+			confirmed_new_dirs: [ws.join("new"), ws.join("new/sub")].into(),
+			..Default::default()
+		};
+		plan.apply(&agreed).unwrap();
+		assert_eq!(fs::read_to_string(ws.join("new/sub/a.txt")).unwrap(), "A");
+	}
+
+	/// Two spellings of one folder to make (here through a symlink to the
+	/// folder above): the second `mkdir` meets the folder this Apply just
+	/// made, which is not someone else's.
+	#[cfg(unix)]
+	#[test]
+	fn one_folder_spelled_twice_is_made_once() {
+		let (_tmp, ws) = tmp();
+		std::os::unix::fs::symlink(&ws, ws.join("link")).unwrap();
+		let placed = PlacedRoot::resolve(None, &ws.join("x")).unwrap();
+		let plan = plan_import(
+			"// file: a.txt\nA\n",
+			"",
+			&[ws.clone()],
+			&ImportMapping::with_primary(placed),
+		)
+		.unwrap();
+		let made = plan
+			.make_requested_dirs(&[ws.join("new"), ws.join("link/new")])
+			.unwrap();
+		assert_eq!(made, vec![ws.join("new")]);
+		assert!(ws.join("new").is_dir());
 	}
 }
