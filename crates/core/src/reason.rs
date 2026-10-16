@@ -1054,6 +1054,45 @@ mod tests {
 		);
 	}
 
+	/// A `Datum` is a bare string on the wire: each of the six fields
+	/// serializes as the `String` it was, and reads back to the same value.
+	#[test]
+	fn datum_is_a_bare_string_on_the_wire() {
+		let d = || Datum::for_test("x");
+		for (reason, json) in [
+			(
+				Reason::Start {
+					start: None,
+					detail: d(),
+				},
+				r#"{"r":"start","start":null,"detail":"x"}"#,
+			),
+			(
+				Reason::Disconnected { detail: d() },
+				r#"{"r":"disconnected","detail":"x"}"#,
+			),
+			(
+				Reason::GitFailed { stderr: d() },
+				r#"{"r":"git_failed","stderr":"x"}"#,
+			),
+			(
+				Reason::Internal {
+					detail: d(),
+					condition: None,
+				},
+				r#"{"r":"internal","detail":"x"}"#,
+			),
+			(Reason::Io { detail: d() }, r#"{"r":"io","detail":"x"}"#),
+			(
+				Reason::SubmoduleUnreadable { detail: d() },
+				r#"{"r":"submodule_unreadable","detail":"x"}"#,
+			),
+		] {
+			assert_eq!(serde_json::to_string(&reason).unwrap(), json);
+			assert_eq!(serde_json::from_str::<Reason>(json).unwrap(), reason);
+		}
+	}
+
 	#[test]
 	fn io_reason_classifies_by_kind_never_by_text() {
 		use std::io::{Error, ErrorKind};
