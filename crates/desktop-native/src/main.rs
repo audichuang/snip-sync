@@ -101,9 +101,46 @@ pub(crate) fn run_isolated(exact_test_path: &str) -> bool {
 /// `ws_tab=<id>` ([`tabs::tag_line`]).
 macro_rules! app_log {
 	($($arg:tt)*) => {{
-		println!("{}", $crate::tabs::tag_line(format!($($arg)*)));
+		let line = $crate::tabs::tag_line(format!($($arg)*));
+		#[cfg(test)]
+		$crate::test_log::push(&line);
+		println!("{line}");
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 	}};
+}
+
+/// The lines `app_log!` printed on this thread, for a test of what a driver
+/// would read. A `#[gpui::test]` runs its foreground work on the test's own
+/// thread, and each test is a process of its own under nextest, so one
+/// test's lines never mix with another's.
+#[cfg(test)]
+pub(crate) mod test_log {
+	use std::cell::RefCell;
+	use std::collections::VecDeque;
+
+	/// The oldest lines are dropped past this many, so a long test cannot
+	/// grow the buffer without bound.
+	const KEEP: usize = 10_000;
+
+	thread_local! {
+		static LINES: RefCell<VecDeque<String>> =
+			const { RefCell::new(VecDeque::new()) };
+	}
+
+	pub(crate) fn push(line: &str) {
+		LINES.with(|lines| {
+			let mut lines = lines.borrow_mut();
+			if lines.len() >= KEEP {
+				lines.pop_front();
+			}
+			lines.push_back(line.to_string());
+		});
+	}
+
+	/// The lines so far; the buffer is empty afterwards.
+	pub(crate) fn take() -> Vec<String> {
+		LINES.with(|lines| lines.borrow_mut().drain(..).collect())
+	}
 }
 
 /// A commit copy's failure: the engine's own text (what the CLI prints, for
@@ -12610,6 +12647,82 @@ mod tests {
 			model.read_with(cx, |m, _| m.status.render(m.locale))
 		}
 
+		/// [`copying_non_contiguous_commits_logs_the_engines_text`] in a
+		/// remote workspace: the worker's export refuses, and the log line
+		/// still carries the engine's text, not the interface's.
+		#[gpui::test]
+		fn copying_non_contiguous_remote_commits_logs_the_engines_text(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			for n in ["one", "two", "three"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				crate::paste::tests::git_run(&alpha, &["add", "."]);
+				crate::paste::tests::git_run(
+					&alpha,
+					&["commit", "-qm", &format!("alpha {n}")],
+				);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the remote log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 3)
+			});
+			let ix_of = |cx: &mut VisualTestContext, subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newest = ix_of(cx, "alpha three");
+			let oldest = ix_of(cx, "alpha one");
+			let id = |ix: usize| -> &'static str {
+				Box::leak(format!("log-subject:{ix}").into_boxed_str())
+			};
+			let row = cx.debug_bounds(id(newest)).expect("the newest row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			let row = cx.debug_bounds(id(oldest)).expect("the oldest row");
+			cx.simulate_click(row.center(), gpui::Modifiers::secondary_key());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "two commits are selected");
+			});
+			let _ = crate::test_log::take();
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let lines = crate::test_log::take();
+			assert!(
+				lines
+					.iter()
+					.any(|l| l.starts_with("[APP:COPY_COMMITS_ERR: ")
+						&& l.contains("not contiguous")),
+				"{lines:#?}"
+			);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "error_payload");
+				let zh = m.status.render(crate::i18n::Locale::ZhTw);
+				assert!(zh.contains("產生 payload 失敗"), "{zh}");
+				assert!(!zh.contains("not contiguous"), "{zh}");
+			});
+		}
+
 		/// Copying the selected commit (Cmd+C in the Git Log) when the worker
 		/// cannot restart (#206).
 		#[cfg(unix)]
@@ -18640,6 +18753,73 @@ mod tests {
 					!commit_preview_shown(m),
 					"the late Log read reinstalled a commit diff",
 				);
+			});
+		}
+
+		/// Copying commits that are not one chain, by the user's gestures
+		/// (click, Cmd-click, Cmd+C): the e2e drivers read the engine's own
+		/// text on `COPY_COMMITS_ERR`, while the status words it in the
+		/// interface language. A regression this stops: the call site printing
+		/// the translated text, dropping the line, or a focus path that never
+		/// starts the copy.
+		#[gpui::test]
+		fn copying_non_contiguous_commits_logs_the_engines_text(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			for n in ["one", "two"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {n}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 3)
+			});
+			let ix_of = |cx: &mut VisualTestContext, subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newest = ix_of(cx, "alpha two");
+			let oldest = ix_of(cx, "base");
+			let id = |ix: usize| -> &'static str {
+				Box::leak(format!("log-subject:{ix}").into_boxed_str())
+			};
+			click(cx, id(newest));
+			let bounds = cx.debug_bounds(id(oldest)).expect("the oldest row");
+			cx.simulate_click(
+				bounds.center(),
+				gpui::Modifiers::secondary_key(),
+			);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "two commits are selected");
+			});
+			let _ = crate::test_log::take();
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let lines = crate::test_log::take();
+			assert!(
+				lines.iter().any(|l| l.starts_with(
+					"[APP:COPY_COMMITS_ERR: commits are not contiguous:"
+				)),
+				"{lines:#?}"
+			);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "error_payload");
+				let zh = m.status.render(crate::i18n::Locale::ZhTw);
+				assert!(zh.contains("產生 payload 失敗"), "{zh}");
+				assert!(!zh.contains("not contiguous"), "{zh}");
 			});
 		}
 
