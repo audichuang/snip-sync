@@ -17,6 +17,7 @@ use snip_core::copy::CopyResult;
 use snip_core::format::parse_clipboard;
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
+use snip_core::reason::Reason;
 use snip_core::restore::{
 	apply_restore_base, is_relative, RestoreBaseSuggestion, RestorePlan,
 	RestoreSelection,
@@ -106,6 +107,13 @@ enum Command {
 		/// Apply the suggested folder-level path adjustment.
 		#[arg(long)]
 		adjust_paths: bool,
+		/// Send the entries under `PREFIX/` to the folder PATH (relative to
+		/// --repo; `.` is --repo itself) instead of --repo. Repeatable.
+		#[arg(long = "map", value_name = "PREFIX=PATH")]
+		map: Vec<String>,
+		/// Make the folders --repo and --map name that do not exist yet.
+		#[arg(long)]
+		create_dirs: bool,
 		/// Read the payload from stdin instead of the clipboard.
 		#[arg(long)]
 		stdin: bool,
@@ -186,6 +194,8 @@ fn main() -> ExitCode {
 			overwrite,
 			skip_existing,
 			adjust_paths,
+			map,
+			create_dirs,
 			stdin,
 			..
 		} => {
@@ -194,10 +204,16 @@ fn main() -> ExitCode {
 				overwrite,
 				skip_existing,
 				adjust_paths,
+				maps: local_maps(&repo, &parse_maps(&map)),
+				create_dirs,
+				repo: Some(repo.clone()),
 			};
 			read_paste_text(stdin).and_then(|text| {
 				paste(
-					&PasteTarget::Local { dest: repo.clone() },
+					&PasteTarget::Local {
+						dest: repo.clone(),
+						bound: None,
+					},
 					&text,
 					&settings,
 					&opts,
@@ -618,6 +634,55 @@ pub(crate) struct PasteOptions {
 	pub overwrite: bool,
 	pub skip_existing: bool,
 	pub adjust_paths: bool,
+	/// `--map PREFIX=PATH`, each PATH already made the folder the target
+	/// pastes into: absolute for a local target, relative to the workspace
+	/// for a remote one.
+	pub maps: Vec<(String, PathBuf)>,
+	/// `--create-dirs`: the user agrees to make the folders that do not exist.
+	pub create_dirs: bool,
+	/// `--repo` of a local paste, to tell it from a `--map` folder in an error.
+	pub repo: Option<PathBuf>,
+}
+
+/// `--map PREFIX=PATH` as given: exactly one `=`, a PREFIX that is one
+/// non-empty name, each PREFIX once. Anything else is a usage error.
+pub(crate) fn parse_maps(maps: &[String]) -> Vec<(String, String)> {
+	let mut out: Vec<(String, String)> = Vec::new();
+	for map in maps {
+		let (prefix, path) = match map.split_once('=') {
+			Some((prefix, path)) if !path.contains('=') => (prefix, path),
+			_ => usage(format!("--map expects PREFIX=PATH, got '{map}'")),
+		};
+		if prefix.is_empty() || prefix.contains(['/', '\\']) {
+			usage(format!(
+				"--map PREFIX must be one folder name, got '{prefix}'"
+			));
+		}
+		if out.iter().any(|(p, _)| p == prefix) {
+			usage(format!("--map names '{prefix}' twice"));
+		}
+		out.push((prefix.to_string(), path.to_string()));
+	}
+	out
+}
+
+/// A local `--map` folder: an absolute PATH as it is, any other under
+/// `--repo`.
+fn local_maps(
+	repo: &Path,
+	maps: &[(String, String)],
+) -> Vec<(String, PathBuf)> {
+	maps.iter()
+		.map(|(prefix, path)| {
+			let path = Path::new(path);
+			let folder = if path.is_absolute() {
+				path.to_path_buf()
+			} else {
+				repo.join(path)
+			};
+			(prefix.clone(), folder)
+		})
+		.collect()
 }
 
 /// The payload: stdin, or the clipboard.
@@ -654,12 +719,23 @@ pub(crate) fn paste(
 
 /// A paste that did not plan, check or write, in the words `snip paste`
 /// has always used.
-fn format_paste_error(err: PasteError) -> String {
+fn format_paste_error(err: PasteError, repo: Option<&Path>) -> String {
 	match err {
+		// `--repo` unless the folder is another one the paste names (`--map`).
 		PasteError::Destination { path, source } => format!(
-			"--repo {} does not exist or cannot be resolved: {source}",
+			"{} {} does not exist or cannot be resolved: {source}",
+			if repo.is_none_or(|repo| repo == path) {
+				"--repo"
+			} else {
+				"--map folder"
+			},
 			path.display()
 		),
+		e if matches!(e.reason(), Reason::NewDirsNotConfirmed { .. }) => {
+			format!(
+				"Snipcode refused to paste: {e}; pass --create-dirs to create them"
+			)
+		}
 		PasteError::OutcomeUnknown(e) => format!(
 			"The connection was lost; whether the paste finished is unknown ({e}). \
 			 Check the destination (snip remote changes / ls) before pasting again."
@@ -716,16 +792,19 @@ fn paste_files(
 	// with --adjust-paths. A worker suggests against its own folders.
 	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
 	let route = PasteRoute {
-		prefixes: Vec::new(),
+		prefixes: opts.maps.clone(),
 		adjust_paths: opts.adjust_paths,
 		header_format: settings.header_format.clone(),
+		// The folders --repo, --in and --map name may be ones to make: a
+		// dry run lists them, an apply needs --create-dirs.
+		allow_new_dirs: true,
 	};
 	let mut note = |s: &RestoreBaseSuggestion| {
 		note_suggestion(s, &paths, opts.adjust_paths)
 	};
 	let import = target
 		.plan_files(text, &route, &RunOptions::default(), Some(&mut note))
-		.map_err(format_paste_error)?;
+		.map_err(|e| format_paste_error(e, opts.repo.as_deref()))?;
 
 	let plan = import.restore_plan();
 	if !opts.apply {
@@ -738,6 +817,21 @@ fn paste_files(
 		);
 		return Ok(());
 	}
+	let new_dirs = import.new_dirs();
+	// A dry run names the folders it would make for --repo, --in and --map.
+	// The folders a file's own path implies are listed beside them, and only
+	// then: a paste into folders that all exist prints what it always did.
+	if !opts.apply && !new_dirs.requested.is_empty() {
+		for dir in &new_dirs.requested {
+			eprintln!("would create folder: {}/", dir.display());
+		}
+		for dir in &new_dirs.incidental {
+			eprintln!(
+				"would create folder: {}/ (for file paths)",
+				dir.display()
+			);
+		}
+	}
 	eprintln!("{}", confirmation_summary(plan));
 	if !opts.apply {
 		return Ok(());
@@ -749,20 +843,37 @@ fn paste_files(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
 		));
 	}
+	if !new_dirs.requested.is_empty() && !opts.create_dirs {
+		let folders: Vec<String> = new_dirs
+			.requested
+			.iter()
+			.map(|d| format!("{}/", d.display()))
+			.collect();
+		return Err(format!(
+			"Snipcode refused to paste: these folders do not exist: {}; pass --create-dirs to create them",
+			folders.join(", ")
+		));
+	}
+	let mut selection = RestoreSelection {
+		overwrite_existing: opts.overwrite,
+		skip_existing: opts.skip_existing,
+		..Default::default()
+	};
+	if opts.create_dirs {
+		// The agreement is to the folders the rows kept need, as the plan
+		// lists them.
+		selection.confirmed_new_dirs = import
+			.new_dirs_for(&selection)
+			.requested
+			.into_iter()
+			.collect();
+	}
 	let result = target
-		.apply_files(
-			text,
-			&route,
-			&import,
-			&RestoreSelection {
-				overwrite_existing: opts.overwrite,
-				skip_existing: opts.skip_existing,
-				..Default::default()
-			},
-		)
-		.map_err(format_paste_error)?;
+		.apply_files(text, &route, &import, &selection)
+		.map_err(|e| format_paste_error(e, opts.repo.as_deref()))?;
 
 	let parts: Vec<String> = [
+		("Created folders", result.created_dirs),
 		("Created", result.created_count),
 		("Overwritten", result.overwritten_count),
 		("Skipped", result.total_skipped()),
@@ -833,6 +944,12 @@ fn paste_commits(
 	if opts.adjust_paths {
 		usage("commit payloads do not support --adjust-paths");
 	}
+	if !opts.maps.is_empty() {
+		usage("commit payloads do not support --map");
+	}
+	if opts.create_dirs {
+		usage("commit payloads do not support --create-dirs");
+	}
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
 
@@ -840,7 +957,7 @@ fn paste_commits(
 	// refused, and a whole-repo replay opens the repo root.
 	let (preview, prepared) = target
 		.plan_commits(text, payload.clone(), &RunOptions::default())
-		.map_err(format_paste_error)?;
+		.map_err(|e| format_paste_error(e, opts.repo.as_deref()))?;
 
 	if !opts.apply {
 		let plan = preview.plan();
@@ -910,7 +1027,7 @@ fn paste_commits(
 	if existing > 0 && !opts.overwrite {
 		target
 			.check_commits(text, &preview, &prepared)
-			.map_err(format_paste_error)?;
+			.map_err(|e| format_paste_error(e, opts.repo.as_deref()))?;
 		usage(format!(
 			"{existing} destination file(s) already exist; commit payloads need --overwrite"
 		));
@@ -918,7 +1035,7 @@ fn paste_commits(
 
 	let result = target
 		.apply_commits(text, &preview, &prepared)
-		.map_err(format_paste_error)?;
+		.map_err(|e| format_paste_error(e, opts.repo.as_deref()))?;
 	stdout_line(&format!("Created {} commit(s).", result.created.len()))?;
 	for sha in &result.created {
 		stdout_line(&format!("  {sha}"))?;
@@ -957,24 +1074,30 @@ mod tests {
 		use snip_core::gitsrc::GitError;
 		use snip_remote::{ErrorCode, RemoteError};
 		fn missing(path: &Path, e: io::Error) -> String {
-			format_paste_error(PasteError::Destination {
-				path: path.to_path_buf(),
-				source: e,
-			})
+			format_paste_error(
+				PasteError::Destination {
+					path: path.to_path_buf(),
+					source: e,
+				},
+				Some(path),
+			)
 		}
 		fn local(e: TransferError) -> String {
-			format_paste_error(PasteError::Local(e))
+			format_paste_error(PasteError::Local(e), None)
 		}
 		fn remote(e: RemoteError) -> String {
-			format_paste_error(PasteError::Remote(e))
+			format_paste_error(PasteError::Remote(e), None)
 		}
 		// What `apply_failure` does to an Apply's error.
 		fn apply(e: RemoteError) -> String {
-			format_paste_error(if e.outcome_unknown() {
-				PasteError::OutcomeUnknown(e)
-			} else {
-				PasteError::Remote(e)
-			})
+			format_paste_error(
+				if e.outcome_unknown() {
+					PasteError::OutcomeUnknown(e)
+				} else {
+					PasteError::Remote(e)
+				},
+				None,
+			)
 		}
 		let refused = |code, message: &str| RemoteError::Refused {
 			code,
@@ -1066,8 +1189,37 @@ mod tests {
 		assert_eq!(apply(refused(ErrorCode::Stale, STALE)), stale_text);
 		// A replay answered without its result keeps its bare words.
 		assert_eq!(
-			format_paste_error(PasteError::NoReplayResult),
+			format_paste_error(PasteError::NoReplayResult, None),
 			"the replay returned no result"
+		);
+		// A folder a `--map` names is not `--repo`.
+		assert_eq!(
+			format_paste_error(
+				PasteError::Destination {
+					path: "/lib".into(),
+					source: io::Error::new(io::ErrorKind::NotFound, "gone")
+				},
+				Some(Path::new("/repo"))
+			),
+			"--map folder /lib does not exist or cannot be resolved: gone"
+		);
+		// A folder to make that was not agreed to, said by the engine here or
+		// by a worker's reason, says how to agree.
+		let not_confirmed = "Snipcode refused to paste: 1 folder(s) would be created without consent: /w/new; pass --create-dirs to create them";
+		assert_eq!(
+			local(TransferError::NewDirsNotConfirmed {
+				dirs: vec!["/w/new".into()]
+			}),
+			not_confirmed
+		);
+		assert_eq!(
+			remote(RemoteError::Refused {
+				code: ErrorCode::BadRequest,
+				message: "1 folder(s) would be created without consent: /w/new".into(),
+				reason: Some(Box::new(Reason::NewDirsNotConfirmed { count: 1 })),
+				suggestion: None,
+			}),
+			"Snipcode refused to paste: 1 folder(s) would be created without consent: /w/new; pass --create-dirs to create them"
 		);
 	}
 }

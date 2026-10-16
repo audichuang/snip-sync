@@ -2629,6 +2629,11 @@ fn paste_commits_disallowed_flags_exit_two() {
 		vec!["--apply", "--adjust-paths"],
 		vec!["--dry-run", "--skip-existing"],
 		vec!["--dry-run", "--adjust-paths"],
+		// #241 L5: folders a commit payload cannot make or route to.
+		vec!["--apply", "--map", "x=."],
+		vec!["--dry-run", "--map", "x=."],
+		vec!["--apply", "--create-dirs"],
+		vec!["--dry-run", "--create-dirs"],
 	];
 
 	for flags in &flag_combos {
@@ -3149,7 +3154,7 @@ fn paste_create_dirs_makes_the_missing_repo() {
 		Some(b"// file: a/b.txt\nhi\n"),
 	);
 	assert_eq!(code(&apply), 0, "stderr was: {}", text(&apply.stderr));
-	assert_eq!(fs::read_to_string(nope.join("a/b.txt")).unwrap(), "hi\n");
+	assert_eq!(fs::read_to_string(nope.join("a/b.txt")).unwrap(), "hi");
 	assert!(
 		text(&apply.stdout).contains("Created folders 1"),
 		"stdout was: {}",
@@ -3174,8 +3179,8 @@ fn paste_map_sends_a_prefix_to_a_folder() {
 		Some(payload.as_bytes()),
 	);
 	assert_eq!(code(&flat), 0, "stderr was: {}", text(&flat.stderr));
-	assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "A\n");
-	assert_eq!(fs::read_to_string(repo.join("top.txt")).unwrap(), "T\n");
+	assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "A");
+	assert_eq!(fs::read_to_string(repo.join("top.txt")).unwrap(), "T");
 	assert!(!repo.join("sub").exists());
 
 	let nested = snip(
@@ -3193,7 +3198,31 @@ fn paste_map_sends_a_prefix_to_a_folder() {
 		Some(payload.as_bytes()),
 	);
 	assert_eq!(code(&nested), 0, "stderr was: {}", text(&nested.stderr));
-	assert_eq!(fs::read_to_string(repo.join("lib/x/a.txt")).unwrap(), "A\n");
+	assert_eq!(fs::read_to_string(repo.join("lib/x/a.txt")).unwrap(), "A");
+}
+
+/// #241 L6: a `--map` that is not PREFIX=PATH, with a PREFIX that is not one
+/// name, or that names a PREFIX twice, is a usage error, not a paste.
+#[test]
+fn paste_map_with_a_bad_shape_exits_two() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let repo_s = repo.to_str().unwrap();
+	let cases: [&[&str]; 5] = [
+		&["--map", "a/b=."],
+		&["--map", "=."],
+		&["--map", "noeq"],
+		&["--map", "a=b=c"],
+		&["--map", "a=.", "--map", "a=lib"],
+	];
+	for maps in cases {
+		let mut args = vec!["--repo", repo_s, "paste", "--dry-run", "--stdin"];
+		args.extend(maps);
+		let out = snip(&args, Some(b"// file: a/x.txt\nhi\n"));
+		assert_eq!(code(&out), 2, "{maps:?}: {}", text(&out.stderr));
+	}
+	assert!(fs::read_dir(&repo).unwrap().next().is_none());
 }
 
 /// #241 L7: a `--repo` that is a regular file is no folder, and the error
