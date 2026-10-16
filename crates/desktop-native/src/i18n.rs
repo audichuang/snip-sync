@@ -1621,6 +1621,12 @@ mod tests {
 			"paste_diff_not_applied",
 			"status_commits_copied",
 			"status_commits_copied_skipped",
+			// Built from a match, so the source scan above does not see them.
+			"clip_err_empty",
+			"clip_err_unsupported",
+			"clip_err_occupied",
+			"clip_err_conversion",
+			"clip_err_other",
 		];
 		for key in test_keys {
 			assert!(
