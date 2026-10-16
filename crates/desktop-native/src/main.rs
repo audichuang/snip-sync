@@ -2475,7 +2475,7 @@ impl WorkbenchModel {
 			lifecycle::Request::Accepted => {
 				// A workspace open/close is under way: an in-flight remote
 				// open that lands later must not touch it (remote.rs).
-				self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
+				self.remote.open_seq.invalidate();
 				self.generation = self.generation.wrapping_add(1);
 				self.preview_generation.invalidate();
 				self.held_selection = None;
@@ -8685,7 +8685,9 @@ mod tests {
 			model.update(cx, |m, cx| {
 				let seq = m.remote.browse.as_ref().unwrap().seq();
 				m.remote_listing_landed(
-					seq.wrapping_sub(1),
+					crate::gen::Stamp::for_tests(
+						seq.raw_for_tests().wrapping_sub(1),
+					),
 					Ok(crate::remote::FolderListing {
 						path: "/elsewhere".into(),
 						folders: vec!["zzz".into()],

@@ -84,6 +84,12 @@ impl<L> Gen<L> {
 }
 
 impl<L> Stamp<L> {
+	/// The count, for a test that builds the stamp before it.
+	#[cfg(test)]
+	pub(crate) fn raw_for_tests(self) -> u64 {
+		self.n
+	}
+
 	/// A stamp with a chosen value, for a test that builds a landing by hand.
 	#[cfg(test)]
 	pub(crate) fn for_tests(n: u64) -> Self {

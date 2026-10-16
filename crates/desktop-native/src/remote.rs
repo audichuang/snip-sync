@@ -237,7 +237,7 @@ pub struct Browse {
 	pub listing: Option<Result<FolderListing, Msg>>,
 	/// A listing that lands with another number is for a folder no longer
 	/// shown.
-	seq: u64,
+	seq: crate::gen::Stamp<crate::gen::BrowseLane>,
 	/// Kept across hops on one host, so a click does not start ssh again.
 	client: Option<Arc<Client>>,
 	/// Ends this listing's connect and calls once another listing, a
@@ -267,7 +267,7 @@ impl Browse {
 		self.client.clone()
 	}
 
-	pub fn seq(&self) -> u64 {
+	pub fn seq(&self) -> crate::gen::Stamp<crate::gen::BrowseLane> {
 		self.seq
 	}
 
@@ -286,7 +286,7 @@ impl Browse {
 			host,
 			path: String::new(),
 			listing: None,
-			seq: 0,
+			seq: crate::gen::Stamp::for_tests(0),
 			client: None,
 			cancel: snip_core::gitrun::CancelToken::new(),
 			prefill: String::new(),
@@ -324,11 +324,11 @@ pub struct MasterState {
 	/// in-flight open: a local open, a close or a newer remote open. A
 	/// result landing with an older seq is dropped, workspace and status
 	/// bar untouched.
-	pub open_seq: u64,
+	pub open_seq: crate::gen::Gen<crate::gen::RemoteOpenLane>,
 	pub message: Option<(bool, Msg)>,
 	/// The host whose folders are listed, and the folder shown.
 	pub browse: Option<Browse>,
-	pub(crate) browse_seq: u64,
+	pub(crate) browse_seq: crate::gen::Gen<crate::gen::BrowseLane>,
 	pub scan_error: Option<Msg>,
 	/// A scan still in flight or waiting to retry. Kept across a cancelled
 	/// drain so an initial scan with no selected repository can resume.
@@ -389,10 +389,11 @@ pub struct Restoring {
 	/// Why the last attempt failed; the tab shows it until one succeeds.
 	pub failed: Option<Msg>,
 	/// The `open_seq` of the attempt in flight.
-	pub(crate) open_seq: Option<u64>,
+	pub(crate) open_seq: Option<crate::gen::Stamp<crate::gen::RemoteOpenLane>>,
 	/// Attempts made; the next one waits [`retry_delay`] of it.
 	pub(crate) attempts: u32,
 	/// Tells a retry timer of an earlier restore of this tab from this one.
+	// U64-NOT-GEN: one restore's identity, drawn from a process-wide counter; only its own retry timer compares it
 	pub(crate) id: u64,
 }
 
@@ -819,8 +820,7 @@ impl WorkbenchModel {
 			.and_then(|b| b.client.clone())
 			.filter(|c| c.host().name == host.name)
 			.unwrap_or_else(|| Arc::new(Client::new(host, device_name())));
-		self.remote.browse_seq = self.remote.browse_seq.wrapping_add(1);
-		let seq = self.remote.browse_seq;
+		let seq = self.remote.browse_seq.bump();
 		let cancel = snip_core::gitrun::CancelToken::new();
 		let previous = self.remote.browse.replace(Browse {
 			host: idx,
@@ -885,7 +885,7 @@ impl WorkbenchModel {
 	/// shown now.
 	pub(crate) fn remote_listing_landed(
 		&mut self,
-		seq: u64,
+		seq: crate::gen::Stamp<crate::gen::BrowseLane>,
 		result: Result<FolderListing, Msg>,
 		cx: &mut Context<Self>,
 	) {
@@ -986,8 +986,7 @@ impl WorkbenchModel {
 		self.remote.busy = true;
 		self.remote.message = None;
 		// Any open that follows (local or remote) invalidates this one.
-		self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
-		let open_seq = self.remote.open_seq;
+		let open_seq = self.remote.open_seq.bump();
 		#[cfg(test)]
 		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
@@ -1061,13 +1060,13 @@ impl WorkbenchModel {
 				.await;
 			let _ = this.update(&mut async_app, |this, cx| {
 				this.remote.busy = false;
-				if this.remote.open_seq != open_seq {
+				if !this.remote.open_seq.is_current(open_seq) {
 					// The user opened a local workspace, closed the
 					// workspace or started another remote open meanwhile:
 					// neither the workspace nor the status bar moves.
 					app_log!(
 						"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
-						this.remote.open_seq
+						this.remote.open_seq.current()
 					);
 					this.resume_remote_restore(cx);
 					return;
@@ -1223,7 +1222,8 @@ impl WorkbenchModel {
 			return;
 		}
 		let interrupted = self.remote.restoring.as_ref().is_some_and(|r| {
-			r.open_seq.is_some_and(|seq| seq != self.remote.open_seq)
+			r.open_seq
+				.is_some_and(|seq| !self.remote.open_seq.is_current(seq))
 		});
 		if interrupted {
 			let r = self.remote.restoring.as_mut().unwrap();
@@ -1257,7 +1257,7 @@ impl WorkbenchModel {
 			return self.restore_failed(why, true, cx);
 		}
 		if self.remote.busy {
-			let seq = self.remote.open_seq;
+			let seq = self.remote.open_seq.current();
 			if let Some(r) = self.remote.restoring.as_mut() {
 				r.open_seq = Some(seq);
 			}
