@@ -9680,6 +9680,16 @@ fn apply_with_reservation_changed(
 	selection: RestoreSelection,
 	how: Interloper,
 ) -> (restore::RestoreExecutionResult, TestRepo) {
+	apply_with_b_changed(selection, |b| how.run(b))
+}
+
+/// Two new files; between the first row's write and the second's, `change`
+/// runs on the second one's reservation, `b.txt`.
+fn apply_with_b_changed(
+	selection: RestoreSelection,
+	change: impl FnOnce(&Path),
+) -> (restore::RestoreExecutionResult, TestRepo) {
+	let mut change = Some(change);
 	let dst = TestRepo::new("dest-repo");
 	dst.write("keep.txt", "k");
 	dst.commit("base");
@@ -9699,7 +9709,7 @@ fn apply_with_reservation_changed(
 			if writes == 1 {
 				assert_eq!(op.relative_path, "a.txt");
 				assert_eq!(fs::read(&b).unwrap(), b"", "b.txt is reserved");
-				how.run(&b);
+				(change.take().unwrap())(&b);
 			}
 		})
 		.unwrap();
@@ -9793,5 +9803,71 @@ fn a_reserved_file_given_binary_content_is_never_overwritten() {
 		let (result, dst) =
 			apply_with_reservation_changed(selection.clone(), how);
 		assert_reservation_kept(&result, &dst, how);
+	}
+}
+
+/// Empties `target` again, as an editor saving an empty buffer does: the
+/// length stays 0, the time it was last modified does not.
+fn empty_it_again(target: &Path) {
+	let file = fs::OpenOptions::new()
+		.write(true)
+		.truncate(true)
+		.open(target)
+		.unwrap();
+	let earlier = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	file.set_modified(earlier).unwrap();
+}
+
+#[test]
+fn a_reserved_file_emptied_again_by_someone_else_is_kept() {
+	let skip_existing = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	for selection in [RestoreSelection::default(), skip_existing] {
+		let (result, dst) = apply_with_b_changed(selection, empty_it_again);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+		assert!(
+			dst.exists("b.txt"),
+			"the file someone else emptied is theirs, not taken back"
+		);
+		assert_eq!(dst.read("b.txt"), "");
+	}
+}
+
+/// Runs on every OS: `fs::hard_link` makes a hard link on Windows too
+/// (there it is only built, by clippy, on a Mac).
+#[test]
+fn a_reserved_file_given_a_hard_link_outside_is_not_written_through() {
+	let overwrite = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	for (selection, b_after) in
+		[(RestoreSelection::default(), ""), (overwrite, "second")]
+	{
+		let mut alias = PathBuf::new();
+		let (result, dst) = apply_with_b_changed(selection, |b| {
+			alias = b.parent().unwrap().parent().unwrap().join("alias.txt");
+			fs::hard_link(b, &alias).unwrap();
+		});
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(
+			fs::read(&alias).unwrap(),
+			b"",
+			"a name outside the destination never receives the paste"
+		);
+		assert!(dst.exists("b.txt"), "{result:?}");
+		assert_eq!(dst.read("b.txt"), b_after, "{result:?}");
+		if b_after.is_empty() {
+			assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+		} else {
+			assert_eq!(result.overwritten_count, 1, "{result:?}");
+		}
 	}
 }
