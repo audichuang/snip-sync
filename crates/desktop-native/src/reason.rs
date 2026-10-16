@@ -124,7 +124,7 @@ pub fn stale_log_token(change: &StaleChange) -> &'static str {
 
 /// The token of a failed Apply's message on the `PASTE_STALE_DETECTED`
 /// line: a stable e2e contract, never a dictionary key that a rename could
-/// change. A destination change reads as [`stale_log_token`]; any other
+/// change. A destination change reads as its `stale_*` token; any other
 /// reason a file apply failed for (a worker's stale refusal, an engine
 /// error) reads `stale_modified`; the paste messages of the app itself keep
 /// their own names.
