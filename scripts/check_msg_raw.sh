@@ -120,7 +120,7 @@ while IFS=: read -r file line_num line_content; do
 		if [[ "$line_content" == *"ALLOWED-ERR-TEXT:"* ]]; then
 			continue
 		fi
-		prev=$(sed -n "$((line_num - 1))p" "$file")
+		prev=$(line_before "$file" "$line_num")
 		if [[ "$prev" == *"ALLOWED-ERR-TEXT:"* ]]; then
 			continue
 		fi

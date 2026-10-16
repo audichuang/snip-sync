@@ -22,8 +22,7 @@ while IFS=: read -r file line_num line_content; do
 	is_test_line "$file" "$line_num" || continue
 
 	# Check if preceding line contains ALLOWED-TEST-REFRESH:
-	prev_line_num=$((line_num - 1))
-	prev_line=$(sed -n "${prev_line_num}p" "$file")
+	prev_line=$(line_before "$file" "$line_num")
 	if [[ "$prev_line" != *"ALLOWED-TEST-REFRESH:"* ]]; then
 		echo "ERROR: Unallowlisted .refresh() call in test code at ${file}:${line_num}:" >&2
 		echo "  ${line_content}" >&2

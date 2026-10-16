@@ -72,3 +72,11 @@ misnamed_test_modules() { # DIR... -> "file:line: text" per misnamed module
 		done < <(find "$dir" -name '*.rs')
 	done
 }
+
+# The line before line $2 of file $1, or nothing on line 1. GNU sed rejects
+# line address 0, which BSD sed reads as no line.
+line_before() {
+	local n=$(($2 - 1))
+	((n >= 1)) || return 0
+	sed -n "${n}p" "$1"
+}
