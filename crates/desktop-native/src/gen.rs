@@ -51,6 +51,12 @@ impl<L> Gen<L> {
 		self.current()
 	}
 
+	/// [`Self::bump`] for a caller that does not keep the stamp: whatever was
+	/// in flight is dropped.
+	pub(crate) fn invalidate(&mut self) {
+		self.n = self.n.wrapping_add(1);
+	}
+
 	/// The stamp of now.
 	pub(crate) fn current(&self) -> Stamp<L> {
 		Stamp {

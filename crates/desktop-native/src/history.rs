@@ -1634,7 +1634,7 @@ impl WorkbenchModel {
 			self.preview_pending_from_log = false;
 			self.preview_loading = false;
 		}
-		self.details_generation = self.details_generation.wrapping_add(1);
+		self.details_generation.invalidate();
 		self.selected_commit = None;
 		self.range_head = None;
 		self.log_selected.clear();
@@ -2171,8 +2171,7 @@ impl WorkbenchModel {
 		id: String,
 		cx: &mut Context<Self>,
 	) {
-		self.details_generation = self.details_generation.wrapping_add(1);
-		let generation = self.details_generation;
+		let generation = self.details_generation.bump();
 		if self
 			.commit_view
 			.commit_details
@@ -2203,7 +2202,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.details_generation != generation {
+				if !model.details_generation.is_current(generation) {
 					return;
 				}
 				// The details land where their commit is selected: on the
@@ -2281,8 +2280,7 @@ impl WorkbenchModel {
 				Some((root, identity, sha, id.clone()))
 			})
 			.collect();
-		self.details_generation = self.details_generation.wrapping_add(1);
-		let generation = self.details_generation;
+		let generation = self.details_generation.bump();
 		if !self.accepting_work() {
 			return;
 		}
@@ -2313,7 +2311,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.details_generation != generation {
+				if !model.details_generation.is_current(generation) {
 					return;
 				}
 				// A multi-selection nothing holds any more has no list to
@@ -2476,7 +2474,7 @@ impl WorkbenchModel {
 		};
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.details_generation = self.details_generation.wrapping_add(1);
+		self.details_generation.invalidate();
 		self.reset_commit_view();
 		self.reset_selection_details();
 		self.compare = None;
@@ -2645,7 +2643,7 @@ impl WorkbenchModel {
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.compare = Some((older.clone(), newer.clone()));
-		self.details_generation = self.details_generation.wrapping_add(1);
+		self.details_generation.invalidate();
 		// Compare shows only its own header, so the whole view and the
 		// multi-selection's list state restart together: an expanded flag
 		// must not stay true over an emptied `selection_details`.
@@ -3083,7 +3081,7 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
-		self.tree_generation += 1;
+		self.tree_generation.invalidate();
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		self.rev_tree = Some(RevTree::new(sha.clone()));
 		self.tree_cursor = 0;
@@ -3095,7 +3093,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn leave_rev_tree(&mut self, cx: &mut Context<Self>) {
-		self.tree_generation += 1;
+		self.tree_generation.invalidate();
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		self.rev_tree = None;
 		self.tree_cursor = 0;
@@ -3113,7 +3111,7 @@ impl WorkbenchModel {
 			return;
 		};
 		let sha = tree.sha.clone();
-		let gen = self.tree_generation;
+		let gen = self.tree_generation.current();
 		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
@@ -3136,7 +3134,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.tree_generation != gen {
+				if !model.tree_generation.is_current(gen) {
 					return;
 				}
 				let Some(tree) = model.rev_tree.as_mut() else {

@@ -900,7 +900,7 @@ pub struct WorkbenchModel {
 	pub log_selection_expanded: bool,
 	/// Commits whose details list every containing branch read.
 	pub log_branches_all: Vec<String>,
-	pub details_generation: u64,
+	pub details_generation: crate::gen::Gen<crate::gen::DetailsLane>,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
 
@@ -961,7 +961,7 @@ pub struct WorkbenchModel {
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
 	pub paste_diff_cancel: Option<CancelToken>,
-	pub paste_diff_generation: u64,
+	pub paste_diff_generation: crate::gen::Gen<crate::gen::PasteDiffLane>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, Failure)>,
@@ -1002,7 +1002,7 @@ pub struct WorkbenchModel {
 	/// counts how many one repo-set change costs.
 	#[cfg(test)]
 	pub(crate) history_replace_loads: u64,
-	pub tree_generation: u64,
+	pub tree_generation: crate::gen::Gen<crate::gen::TreeLane>,
 	pub mode: String,
 	pub focus_handle: FocusHandle,
 	pub reader_focus: FocusHandle,
@@ -1470,7 +1470,7 @@ impl WorkbenchModel {
 			log_details_h: None,
 			log_selection_expanded: false,
 			log_branches_all: Vec::new(),
-			details_generation: 0,
+			details_generation: Default::default(),
 			details_cancel: None,
 			git_user_email: None,
 			commit_view: Default::default(),
@@ -1526,7 +1526,7 @@ impl WorkbenchModel {
 			add_cancel: None,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			paste_diff_cancel: None,
-			paste_diff_generation: 0,
+			paste_diff_generation: Default::default(),
 			status: if workspace.is_some() {
 				Msg::new("status_scanning", [])
 			} else {
@@ -1544,7 +1544,7 @@ impl WorkbenchModel {
 			history_generation: 0,
 			#[cfg(test)]
 			history_replace_loads: 0,
-			tree_generation: 0,
+			tree_generation: Default::default(),
 			mode,
 			focus_handle: cx.focus_handle(),
 			reader_focus: cx.focus_handle().tab_index(34).tab_stop(true),
@@ -2480,7 +2480,7 @@ impl WorkbenchModel {
 				self.held_selection = None;
 				self.history_generation =
 					self.history_generation.wrapping_add(1);
-				self.tree_generation = self.tree_generation.wrapping_add(1);
+				self.tree_generation.invalidate();
 				for slot in [
 					&mut self.history_cancel,
 					&mut self.preview_cancel,
@@ -2682,7 +2682,7 @@ impl WorkbenchModel {
 		self.preview_generation = self.preview_generation.wrapping_add(1);
 		self.held_selection = None;
 		self.history_generation = self.history_generation.wrapping_add(1);
-		self.tree_generation = self.tree_generation.wrapping_add(1);
+		self.tree_generation.invalidate();
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		for slot in [
 			&mut self.history_cancel,
@@ -2731,7 +2731,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_reload_for = None;
-		self.details_generation = self.details_generation.wrapping_add(1);
+		self.details_generation.invalidate();
 		self.git_user_email = None;
 		self.compare = None;
 		self.changes_loaded = false;
@@ -4048,7 +4048,7 @@ impl WorkbenchModel {
 			let _ = arm_cancel(&mut self.history_cancel);
 			self.log_reload_for = Some(task_generation);
 		}
-		self.tree_generation += 1;
+		self.tree_generation.invalidate();
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
@@ -4113,7 +4113,7 @@ impl WorkbenchModel {
 			// preview read, and the details read of the commit that was
 			// selected must not land (L6 and L8 of `invariants`).
 			self.preview_pending_from_log = false;
-			self.details_generation = self.details_generation.wrapping_add(1);
+			self.details_generation.invalidate();
 			let _ = arm_cancel(&mut self.details_cancel);
 		}
 		// The same commit stays selected while the repo is read again, so
@@ -5712,7 +5712,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.paste_diff_cancel.take() {
 			token.cancel();
 		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.paste_diff_generation.invalidate();
 	}
 
 	/// A click on a folder or root row puts the cursor on it.
@@ -5854,7 +5854,7 @@ impl WorkbenchModel {
 		};
 
 		let cancel = arm_cancel(&mut self.paste_diff_cancel);
-		let task_gen = self.paste_diff_generation;
+		let task_gen = self.paste_diff_generation.current();
 		let selected_idx = idx;
 		let item_path = item.path.clone();
 		// Commit reads already own a charged core preview. Their unused UI
@@ -5986,7 +5986,7 @@ impl WorkbenchModel {
 			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.paste_diff_generation != task_gen {
+				if !model.paste_diff_generation.is_current(task_gen) {
 					return;
 				}
 				let Some(plan) = model.paste.plan() else {
@@ -6176,7 +6176,7 @@ impl WorkbenchModel {
 							if let Some(token) = model.paste_diff_cancel.take() {
 								token.cancel();
 							}
-							model.paste_diff_generation = model.paste_diff_generation.wrapping_add(1);
+							model.paste_diff_generation.invalidate();
 							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
@@ -6282,7 +6282,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.paste_diff_cancel.take() {
 			token.cancel();
 		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.paste_diff_generation.invalidate();
 		self.paste.invalidate_job();
 		if self.paste.plan().is_none() && !was_loading {
 			return;
@@ -25253,7 +25253,7 @@ mod tests {
 					(
 						m.lifecycle.generation(),
 						m.history_generation,
-						m.tree_generation,
+						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,
 					)
@@ -25264,7 +25264,7 @@ mod tests {
 					(
 						m.lifecycle.generation(),
 						m.history_generation,
-						m.tree_generation,
+						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,
 					)
