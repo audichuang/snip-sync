@@ -170,3 +170,71 @@ fn a_refused_apply_reports_the_empty_file_it_could_not_take_back() {
 	assert!(text.contains(&a.display().to_string()), "{text}");
 	assert!(text.contains("injected release"), "{text}");
 }
+
+/// Two Applies running at once share one ceiling on pins: the second one
+/// is never handed the room the first has not used yet. Each once read
+/// its own budget, and three Applies under a limit of 256 held 253 pins
+/// between them, with no descriptor left for their rows.
+#[cfg(target_os = "linux")]
+#[test]
+fn applies_running_together_share_one_ceiling_on_pins() {
+	use std::sync::atomic::Ordering;
+	let mut first = Made::default();
+	let mut second = Made::default();
+	let ceiling = first.ceiling.max(second.ceiling);
+	assert!(ceiling > 0, "nothing could be pinned at all");
+	let mut taken = 0;
+	for _ in 0..PIN_CAP * 2 {
+		taken += usize::from(first.take_pin());
+		taken += usize::from(second.take_pin());
+	}
+	assert_eq!(
+		taken, ceiling,
+		"first {} second {}",
+		first.pinned, second.pinned
+	);
+	assert_eq!(PINNED.load(Ordering::Relaxed), ceiling);
+	drop(first);
+	drop(second);
+	assert_eq!(PINNED.load(Ordering::Relaxed), 0);
+}
+
+/// Three Applies pasting 300 new files each at once, with the soft limit
+/// on open files at 256: every file is written and none is left empty.
+#[cfg(target_os = "linux")]
+#[test]
+fn three_applies_at_once_are_written_with_256_descriptors() {
+	use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+	let roots: Vec<_> = (0..3).map(|_| tmp()).collect();
+	let plans: Vec<_> = roots.iter().map(|(_, ws)| plan(ws, &many())).collect();
+	let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+	setrlimit(Resource::RLIMIT_NOFILE, 256.min(hard), hard).unwrap();
+	let start = std::sync::Barrier::new(plans.len());
+	let results: Vec<_> = std::thread::scope(|scope| {
+		let running: Vec<_> = plans
+			.iter()
+			.map(|plan| {
+				let start = &start;
+				scope.spawn(move || {
+					start.wait();
+					plan.apply(&RestoreSelection::default())
+				})
+			})
+			.collect();
+		running.into_iter().map(|t| t.join().unwrap()).collect()
+	});
+	for ((_, ws), result) in roots.iter().zip(results) {
+		let result = result.unwrap();
+		assert!(
+			result.errors.is_empty(),
+			"{:?}",
+			&result.errors[..5.min(result.errors.len())]
+		);
+		assert_eq!(result.created_count, FILES);
+		for i in 0..FILES {
+			let path = ws.join(format!("d{}/f{i}.txt", i % 30));
+			assert_eq!(fs::read_to_string(&path).unwrap(), format!("C{i}"));
+		}
+	}
+}

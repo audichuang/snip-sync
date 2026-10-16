@@ -2452,10 +2452,11 @@ enum Reserve {
 /// and Windows cannot replace an open file, so nothing is held there.
 ///
 /// Pins are descriptors, and the Apply's own rows and take-backs need
-/// descriptors too: how many it holds is a budget read from the process's
-/// limit and what is open already ([`pin_budget`]); past it, or with no
-/// room at all, an object is told by its number alone, as elsewhere. A
-/// pinned file is checked through its pin, with no descriptor of its own.
+/// descriptors too: how many the process holds is a ceiling read from its
+/// limit and what else is open ([`pin_ceiling`]), shared by every Apply
+/// running in it; past it, or with no room at all, an object is told by
+/// its number alone, as elsewhere. A pinned file is checked through its
+/// pin, with no descriptor of its own.
 struct Made {
 	/// Folders in the order made; `true` for a placed folder's level.
 	dirs: Vec<(PathBuf, DirKey, bool)>,
@@ -2466,9 +2467,10 @@ struct Made {
 	/// The handles that keep the folders made from being freed (Linux).
 	#[cfg(target_os = "linux")]
 	dir_pins: Vec<fs::File>,
-	/// How many objects this Apply may still pin, and how many it did.
+	/// How many objects the process may hold pinned, as read when this
+	/// Apply began, and how many this Apply pinned.
 	#[cfg(target_os = "linux")]
-	budget: usize,
+	ceiling: usize,
 	#[cfg(target_os = "linux")]
 	pinned: usize,
 }
@@ -2492,23 +2494,26 @@ const PIN_RESERVE: usize = 64;
 static PINNED: std::sync::atomic::AtomicUsize =
 	std::sync::atomic::AtomicUsize::new(0);
 
-/// How many objects an Apply starting now may pin: half of what the soft
-/// limit leaves past the descriptors open and [`PIN_RESERVE`], within what
-/// [`PIN_CAP`] leaves to the process. When what is open cannot be counted,
-/// half the limit is taken as open.
+/// How many objects the whole process may hold pinned, read now: half of
+/// what the soft limit leaves past [`PIN_RESERVE`] and the descriptors
+/// open other than pins, within [`PIN_CAP`]. It is a ceiling on the pins
+/// of every Apply together, never an allowance each Apply takes for
+/// itself: two Applies each given the room left would hold twice that.
+/// When what is open cannot be counted, half the limit is taken as open.
 #[cfg(target_os = "linux")]
-fn pin_budget() -> usize {
+fn pin_ceiling() -> usize {
 	use nix::sys::resource::{getrlimit, Resource};
 	use std::sync::atomic::Ordering;
 	let Ok((soft, _)) = getrlimit(Resource::RLIMIT_NOFILE) else {
 		return 0;
 	};
 	let soft = usize::try_from(soft).unwrap_or(usize::MAX);
-	let open = fs::read_dir("/proc/self/fd")
-		.map(Iterator::count)
+	let pinned = PINNED.load(Ordering::Relaxed);
+	let others = fs::read_dir("/proc/self/fd")
+		.map(|fds| fds.count().saturating_sub(pinned))
 		.unwrap_or(soft / 2);
-	let room = soft.saturating_sub(open).saturating_sub(PIN_RESERVE) / 2;
-	room.min(PIN_CAP.saturating_sub(PINNED.load(Ordering::Relaxed)))
+	let room = soft.saturating_sub(others).saturating_sub(PIN_RESERVE) / 2;
+	room.min(PIN_CAP)
 }
 
 // Derivable only where nothing is pinned.
@@ -2522,7 +2527,7 @@ impl Default for Made {
 			#[cfg(target_os = "linux")]
 			dir_pins: Vec::new(),
 			#[cfg(target_os = "linux")]
-			budget: pin_budget(),
+			ceiling: pin_ceiling(),
 			#[cfg(target_os = "linux")]
 			pinned: 0,
 		}
@@ -2555,23 +2560,35 @@ impl Made {
 		key
 	}
 
-	/// Takes one pin of the budget, if one is left.
+	/// Takes one pin, if the process holds fewer than the ceiling: counted
+	/// and checked in one step, so Applies racing for the last ones never
+	/// take more than there are.
 	#[cfg(target_os = "linux")]
 	fn take_pin(&mut self) -> bool {
 		use std::sync::atomic::Ordering;
-		if self.pinned >= self.budget {
-			return false;
+		let mut now = PINNED.load(Ordering::Acquire);
+		while now < self.ceiling {
+			match PINNED.compare_exchange_weak(
+				now,
+				now + 1,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => {
+					self.pinned += 1;
+					return true;
+				}
+				Err(seen) => now = seen,
+			}
 		}
-		self.pinned += 1;
-		PINNED.fetch_add(1, Ordering::Relaxed);
-		true
+		false
 	}
 
 	/// Pins the folder at `path` if it is still `key` (see [`Made`]).
 	#[cfg(target_os = "linux")]
 	fn pin_dir(&mut self, path: &Path, key: &DirKey) {
 		use std::os::unix::fs::OpenOptionsExt;
-		if self.pinned >= self.budget {
+		if PINNED.load(std::sync::atomic::Ordering::Relaxed) >= self.ceiling {
 			return;
 		}
 		// The access mode is ignored with `O_PATH`: no permission on the
@@ -2592,7 +2609,7 @@ impl Made {
 	fn pin_dir(&mut self, _path: &Path, _key: &DirKey) {}
 
 	/// The file just made through `handle`, as `key`, last modified at
-	/// `modified`: its handle kept as its pin on Linux within the budget
+	/// `modified`: its handle kept as its pin on Linux within the ceiling
 	/// (see [`Made`]), closed otherwise. One held per new file past it
 	/// would run out of descriptors on a large paste, and Windows cannot
 	/// replace an open file.
