@@ -15162,6 +15162,130 @@ mod tests {
 			);
 		}
 
+		/// A paste exported with `clipcode-root` from the folder above the
+		/// destination: the first path segment repeats the destination's name.
+		const RESTORE_BASE_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+
+		/// The restore-base suggestion reaches the panel as a hint row with
+		/// [Adjust paths] and [Use as-is]; neither is applied unasked, and the
+		/// first Enter after a click still applies the plan (#240).
+		#[gpui::test]
+		fn restore_base_hint_adjusts_paths_and_the_next_enter_applies(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let sub = repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_PAYLOAD);
+			let paths = |model: &Entity<WorkbenchModel>,
+			             cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					plan.items
+						.iter()
+						.map(|i| i.path.clone())
+						.collect::<Vec<_>>()
+				})
+			};
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"no restore-base hint row"
+			);
+			assert_eq!(paths(&model, cx), vec!["sub/a.ts".to_string()]);
+
+			click(cx, "paste-adjust");
+			settle(cx);
+			assert_eq!(paths(&model, cx), vec!["a.ts".to_string()]);
+
+			click(cx, "paste-as-is");
+			settle(cx);
+			assert_eq!(paths(&model, cx), vec!["sub/a.ts".to_string()]);
+
+			click(cx, "paste-adjust");
+			settle(cx);
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(fs::read_to_string(sub.join("a.ts")).unwrap(), "x");
+			assert!(!sub.join("sub").exists());
+		}
+
+		/// The worker's suggestion is shown too, adjusting re-plans on the
+		/// worker, and its Apply writes the adjusted path (#240).
+		#[gpui::test]
+		fn remote_paste_shows_the_worker_restore_base_hint_and_adjusts(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(&model, cx, RESTORE_BASE_PAYLOAD);
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"no restore-base hint row for the worker's suggestion"
+			);
+			click(cx, "paste-adjust");
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert!(
+				!model.read_with(cx, |m, _| m.paste.is_loading()),
+				"the adjusted re-plan never landed"
+			);
+			let paths: Vec<String> = model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.map(|i| i.path.clone())
+					.collect()
+			});
+			assert_eq!(paths, ["a.ts"]);
+
+			remote_paste_apply(&model, cx);
+			assert_eq!(fs::read_to_string(sub.join("a.ts")).unwrap(), "x");
+			assert!(!sub.join("sub").exists());
+		}
+
 		/// Click the centre of the rendered control `id`, the way a user
 		/// does. Fails when the UI renders no such element, so it also pins
 		/// the id shape the drivers rely on.
