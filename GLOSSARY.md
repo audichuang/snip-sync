@@ -28,6 +28,10 @@ _Avoid_: 工具列、bar（泛指時）
 一段文字至少要看得到的 grapheme 數，由 `FitRole::rule()` 決定（subject 與 ref 標籤 6、作者 3、chip 的鍵加值 4 個字；日期整段）。空間不夠時，文字被截到這個下限為止，再不夠就整個 chip、整欄或整組標籤退出，不再截。
 _Avoid_: 最小寬度、幾 px
 
+**探索軸**（exploration axis）:
+dogfood 與 gpui 矩陣測試共用的固定維度：視窗寬度（含縮放路徑）、語系、Log 欄位（hash 與窗格）、資料形狀、狀態。每輪 dogfood 依軸走並交一張覆蓋表，定義見 `docs/ui-exploration-axes.md`。
+_Avoid_: 隨便看看、也看大視窗
+
 ## 貼上
 
 **貼上目標**（paste target）:
