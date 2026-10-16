@@ -1028,6 +1028,84 @@ pub struct DestinationFreshnessSnapshot {
 	/// as well as by path). `None`: no tail, or an older peer.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub placed_tails: Option<Vec<PathBuf>>,
+	/// The folders of `missing_dirs` each planned create needs, worked out
+	/// where the plan was made ([`PlannedNewDirs`]). A master reads a
+	/// worker's paths only as they are written: it never takes them apart
+	/// by its own path rules (on Unix `\` is part of a name), so what a
+	/// worker on another OS makes comes from here. Recorded only when the
+	/// plan places a folder (`placed_tails`), so a plan without one is what
+	/// it was. `None`: no tail, or an older peer; then the folders are read
+	/// off the paths, right only when both machines share path rules.
+	/// Not compared by `matches_preview`: it follows from the plan the
+	/// digest covers and `missing_dirs`, and a worker's Apply works it out
+	/// again from its own plan.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub new_dirs: Option<PlannedNewDirs>,
+}
+
+/// The folders a plan's creates need made, as the planning machine reads
+/// its own paths: [`DestinationFreshnessSnapshot::new_dirs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedNewDirs {
+	/// Every folder of `missing_dirs` a create needs, shallow to deep (the
+	/// order [`NewDirs`] lists them in), each once.
+	pub dirs: Vec<PathBuf>,
+	/// For each create, by its index in the plan: the positions in `dirs`
+	/// of the folders it needs, ascending. Empty for one that exists.
+	pub needs: Vec<Vec<usize>>,
+}
+
+impl PlannedNewDirs {
+	/// Read off the paths of `creates` by this machine's path rules: a
+	/// folder that exists has every ancestor existing, so what is missing
+	/// is one run from the file upward.
+	fn of(creates: &[CreateOperation], missing: &HashSet<PathBuf>) -> Self {
+		let mut per_create: Vec<Vec<&Path>> = Vec::with_capacity(creates.len());
+		let mut all: BTreeSet<(usize, &Path)> = BTreeSet::new();
+		for op in creates {
+			let mut chain = Vec::new();
+			if !op.existed {
+				let mut dir = op.absolute_path.parent();
+				while let Some(d) = dir {
+					if !missing.contains(d) {
+						break;
+					}
+					all.insert((d.components().count(), d));
+					chain.push(d);
+					dir = d.parent();
+				}
+			}
+			per_create.push(chain);
+		}
+		let position: HashMap<&Path, usize> =
+			all.iter().enumerate().map(|(i, (_, d))| (*d, i)).collect();
+		let needs = per_create
+			.into_iter()
+			.map(|chain| {
+				let mut idx: Vec<usize> =
+					chain.into_iter().map(|d| position[d]).collect();
+				idx.sort_unstable();
+				idx
+			})
+			.collect();
+		Self {
+			dirs: all.into_iter().map(|(_, d)| d.to_path_buf()).collect(),
+			needs,
+		}
+	}
+
+	fn heap_bytes(&self) -> usize {
+		let mut bytes = self.dirs.capacity() * std::mem::size_of::<PathBuf>()
+			+ self.needs.capacity() * std::mem::size_of::<Vec<usize>>();
+		for dir in &self.dirs {
+			bytes = bytes.saturating_add(dir.capacity());
+		}
+		for need in &self.needs {
+			bytes = bytes
+				.saturating_add(need.capacity() * std::mem::size_of::<usize>());
+		}
+		bytes
+	}
 }
 
 impl DestinationFreshnessSnapshot {
@@ -1100,6 +1178,9 @@ impl DestinationFreshnessSnapshot {
 			for dir in dirs {
 				bytes = bytes.saturating_add(dir.capacity());
 			}
+		}
+		if let Some(new_dirs) = &self.new_dirs {
+			bytes = bytes.saturating_add(new_dirs.heap_bytes());
 		}
 		if let Some(dirs) = &self.symlinked_dirs {
 			bytes = bytes
@@ -1194,6 +1275,7 @@ impl DestinationFreshnessSnapshot {
 			symlinked_dirs: Some(symlinked_dirs),
 			requested_dirs: None,
 			placed_tails: None,
+			new_dirs: None,
 		})
 	}
 
@@ -1246,6 +1328,7 @@ impl DestinationFreshnessSnapshot {
 			symlinked_dirs: None,
 			requested_dirs: None,
 			placed_tails: None,
+			new_dirs: None,
 		})
 	}
 
@@ -1815,30 +1898,35 @@ impl TransferImportPlan {
 	pub fn new_dirs_for(&self, selection: &RestoreSelection) -> NewDirs {
 		let empty = HashSet::new();
 		let freshness = &self.destination_freshness;
-		let missing = freshness.missing_dirs.as_ref().unwrap_or(&empty);
 		let requested = freshness.requested_dirs.as_ref().unwrap_or(&empty);
-		let mut found: BTreeSet<(usize, PathBuf)> = BTreeSet::new();
+		// The planning machine's answer when it sent one: a worker's paths
+		// are read here only as written.
+		let read_here;
+		let planned = match &freshness.new_dirs {
+			Some(planned) => planned,
+			None => {
+				read_here = PlannedNewDirs::of(
+					self.create_operations(),
+					freshness.missing_dirs.as_ref().unwrap_or(&empty),
+				);
+				&read_here
+			}
+		};
+		let mut kept: BTreeSet<usize> = BTreeSet::new();
 		for (i, op) in self.create_operations().iter().enumerate() {
 			if op.existed || selection.unchecked_creates.contains(&i) {
 				continue;
 			}
-			// A folder that exists has every ancestor existing: what is
-			// missing is one run from the file upward.
-			let mut dir = op.absolute_path.parent();
-			while let Some(d) = dir {
-				if !missing.contains(d) {
-					break;
-				}
-				found.insert((d.components().count(), d.to_path_buf()));
-				dir = d.parent();
+			if let Some(need) = planned.needs.get(i) {
+				kept.extend(need.iter().copied());
 			}
 		}
 		let mut out = NewDirs::default();
-		for (_, dir) in found {
-			if requested.contains(&dir) {
-				out.requested.push(dir);
+		for dir in kept.into_iter().filter_map(|i| planned.dirs.get(i)) {
+			if requested.contains(dir) {
+				out.requested.push(dir.clone());
 			} else {
-				out.incidental.push(dir);
+				out.incidental.push(dir.clone());
 			}
 		}
 		out
@@ -4531,6 +4619,16 @@ pub fn plan_import_parsed_with(
 		placed_tails.sort();
 		placed_tails.dedup();
 		destination_freshness.placed_tails = Some(placed_tails);
+		// Which of the folders to make each create needs, read here, where
+		// the paths are this machine's: a master on another OS cannot.
+		let empty = HashSet::new();
+		destination_freshness.new_dirs = Some(PlannedNewDirs::of(
+			&restore_plan.create_operations,
+			destination_freshness
+				.missing_dirs
+				.as_ref()
+				.unwrap_or(&empty),
+		));
 	}
 
 	Ok((
@@ -5201,6 +5299,7 @@ fn capture_replay_freshness(
 		symlinked_dirs: None,
 		requested_dirs: None,
 		placed_tails: None,
+		new_dirs: None,
 	})
 }
 

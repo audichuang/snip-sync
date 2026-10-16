@@ -8690,9 +8690,11 @@ fn test_a_plan_without_a_tail_records_no_requested_dirs() {
 	let fresh = plan.destination_freshness();
 	assert!(fresh.requested_dirs.is_none());
 	assert!(fresh.placed_tails.is_none());
+	assert!(fresh.new_dirs.is_none());
 	let wire = serde_json::to_string(fresh).unwrap();
 	assert!(!wire.contains("requested_dirs"));
 	assert!(!wire.contains("placed_tails"));
+	assert!(!wire.contains("new_dirs"));
 	assert_eq!(plan.new_dirs().requested, Vec::<PathBuf>::new());
 	assert_eq!(plan.new_dirs().incidental, vec![ws.join("sub")]);
 }

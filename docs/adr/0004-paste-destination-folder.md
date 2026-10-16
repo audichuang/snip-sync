@@ -18,6 +18,7 @@
 ## 其他
 
 - **`PREPARED_IMPORT_VERSION` 不升。** prepared 快取是 worker 行程內的記憶體，線上只多了加法欄位；升版會讓協定 7–8 的 worker 失去 prepared import，是退步。只升 `PROTOCOL_MAX` 到 9，新增 `CREATE_DIRS_VERSION = 9`。協商低於 9 的 worker 照舊拒絕不存在的資料夾；master 只在被拒絕之後確認那個資料夾真的不存在，才回 `WorkerTooOld`，一般的貼上不多一次往返。
+- **master 不解析 worker 的路徑。** 計畫要建立哪些資料夾、每一列需要哪幾個，由規劃的那一台依它自己的路徑規則算好，放在 `DestinationFreshnessSnapshot::new_dirs`（`dirs` 由淺到深、各一次；`needs` 依 create 的索引列出它需要的 `dirs` 位置），master 只依勾選的列取出、照順序列給使用者並原樣送回同意，不對 worker 的路徑做 `parent()` 之類的運算：Unix 上 `C:\ws\new\a.txt` 的反斜線是檔名字元，曾讓 Windows worker 的計畫在 Unix master 上列不出資料夾、`--create-dirs` 送出空的同意。只在有尾段（`placed_tails`）時記錄，沒有尾段的快照與 frame 逐位元不變；不進 `matches_preview`（由 digest 涵蓋的計畫與 `missing_dirs` 推得，worker 的 Apply 也以自己重新規劃的計畫重算）。沒有這個欄位時（沒有尾段，或此欄位之前的協定 9 開發版 worker）master 退回依路徑計算，只在兩台的路徑規則相同時正確。
 - **工作區外一律不允許**：GUI（`bound`）與 worker（以工作區為界）。CLI 不設界。
 - **名稱規則在所有平台一致**：尾段拒絕 `..`、`.git`、`sanitize_relative_path` 擋的字元、結尾是點或空白的名稱與 Windows 保留名稱，讓同一個指令在哪台機器上都得到同一個結果。已存在的資料夾不受影響，因為規則只檢查要建立的名稱。
 - 新資料夾不能建進 Git 目錄（`PlacedRoot::resolve` 與 Apply 各檢查一次）。

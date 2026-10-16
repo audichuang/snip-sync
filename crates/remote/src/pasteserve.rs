@@ -198,6 +198,11 @@ fn check_snapshot(
 		&& freshness.requested_dirs.iter().flatten().all(|p| inside(p))
 		&& freshness.placed_tails.iter().flatten().all(|p| inside(p))
 		&& freshness
+			.new_dirs
+			.iter()
+			.flat_map(|n| &n.dirs)
+			.all(|p| inside(p))
+		&& freshness
 			.symlinked_dirs
 			.iter()
 			.flat_map(|m| m.keys())
