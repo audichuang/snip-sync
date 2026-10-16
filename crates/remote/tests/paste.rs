@@ -1562,3 +1562,133 @@ fn a_lost_replay_check_answer_through_a_paste_target_is_a_plain_failure() {
 		"{err:?}"
 	);
 }
+
+#[test]
+fn a_paste_target_refuses_a_changed_repo_under_a_non_repo_destination_on_both_sides(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local_real = tmp.path().join("local_real");
+	for dir in [&ws, &local_real] {
+		fs::create_dir_all(dir).unwrap();
+		init_repo(&dir.join("repoA"));
+	}
+	let local_dest = spelled(tmp.path(), &local_real, "local");
+	let text = entry("repoA/x.txt", "x");
+	let route = PasteRoute::default();
+	let opts = RunOptions::default();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let local = PasteTarget::Local { dest: local_dest };
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let lp = local.plan_files(&text, &route, &opts, None).unwrap();
+	let rp = remote.plan_files(&text, &route, &opts, None).unwrap();
+	// A repository below the destination moves after the preview: the write
+	// lock takes it, so the preview has to have seen it.
+	for dir in [&ws, &local_real] {
+		let repo = dir.join("repoA");
+		fs::write(repo.join("other.txt"), "other\n").unwrap();
+		git(&repo, &["add", "other.txt"]);
+	}
+	let sel = unchecked(&[]);
+	let mut reasons = Vec::new();
+	for (name, target, plan) in
+		[("local", &local, &lp), ("remote", &remote, &rp)]
+	{
+		let err = target
+			.apply_files(&text, &route, plan, &sel)
+			.err()
+			.unwrap_or_else(|| {
+				panic!("the {name} target wrote into a changed repository")
+			});
+		assert!(err.is_stale(), "{name}: {err:?}");
+		assert!(
+			matches!(
+				err.reason(),
+				snip_remote::Reason::DestinationChanged {
+					change: snip_remote::StaleChange::Repository
+				}
+			),
+			"{name}: {:?}",
+			err.reason()
+		);
+		reasons.push(err.reason());
+	}
+	assert_eq!(reasons[0], reasons[1], "both sides name the same change");
+	for dir in [&ws, &local_real] {
+		assert!(!dir.join("repoA/x.txt").exists());
+	}
+}
+
+#[test]
+fn a_file_where_a_new_folder_was_planned_is_stale_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = [entry("new/a.txt", "a"), entry("keep.txt", "keep")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	fs::write(ws.join("new"), "someone's file").unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker wrote around a file that took a folder's place");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert_eq!(
+		err.reason(),
+		snip_remote::Reason::DestinationChanged {
+			change: snip_remote::StaleChange::Created { rel: "new".into() }
+		}
+	);
+	assert!(!ws.join("keep.txt").exists());
+}
+
+#[test]
+fn a_folder_created_after_a_remote_preview_still_applies() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("new/a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	fs::create_dir(ws.join("new")).unwrap();
+	client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.unwrap();
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
+}

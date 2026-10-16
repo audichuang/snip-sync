@@ -7521,3 +7521,259 @@ fn import_refuses_deleted_git_file_and_leaves_it_intact() {
 	assert_eq!(fs::read(&git_config).unwrap(), original_config);
 	assert_eq!(fs::read(&git_head).unwrap(), original_head);
 }
+
+// ---------------------------------------------------------------------------
+// 27. Freshness covers the repositories the write lock takes and the folders
+//     on a target's path (#237)
+// ---------------------------------------------------------------------------
+
+/// Runs `git` in `dir` with an empty global config and a fixed identity.
+fn git_at(dir: &Path, cfg: &Path, args: &[&str]) {
+	let out = Command::new("git")
+		.args(["-c", "user.name=Test User", "-c", "user.email=t@t"])
+		.args(["-c", "commit.gpgsign=false"])
+		.args(args)
+		.current_dir(dir)
+		.env("GIT_CONFIG_GLOBAL", cfg)
+		.env("LC_ALL", "C")
+		.output()
+		.unwrap();
+	assert!(
+		out.status.success(),
+		"git {args:?} in {dir:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+}
+
+/// `git init` in an existing folder, with one commit.
+fn git_init_at(dir: &Path, cfg: &Path) {
+	git_at(dir, cfg, &["init", "-q", "-b", "main"]);
+	fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+	git_at(dir, cfg, &["add", "-A"]);
+	git_at(dir, cfg, &["commit", "-q", "-m", "seed"]);
+}
+
+impl TestRepo {
+	/// The folder holding this repository: a canonical folder that is not a
+	/// repository itself.
+	fn workspace(&self) -> PathBuf {
+		let parent = self.repo_path.parent().unwrap();
+		dunce::canonicalize(parent).unwrap()
+	}
+
+	/// A repository nested at `rel`, with one commit.
+	fn nested(&self, rel: &str) -> PathBuf {
+		let dir = self.repo_path.join(rel);
+		fs::create_dir_all(&dir).unwrap();
+		git_init_at(&dir, &self.cfg);
+		dir
+	}
+}
+
+fn assert_not_a_repo(ws: &Path) {
+	assert!(
+		matches!(Git::open(ws), Err(gitsrc::GitError::NotARepository(_))),
+		"{ws:?} lies inside a git repository; these tests need a non-repo workspace root",
+	);
+}
+
+fn stale_change(err: TransferError) -> StaleChange {
+	match err {
+		TransferError::StaleDestination { change, .. } => change,
+		other => panic!("expected StaleDestination, got {other:?}"),
+	}
+}
+
+fn plan_one(
+	root: &Path,
+	text: &str,
+) -> snip_core::transfer::TransferImportPlan {
+	let id = CanonicalRootId::new(root).unwrap();
+	plan_import(
+		text,
+		"// file: $FILE_PATH",
+		&[root.to_path_buf()],
+		&ImportMapping::with_primary(id),
+	)
+	.unwrap()
+}
+
+#[test]
+fn test_freshness_covers_a_repo_under_a_non_repo_destination() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let ws = a.workspace();
+	assert_not_a_repo(&ws);
+
+	let plan = plan_one(&ws, "// file: repoA/x.txt\nx\n");
+	a.write("other.txt", "other\n");
+	a.git(&["add", "other.txt"]);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(stale_change(err), StaleChange::Repository);
+	assert!(!a.exists("x.txt"));
+}
+
+#[test]
+fn test_freshness_covers_the_inner_repo_of_a_nested_pair() {
+	let o = TestRepo::new("outer");
+	o.write("seed.txt", "seed\n");
+	o.commit("seed");
+	let inner = o.nested("inner");
+
+	let plan = plan_one(o.path(), "// file: inner/x.txt\nx\n");
+	fs::write(inner.join("more.txt"), "more\n").unwrap();
+	git_at(&inner, &o.cfg, &["add", "-A"]);
+	git_at(&inner, &o.cfg, &["commit", "-q", "-m", "more"]);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(stale_change(err), StaleChange::Repository);
+	assert!(!inner.join("x.txt").exists());
+}
+
+#[test]
+fn test_a_repo_initialised_above_a_target_after_preview_is_stale() {
+	let host = TestRepo::new("host");
+	let ws = host.workspace();
+	assert_not_a_repo(&ws);
+	let plain = ws.join("plain");
+	fs::create_dir_all(&plain).unwrap();
+
+	let plan = plan_one(&ws, "// file: plain/x.txt\nx\n");
+	git_init_at(&plain, &host.cfg);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match err {
+		TransferError::StaleDestination { reason, change, .. } => {
+			assert_eq!(change, StaleChange::Repository);
+			assert!(reason.contains("repositories changed"), "{reason}");
+		}
+		other => panic!("expected StaleDestination, got {other:?}"),
+	}
+	assert!(!plain.join("x.txt").exists());
+}
+
+#[test]
+fn test_a_file_where_a_new_folder_was_planned_is_stale_and_nothing_is_written()
+{
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: new/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::write(dst.path().join("new"), "x").unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "new".into() }
+	);
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[test]
+fn test_an_existing_folder_replaced_by_a_file_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	fs::write(dst.path().join("old"), "x").unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[test]
+fn test_a_planned_folder_that_appears_as_a_folder_or_a_parent_that_vanishes_still_applies(
+) {
+	// (a) a folder planned as new is created by someone else first.
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	let plan = plan_one(dst.path(), "// file: new/a.txt\na\n");
+	fs::create_dir(dst.path().join("new")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("new/a.txt"), "a");
+
+	// (b) an existing folder vanishes: the write recreates it.
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+	let plan = plan_one(dst.path(), "// file: old/b.txt\nb\n");
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("old/b.txt"), "b");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_where_a_new_folder_was_planned_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("other")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: new/a.txt\na\n");
+	std::os::unix::fs::symlink("other", dst.path().join("new")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "new".into() }
+	);
+	assert!(!dst.exists("other/a.txt"));
+}
+
+#[test]
+fn test_a_file_on_the_folder_path_is_refused_at_preview_on_every_platform() {
+	let dst = TestRepo::new("dst");
+	dst.write("a.txt", "a file\n");
+	dst.commit("seed");
+	let id = CanonicalRootId::new(dst.path()).unwrap();
+	let not_a_dir = |what: &str, res: Result<_, TransferError>| match res {
+		Err(TransferError::Io(e)) => {
+			assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}")
+		}
+		Err(other) => panic!("expected Io(NotADirectory), got {other:?}"),
+		Ok(_) => panic!("{what}: a file where a folder is needed was planned"),
+	};
+	not_a_dir(
+		"regular file",
+		plan_import(
+			"// file: a.txt/b.txt\nb\n",
+			"// file: $FILE_PATH",
+			&[dst.path().to_path_buf()],
+			&ImportMapping::with_primary(id.clone()),
+		),
+	);
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::symlink("missing", dst.path().join("link")).unwrap();
+		not_a_dir(
+			"dangling symlink",
+			plan_import(
+				"// file: link/b.txt\nb\n",
+				"// file: $FILE_PATH",
+				&[dst.path().to_path_buf()],
+				&ImportMapping::with_primary(id),
+			),
+		);
+	}
+}
