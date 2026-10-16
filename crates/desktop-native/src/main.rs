@@ -891,6 +891,7 @@ pub struct WorkbenchModel {
 	/// The changed-files rows, keyed on a hash of what builds them: the
 	/// tree sorts up to `MAX_COMMIT_FILES` paths, too slow for every frame.
 	pub commit_rows_cache: std::cell::RefCell<
+		// U64-NOT-GEN: cache key: a hash of what builds the rows
 		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
 	>,
 	/// Details pane height under the changed files once dragged; `None`
@@ -986,11 +987,15 @@ pub struct WorkbenchModel {
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
+	// U64-NOT-GEN: id, not a landing guard
 	pub user_action_seq: u64,
+	// U64-NOT-GEN: id, not a landing guard
 	pub status_error_action: Option<u64>,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
+	// U64-NOT-GEN: id, not a landing guard
 	pub toast: Option<(u64, bool, Msg)>,
+	// U64-NOT-GEN: id, not a landing guard
 	toast_seq: u64,
 	pub is_loading: bool,
 	pub is_copying: bool,
@@ -1001,6 +1006,7 @@ pub struct WorkbenchModel {
 	/// Replace loads of the log that got past the discovery wait: a test
 	/// counts how many one repo-set change costs.
 	#[cfg(test)]
+	// U64-NOT-GEN: test counter
 	pub(crate) history_replace_loads: u64,
 	pub tree_generation: crate::gen::Gen<crate::gen::TreeLane>,
 	pub mode: String,
@@ -2365,6 +2371,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 		cancel: Option<CancelToken>,
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let registered = self.lifecycle.register_read(cancel);
 		self.spawn_registered(cx, registered, fut)
@@ -2376,6 +2383,7 @@ impl WorkbenchModel {
 		&mut self,
 		cx: &mut Context<Self>,
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let registered = self.lifecycle.register_mutating();
 		self.spawn_registered(cx, registered, fut)
@@ -2384,8 +2392,10 @@ impl WorkbenchModel {
 	fn spawn_registered(
 		&mut self,
 		cx: &mut Context<Self>,
+		// U64-NOT-GEN: lifecycle job id
 		(id, flag): (u64, lifecycle::FinishFlag),
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let fut = tabs::tagged(self.ws_tab, fut);
 		let task = cx.foreground_executor().spawn(async move {

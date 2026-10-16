@@ -124,7 +124,9 @@ fn headed(key: &'static str, datum: &str) -> Msg {
 /// message is never data here.
 fn invalid_payload(
 	kind: PayloadErrorKind,
+	// U64-NOT-GEN: a source position
 	line: Option<u64>,
+	// U64-NOT-GEN: a source position
 	column: Option<u64>,
 ) -> Msg {
 	match (kind, line, column) {

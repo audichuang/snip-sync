@@ -157,6 +157,7 @@ impl Drop for FinishFlag {
 }
 
 struct Job {
+	// U64-NOT-GEN: lifecycle job id
 	id: u64,
 	kind: JobKind,
 	cancel: Option<CancelToken>,
@@ -171,6 +172,7 @@ enum Phase {
 
 pub struct Lifecycle {
 	generation: crate::gen::Gen<crate::gen::WorkspaceLane>,
+	// U64-NOT-GEN: lifecycle job id
 	next_id: u64,
 	jobs: Vec<Job>,
 	phase: Phase,
@@ -225,6 +227,7 @@ impl Lifecycle {
 	pub fn register_read(
 		&mut self,
 		cancel: Option<CancelToken>,
+		// U64-NOT-GEN: lifecycle job id
 	) -> (u64, FinishFlag) {
 		let kind = if cancel.is_some() {
 			JobKind::CancellableRead
@@ -235,6 +238,7 @@ impl Lifecycle {
 	}
 
 	/// A confirmed paste or replay: never cancelled, and it refuses a close.
+	// U64-NOT-GEN: lifecycle job id
 	pub fn register_mutating(&mut self) -> (u64, FinishFlag) {
 		self.push(JobKind::Mutating, None)
 	}
@@ -243,6 +247,7 @@ impl Lifecycle {
 		&mut self,
 		kind: JobKind,
 		cancel: Option<CancelToken>,
+		// U64-NOT-GEN: lifecycle job id
 	) -> (u64, FinishFlag) {
 		let finished = Arc::new(AtomicBool::new(false));
 		let id = self.next_id;
@@ -257,12 +262,14 @@ impl Lifecycle {
 		(id, FinishFlag(finished))
 	}
 
+	// U64-NOT-GEN: lifecycle job id
 	pub fn attach(&mut self, id: u64, task: Task<()>) {
 		if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
 			job.task = Some(task);
 		}
 	}
 
+	// U64-NOT-GEN: lifecycle job id
 	pub fn is_live(&self, id: u64) -> bool {
 		self.jobs
 			.iter()

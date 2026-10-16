@@ -189,10 +189,13 @@ pub struct PastePending {
 	/// Captured replay plans still held by selected-row reads, including
 	/// cancelled reads that have not returned from their worker yet.
 	detail_reads: Vec<DetailRead>,
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
 	ui_commit: Option<Weak<CommitReplayPreview>>,
+	// U64-NOT-GEN: module-private sequence, compared only inside paste
 	seq: u64,
+	// U64-NOT-GEN: module-private sequence, compared only inside paste
 	input: Option<(u64, usize, Option<Weak<str>>)>,
 	latest: Option<PasteRequest>,
 	pub ready: Option<PasteOutcome>,
@@ -327,6 +330,7 @@ impl PastePending {
 		))
 	}
 
+	// U64-NOT-GEN: module-private sequence, compared only inside paste
 	pub fn invalidate(&mut self, seq: u64) {
 		self.seq = seq;
 		self.latest = None;
@@ -459,6 +463,7 @@ pub struct PasteWorker {
 	input: Option<PasteInput>,
 	pool: Arc<Mutex<PastePending>>,
 	cancel: CancelToken,
+	// U64-NOT-GEN: module-private sequence, compared only inside paste
 	seq: u64,
 }
 impl PasteWorker {
@@ -882,6 +887,7 @@ impl PrefixChoice {
 }
 
 /// 1023 B, 1.5 KB, 2.1 MB (binary units, one decimal).
+// U64-NOT-GEN: a byte count
 pub(crate) fn human_bytes(n: u64) -> String {
 	const K: f64 = 1024.0;
 	if n < 1024 {
@@ -1303,6 +1309,7 @@ fn commit_refusal(
 	}
 }
 
+// U64-NOT-GEN: content digest of the roots, not a counter
 pub(crate) fn roots_digest(roots: &[PathBuf]) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1334,6 +1341,7 @@ pub struct PastePreviewPlan {
 	pub prefix_choices: Vec<PrefixChoice>,
 	/// Digest of the repo roots the candidates were last built from, so a
 	/// landing that brings the same set skips the canonicalize.
+	// U64-NOT-GEN: content digest of the roots, not a counter
 	seen_roots: u64,
 	/// The restore-base suggestion the last plan heard (local engine or the
 	/// worker). Only kept when there are no prefix rows: see `restore_hint`.
@@ -1728,6 +1736,7 @@ pub(crate) struct CommitDiffRequest {
 /// per distinct preview, unless the UI holds that Arc, which the UI's bytes
 /// already count.
 struct DetailRead {
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	id: u64,
 	preview: Weak<CommitReplayPreview>,
 	bytes: usize,
@@ -1746,6 +1755,7 @@ fn ui_holds(
 
 struct DetailReadCharge {
 	pool: Arc<Mutex<PastePending>>,
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	id: u64,
 }
 
@@ -1980,6 +1990,7 @@ impl PastePreviewPlan {
 	}
 
 	/// The digest of the repo roots this plan last saw.
+	// U64-NOT-GEN: content digest of the roots, not a counter
 	pub(crate) fn seen_roots(&self) -> u64 {
 		self.seen_roots
 	}

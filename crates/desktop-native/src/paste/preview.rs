@@ -20,8 +20,10 @@ pub struct PastePreview {
 	/// A read-only preview or mapping rebuild is running; nothing can be applied until it lands.
 	loading: bool,
 	/// Bumped for every paste request, remap and cancel; an older result is dropped.
+	// U64-NOT-GEN: module-private sequence, compared only inside paste
 	generation: u64,
 	pending: Arc<Mutex<PastePending>>,
+	// U64-NOT-GEN: id, not a landing guard
 	worker: Option<(u64, CancelToken)>,
 	cancel: Option<CancelToken>,
 	scroll: gpui::UniformListScrollHandle,
@@ -228,6 +230,7 @@ impl PastePreview {
 		self.apply_delay
 	}
 
+	// U64-NOT-GEN: id, not a landing guard
 	pub fn worker_id(&self) -> Option<u64> {
 		self.worker.as_ref().map(|(id, _)| *id)
 	}
@@ -377,6 +380,7 @@ impl PastePreview {
 		}
 	}
 
+	// U64-NOT-GEN: id, not a landing guard
 	pub fn bind_job(&mut self, id: u64, cancel: CancelToken) {
 		self.cancel = Some(cancel.clone());
 		self.worker = Some((id, cancel));

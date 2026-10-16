@@ -293,12 +293,15 @@ impl Preview {
 	}
 
 	/// FNV-1a over the retained text (E2E oracle only; never the text itself).
+	// U64-NOT-GEN: content hash
 	pub fn fingerprint(&self) -> u64 {
 		fnv1a(self.text.as_bytes())
 	}
 }
 
+// U64-NOT-GEN: content hash
 pub fn fnv1a(bytes: &[u8]) -> u64 {
+	// U64-NOT-GEN: content hash
 	let mut h: u64 = 0xcbf29ce484222325;
 	for &b in bytes {
 		h ^= b as u64;

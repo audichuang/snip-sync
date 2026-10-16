@@ -60,6 +60,7 @@ type Key = (PathBuf, PathBuf);
 pub struct RepoSet {
 	entries: Vec<RepoEntry>,
 	/// Advances on every change of the list, never goes back.
+	// U64-NOT-GEN: revision for the log line and tests; no landing compares it
 	rev: u64,
 	/// `(root, name)` of each entry, rebuilt when the list changes: what a
 	/// consumer needs to map the list before a change onto the one after.
@@ -139,6 +140,7 @@ impl RepoSet {
 		}
 	}
 
+	// U64-NOT-GEN: revision for the log line and tests; no landing compares it
 	pub(crate) fn rev(&self) -> u64 {
 		self.rev
 	}
