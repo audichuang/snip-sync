@@ -209,15 +209,30 @@ impl Lifecycle {
 		}
 	}
 
-	pub fn register(
+	/// A read. With `cancel` (the token its work polls) a close or quit
+	/// cancels it; without one it is drained.
+	pub fn register_read(
+		&mut self,
+		cancel: Option<CancelToken>,
+	) -> (u64, FinishFlag) {
+		let kind = if cancel.is_some() {
+			JobKind::CancellableRead
+		} else {
+			JobKind::UncancellableRead
+		};
+		self.push(kind, cancel)
+	}
+
+	/// A confirmed paste or replay: never cancelled, and it refuses a close.
+	pub fn register_mutating(&mut self) -> (u64, FinishFlag) {
+		self.push(JobKind::Mutating, None)
+	}
+
+	fn push(
 		&mut self,
 		kind: JobKind,
 		cancel: Option<CancelToken>,
 	) -> (u64, FinishFlag) {
-		let cancel = match kind {
-			JobKind::CancellableRead => cancel,
-			JobKind::UncancellableRead | JobKind::Mutating => None,
-		};
 		let finished = Arc::new(AtomicBool::new(false));
 		let id = self.next_id;
 		self.next_id = self.next_id.wrapping_add(1);
@@ -260,6 +275,27 @@ impl Lifecycle {
 		self.jobs
 			.iter()
 			.filter(|job| !job.finished.load(Ordering::SeqCst))
+			.count()
+	}
+
+	/// The kinds of the jobs that have not finished.
+	#[cfg(test)]
+	pub fn live_kinds(&self) -> Vec<JobKind> {
+		self.jobs
+			.iter()
+			.filter(|job| !job.finished.load(Ordering::SeqCst))
+			.map(|job| job.kind)
+			.collect()
+	}
+
+	/// Unfinished jobs a close can cancel: those holding a token.
+	#[cfg(test)]
+	pub fn live_jobs_with_cancel(&self) -> usize {
+		self.jobs
+			.iter()
+			.filter(|job| {
+				!job.finished.load(Ordering::SeqCst) && job.cancel.is_some()
+			})
 			.count()
 	}
 
@@ -380,9 +416,7 @@ mod tests {
 		let mut life = fresh();
 		let now = Instant::now();
 		let token = CancelToken::new();
-		let flag = life
-			.register(JobKind::CancellableRead, Some(token.clone()))
-			.1;
+		let flag = life.register_read(Some(token.clone())).1;
 		assert_eq!(life.request(Intent::Quit, now), Request::Accepted);
 		assert!(token.is_cancelled());
 		assert_eq!(life.generation(), 2);
@@ -410,10 +444,8 @@ mod tests {
 		let mut life = fresh();
 		let now = Instant::now();
 		let read = CancelToken::new();
-		let _read = life
-			.register(JobKind::CancellableRead, Some(read.clone()))
-			.1;
-		let _write = life.register(JobKind::Mutating, None).1;
+		let _read = life.register_read(Some(read.clone())).1;
+		let _write = life.register_mutating().1;
 		assert_eq!(life.request(Intent::Quit, now), Request::RefusedApplying);
 		assert!(!read.is_cancelled());
 		assert_eq!(life.generation(), 1);
@@ -424,17 +456,11 @@ mod tests {
 	fn uncancellable_read_is_drained_and_not_reported_cancelled() {
 		let mut life = fresh();
 		let now = Instant::now();
-		let token = CancelToken::new();
-		let flag = life
-			.register(JobKind::UncancellableRead, Some(token.clone()))
-			.1;
+		let flag = life.register_read(None).1;
+		assert_eq!(life.live_kinds(), [JobKind::UncancellableRead]);
 		assert_eq!(
 			life.request(Intent::CloseWorkspace, now),
 			Request::Accepted
-		);
-		assert!(
-			!token.is_cancelled(),
-			"a legacy API token must not be described as cancelled"
 		);
 		assert_eq!(life.poll_at(now, GitLoad::idle()), Step::Draining);
 		drop(flag);
@@ -442,6 +468,42 @@ mod tests {
 			life.poll_at(now, GitLoad::idle()),
 			Step::Ready(Intent::CloseWorkspace)
 		);
+	}
+
+	#[test]
+	fn a_read_with_a_token_is_cancelled_and_one_without_is_drained() {
+		let mut life = fresh();
+		let now = Instant::now();
+		let token = CancelToken::new();
+		let cancellable = life.register_read(Some(token.clone())).1;
+		let drained = life.register_read(None).1;
+		assert_eq!(
+			life.live_kinds(),
+			[JobKind::CancellableRead, JobKind::UncancellableRead]
+		);
+		assert_eq!(life.live_jobs_with_cancel(), 1);
+		assert_eq!(
+			life.request(Intent::CloseWorkspace, now),
+			Request::Accepted
+		);
+		assert!(token.is_cancelled());
+		drop(cancellable);
+		assert_eq!(
+			life.poll_at(now, GitLoad::idle()),
+			Step::Draining,
+			"a read with no token is drained, not cancelled"
+		);
+		drop(drained);
+		assert_eq!(
+			life.poll_at(now, GitLoad::idle()),
+			Step::Ready(Intent::CloseWorkspace)
+		);
+
+		let mut life = fresh();
+		let _write = life.register_mutating().1;
+		assert_eq!(life.live_kinds(), [JobKind::Mutating]);
+		assert_eq!(life.live_jobs_with_cancel(), 0);
+		assert_eq!(life.request(Intent::Quit, now), Request::RefusedApplying);
 	}
 
 	#[test]
@@ -463,7 +525,7 @@ mod tests {
 		);
 
 		let mut life = fresh();
-		let _flag = life.register(JobKind::CancellableRead, None).1;
+		let _flag = life.register_read(Some(CancelToken::new())).1;
 		assert_eq!(life.request(Intent::Quit, now), Request::Accepted);
 		let later = now + DRAIN_DEADLINE;
 		assert_eq!(
@@ -485,7 +547,7 @@ mod tests {
 	fn quit_during_close_upgrades_the_intent_without_a_second_generation() {
 		let mut life = fresh();
 		let now = Instant::now();
-		let _flag = life.register(JobKind::CancellableRead, None).1;
+		let _flag = life.register_read(Some(CancelToken::new())).1;
 		assert_eq!(
 			life.request(Intent::CloseWorkspace, now),
 			Request::Accepted
@@ -500,7 +562,7 @@ mod tests {
 	fn open_during_close_drain_is_kept_and_quit_stays_final() {
 		let mut life = fresh();
 		let now = Instant::now();
-		let flag = life.register(JobKind::CancellableRead, None).1;
+		let flag = life.register_read(Some(CancelToken::new())).1;
 		let path = std::path::PathBuf::from("/next");
 		assert_eq!(
 			life.request(Intent::CloseWorkspace, now),
@@ -517,7 +579,7 @@ mod tests {
 			Step::Ready(Intent::OpenWorkspace(path.clone()))
 		);
 
-		let _live = life.register(JobKind::CancellableRead, None).1;
+		let _live = life.register_read(Some(CancelToken::new())).1;
 		assert_eq!(life.request(Intent::Quit, now), Request::Accepted);
 		assert_eq!(
 			life.request(Intent::OpenWorkspace(path), now),

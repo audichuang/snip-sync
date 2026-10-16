@@ -46,6 +46,14 @@ thread_local! {
 }
 
 impl SelectorCandidate<'_> {
+	/// The root of a repo row.
+	fn repo_root(&self) -> Option<&std::path::Path> {
+		match self {
+			Self::Repo { index, repos, .. } => Some(&repos[*index].root),
+			Self::Ref { .. } => None,
+		}
+	}
+
 	fn label(&self) -> &str {
 		match self {
 			Self::Repo { index, repos, .. } => &repos[*index].name,
@@ -252,6 +260,36 @@ impl WorkbenchModel {
 		range: std::ops::Range<usize>,
 	) -> impl Iterator<Item = (usize, SelectorItem)> + '_ {
 		items_for_range(self.selector_candidates(q), range)
+	}
+
+	/// The repo list changed under an open repo selector: the cursor stays
+	/// on the repo it pointed at (it is an index into the filtered list, so
+	/// a repo found ahead of it would move it onto another one), or is
+	/// clamped when that repo is gone. `before` is the list as the cursor
+	/// last saw it.
+	pub(crate) fn rebind_selector_cursor(
+		&mut self,
+		before: &[(std::path::PathBuf, String)],
+		cx: &mut Context<Self>,
+	) {
+		if self.popover != Some(Popover::Repo) {
+			return;
+		}
+		let q = self.selector_input.read(cx).text().to_string();
+		let query = q.to_lowercase();
+		let under_cursor = before
+			.iter()
+			.filter(|(_, name)| {
+				query.is_empty() || name.to_lowercase().contains(&query)
+			})
+			.nth(self.popover_cursor)
+			.map(|(root, _)| root);
+		let moved = under_cursor.and_then(|root| {
+			self.selector_candidates(&q)
+				.position(|row| row.repo_root() == Some(root.as_path()))
+		});
+		let last = self.selector_candidates(&q).count().saturating_sub(1);
+		self.popover_cursor = moved.unwrap_or(self.popover_cursor.min(last));
 	}
 
 	pub fn open_popover(

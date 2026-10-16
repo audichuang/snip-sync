@@ -20,7 +20,7 @@ use snip_core::transfer::{
 	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
-use crate::codeless;
+use crate::codeless::Codeless;
 use crate::prepared::{self, CacheError, CachedImport, PreparedCache};
 use crate::proto::{
 	valid_rel_path, ErrorCode, ImportExpect, ImportPlanned, PasteMapping,
@@ -423,7 +423,7 @@ pub(crate) fn import_apply(
 				}
 			})
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Imported(codeless::restore_result(result)))
+		Ok(Response::Imported(Codeless::new(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -640,7 +640,7 @@ fn run_prepared_replay(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(codeless::replay_result(result)))
+		Ok(Response::Replayed(Codeless::new(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -689,7 +689,7 @@ pub(crate) fn replay_apply(
 		let result = preview
 			.apply_with(&opts)
 			.map_err(|e| transfer_refusal(e, cancel))?;
-		Ok(Response::Replayed(codeless::replay_result(result)))
+		Ok(Response::Replayed(Codeless::new(result)))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }
@@ -697,7 +697,9 @@ pub(crate) fn replay_apply(
 #[cfg(test)]
 mod reason_tests {
 	use super::*;
+	use crate::codeless::Codeless;
 	use snip_core::commits::{CommitError, ReplayFailure, ReplayResult};
+	use snip_core::reason::Datum;
 
 	fn reason_of(refusal: Refusal) -> (ErrorCode, Option<Reason>, String) {
 		let Response::Error {
@@ -817,7 +819,8 @@ mod reason_tests {
 			}),
 		};
 		let sent = |reason| {
-			codeless::replay_result(failed(reason))
+			Codeless::new(failed(reason))
+				.into_inner()
 				.failure
 				.unwrap()
 				.reason
@@ -835,10 +838,10 @@ mod reason_tests {
 		// directory from a generic I/O error otherwise).
 		assert_eq!(
 			sent(Reason::Io {
-				detail: "/opt/secret".into()
+				detail: Datum::for_test("/opt/secret")
 			}),
 			Some(Reason::Io {
-				detail: String::new()
+				detail: Datum::default()
 			})
 		);
 		for r in [
@@ -851,12 +854,12 @@ mod reason_tests {
 			let want = r.clone().scrubbed();
 			assert_eq!(sent(r.clone()), Some(want), "{r:?}");
 		}
-		let wire = serde_json::to_string(&Response::Replayed(
-			codeless::replay_result(failed(Reason::OutsideScope {
+		let wire = serde_json::to_string(&Response::Replayed(Codeless::new(
+			failed(Reason::OutsideScope {
 				path: "a".into(),
 				scope: "/opt/secret".into(),
-			})),
-		))
+			}),
+		)))
 		.unwrap();
 		assert!(!wire.contains("secret"), "{wire}");
 	}

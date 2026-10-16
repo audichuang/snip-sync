@@ -20,7 +20,7 @@ use snip_core::gitsrc::{GitError, GitSource};
 use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
-use snip_core::reason::{Reason, StaleChange};
+use snip_core::reason::{Datum, Reason, StaleChange};
 
 use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
@@ -33,21 +33,37 @@ use crate::proto::{
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
-use crate::{ConnectFailureKind, RemoteError, StartReason};
+use crate::{ConnectFailureKind, RemoteError, StartReason, WaitEnd};
 
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-// Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a stalled
-// worker must fail a call in time. It bounds the SILENCE between bytes, not
-// a frame's whole transfer: a long job sends a heartbeat every second, and
-// a large reply may take longer than this to arrive whole on a slow link
-// as long as it keeps moving. Once a reply has started arriving mid-frame,
-// its silence may run to MID_FRAME_IDLE_FACTOR times this bound, still
-// inside the call's absolute deadline (#191).
+// The silence a call tolerates, between bytes, never a frame's whole
+// transfer: a large reply may take longer than this to arrive whole on a
+// slow link as long as it keeps moving. One rule, by where the call is
+// (#191, [`silence_budget`]):
+// - Before the first byte of its reply: this bound. A connection that went
+//   dead while pooled (a sleep, a NAT timeout, no RST) fails fast.
+// - Once the reply has started, anywhere (inside a frame, between the
+//   frames of one reply, after a heartbeat): REPLY_IDLE_FACTOR times it.
+//   From then on a pause says only that the link or the process froze: a
+//   worker of protocol 2 and up sends a heartbeat every second while its
+//   work runs, whatever the work is, so a live worker is never this quiet.
+// The call's absolute deadline bounds both. A close or quit does not wait
+// for either: it ends a call by its cancel token.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// How much longer than the idle bound a reply already arriving may pause.
-const MID_FRAME_IDLE_FACTOR: u32 = 6;
+/// How much longer than the idle bound a reply that has started may pause.
+const REPLY_IDLE_FACTOR: u32 = 6;
+
+/// The silence a call tolerates: `idle` until the first byte of its reply,
+/// [`REPLY_IDLE_FACTOR`] times that once the reply has started (#191).
+fn silence_budget(idle: Duration, reply_started: bool) -> Duration {
+	if reply_started {
+		idle.saturating_mul(REPLY_IDLE_FACTOR)
+	} else {
+		idle
+	}
+}
 /// How often a wait re-checks its deadline, its cancel token and the
 /// stream's last-byte clock.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -199,7 +215,7 @@ impl HandshakeGate {
 				return Err(RemoteError::Start {
 					kind: ConnectFailureKind::TimedOut,
 					reason: None,
-					detail: String::new(),
+					detail: Datum::default(),
 					message: "timed out waiting for a connection slot to that \
 					          machine: other connections there are still \
 					          starting; try again"
@@ -240,10 +256,13 @@ pub(crate) trait FrameIo {
 	) -> Result<Option<Response>, RemoteError>;
 
 	/// The next frame while bytes keep arriving: `idle` bounds the SILENCE
-	/// between bytes, not the arrival of a whole frame — a large reply may
-	/// take longer than that to cross a slow link. The wait also ends at
-	/// the absolute `deadline` or on `cancel`. The default has no byte
-	/// clock and simply reads the next frame (tests feed memory streams).
+	/// before the call's reply starts, not the arrival of a whole frame — a
+	/// large reply may take longer than that to cross a slow link. Once the
+	/// reply has started, a pause anywhere in it may run to
+	/// [`REPLY_IDLE_FACTOR`] times `idle` ([`silence_budget`]). The wait also
+	/// ends at the absolute `deadline` or on `cancel`. The default has no
+	/// byte clock and simply reads the next frame (tests feed memory
+	/// streams).
 	fn recv_idle(
 		&mut self,
 		idle: Duration,
@@ -252,6 +271,13 @@ pub(crate) trait FrameIo {
 	) -> Result<Option<Response>, RemoteError> {
 		let _ = (deadline, cancel);
 		self.recv(idle)
+	}
+
+	/// The error for a call past its absolute deadline. A stream with a
+	/// byte clock says how much arrived and for how long; the default has
+	/// none.
+	fn overdue(&self) -> RemoteError {
+		RemoteError::TimedOut
 	}
 }
 
@@ -353,12 +379,10 @@ pub struct Connection {
 	/// it pulled. Shared with the read thread; a wait ends when the stream
 	/// goes silent past [`IO_TIMEOUT`].
 	last_byte: Arc<StreamClock>,
-	/// When the current call started, and the stream's byte count and
-	/// whole-frame count at that point: the call's reply is what arrives
-	/// past them (#191).
+	/// When the current call started, and the stream's byte count at that
+	/// point: the call's reply is what arrives past it (#191).
 	call_started: Instant,
 	call_base: u64,
-	frame_base: u64,
 }
 
 impl Connection {
@@ -430,7 +454,6 @@ impl Connection {
 			last_byte,
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
@@ -550,7 +573,7 @@ impl Connection {
 		RemoteError::Start {
 			kind: start_failure_kind(&cause, code, &stderr),
 			reason: start_reason(&cause, code, &stderr),
-			detail: stderr.clone(),
+			detail: Datum::transport_stderr(stderr.clone()),
 			message: start_message(cause, code, &stderr),
 		}
 	}
@@ -590,7 +613,6 @@ impl Connection {
 		let mut frames = 0;
 		self.call_started = Instant::now();
 		self.call_base = self.last_byte.received();
-		self.frame_base = self.call_base;
 		self.in_flight.store(true, Ordering::SeqCst);
 		let res = self.send_guarded(request, cancel, deadline).and_then(|()| {
 			self.last_byte.restart();
@@ -652,6 +674,18 @@ impl Connection {
 		}
 	}
 
+	/// The error for a call whose wait ended without an answer: how it
+	/// ended, and how much of the reply arrived in how long. The one place
+	/// that builds it, so no exit reports less than another (#191).
+	fn unanswered(&self, ended: WaitEnd) -> RemoteError {
+		RemoteError::Stalled {
+			silent: self.last_byte.silent_ms() as f64 / 1000.0,
+			received: self.last_byte.received().saturating_sub(self.call_base),
+			elapsed: self.call_started.elapsed().as_secs_f64(),
+			ended,
+		}
+	}
+
 	/// Kills the transport process, closing the pipes a stuck write or
 	/// read is parked on. Without a process (an in-process worker) there
 	/// is nothing to kill; its stuck writer thread is simply abandoned.
@@ -680,6 +714,10 @@ impl io::Write for DeadWriter {
 }
 
 impl FrameIo for Connection {
+	fn overdue(&self) -> RemoteError {
+		self.unanswered(WaitEnd::Deadline)
+	}
+
 	fn recv(
 		&mut self,
 		timeout: Duration,
@@ -688,7 +726,6 @@ impl FrameIo for Connection {
 			Ok(frame) => {
 				// The frame left the queue; the pump may read on.
 				self.retained.fetch_sub(1, Ordering::Relaxed);
-				self.frame_base = self.last_byte.received();
 				Ok(frame?)
 			}
 			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
@@ -707,7 +744,6 @@ impl FrameIo for Connection {
 				Ok(frame) => {
 					// The frame left the queue; the pump may read on.
 					self.retained.fetch_sub(1, Ordering::Relaxed);
-					self.frame_base = self.last_byte.received();
 					return Ok(frame?);
 				}
 				Err(RecvTimeoutError::Disconnected) => return Ok(None),
@@ -717,29 +753,17 @@ impl FrameIo for Connection {
 				return Err(RemoteError::Cancelled);
 			}
 			if Instant::now() >= deadline {
-				return Err(RemoteError::TimedOut);
+				return Err(self.unanswered(WaitEnd::Deadline));
 			}
-			// No byte for `idle`: the worker is stuck, whatever it may
-			// still be computing. Bytes still moving (a large frame on a
-			// slow link, a heartbeat) keep the wait alive. A reply that has
-			// started arriving mid-frame may pause longer, still bounded by
-			// `deadline` (#191).
-			let silent = self.last_byte.silent_ms();
-			let mid_frame = self.last_byte.received() > self.frame_base;
-			let limit = if mid_frame {
-				idle.saturating_mul(MID_FRAME_IDLE_FACTOR)
-			} else {
-				idle
-			};
-			if silent >= limit.as_millis() as u64 {
-				return Err(RemoteError::Stalled {
-					silent: silent as f64 / 1000.0,
-					received: self
-						.last_byte
-						.received()
-						.saturating_sub(self.call_base),
-					elapsed: self.call_started.elapsed().as_secs_f64(),
-				});
+			// No byte for the call's silence budget: the connection or the
+			// process froze. Bytes still moving (a large frame on a slow
+			// link, a heartbeat) keep the wait alive, and so does a reply
+			// that has begun, for REPLY_IDLE_FACTOR times longer (#191).
+			let started = self.last_byte.received() > self.call_base;
+			if self.last_byte.silent_ms()
+				>= silence_budget(idle, started).as_millis() as u64
+			{
+				return Err(self.unanswered(WaitEnd::Silence));
 			}
 		}
 	}
@@ -898,7 +922,7 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 		RemoteError::Start {
 			kind: ConnectFailureKind::WorkerUnavailable,
 			reason: Some(StartReason::NoCommand),
-			detail: String::new(),
+			detail: Datum::default(),
 			message: "no command to start the worker".into(),
 		}
 	})?;
@@ -914,7 +938,7 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				kind: ConnectFailureKind::WorkerUnavailable,
 				reason: Some(StartReason::CannotRun),
 				// Data only: the program and what the OS said.
-				detail: format!("{program}: {err}"),
+				detail: Datum::spawn_failure(&program, &err),
 				message: format!("cannot run {program}: {err}"),
 			}
 		})?;
@@ -1082,7 +1106,7 @@ pub(crate) fn exchange(
 			Some(response) => {
 				*frames += 1;
 				if Instant::now() >= deadline {
-					return Err(RemoteError::TimedOut);
+					return Err(io.overdue());
 				}
 				match response {
 					Response::Chunk { data } => {
@@ -1144,10 +1168,9 @@ pub(crate) fn exchange(
 				}
 			}
 			None => {
-				return Err(RemoteError::Io(io::Error::new(
-					io::ErrorKind::UnexpectedEof,
-					"the worker closed the connection",
-				)));
+				return Err(RemoteError::Io(
+					crate::iofault::IoFault::WorkerClosed.into(),
+				));
 			}
 		}
 	}
@@ -1608,7 +1631,6 @@ impl Client {
 			last_byte: StreamClock::new(),
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		});
 	}
 
@@ -2057,7 +2079,7 @@ impl Client {
 					None,
 					APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
 				) {
-				Ok(Response::Imported(result)) => Ok(result),
+				Ok(Response::Imported(result)) => Ok(result.into_inner()),
 				Ok(_) => Err(unexpected()),
 				Err(error) => Err(error),
 			};
@@ -2295,7 +2317,7 @@ impl Client {
 				.call(request, None, limit.saturating_sub(start.elapsed()))
 			{
 				Ok(Response::Replayed(result)) if !check_only => {
-					Ok(Some(result))
+					Ok(Some(result.into_inner()))
 				}
 				Ok(Response::Fresh) if check_only => Ok(None),
 				Ok(_) => Err(unexpected()),
@@ -2375,7 +2397,7 @@ impl Client {
 			expect: expect.clone(),
 		};
 		match self.call_with(&req, cancel, APPLY_CALL_LIMIT)? {
-			Response::Imported(result) => Ok(result),
+			Response::Imported(result) => Ok(result.into_inner()),
 			_ => Err(unexpected()),
 		}
 	}
@@ -2434,7 +2456,9 @@ impl Client {
 			APPLY_CALL_LIMIT
 		};
 		match self.call_with(&req, cancel, limit)? {
-			Response::Replayed(result) if !check_only => Ok(Some(result)),
+			Response::Replayed(result) if !check_only => {
+				Ok(Some(result.into_inner()))
+			}
 			Response::Fresh if check_only => Ok(None),
 			_ => Err(unexpected()),
 		}
@@ -2472,7 +2496,7 @@ impl Client {
 			under: under.map(str::to_string),
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
-			Response::Repos(scan) => Ok(scan),
+			Response::Repos(scan) => Ok(scan.into_inner()),
 			_ => Err(unexpected()),
 		}
 	}
@@ -2984,14 +3008,14 @@ impl From<RemoteError> for GitError {
 			RemoteError::Refused {
 				code: ErrorCode::Timeout,
 				..
-			}
-			| RemoteError::TimedOut
-			| RemoteError::Stalled { .. } => GitError::Timeout {
+			} => GitError::Timeout {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
 			// The rest has no typed variant of its own: the CLI prints the
-			// error's text, a front end words the reason.
+			// error's text, a front end words the reason. TimedOut and
+			// Stalled say how long and how much arrived: their own text, not
+			// a 90 s limit they may never have reached (#191).
 			other => GitError::remote(other.reason(), other.to_string()),
 		}
 	}
@@ -3000,6 +3024,7 @@ impl From<RemoteError> for GitError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::codeless::Codeless;
 	use crate::proto::write_frame;
 
 	/// A worker that cannot be started for a reason of ours is typed, with
@@ -3014,7 +3039,7 @@ mod tests {
 			error.reason(),
 			Reason::Start {
 				start: Some(StartReason::NoCommand),
-				detail: String::new(),
+				detail: Datum::default(),
 			}
 		);
 		let missing = std::env::temp_dir().join("snip-no-such-program-225");
@@ -3032,7 +3057,10 @@ mod tests {
 			panic!("{error:?}")
 		};
 		assert_eq!(start, Some(StartReason::CannotRun));
-		assert!(detail.starts_with(&format!("{program}: ")), "{detail}");
+		assert!(
+			detail.as_str().starts_with(&format!("{program}: ")),
+			"{detail:?}"
+		);
 		assert!(!error.is_restore_retryable());
 	}
 
@@ -3251,7 +3279,9 @@ mod tests {
 				..
 			})
 		));
-		fixture.answer(Some(Response::Imported(Default::default())));
+		fixture.answer(Some(Response::Imported(Codeless::new(
+			Default::default(),
+		))));
 		join_prepared(first).unwrap();
 		let before = fixture.writes.lock().unwrap().len();
 		assert!(matches!(
@@ -3339,7 +3369,9 @@ mod tests {
 		let before = fixture.writes.lock().unwrap().len();
 		let second = fixture.start();
 		wait_for_request(before);
-		fixture.answer(Some(Response::Imported(Default::default())));
+		fixture.answer(Some(Response::Imported(Codeless::new(
+			Default::default(),
+		))));
 		join_prepared(second).unwrap();
 		assert!(fixture.lease.retained_heap_bytes() <= ready);
 	}
@@ -3730,7 +3762,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind: start_failure_kind(&cause, code, stderr),
 				reason: start_reason(&cause, code, stderr),
-				detail: stderr.to_string(),
+				detail: Datum::for_test(stderr),
 				message: start_message(cause.clone(), code, stderr),
 			};
 			assert_eq!(
@@ -3760,7 +3792,12 @@ mod tests {
 		}
 		for error in [
 			RemoteError::Cancelled,
-			RemoteError::Connect("Connection reset by peer".into()),
+			RemoteError::Start {
+				kind: ConnectFailureKind::Other,
+				reason: None,
+				detail: Datum::for_test("Connection reset by peer"),
+				message: "Connection reset by peer".into(),
+			},
 			RemoteError::Protocol("bad frame".into()),
 			RemoteError::WorkerTooOld {
 				worker: "old".into(),
@@ -3797,7 +3834,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind,
 				reason: None,
-				detail: stderr.to_string(),
+				detail: Datum::for_test(stderr),
 				message: start_message(StartCause::Ended, Some(255), stderr),
 			};
 			assert!(error.is_restore_retryable(), "{stderr}");
@@ -3810,7 +3847,7 @@ mod tests {
 				"user@box: Permission denied (publickey).",
 			),
 			reason: None,
-			detail: String::new(),
+			detail: Datum::default(),
 			message: String::new(),
 		};
 		assert!(!denied.is_restore_retryable(), "{denied:?}");
@@ -3823,7 +3860,7 @@ mod tests {
 			let error = RemoteError::Start {
 				kind,
 				reason: None,
-				detail: String::new(),
+				detail: Datum::default(),
 				message: String::new(),
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
@@ -3896,7 +3933,6 @@ mod tests {
 			last_byte: fresh_clock(),
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		}
 	}
 
@@ -4122,6 +4158,29 @@ mod tests {
 		assert_eq!(frames, 0);
 	}
 
+	/// A stream that ends between frames is the worker having closed: the
+	/// reason says so in its own words, while the CLI keeps its sentence and
+	/// a reused connection is still tried again.
+	#[test]
+	fn a_clean_close_mid_call_is_worker_closed() {
+		let mut stream = FakeDuplex::new(&[]);
+		let mut frames = 0;
+		let err = exchange(
+			&mut stream,
+			None,
+			IO_TIMEOUT,
+			Instant::now() + Duration::from_secs(10),
+			&mut frames,
+		)
+		.unwrap_err();
+		assert_eq!(err.to_string(), "the worker closed the connection");
+		assert_eq!(
+			serde_json::to_value(err.reason()).unwrap(),
+			serde_json::json!({"r": "worker_closed"})
+		);
+		assert!(should_resend(true, 0, &err));
+	}
+
 	#[test]
 	fn git_error_conversion_table() {
 		let err1 = RemoteError::Refused {
@@ -4162,11 +4221,15 @@ mod tests {
 		));
 
 		let err5 = RemoteError::TimedOut;
-		assert!(matches!(
-			GitError::from(err5),
-			GitError::Timeout { ref args, secs }
-				if args == "remote view" && secs == GIT_CALL_LIMIT.as_secs()
-		));
+		let g5 = GitError::from(err5);
+		assert!(
+			matches!(
+				&g5,
+				GitError::Remote { reason, .. }
+					if matches!(**reason, Reason::TimedOut)
+			),
+			"{g5:?}"
+		);
 
 		let err6 = RemoteError::WorkerTooOld {
 			worker: "w".into(),
@@ -4217,7 +4280,7 @@ mod tests {
 		let started = RemoteError::Start {
 			kind: ConnectFailureKind::WorkerUnavailable,
 			reason: Some(StartReason::NoWorker),
-			detail: "sh: snip: not found".into(),
+			detail: Datum::for_test("sh: snip: not found"),
 			message: "snip is not installed on that machine".into(),
 		};
 		let git = GitError::from(started);
@@ -4239,7 +4302,7 @@ mod tests {
 		let unknown = RemoteError::Start {
 			kind: ConnectFailureKind::Other,
 			reason: None,
-			detail: "boom".into(),
+			detail: Datum::for_test("boom"),
 			message: "boom".into(),
 		};
 		assert!(matches!(
@@ -4884,7 +4947,14 @@ mod tests {
 		.unwrap_err();
 		let text = err.to_string();
 		assert!(
-			matches!(err, RemoteError::Stalled { received: 0, .. }),
+			matches!(
+				err,
+				RemoteError::Stalled {
+					received: 0,
+					ended: WaitEnd::Silence,
+					..
+				}
+			),
 			"{err:?}"
 		);
 		assert!(text.contains("did not answer in time"), "{text}");
@@ -4900,7 +4970,7 @@ mod tests {
 
 	/// A reply that has started arriving may pause longer than the idle
 	/// bound mid-frame: the worker answered and the link is slow. The pause
-	/// here is under MID_FRAME_IDLE_FACTOR times the bound, so the call
+	/// here is under REPLY_IDLE_FACTOR times the bound, so the call
 	/// succeeds (#191).
 	#[test]
 	fn a_reply_paused_mid_frame_outlasts_the_idle_bound() {
@@ -4989,12 +5059,301 @@ mod tests {
 		drop(w);
 	}
 
+	/// A pipe-fed connection whose exchange is in flight, as the pump needs
+	/// for a reply of several frames: with no call in flight it ends after
+	/// the first whole frame (it reads that as unsolicited). Returns the
+	/// pipe's write end and the queue count of frames the pump has retained.
+	fn pipe_conn() -> (Connection, io::PipeWriter, Arc<AtomicUsize>) {
+		let (r, w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		in_flight.store(true, Ordering::SeqCst);
+		let mut conn = test_conn(
+			Box::new(std::io::sink()),
+			frames,
+			Arc::clone(&retained),
+			in_flight,
+		);
+		conn.last_byte = last_byte;
+		(conn, w, retained)
+	}
+
+	/// Waits, bounded, until the pump has queued `n` frames.
+	fn wait_for_retained(retained: &AtomicUsize, n: usize) {
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while retained.load(Ordering::Relaxed) < n {
+			assert!(Instant::now() < end, "the pump never queued {n} frames");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	fn frame_bytes(response: &Response) -> Vec<u8> {
+		let mut bytes = Vec::new();
+		write_frame(&mut bytes, response).unwrap();
+		bytes
+	}
+
+	/// The frames of a 64 KiB `Text` reply sent as two chunks and a join.
+	fn chunked_text_frames() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+		let json = serde_json::to_string(&Response::Text {
+			content: Some("x".repeat(64 * 1024)),
+		})
+		.unwrap();
+		let (first, second) = json.split_at(json.len() / 2);
+		(
+			frame_bytes(&Response::Chunk { data: first.into() }),
+			frame_bytes(&Response::Chunk {
+				data: second.into(),
+			}),
+			frame_bytes(&Response::Joined),
+		)
+	}
+
+	/// A pause between the frames of one reply is silence the reply has
+	/// already begun: it gets the long bound, as a pause inside a frame does
+	/// (#191). The first chunk was consumed when the pause began, so a bound
+	/// that reset at every consumed frame treated the pause as a new wait.
+	#[test]
+	fn a_reply_paused_between_chunk_frames_outlasts_the_idle_bound() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let (first, second, joined) = chunked_text_frames();
+		let producer = std::thread::spawn(move || {
+			if w.write_all(&first).is_err() {
+				return;
+			}
+			std::thread::sleep(scaled(Duration::from_millis(900)));
+			let _ = w.write_all(&second);
+			let _ = w.write_all(&joined);
+		});
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect(
+			"a pause between a reply's frames within the bound must succeed",
+		);
+		match reply {
+			Response::Text { content } => {
+				assert_eq!(content.map(|c| c.len()), Some(64 * 1024));
+			}
+			other => panic!("expected Text, got {other:?}"),
+		}
+		assert_eq!(frames, 3);
+		producer.join().unwrap();
+	}
+
+	/// After a heartbeat the worker is alive and working: silence from there
+	/// ends only at the long bound, not at the short one that guards a
+	/// connection that never answered (#191).
+	#[test]
+	fn a_reply_silent_after_a_heartbeat_ends_only_at_the_long_bound() {
+		let (mut conn, mut w, retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		w.write_all(&pending).unwrap();
+		wait_for_retained(&retained, 1);
+		let idle = scaled(Duration::from_millis(100));
+		let mut frames = 0;
+		let started = Instant::now();
+		let err = exchange(
+			&mut conn,
+			None,
+			idle,
+			started + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.unwrap_err();
+		match err {
+			RemoteError::Stalled {
+				received,
+				ended: WaitEnd::Silence,
+				..
+			} => assert_eq!(received, pending.len() as u64),
+			other => panic!("expected a Silence stall, got {other:?}"),
+		}
+		assert!(
+			started.elapsed() >= idle * 5,
+			"the wait after a heartbeat must outlast the idle bound, ended after {:?}",
+			started.elapsed()
+		);
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the wait must still end, took {:?}",
+			started.elapsed()
+		);
+		assert_eq!(frames, 1);
+		// The pipe stays open until the assertions have run.
+		drop(w);
+	}
+
+	/// The same pause after a heartbeat that ends in the answer: a worker
+	/// that heartbeats and then answers late is not stalled.
+	#[test]
+	fn a_reply_paused_after_a_heartbeat_outlasts_the_idle_bound() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		let text = frame_bytes(&Response::Text {
+			content: Some("done".into()),
+		});
+		let producer = std::thread::spawn(move || {
+			if w.write_all(&pending).is_err() {
+				return;
+			}
+			std::thread::sleep(scaled(Duration::from_millis(900)));
+			let _ = w.write_all(&text);
+		});
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect("a pause after a heartbeat within the bound must succeed");
+		assert!(
+			matches!(reply, Response::Text { content: Some(ref c) } if c == "done"),
+			"{reply:?}"
+		);
+		assert_eq!(frames, 2);
+		producer.join().unwrap();
+	}
+
+	/// The call's own time limit ends a reply that keeps flowing, and says
+	/// how much arrived and for how long, like a silence does (#191).
+	#[test]
+	fn the_call_deadline_with_bytes_flowing_reports_bytes_and_time() {
+		let (mut conn, mut w, _retained) = pipe_conn();
+		let bytes = frame_bytes(&Response::Text {
+			content: Some("x".repeat(1024 * 1024)),
+		});
+		// Detached: the frame takes longer than the call, and the producer
+		// ends when the pipe's reader is gone.
+		std::thread::spawn(move || {
+			for piece in bytes.chunks(16 * 1024) {
+				if w.write_all(piece).is_err() {
+					return;
+				}
+				std::thread::sleep(scaled(Duration::from_millis(50)));
+			}
+		});
+		let mut frames = 0;
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_secs(1)),
+			Instant::now() + scaled(Duration::from_millis(600)),
+			&mut frames,
+		)
+		.unwrap_err();
+		let text = err.to_string();
+		match err {
+			RemoteError::Stalled {
+				received,
+				elapsed,
+				ended: WaitEnd::Deadline,
+				..
+			} => {
+				assert!(received > 0, "received {received}");
+				assert!(
+					elapsed >= scaled(Duration::from_millis(500)).as_secs_f64(),
+					"elapsed {elapsed}"
+				);
+			}
+			other => panic!("expected a Deadline stall, got {other:?}"),
+		}
+		assert!(text.contains("bytes"), "{text}");
+		assert!(text.contains("time limit"), "{text}");
+	}
+
+	/// The deadline check after a frame arrives reports progress too: here a
+	/// heartbeat is already queued when the call's time is up.
+	#[test]
+	fn a_frame_past_the_deadline_reports_bytes_and_time() {
+		let (mut conn, mut w, retained) = pipe_conn();
+		let pending = frame_bytes(&Response::Pending);
+		w.write_all(&pending).unwrap();
+		wait_for_retained(&retained, 1);
+		let mut frames = 0;
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_secs(1)),
+			Instant::now(),
+			&mut frames,
+		)
+		.unwrap_err();
+		match err {
+			RemoteError::Stalled {
+				received,
+				ended: WaitEnd::Deadline,
+				..
+			} => assert_eq!(received, pending.len() as u64),
+			other => panic!("expected a Deadline stall, got {other:?}"),
+		}
+		assert_eq!(frames, 1);
+		drop(w);
+	}
+
+	/// A reply not yet begun gets the idle bound, one that has begun
+	/// REPLY_IDLE_FACTOR times it (#191).
+	#[test]
+	fn silence_budget_by_reply_state() {
+		let idle = Duration::from_millis(300);
+		for (started, expected) in
+			[(false, idle), (true, idle * REPLY_IDLE_FACTOR)]
+		{
+			assert_eq!(silence_budget(idle, started), expected);
+		}
+	}
+
+	#[test]
+	fn stalled_text_names_how_the_wait_ended() {
+		let stall = |ended| RemoteError::Stalled {
+			silent: 5.0,
+			received: 1234,
+			elapsed: 6.0,
+			ended,
+		};
+		let silence = stall(WaitEnd::Silence).to_string();
+		let deadline = stall(WaitEnd::Deadline).to_string();
+		for text in [&silence, &deadline] {
+			assert!(
+				text.starts_with("the worker did not answer in time"),
+				"{text}"
+			);
+			assert!(text.contains("1234 bytes"), "{text}");
+		}
+		assert!(silence.contains("no data for"), "{silence}");
+		assert!(deadline.contains("time limit passed"), "{deadline}");
+	}
+
+	/// A timeout keeps its progress when a Git caller reads it: the CLI
+	/// prints this text, and 90 s was never what elapsed (#191).
+	#[test]
+	fn remote_timeouts_keep_their_progress_as_git_errors() {
+		let stalled = GitError::from(RemoteError::Stalled {
+			silent: 5.0,
+			received: 1234,
+			elapsed: 6.0,
+			ended: WaitEnd::Silence,
+		});
+		assert!(stalled.to_string().contains("1234 bytes"), "{stalled}");
+		assert!(matches!(stalled.reason(), Reason::TimedOut), "{stalled:?}");
+		let bare = GitError::from(RemoteError::TimedOut);
+		assert!(!bare.to_string().contains("90s"), "{bare}");
+		assert!(matches!(bare.reason(), Reason::TimedOut), "{bare:?}");
+	}
+
 	#[test]
 	fn stalled_is_a_transient_read_failure_with_unknown_outcome() {
 		let error = RemoteError::Stalled {
 			silent: 5.0,
 			received: 1,
 			elapsed: 6.0,
+			ended: WaitEnd::Silence,
 		};
 		assert!(error.is_transient_read_failure());
 		assert!(error.outcome_unknown());

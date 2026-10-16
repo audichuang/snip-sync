@@ -18,10 +18,11 @@ use gpui::Context;
 use crate::i18n::Msg;
 use crate::reader::PreviewSource;
 use crate::reason::reason_msg;
+use crate::repo_set::RepoOp;
 use crate::tree::{
 	listed_tree_result, FileTreeNode, ListedChild, TreeIo, TreeIoResult,
 };
-use crate::{arm_cancel, lifecycle, RepoEntry, WorkbenchModel};
+use crate::{arm_cancel, RepoEntry, WorkbenchModel};
 
 pub use snip_remote::device_name;
 
@@ -691,14 +692,7 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 	reason_msg(&err.reason())
 }
 
-/// [`describe_msg`] for a failure of the user's `path`: a worded refusal
-/// keeps the path as the detail, so the status line says which path failed.
-pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
-	match err {
-		RemoteError::Refused { .. } => Msg::detail(describe_msg(err), path),
-		other => describe_msg(other),
-	}
-}
+pub use crate::reason::describe_msg_at;
 
 /// A Git view's error as a message.
 pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
@@ -828,41 +822,35 @@ impl WorkbenchModel {
 		let open_delay = self.e2e_remote_open_delay;
 		// Like an open, the listing's ssh belongs to this tab: a close or
 		// quit cancels it and waits for the connection to go.
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				#[cfg(test)]
-				if let Some(delay) = open_delay {
-					hold_open(&mut async_app, delay, &token).await;
-				}
-				let result = bg
-					.spawn(async move {
-						let cancel = Some(&token);
-						let ws = client.open_workspace_with(&path, cancel)?;
-						let (entries, _) =
-							client.list_folders(&ws.id, "", cancel)?;
-						let folders = entries
-							.into_iter()
-							.filter(|e| {
-								e.directory
-									&& e.utf8 && !e.name.starts_with('.')
-							})
-							.map(|e| e.name)
-							.collect();
-						Ok(FolderListing {
-							path: ws.id,
-							folders,
+		self.spawn_owned(cx, Some(cancel), async move {
+			#[cfg(test)]
+			if let Some(delay) = open_delay {
+				hold_open(&mut async_app, delay, &token).await;
+			}
+			let result = bg
+				.spawn(async move {
+					let cancel = Some(&token);
+					let ws = client.open_workspace_with(&path, cancel)?;
+					let (entries, _) =
+						client.list_folders(&ws.id, "", cancel)?;
+					let folders = entries
+						.into_iter()
+						.filter(|e| {
+							e.directory && e.utf8 && !e.name.starts_with('.')
 						})
+						.map(|e| e.name)
+						.collect();
+					Ok(FolderListing {
+						path: ws.id,
+						folders,
 					})
-					.await
-					.map_err(describe_msg);
-				let _ = this.update(&mut async_app, |this, cx| {
-					this.remote_listing_landed(seq, result, cx);
-				});
-			},
-		);
+				})
+				.await
+				.map_err(describe_msg);
+			let _ = this.update(&mut async_app, |this, cx| {
+				this.remote_listing_landed(seq, result, cx);
+			});
+		});
 	}
 
 	/// A folder listing lands; dropped when another folder or host is
@@ -1003,110 +991,100 @@ impl WorkbenchModel {
 			.filter(|b| b.host == idx)
 			.and_then(|b| b.client.take())
 			.filter(|c| c.host().name == host.name);
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let _priority_release = priority_release;
-				if let Some(gate) = priority_wait {
-					let executor = async_app.background_executor().clone();
-					let deadline = executor.now() + RESTORE_PRIORITY_LIMIT;
-					while !gate.load(std::sync::atomic::Ordering::SeqCst)
-						&& !token.is_cancelled()
+		self.spawn_owned(cx, Some(cancel), async move {
+			let _priority_release = priority_release;
+			if let Some(gate) = priority_wait {
+				let executor = async_app.background_executor().clone();
+				let deadline = executor.now() + RESTORE_PRIORITY_LIMIT;
+				while !gate.load(std::sync::atomic::Ordering::SeqCst)
+					&& !token.is_cancelled()
+				{
+					let remaining =
+						deadline.saturating_duration_since(executor.now());
+					if remaining.is_zero() {
+						break;
+					}
+					executor
+						.timer(
+							remaining.min(std::time::Duration::from_millis(50)),
+						)
+						.await;
+				}
+			}
+			// Tests hold the open at the test clock so a user action can
+			// land while it is in flight; a cancel ends the hold as it
+			// ends a real connect.
+			#[cfg(test)]
+			if let Some(delay) = open_delay {
+				hold_open(&mut async_app, delay, &token).await;
+			}
+			let shown_path = path.trim().to_string();
+			let result = bg
+				.spawn(async move {
+					let client = reuse.unwrap_or_else(|| {
+						Arc::new(Client::new(host, device_name()))
+					});
+					match client.open_workspace_with(path.trim(), Some(&token))
 					{
-						let remaining =
-							deadline.saturating_duration_since(executor.now());
-						if remaining.is_zero() {
-							break;
+						Ok(workspace) => Ok(OpenedRemote { client, workspace }),
+						Err(err) => Err((client, err)),
+					}
+				})
+				.await;
+			let _ = this.update(&mut async_app, |this, cx| {
+				this.remote.busy = false;
+				if this.remote.open_seq != open_seq {
+					// The user opened a local workspace, closed the
+					// workspace or started another remote open meanwhile:
+					// neither the workspace nor the status bar moves.
+					app_log!(
+						"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
+						this.remote.open_seq
+					);
+					this.resume_remote_restore(cx);
+					return;
+				}
+				let restore = this
+					.remote
+					.restoring
+					.as_ref()
+					.is_some_and(|r| r.open_seq == Some(open_seq));
+				match result {
+					Ok(opened) => {
+						this.hide_workspace_menu();
+						let target =
+							crate::tabs::OpenTarget::Remote(Box::new(opened));
+						if restore {
+							// The tab already stands for this folder.
+							this.open_in_place(target, cx);
+						} else {
+							this.route_open(target, cx);
 						}
-						executor
-							.timer(
-								remaining
-									.min(std::time::Duration::from_millis(50)),
-							)
-							.await;
+					}
+					Err((client, err)) => {
+						this.return_browse_client(idx, client);
+						let retryable = err.is_restore_retryable();
+						// The reason stays a message: worded when drawn, in
+						// the language then in force (#206 #208).
+						// The log line is the engine's text, not the UI's.
+						app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+						let err = describe_msg_at(err, &shown_path);
+						// Also on the status bar: a reconnect on launch runs
+						// with the menu closed.
+						this.set_status_msg(Msg::with_msg_arg(
+							"remote_open_failed",
+							[String::new()],
+							0,
+							err.clone(),
+						));
+						this.remote_note(false, err.clone(), cx);
+						if restore {
+							this.restore_failed(err, retryable, cx);
+						}
 					}
 				}
-				// Tests hold the open at the test clock so a user action can
-				// land while it is in flight; a cancel ends the hold as it
-				// ends a real connect.
-				#[cfg(test)]
-				if let Some(delay) = open_delay {
-					hold_open(&mut async_app, delay, &token).await;
-				}
-				let shown_path = path.trim().to_string();
-				let result = bg
-					.spawn(async move {
-						let client = reuse.unwrap_or_else(|| {
-							Arc::new(Client::new(host, device_name()))
-						});
-						match client
-							.open_workspace_with(path.trim(), Some(&token))
-						{
-							Ok(workspace) => {
-								Ok(OpenedRemote { client, workspace })
-							}
-							Err(err) => Err((client, err)),
-						}
-					})
-					.await;
-				let _ = this.update(&mut async_app, |this, cx| {
-					this.remote.busy = false;
-					if this.remote.open_seq != open_seq {
-						// The user opened a local workspace, closed the
-						// workspace or started another remote open meanwhile:
-						// neither the workspace nor the status bar moves.
-						app_log!(
-							"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
-							this.remote.open_seq
-						);
-						this.resume_remote_restore(cx);
-						return;
-					}
-					let restore = this
-						.remote
-						.restoring
-						.as_ref()
-						.is_some_and(|r| r.open_seq == Some(open_seq));
-					match result {
-						Ok(opened) => {
-							this.hide_workspace_menu();
-							let target = crate::tabs::OpenTarget::Remote(
-								Box::new(opened),
-							);
-							if restore {
-								// The tab already stands for this folder.
-								this.open_in_place(target, cx);
-							} else {
-								this.route_open(target, cx);
-							}
-						}
-						Err((client, err)) => {
-							this.return_browse_client(idx, client);
-							let retryable = err.is_restore_retryable();
-							// The reason stays a message: worded when drawn, in
-							// the language then in force (#206 #208).
-							// The log line is the engine's text, not the UI's.
-							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
-							let err = describe_msg_at(err, &shown_path);
-							// Also on the status bar: a reconnect on launch runs
-							// with the menu closed.
-							this.set_status_msg(Msg::with_msg_arg(
-								"remote_open_failed",
-								[String::new()],
-								0,
-								err.clone(),
-							));
-							this.remote_note(false, err.clone(), cx);
-							if restore {
-								this.restore_failed(err, retryable, cx);
-							}
-						}
-					}
-				});
-			},
-		);
+			});
+		});
 	}
 
 	/// Opens the path typed into the menu, on the host being browsed.
@@ -1434,7 +1412,6 @@ impl WorkbenchModel {
 
 		self.spawn_owned(
 			cx,
-			lifecycle::JobKind::CancellableRead,
 			Some(cancel_job),
 			async move {
 				let bg = async_app.background_executor().clone();
@@ -1468,10 +1445,7 @@ impl WorkbenchModel {
 							if retries > 0 {
 								app_log!("[APP:REMOTE_SCAN_RECOVERED: retries={retries} repos={}]", e.repos.len());
 							}
-							if wipe {
-								model.begin_rescan();
-							}
-							model.merge_repo_entries(e.repos);
+							model.apply_scan_page(wipe, e.repos, cx);
 							for err in e.errors {
 								model.push_discovery_error(err);
 							}
@@ -1550,11 +1524,16 @@ impl WorkbenchModel {
 							model.is_loading = false;
 							model.refresh_reload = false;
 							if wipe {
-								model.repos.clear();
 								model.pinned_repo = None;
 								model.selected_repo_idx = None;
 								model.release_repo_state();
-								model.sync_change_slots();
+								// The scan is over (`is_loading` is off), so
+								// the Changes nodes go with the list.
+								let change = model.repos.apply(
+									RepoOp::Clear,
+									&model.workspace_root,
+								);
+								model.repos_changed(change, cx);
 							}
 							model.ensure_ws_tree(cx);
 							if model
@@ -1644,7 +1623,7 @@ mod tests {
 		RemoteError::Start {
 			kind: ConnectFailureKind::Other,
 			reason,
-			detail: detail.into(),
+			detail: snip_core::reason::Datum::for_test(detail),
 			message: "english text the CLI prints".into(),
 		}
 	}
@@ -1658,7 +1637,7 @@ mod tests {
 			GitError::remote(
 				snip_core::reason::Reason::Start {
 					start: Some(StartReason::NoWorker),
-					detail: String::new(),
+					detail: snip_core::reason::Datum::default(),
 				},
 				"snip is not installed",
 			)
