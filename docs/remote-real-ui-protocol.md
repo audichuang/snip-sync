@@ -313,7 +313,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | 右鍵選單 | `menu-item:copy-files`（複製）、`menu-item:copy-path` |
 | Changes | `change-row:<path>`、`change-header:<group>`、`change-dir:<key>`、`change-unreadable`（無法讀取的儲存庫節點）、`change-unreadable-toggle`、`changes-empty` |
 | Log | `log-subject:<ix>`、`log-error`、`log-failed-feeds`（讀不到的 repo 橫幅）、`log-empty` |
-| 貼上面板 | `paste-panel`、`paste-items`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`、`paste-map:<prefix>`、`paste-map-pick:<…>`、`paste-commit:<n>`、`btn-apply`、`btn-cancel` |
+| 貼上面板 | `paste-panel`、`paste-items`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`、`paste-dir:<ord>:<rel>`、`paste-dir-toggle:<ord>:<rel>`、`paste-dir-include:<ord>:<rel>`（`<ord>` 是 root 在畫面上的序號，root 列本身的 `<rel>` 是空字串）、`paste-map:<prefix>`、`paste-map-pick:<…>`、`paste-commit:<n>`、`btn-apply`、`btn-cancel` |
 
 | 日誌 | 意思 |
 |---|---|

@@ -58,12 +58,16 @@ pub enum Landed {
 pub enum Nav {
 	Ignored,
 	Moved(usize),
+	/// The cursor is on a folder row now (it has no file detail).
+	MovedDir,
 	Refused(Msg),
 }
 
 #[derive(Debug)]
 pub enum Folded {
 	NoPlan,
+	/// A key that does nothing at the cursor.
+	Ignored,
 	Kept,
 	Reselected(Nav),
 }
@@ -251,7 +255,10 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Landed {
 		let remap = outcome.remap;
-		let built = outcome.result.and_then(|plan| {
+		let built = outcome.result.and_then(|mut plan| {
+			// Folds and the folder cursor survive a remap only where the
+			// folder is still there.
+			plan.normalize_cursor();
 			let detail = plan.detail_preview();
 			pending.admit_ui(ordinary, Some(&plan), detail.as_ref())?;
 			Ok((plan, detail))
@@ -437,11 +444,52 @@ impl PastePreview {
 		match pending.admit_ui(ordinary, Some(plan), detail.as_ref()) {
 			Ok(()) => {
 				plan.selected_item_idx = idx;
+				plan.cursor_dir = None;
 				self.detail = detail;
 				self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
 				Nav::Moved(idx)
 			}
 			Err(e) => Nav::Refused(e),
+		}
+	}
+
+	/// Puts the cursor on a folder row. A folder has no file detail.
+	pub fn select_dir(
+		&mut self,
+		key: DirKey,
+		ordinary: Option<&Preview>,
+	) -> Nav {
+		let Some(plan) = self.plan.as_mut() else {
+			return Nav::Ignored;
+		};
+		let on = PasteCursor::Dir(key.clone());
+		if !plan.cursor_rows().iter().any(|(c, ..)| *c == on) {
+			return Nav::Ignored;
+		}
+		let before = plan.cursor_dir.replace(key);
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		match pending.admit_ui(ordinary, Some(plan), None) {
+			Ok(()) => {
+				self.detail = None;
+				Nav::MovedDir
+			}
+			Err(e) => {
+				plan.cursor_dir = before;
+				Nav::Refused(e)
+			}
+		}
+	}
+
+	/// Moves the cursor to a row `step_target` or an arrow key chose.
+	pub fn move_to(
+		&mut self,
+		cursor: PasteCursor,
+		ordinary: Option<&Preview>,
+	) -> Nav {
+		match cursor {
+			PasteCursor::Item(idx) => self.select(idx, ordinary),
+			PasteCursor::Dir(key) => self.select_dir(key, ordinary),
 		}
 	}
 
@@ -454,7 +502,9 @@ impl PastePreview {
 		let Some(plan) = self.plan.as_ref() else {
 			return Err(Msg::new("paste_err_nothing", []));
 		};
-		if plan.selected_item_idx != idx {
+		// A read that finishes after the cursor moved on, to another file
+		// or to a folder, is not shown.
+		if plan.selected_item_idx != idx || plan.cursor_dir.is_some() {
 			return Ok(());
 		}
 		let pool = self.pending.clone();
@@ -470,7 +520,54 @@ impl PastePreview {
 			return Nav::Ignored;
 		};
 		let target = plan.step_target(forward);
-		self.select(target, ordinary)
+		self.move_to(target, ordinary)
+	}
+
+	/// Folds or unfolds a folder. The fold grows the retained state (its
+	/// key), so unlike a commit fold it is admitted first and a refusal
+	/// undoes all of it, never leaving a cursor on a row nobody can see.
+	pub fn toggle_dir_fold(
+		&mut self,
+		key: DirKey,
+		ordinary: Option<&Preview>,
+	) -> Folded {
+		let Some(plan) = self.plan.as_mut() else {
+			return Folded::NoPlan;
+		};
+		let was_folded = plan.collapsed_dirs.contains(&key);
+		let cursor_before = plan.cursor_dir.clone();
+		let hidden = plan.toggle_dir_collapsed(&key);
+		if hidden.is_some() {
+			plan.cursor_dir = Some(key.clone());
+		}
+		let detail = if hidden.is_some() {
+			None
+		} else {
+			self.detail.as_ref()
+		};
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		match pending.admit_ui(ordinary, Some(plan), detail) {
+			Ok(()) if hidden.is_some() => {
+				self.detail = None;
+				Folded::Reselected(Nav::MovedDir)
+			}
+			Ok(()) => Folded::Kept,
+			Err(e) => {
+				if was_folded {
+					plan.collapsed_dirs.insert(key);
+				} else {
+					plan.collapsed_dirs.remove(&key);
+				}
+				plan.cursor_dir = cursor_before;
+				Folded::Reselected(Nav::Refused(e))
+			}
+		}
+	}
+
+	/// The include box of a folder.
+	pub fn toggle_dir_selected(&mut self, key: &DirKey) -> Option<bool> {
+		self.plan.as_mut()?.set_dir_selected(key)
 	}
 
 	pub fn toggle_fold(
@@ -823,6 +920,8 @@ mod tests {
 		);
 		// With room, the same fold goes through.
 		let mut s = landed(SRC_TREE, dir.path(), None);
+		let c = index_of(&s, "src/lib/c.ts");
+		assert_eq!(s.select(c, None), Nav::Moved(c));
 		let app = dir_key(&s, "src/app");
 		assert!(matches!(s.toggle_dir_fold(app.clone(), None), Folded::Kept));
 		assert!(s.plan().unwrap().collapsed_dirs.contains(&app));

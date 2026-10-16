@@ -453,7 +453,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_refusal_cause_dir_in_way" => "目錄佔住了檔案位置",
 			"reason_refusal_cause_file_in_way" => "父目錄被檔案佔住",
 			"reason_refusal_cause_case_alias" => "路徑和目的地或這個 commit 裡的另一個路徑只差大小寫；可以改用檔案模式貼上，或先把名稱改成一致",
-			"paste_keys" => "Enter 套用 · Esc 取消 · ↑↓ 切換項目 · 空白鍵切換",
+			"paste_keys" => {
+				"Enter 套用 · Esc 取消 · ↑↓ 切換項目 · ←→ 收合／展開 · 空白鍵切換"
+			},
 			"copy_from" => "複製來源",
 			"selected" => "已選",
 			"repos_count" => "個儲存庫",
@@ -961,7 +963,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_refusal_cause_dir_in_way" => "a directory is in the way of the file",
 			"reason_refusal_cause_file_in_way" => "a file is in the way of its parent directory",
 			"reason_refusal_cause_case_alias" => "the path differs only in letter case from another one in the destination or the commit; paste in file mode instead, or rename it to match first",
-			"paste_keys" => "Enter apply · Esc cancel · ↑↓ item · Space toggle",
+			"paste_keys" => {
+				"Enter apply · Esc cancel · ↑↓ item · ←→ fold · Space toggle"
+			},
 			"copy_from" => "Copy from",
 			"selected" => "selected",
 			"repos_count" => "repos",

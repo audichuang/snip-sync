@@ -291,6 +291,8 @@ actions!(
 		NavUp,
 		NavDown,
 		NavToggle,
+		NavCollapse,
+		NavExpand,
 		SelectRepo1,
 		SelectRepo2,
 		ToggleTab,
@@ -5046,9 +5048,16 @@ impl WorkbenchModel {
 			Some(paste::preview::Landed::Shown { remap }) => {
 				self.refresh_paste_candidates(cx);
 				self.show_landed_plan(remap);
-				let selected_idx =
-					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
-				self.load_paste_diff(selected_idx, cx);
+				// A folder under the cursor has no file to read.
+				let on_item =
+					self.paste.plan().and_then(|p| match p.cursor() {
+						paste::PasteCursor::Item(ix) => Some(ix),
+						paste::PasteCursor::Dir(_) => None,
+					});
+				match on_item {
+					Some(ix) => self.load_paste_diff(ix, cx),
+					None => self.cancel_paste_diff(),
+				}
 				cx.notify();
 			}
 			Some(paste::preview::Landed::Refused { err, closed }) => {
@@ -5321,6 +5330,17 @@ impl WorkbenchModel {
 				app_log!("[APP:PASTE_NAV: idx={}]", idx);
 				cx.notify();
 			}
+			paste::preview::Nav::MovedDir => {
+				// A folder has no file to read; one still loading is dropped.
+				self.cancel_paste_diff();
+				if let Some(dir) = self.paste.plan().and_then(|p| {
+					let key = p.cursor_dir.as_ref()?;
+					Some(p.dir_label(key))
+				}) {
+					app_log!("[APP:PASTE_NAV_DIR: dir={}]", dir);
+				}
+				cx.notify();
+			}
 			paste::preview::Nav::Refused(err) => {
 				self.set_status_msg(err);
 				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
@@ -5356,7 +5376,8 @@ impl WorkbenchModel {
 
 	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
 		match self.paste.toggle_fold(c, self.preview.as_ref()) {
-			paste::preview::Folded::NoPlan => {}
+			paste::preview::Folded::NoPlan
+			| paste::preview::Folded::Ignored => {}
 			paste::preview::Folded::Kept => {
 				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
 				cx.notify();
@@ -5376,15 +5397,116 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Drops the diff read in flight: its answer is for a row the cursor has
+	/// left.
+	fn cancel_paste_diff(&mut self) {
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+	}
+
+	/// A click on a folder or root row puts the cursor on it.
+	pub fn select_paste_dir(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		let nav = self.paste.select_dir(key, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	/// Folds or unfolds a folder; a fold that hides the cursor moves it
+	/// onto the folder.
+	pub fn toggle_paste_dir(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		let before = self
+			.paste
+			.plan()
+			.map(|p| (p.dir_label(&key), p.collapsed_dirs.contains(&key)));
+		let folded = self
+			.paste
+			.toggle_dir_fold(key.clone(), self.preview.as_ref());
+		let (Some((label, was)), Some(plan)) = (before, self.paste.plan())
+		else {
+			return;
+		};
+		// A refused fold is undone: nothing toggled, nothing to report.
+		let now = plan.collapsed_dirs.contains(&key);
+		if now != was {
+			app_log!(
+				"[APP:PASTE_DIR_TOGGLED: dir={} collapsed={}]",
+				label,
+				now
+			);
+		}
+		if let paste::preview::Folded::Reselected(nav) = folded {
+			self.report_paste_nav(nav, cx);
+		}
+		cx.notify();
+	}
+
+	/// The include box of a folder or root row.
+	pub fn toggle_paste_dir_selected(
+		&mut self,
+		key: paste::DirKey,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("include", cx) || self.paste.is_loading()
+		{
+			return;
+		}
+		if let Some(state) = self.paste.toggle_dir_selected(&key) {
+			if let Some(plan) = self.paste.plan() {
+				app_log!(
+					"[APP:PASTE_DIR_SEL_TOGGLED: dir={} state={}]",
+					plan.dir_label(&key),
+					state
+				);
+			}
+			cx.notify();
+		}
+	}
+
+	/// Left and Right in the paste tree: fold, unfold or walk to the parent
+	/// or first child.
+	pub fn paste_tree_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+		let Some(plan) = self.paste.plan() else {
+			return;
+		};
+		let step = if forward {
+			plan.nav_right()
+		} else {
+			plan.nav_left()
+		};
+		match step {
+			paste::TreeStep::Nothing => {}
+			paste::TreeStep::Fold(key) | paste::TreeStep::Unfold(key) => {
+				self.toggle_paste_dir(key, cx)
+			}
+			paste::TreeStep::Move(cursor) => {
+				let nav = self.paste.move_to(cursor, self.preview.as_ref());
+				let moved = match nav {
+					paste::preview::Nav::Moved(idx) => Some(idx),
+					_ => None,
+				};
+				self.report_paste_nav(nav, cx);
+				if let Some(idx) = moved {
+					self.load_paste_diff(idx, cx);
+				}
+			}
+		}
+	}
+
 	pub(crate) fn load_paste_diff(
 		&mut self,
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if let Some(token) = self.paste_diff_cancel.take() {
-			token.cancel();
-		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.cancel_paste_diff();
 
 		let Some(plan) = self.paste.plan() else {
 			return;
@@ -5556,7 +5678,9 @@ impl WorkbenchModel {
 				let Some(plan) = model.paste.plan() else {
 					return;
 				};
-				if plan.selected_item_idx != selected_idx {
+				if plan.selected_item_idx != selected_idx
+					|| plan.cursor_dir.is_some()
+				{
 					return;
 				}
 				let Some(item) = plan.items.get(selected_idx) else {
@@ -6395,6 +6519,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("up", NavUp, Some("PastePanel")),
 		KeyBinding::new("down", NavDown, Some("PastePanel")),
 		KeyBinding::new("space", NavToggle, Some("PastePanel")),
+		KeyBinding::new("left", NavCollapse, Some("PastePanel")),
+		KeyBinding::new("right", NavExpand, Some("PastePanel")),
 		// Reader.
 		KeyBinding::new("ctrl-c", ReaderCopy, Some("Reader")),
 		KeyBinding::new("cmd-c", ReaderCopy, Some("Reader")),

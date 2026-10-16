@@ -63,13 +63,13 @@ use crate::{
 	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
 	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
 	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
-	LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
-	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
-	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
-	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
-	ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse,
-	TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel,
-	WorkbenchTab,
+	LogOpen, LogSearchFocus, LogUp, NavCollapse, NavDown, NavExpand, NavToggle,
+	NavUp, OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview,
+	Popover, Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown,
+	ReaderPageUp, ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind,
+	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
+	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
+	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
@@ -657,6 +657,20 @@ fn checkbox(checked: bool) -> Div {
 				pal().accent_text,
 			))
 		})
+}
+
+/// A folder's include box: [`checkbox`], with a bar across it when only
+/// some of the rows under it are included.
+fn checkbox_tri(tick: crate::paste::Tick) -> Div {
+	use crate::paste::Tick;
+	match tick {
+		Tick::All => checkbox(true),
+		Tick::Empty | Tick::Locked => checkbox(false),
+		Tick::Partial => checkbox(false)
+			.border_color(rgb(pal().accent))
+			.bg(rgb(pal().accent))
+			.child(div().w(px(6.)).h(px(2.)).bg(rgb(pal().accent_text))),
+	}
 }
 
 /// Compact square icon button for tool window / header toolbars. The label
@@ -1808,7 +1822,13 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &NavToggle, _, cx| {
 				if let Some(p) = this.paste.plan() {
-					let idx = p.selected_item_idx;
+					let idx = match p.cursor() {
+						crate::paste::PasteCursor::Dir(key) => {
+							this.toggle_paste_dir_selected(key, cx);
+							return;
+						}
+						crate::paste::PasteCursor::Item(idx) => idx,
+					};
 					if !p.display_order().contains(&idx) {
 						// Folded away: the row is not on screen.
 						return;
@@ -1820,6 +1840,18 @@ impl Render for WorkbenchModel {
 					} else {
 						this.toggle_paste_selected(idx, cx);
 					}
+				}
+			}))
+			// Left / Right fold the paste tree, but only while the panel
+			// itself has the focus: a view inside it keeps its own arrows.
+			.on_action(cx.listener(|this, _: &NavCollapse, window, cx| {
+				if this.paste_focus.is_focused(window) {
+					this.paste_tree_step(false, cx);
+				}
+			}))
+			.on_action(cx.listener(|this, _: &NavExpand, window, cx| {
+				if this.paste_focus.is_focused(window) {
+					this.paste_tree_step(true, cx);
 				}
 			}))
 			.on_mouse_move(cx.listener(
