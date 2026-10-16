@@ -1576,6 +1576,7 @@ impl Render for WorkbenchModel {
 		// The window's tooltip rule for this frame: tooltips ask it as they
 		// are drawn, after this tab (and the tab bar above it) rendered.
 		self.publish_gate(window, cx);
+		// Triggers are written again as this frame draws them.
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}

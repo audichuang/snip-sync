@@ -2832,6 +2832,8 @@ impl WorkbenchModel {
 				cx,
 			);
 		}
+		// A callback that lands in a background tab opens nothing: no field
+		// is drawn to take the keyboard when the tab is shown again.
 		self.overlays.set_workspace_picker(true);
 		self.pending_focus = Some(self.workspace_path_input.read(cx).handle());
 		cx.notify();
@@ -24392,6 +24394,152 @@ mod tests {
 					"the focus after a layer closes:\n{}",
 					failures.join("\n")
 				);
+			}
+
+			/// Ctrl+F / Ctrl+G with the find bar already open still close the
+			/// floating layer that was opened over it: the keyboard goes to
+			/// the bar, so no layer may stay drawn (and mute the tooltips)
+			/// behind it.
+			#[gpui::test]
+			fn reopening_an_open_inline_layer_closes_the_floating_one(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for opener in WIDE_OPENERS {
+					for (first, key) in [
+						("ctrl-f", "ctrl-f"),
+						("ctrl-f", "ctrl-g"),
+						("ctrl-g", "ctrl-f"),
+						("ctrl-g", "ctrl-g"),
+					] {
+						cx.simulate_keystrokes(first);
+						settle_checked(cx, &model);
+						opener.fire(&model, cx);
+						assert_eq!(
+							floating_now(&model, cx),
+							[opener.opens()],
+							"{} opened over the find bar",
+							opener.label()
+						);
+						cx.simulate_keystrokes(key);
+						settle_checked(cx, &model);
+						let (open, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						let at = focus_name(&model, cx);
+						let label = opener.label();
+						if !open.is_empty() {
+							failures.push(format!(
+								"{label}, {first} then {key}: floating {open:?}"
+							));
+						}
+						if inl != ["find-bar"] || at != "find-field" {
+							failures.push(format!(
+								"{label}, {first} then {key}: inline {inl:?}, focus {at}"
+							));
+						}
+						cases += 1;
+						reset(&model, cx);
+					}
+				}
+				assert_eq!(cases, WIDE_OPENERS.len() * 4);
+				assert!(
+					failures.is_empty(),
+					"{} of {cases} cases left a floating layer over the find bar:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// Where a trigger was drawn is forgotten when a frame does not
+			/// draw it: the chip a narrower window folds into "more" must not
+			/// keep its old place, or a press there would pass for a press on
+			/// it and the layer would survive an outside press.
+			#[gpui::test]
+			fn a_trigger_that_is_not_drawn_has_no_place(
+				cx: &mut TestAppContext,
+			) {
+				use crate::{overlay::TriggerId, ui::LogMenu};
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-branch", "log-menu:Branch")
+					.fire(&model, cx);
+				let slot = model.read_with(cx, |m, _| {
+					m.overlays.trigger_slot(TriggerId::LogChip(LogMenu::Branch))
+				});
+				let at = slot.get().expect("the chip is drawn at 1080w").center();
+				cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+				settle(cx);
+				assert!(
+					cx.debug_bounds("log-filter-branch").is_none(),
+					"the chip is folded away at 900w"
+				);
+				assert_eq!(
+					slot.get(),
+					None,
+					"the folded chip keeps no place from the wide frame"
+				);
+				let open = floating_now(&model, cx);
+				if open == ["log-menu:Branch"] {
+					cx.simulate_click(at, Modifiers::none());
+					settle_checked(cx, &model);
+					assert!(
+						floating_now(&model, cx).is_empty(),
+						"a press where the chip used to be is an outside press"
+					);
+				}
+			}
+
+			/// A selector opened by a press on its header button gives the
+			/// keyboard back to that button: the button took the focus the
+			/// press, so it is where the keyboard was when the layer opened.
+			/// (The shortcut gives it back to the pane it was pressed in.)
+			#[gpui::test]
+			fn a_selector_opened_by_a_click_returns_to_its_button(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "tree");
+				Opener::Click("btn-repo-selector", "selector:Repo")
+					.fire(&model, cx);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(floating_now(&model, cx).is_empty());
+				assert_eq!(
+					focus_name(&model, cx),
+					"other",
+					"back on the button that opened it, not the tree"
+				);
+			}
+
+			/// The folder dialog's failure lands after the tab went to the
+			/// background: the typed-path menu opens nothing there, and no
+			/// field is asked to take the keyboard when the tab is shown.
+			#[gpui::test]
+			fn the_workspace_picker_asks_for_no_focus_in_a_background_tab(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let background = tab(&root, cx, 0);
+				assert_eq!(active(&root, cx), Some(1));
+				background.update(cx, |m, cx| {
+					m.pending_focus = None;
+					m.show_workspace_picker(cx);
+				});
+				background.read_with(cx, |m, _| {
+					assert!(
+						!m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						),
+						"a background tab opens no menu"
+					);
+					assert!(
+						m.pending_focus.is_none(),
+						"and queues no focus for a field that is not drawn"
+					);
+				});
 			}
 
 			/// An IME composition owns Escape: the first one ends the

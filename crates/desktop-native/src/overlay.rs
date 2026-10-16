@@ -381,6 +381,16 @@ impl OverlayStack {
 		self.triggers.borrow_mut().entry(id).or_default().clone()
 	}
 
+	/// Forgets where every trigger was drawn. Called as a frame starts: a
+	/// trigger the layout does not draw this frame (a chip folded into
+	/// "more" by a narrower window) must not keep its old place, or a press
+	/// there would pass for a press on it.
+	pub(crate) fn clear_trigger_slots(&self) {
+		for slot in self.triggers.borrow().values() {
+			slot.set(None);
+		}
+	}
+
 	/// True when a press at `at` is on the control that opened the open
 	/// layer `kind`: that press is the trigger's to handle.
 	fn on_trigger(&self, kind: OverlayKind, at: gpui::Point<Pixels>) -> bool {
@@ -842,7 +852,9 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if !kind.is_floating() && self.overlays.is_open(kind) {
-			// Already open: whoever asked takes the keyboard into it.
+			// Already open: whoever asked takes the keyboard into it, and
+			// an inline layer opens over nothing floating, so a floating
+			// layer opened since goes.
 			return;
 		}
 		if kind.is_floating() && !crate::tabs::is_shown(self.ws_tab) {
@@ -1358,6 +1370,15 @@ mod tests {
 			.map(|k| k.panel_selector())
 			.collect();
 		assert_eq!(selectors.len(), 6, "one selector per kind of panel");
+		// A tooltip is muted by exactly the floating layers (the user's
+		// decision): an inline layer leaves them alone.
+		for k in OverlayKind::ALL {
+			assert_eq!(
+				k.suppresses_tooltips(),
+				k.is_floating(),
+				"{k:?}: muted tooltips follow floating"
+			);
+		}
 		assert_eq!(
 			OverlayKind::ALL.iter().filter(|k| k.is_floating()).count(),
 			10
