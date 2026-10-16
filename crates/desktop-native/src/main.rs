@@ -19327,6 +19327,119 @@ mod tests {
 			});
 		}
 
+		/// The budget's refusal puts the whole selection back, the
+		/// multi-selection with it (#230): a file list that outlived its
+		/// `log_selected` named origins past its end, so a copy took the
+		/// file from the wrong commit.
+		#[gpui::test]
+		fn a_file_the_budget_refuses_keeps_the_multi_selection(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			for name in ["b1", "b2"] {
+				fs::write(beta.join(format!("{name}.txt")), "beta\n").unwrap();
+				git(&beta, &["add", "."]);
+				git(&beta, &["commit", "-q", "-m", name]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "b1", "b2"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let row_of = |cx: &mut VisualTestContext, subject: &str| {
+				model.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == subject)
+						.expect("commit listed")
+				})
+			};
+			let (i2, i1) = (row_of(cx, "b2"), row_of(cx, "b1"));
+			let b2_id = model.read_with(cx, |m, _| {
+				m.display_commits()[i2].sha.clone()
+			});
+			let at = |cx: &mut VisualTestContext,
+			          ix: usize,
+			          mods: gpui::Modifiers| {
+				cx.run_until_parked();
+				let id: &'static str =
+					Box::leak(format!("log-subject:{ix}").into_boxed_str());
+				let row = cx.debug_bounds(id).expect("a commit row");
+				cx.simulate_click(row.center(), mods);
+			};
+			at(cx, i2, gpui::Modifiers::none());
+			settle_until(cx, "the first commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
+				})
+			});
+			at(cx, i1, gpui::Modifiers::secondary_key());
+			settle_until(cx, "the multi-selection's files and diff", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_file_origin.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "a multi-selection");
+			});
+
+			model.update(cx, |m, _| {
+				m.paste
+					.enqueue(crate::paste::PasteRequest::Clipboard {
+						text: "n".repeat(
+							crate::paste::MAX_RETAINED_PREVIEW_BYTES
+								- 32 * 1024,
+						),
+						dest: PathBuf::new(),
+						roots: Vec::new(),
+						generation: 0,
+						remote: None,
+					})
+					.expect("the queued paste fits");
+			});
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(alpha),
+					"big.txt",
+					snip_core::transfer::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.log_selected.len(),
+					2,
+					"the multi-selection must come back with its file list",
+				);
+				assert!(
+					m.commit_view
+						.commit_file_origin
+						.iter()
+						.all(|&o| (o as usize) < m.log_selected.len()),
+					"an origin past the end of the selection",
+				);
+				let (_, want) =
+					m.log_root_for(&b2_id).expect("b2's repository");
+				let (_, got) = m
+					.commit_file_rev("b2.txt")
+					.expect("b2.txt names a revision");
+				assert_eq!(got, want, "b2.txt belongs to the newer commit");
+			});
+		}
+
 		/// A search the Log cannot run hides the commits it replaced, so it
 		/// drops the selection too (#230): the right side must not show a
 		/// commit that is no longer listed.
