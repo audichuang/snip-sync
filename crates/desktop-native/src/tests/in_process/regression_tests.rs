@@ -449,3 +449,53 @@ fn fuzz_regression_a_paste_preview_hides_the_reader_and_keeps_its_find_bar_open(
 	assert!(cx.debug_bounds("find-bar").is_some(), "the reader is back");
 	overlays::assert_overlay_panels_match(cx, &model);
 }
+
+/// L6: with no commit selected the commit view is empty, except for the
+/// file a rev tree has open: "Browse tree at this commit" outlives the
+/// editor tab (its own button leaves it), and a file of it is selected in the
+/// commit view with no commit selected. The check read that as a view left
+/// behind (found by `fuzz_local_workbench_keeps_derived_state`: browse a
+/// commit's tree, close the tab, open a file of the tree).
+#[gpui::test]
+fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let rev_row = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with("rev-row:"))
+		})
+	};
+	let browse = model.read_with(cx, |m, _| {
+		m.probes
+			.as_ref()
+			.unwrap()
+			.drawn()
+			.into_iter()
+			.find(|id| id.starts_with("btn-browse-tree:"))
+			.expect("the commit offers its tree")
+	});
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "the tree", |cx| rev_row(cx).is_some());
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	model.read_with(cx, |m, _| {
+		assert!(m.rev_tree.is_some(), "closing the tab leaves the tree");
+		assert!(m.selected_commit.is_none());
+	});
+	let row = rev_row(cx).expect("a file of the tree");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	model.read_with(cx, |m, cx| {
+		assert!(m.selected_commit.is_none());
+		assert!(m.commit_view.selected_commit_file.is_some());
+		invariants::assert_holds(m, cx, &[L2, L6]);
+	});
+}
