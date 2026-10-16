@@ -15292,9 +15292,9 @@ mod tests {
 		/// a window with the OS text system and the embedded fonts, draws
 		/// the fixture's Log and reads the whole window's `TEXT_FIT` (#228):
 		/// what each text shows is checked against the rule of its role
-		/// (graphemes, never pixels). It is inline so that
-		/// `check_test_refresh.sh` (which reads what follows `mod tests {`)
-		/// still bans `.refresh()` here.
+		/// (graphemes, never pixels). It is inline so that the redraw ban of
+		/// `check_test_refresh.sh`, which only reads what follows the
+		/// tests module's opening line, still covers it.
 		mod fit_matrix {
 			use super::*;
 			use crate::ui::{rule_holds, FitRole};
