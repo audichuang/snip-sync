@@ -129,6 +129,83 @@ impl Request {
 	}
 }
 
+/// How the worker serves a [`RequestKind`]: where a [`Fault`] can act on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+	/// Answered before dispatch.
+	Hello,
+	/// `State::handle` does the work, under heartbeats (`run_inline`):
+	/// OpenWorkspace, ListDir, Stat, Read.
+	Inline,
+	/// Refused at once, with no work behind it: Write, Rename.
+	RefusedAtOnce,
+	/// Served as a job (`run_job`, `run_job_with`, `serve_copy`).
+	Job,
+	/// A piece of a request, never dispatched alone.
+	Framing,
+}
+
+impl RequestKind {
+	/// How the worker serves this kind. An exhaustive match: a new request
+	/// must decide.
+	pub fn class(self) -> Class {
+		match self {
+			Self::Hello => Class::Hello,
+			Self::OpenWorkspace | Self::ListDir | Self::Stat | Self::Read => {
+				Class::Inline
+			}
+			Self::Write | Self::Rename => Class::RefusedAtOnce,
+			Self::ReplayRead
+			| Self::ScanRepos
+			| Self::GitView
+			| Self::Export
+			| Self::ExportCommits
+			| Self::ExportChanges
+			| Self::ImportPlan
+			| Self::PrepareImport
+			| Self::ApplyPrepared
+			| Self::ImportApply
+			| Self::ReplayPlan
+			| Self::ReplayApply
+			| Self::PrepareReplay
+			| Self::ApplyPreparedReplay => Class::Job,
+			Self::Chunk | Self::FrameChunk | Self::FrameJoin => Class::Framing,
+		}
+	}
+
+	/// Whether the request can write to the workspace (a master never sends
+	/// it twice). `ReplayApply` and `ApplyPreparedReplay` write only when not
+	/// `check_only`: a test sends them with `check_only: false`.
+	pub fn may_write(self) -> bool {
+		match self {
+			Self::ApplyPrepared
+			| Self::ImportApply
+			| Self::ReplayApply
+			| Self::ApplyPreparedReplay => true,
+			Self::Hello
+			| Self::OpenWorkspace
+			| Self::ListDir
+			| Self::Stat
+			| Self::Read
+			| Self::ReplayRead
+			| Self::Write
+			| Self::Rename
+			| Self::ScanRepos
+			| Self::GitView
+			| Self::Export
+			| Self::ExportCommits
+			| Self::ExportChanges
+			| Self::ImportPlan
+			| Self::PrepareImport
+			| Self::ReplayPlan
+			| Self::PrepareReplay
+			| Self::Chunk
+			| Self::FrameChunk
+			| Self::FrameJoin => false,
+		}
+	}
+}
+
 /// What a worker does to one answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fault {
@@ -290,5 +367,35 @@ mod tests {
 		}
 		assert_eq!(read("w").workspace(), Some("w"));
 		assert_eq!(Request::FrameJoin.workspace(), None);
+	}
+
+	#[test]
+	fn every_request_kind_has_a_class() {
+		let count = |c: Class| {
+			ALL_REQUEST_KINDS
+				.into_iter()
+				.filter(|k| k.class() == c)
+				.count()
+		};
+		assert_eq!(count(Class::Hello), 1);
+		assert_eq!(count(Class::Inline), 4);
+		assert_eq!(count(Class::RefusedAtOnce), 2);
+		assert_eq!(count(Class::Job), 14);
+		assert_eq!(count(Class::Framing), 3);
+		let writers: Vec<_> = ALL_REQUEST_KINDS
+			.into_iter()
+			.filter(|k| k.may_write())
+			.collect();
+		assert_eq!(
+			writers,
+			[
+				RequestKind::ApplyPrepared,
+				RequestKind::ImportApply,
+				RequestKind::ReplayApply,
+				RequestKind::ApplyPreparedReplay,
+			]
+		);
+		// A writer is a job: only a job can have written something.
+		assert!(writers.iter().all(|k| k.class() == Class::Job));
 	}
 }

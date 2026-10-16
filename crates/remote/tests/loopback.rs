@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use snip_remote::fault::{
-	Fault, FaultRule, Match, RequestKind, ALL_REQUEST_KINDS,
+	Class, Fault, FaultRule, Match, RequestKind, ALL_REQUEST_KINDS,
 };
 use snip_remote::proto::EntryKind;
 use snip_remote::{
@@ -322,39 +322,6 @@ fn open_ws(w: &Arc<Worker>, root: &std::path::Path) -> String {
 	}
 }
 
-/// Whether the dispatch answers this request from `State::handle` with real
-/// work behind it: the requests that must heartbeat while they run. Every
-/// kind is named, so a new request has to decide here.
-fn served_inline(kind: RequestKind) -> bool {
-	match kind {
-		RequestKind::OpenWorkspace
-		| RequestKind::ListDir
-		| RequestKind::Stat
-		| RequestKind::Read => true,
-		// Refused at once, with no work behind them.
-		RequestKind::Hello | RequestKind::Write | RequestKind::Rename => false,
-		// Jobs: they heartbeat through `run_job`.
-		RequestKind::ReplayRead
-		| RequestKind::ScanRepos
-		| RequestKind::GitView
-		| RequestKind::Export
-		| RequestKind::ExportCommits
-		| RequestKind::ExportChanges
-		| RequestKind::ImportPlan
-		| RequestKind::PrepareImport
-		| RequestKind::ApplyPrepared
-		| RequestKind::ImportApply
-		| RequestKind::ReplayPlan
-		| RequestKind::ReplayApply
-		| RequestKind::PrepareReplay
-		| RequestKind::ApplyPreparedReplay => false,
-		// Pieces of a request, never dispatched alone.
-		RequestKind::Chunk
-		| RequestKind::FrameChunk
-		| RequestKind::FrameJoin => false,
-	}
-}
-
 fn inline_request(
 	kind: RequestKind,
 	ws: &str,
@@ -394,7 +361,7 @@ fn every_inline_request_heartbeats_while_it_runs() {
 	let ws = open_ws(&w, &root);
 	let kinds: Vec<RequestKind> = ALL_REQUEST_KINDS
 		.into_iter()
-		.filter(|k| served_inline(*k))
+		.filter(|k| k.class() == Class::Inline)
 		.collect();
 	assert_eq!(kinds.len(), 4, "{kinds:?}");
 	for kind in &kinds {
@@ -570,7 +537,7 @@ fn every_inline_request_past_its_deadline_heartbeats_then_times_out() {
 	let slow = SLOW_WORK.max(deadline + Duration::from_secs(2));
 	let kinds: Vec<RequestKind> = ALL_REQUEST_KINDS
 		.into_iter()
-		.filter(|k| served_inline(*k))
+		.filter(|k| k.class() == Class::Inline)
 		.collect();
 	assert_eq!(kinds.len(), 4, "{kinds:?}");
 	for kind in &kinds {

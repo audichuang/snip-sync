@@ -1394,36 +1394,6 @@ mod tests {
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
 	}
 
-	/// Whether `State::handle` does work for this kind, so a job's end must
-	/// reach it. Every kind is named, so a new request has to decide.
-	fn handled_inline(kind: crate::fault::RequestKind) -> bool {
-		use crate::fault::RequestKind as K;
-		match kind {
-			K::OpenWorkspace | K::ListDir | K::Stat | K::Read => true,
-			// Answered at once, with no work behind them, or served as jobs.
-			K::Hello
-			| K::ReplayRead
-			| K::Write
-			| K::Rename
-			| K::ScanRepos
-			| K::GitView
-			| K::Export
-			| K::ExportCommits
-			| K::ExportChanges
-			| K::ImportPlan
-			| K::PrepareImport
-			| K::ApplyPrepared
-			| K::ImportApply
-			| K::ReplayPlan
-			| K::ReplayApply
-			| K::PrepareReplay
-			| K::ApplyPreparedReplay
-			| K::Chunk
-			| K::FrameChunk
-			| K::FrameJoin => false,
-		}
-	}
-
 	/// An op that is handed a cancel and a deadline must use them: a job
 	/// that must stop gets its refusal back, and the work is not started.
 	/// The folder has a file, so a listing that ignored the job would be
@@ -1468,7 +1438,7 @@ mod tests {
 		};
 		let kinds: Vec<K> = crate::fault::ALL_REQUEST_KINDS
 			.into_iter()
-			.filter(|k| handled_inline(*k))
+			.filter(|k| k.class() == crate::fault::Class::Inline)
 			.collect();
 		assert_eq!(kinds.len(), 4, "{kinds:?}");
 		for kind in kinds {
