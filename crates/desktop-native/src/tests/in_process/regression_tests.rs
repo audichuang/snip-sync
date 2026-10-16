@@ -122,10 +122,11 @@ fn commit_shown(
 	fs::write(alpha.join("a.txt"), "one").unwrap();
 	git(&alpha, &["add", "."]);
 	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	repo(ws.path(), "beta", &[]);
 	let (model, cx) =
 		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
 	settle_until(cx, "the Log", |cx| {
-		model.read_with(cx, |m, _| !m.commits.is_empty())
+		model.read_with(cx, |m, _| !m.commits.is_empty() && m.repos.len() == 2)
 	});
 	// Probes on, then the first row the Log drew.
 	click_probed(&model, cx, "btn-log-refresh");
@@ -210,5 +211,31 @@ fn fuzz_regression_a_details_read_in_flight_when_the_tab_closes_is_dropped(
 	model.read_with(cx, |m, cx| {
 		assert!(m.selected_commit.is_none());
 		invariants::assert_holds(m, cx, &[L6, L8]);
+	});
+}
+
+/// L6: switching the open repo drops the Log's selection and reads the repo
+/// anew; the Log's claim on the latest preview read goes with it. The switch
+/// cleared `selected_commit` and kept `preview_pending_from_log` (found by
+/// `fuzz_local_workbench_keeps_derived_state`: Log row, then another repo).
+#[gpui::test]
+fn fuzz_regression_switching_the_repo_leaves_the_log_no_preview_to_own(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	model.read_with(cx, |m, _| assert!(m.selected_repo_idx.is_some()));
+	// The other repo than the open one.
+	let other = model.read_with(cx, |m, _| 1 - m.selected_repo_idx.unwrap());
+	model.read_with(cx, |m, _| {
+		assert!(m.selected_commit.is_some() && m.preview_pending_from_log)
+	});
+	model.update_in(cx, |m, _, cx| m.select_repo(other, cx));
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(
+			m.selected_commit.is_none(),
+			"the switch drops the selection"
+		);
+		invariants::assert_holds(m, cx, &[L6]);
 	});
 }
