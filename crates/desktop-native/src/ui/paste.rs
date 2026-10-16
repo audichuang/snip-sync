@@ -318,6 +318,9 @@ impl WorkbenchModel {
 		let inc_id = dir_control_id(DirControl::Include, ord, &rel);
 		let tick = sum.tick();
 		let on_cursor = plan.cursor_dir.as_ref() == Some(&key);
+		// A replay's folders fold like its headers: a click anywhere on the
+		// row, and its include box is locked (all or nothing is written).
+		let by_commit = plan.whole_commit;
 		let written = if sum.included == sum.files {
 			sum.files.to_string()
 		} else {
@@ -331,7 +334,11 @@ impl WorkbenchModel {
 			.when(on_cursor, |d| d.bg(rgb(pal().selection_bg)))
 			.when(!on_cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.on_click(cx.listener(move |this, _, _, cx| {
-				this.select_paste_dir(on_row.clone(), cx)
+				if by_commit {
+					this.toggle_paste_dir(on_row.clone(), cx)
+				} else {
+					this.select_paste_dir(on_row.clone(), cx)
+				}
 			}))
 			.child(
 				tree_chevron(toggle_id.clone(), collapsed)
@@ -358,6 +365,13 @@ impl WorkbenchModel {
 							.tooltip(tip(t("paste_busy_refused", loc)))
 					})
 					.when(tick == Tick::Locked, |d| d.opacity(0.4))
+					// A locked box does not fold the row it sits on.
+					.when(by_commit, |d| {
+						d.on_click(|_, _, cx| cx.stop_propagation())
+					})
+					.when(by_commit && !applying, |d| {
+						d.tooltip(tip(t("commit_subset_rejected", loc)))
+					})
 					// Still routed to the model while applying so the refusal
 					// is explicit, like a file's box.
 					.when(tick != Tick::Locked, |d| {
@@ -596,13 +610,14 @@ impl WorkbenchModel {
 			let planned_skip = item.planned_skip();
 			let by_commit = item.commit.is_some();
 			let ow_on = item.overwrite_allowed;
-			// A commit's rows are in replay order, so they keep the full path.
 			let (_, base) = split_dir(&path);
-			// A skipped row only has its raw path, which can be anything.
-			let name = if by_commit || planned_skip {
+			// A skipped row only has its raw path, which can be anything. A
+			// rename's deleted old path stands under the new path's folder,
+			// so it names its own.
+			let name = if planned_skip || item.is_rename_source() {
 				path.as_str()
 			} else {
-				base
+				split_dir(plan.place_path(ix)).1
 			};
 			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
@@ -621,7 +636,7 @@ impl WorkbenchModel {
 				}))
 				// Under a folder, the file lines up with its siblings'
 				// checkboxes, past the folders' chevron column.
-				.when(!by_commit, |d| d.child(div().flex_shrink_0().w(px(16.))))
+				.child(div().flex_shrink_0().w(px(16.)))
 				.child(
 					div()
 						.id(SharedString::from(inc_id.clone()))

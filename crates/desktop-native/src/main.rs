@@ -5514,6 +5514,9 @@ impl WorkbenchModel {
 		else {
 			return;
 		};
+		if matches!(folded, paste::preview::Folded::Ignored) {
+			return;
+		}
 		// A refused fold is undone: nothing toggled, nothing to report.
 		let now = plan.collapsed_dirs.contains(&key);
 		if now != was {
@@ -5524,7 +5527,14 @@ impl WorkbenchModel {
 			);
 		}
 		if let paste::preview::Folded::Reselected(nav) = folded {
+			let moved = match nav {
+				paste::preview::Nav::Moved(idx) => Some(idx),
+				_ => None,
+			};
 			self.report_paste_nav(nav, cx);
+			if let Some(idx) = moved {
+				self.load_paste_diff(idx, cx);
+			}
 		}
 		cx.notify();
 	}
@@ -15536,6 +15546,7 @@ mod tests {
 			path: &str,
 		) -> crate::paste::DirKey {
 			model.read_with(cx, |m, _| crate::paste::DirKey {
+				commit: None,
 				root: m.paste.plan().unwrap().items[0].dest_root.clone(),
 				path: path.into(),
 			})

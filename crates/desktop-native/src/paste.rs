@@ -32,7 +32,7 @@ use snip_remote::{
 	FilePastePlan, PasteError, PasteRoute, PasteTarget, RemoteError,
 };
 
-use crate::dirtree::{DirTree, TreeSink};
+use crate::dirtree::{DirTree, TreePath, TreeSink};
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
 use crate::reason::reason_msg;
@@ -616,6 +616,12 @@ impl PasteItem {
 		matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
 	}
 
+	/// The deleted old path of a commit's rename. It stands beside the new
+	/// path in the tree, so its row names its own full path.
+	pub fn is_rename_source(&self) -> bool {
+		self.is_delete() && self.rename_note.is_some()
+	}
+
 	/// An existing destination file that the user may choose to overwrite.
 	/// A skipped row is never written, so it never asks.
 	pub fn overwritable(&self) -> bool {
@@ -683,10 +689,13 @@ impl PasteItem {
 /// Key of a destination root in the preview tree.
 pub type RootKey = PathBuf;
 
-/// A folder row of the file-mode tree: its root and its path under it
-/// ("" is the root row itself).
+/// A folder row of the paste tree: its root and its path under it ("" is
+/// the root row itself). A commit replay lists each commit's own folders, so
+/// a folder named like another commit's is a different row: `commit` says
+/// whose it is (`None` in a file paste).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DirKey {
+	pub commit: Option<usize>,
 	pub root: RootKey,
 	pub path: String,
 }
@@ -1476,6 +1485,7 @@ impl TreeSink for PasteSink<'_> {
 		depth: usize,
 	) -> bool {
 		let key = DirKey {
+			commit: None,
 			root: self.root.clone(),
 			path: path.to_string(),
 		};
@@ -1493,6 +1503,56 @@ impl TreeSink for PasteSink<'_> {
 
 	fn file(&mut self, ix: usize, depth: usize) {
 		self.rows.push(PasteNode::File(ix, depth));
+	}
+}
+
+/// A commit row's place in the tree, for [`DirTree`].
+struct Placed<'a>(&'a str);
+
+impl TreePath for Placed<'_> {
+	fn tree_path(&self) -> &str {
+		self.0
+	}
+}
+
+/// Turns the directory tree of one commit's rows into paste nodes. The tree
+/// sees the commit's rows only, so its indices start at `base` in `items`.
+struct CommitSink<'a> {
+	plan: &'a PastePreviewPlan,
+	commit: usize,
+	base: usize,
+	rows: &'a mut Vec<PasteNode>,
+}
+
+impl TreeSink for CommitSink<'_> {
+	fn dir(
+		&mut self,
+		path: &str,
+		name: &str,
+		members: &[usize],
+		depth: usize,
+	) -> bool {
+		let key = DirKey {
+			commit: Some(self.commit),
+			root: self.plan.items[self.base].dest_root.clone(),
+			path: path.to_string(),
+		};
+		let collapsed = self.plan.collapsed_dirs.contains(&key);
+		let members: Vec<usize> =
+			members.iter().map(|&m| self.base + m).collect();
+		self.rows.push(PasteNode::Dir {
+			key,
+			ord: self.commit,
+			name: name.to_string(),
+			depth,
+			sum: self.plan.summary(&members),
+			collapsed,
+		});
+		!collapsed
+	}
+
+	fn file(&mut self, ix: usize, depth: usize) {
+		self.rows.push(PasteNode::File(self.base + ix, depth));
 	}
 }
 
@@ -2667,13 +2727,16 @@ impl PastePreviewPlan {
 	}
 
 	/// A folder row as the logs and drivers name it: `<ord>:<rel>`, the
-	/// root's position on screen and the folder's path under it.
+	/// root's position on screen (a replay's: the commit's index) and the
+	/// folder's path under it.
 	pub fn dir_label(&self, key: &DirKey) -> String {
-		let ord = self
-			.root_groups()
-			.iter()
-			.position(|g| g.root == key.root)
-			.unwrap_or(0);
+		// A replay has one root; its folders are told apart by commit.
+		let ord = key.commit.unwrap_or_else(|| {
+			self.root_groups()
+				.iter()
+				.position(|g| g.root == key.root)
+				.unwrap_or(0)
+		});
 		format!("{ord}:{}", key.path)
 	}
 
@@ -2686,19 +2749,24 @@ impl PastePreviewPlan {
 
 	/// The rows the cursor can stand on, in screen order, with their tree
 	/// depth and, for a folder, whether it is folded. A commit replay has
-	/// only its file rows (the headers fold, they are not selected).
+	/// only its file rows (its headers and folders fold, they are not
+	/// selected).
 	pub fn cursor_rows(&self) -> Vec<(PasteCursor, usize, Option<bool>)> {
 		let nodes = if self.whole_commit {
 			self.commit_rows()
 		} else {
 			self.tree_rows()
 		};
+		let by_commit = self.whole_commit;
 		nodes
 			.into_iter()
 			.filter_map(|n| match n {
 				PasteNode::Root { key, collapsed, .. } => {
 					Some((PasteCursor::Dir(key), 0, Some(collapsed)))
 				}
+				// A commit's folders fold like its headers do: they are
+				// clicked, the cursor does not stand on them.
+				PasteNode::Dir { .. } if by_commit => None,
 				PasteNode::Dir {
 					key,
 					depth,
@@ -2795,7 +2863,13 @@ impl PastePreviewPlan {
 		for &ix in members {
 			let item = &self.items[ix];
 			sum.files += 1;
-			if !item.planned_skip() {
+			if self.whole_commit {
+				// A replay is written whole or not at all: nothing under a
+				// folder can be toggled, and "included" is what Apply writes.
+				sum.included += usize::from(
+					item.selected && !item.action().is_not_written(),
+				);
+			} else if !item.planned_skip() {
 				sum.toggleable += 1;
 				sum.included += usize::from(item.selected);
 			}
@@ -2811,6 +2885,7 @@ impl PastePreviewPlan {
 		let mut rows = Vec::new();
 		for (ord, group) in self.root_groups().into_iter().enumerate() {
 			let key = DirKey {
+				commit: None,
 				root: group.root.clone(),
 				path: String::new(),
 			};
@@ -2895,7 +2970,11 @@ impl PastePreviewPlan {
 		}
 		for (root, path, depth) in self.all_dirs() {
 			if depth == 1 {
-				self.collapsed_dirs.insert(DirKey { root, path });
+				self.collapsed_dirs.insert(DirKey {
+					commit: None,
+					root,
+					path,
+				});
 			}
 		}
 		if let Some(key) = self.hiding_dir(self.selected_item_idx) {
@@ -2914,9 +2993,14 @@ impl PastePreviewPlan {
 		let mut exists: BTreeSet<DirKey> = self
 			.all_dirs()
 			.into_iter()
-			.map(|(root, path, _)| DirKey { root, path })
+			.map(|(root, path, _)| DirKey {
+				commit: None,
+				root,
+				path,
+			})
 			.collect();
 		exists.extend(self.root_groups().into_iter().map(|g| DirKey {
+			commit: None,
 			root: g.root,
 			path: String::new(),
 		}));
@@ -2943,6 +3027,15 @@ impl PastePreviewPlan {
 		&mut self,
 		key: &DirKey,
 	) -> Option<PasteCursor> {
+		if self.whole_commit {
+			// The cursor never stands on a replay's folder: it goes to the
+			// nearest row still shown, as when a header folds.
+			let before = self.display_order();
+			if !self.collapsed_dirs.remove(key) {
+				self.collapsed_dirs.insert(key.clone());
+			}
+			return self.row_left_hidden(&before).map(PasteCursor::Item);
+		}
 		if self.collapsed_dirs.remove(key) {
 			return None;
 		}
@@ -3030,24 +3123,66 @@ impl PastePreviewPlan {
 		Some(on)
 	}
 
+	/// Whether a folder or root row with this key is shown now.
+	pub fn has_dir_row(&self, key: &DirKey) -> bool {
+		let nodes = if self.whole_commit {
+			self.commit_rows()
+		} else {
+			self.tree_rows()
+		};
+		nodes.iter().any(|n| {
+			matches!(n, PasteNode::Root { key: k, .. }
+				| PasteNode::Dir { key: k, .. } if k == key)
+		})
+	}
+
+	/// Where item `ix` stands in the tree. A commit's rename is a deletion of
+	/// the old path next to a write of the new one, and the pair stays
+	/// together under the new path (#196), where the user will look for it.
+	pub fn place_path(&self, ix: usize) -> &str {
+		let item = &self.items[ix];
+		if item.is_rename_source() {
+			if let Some(next) = self.items.get(ix + 1) {
+				if next.commit == item.commit && next.op_index == item.op_index
+				{
+					return &next.path;
+				}
+			}
+		}
+		&item.path
+	}
+
 	/// The commit replay as the user will see it: each commit's header, in
-	/// replay order, followed by its file rows in natural path order. An empty commit is a header
-	/// with no rows; a collapsed commit keeps only its header.
+	/// replay order, followed by its rows as the same directory tree a file
+	/// paste shows (folders first, natural path order). An empty commit is a
+	/// header with no rows; a collapsed commit keeps only its header, and a
+	/// collapsed folder only its own row.
 	pub fn commit_rows(&self) -> Vec<PasteNode> {
 		let Some(preview) = &self.commit_preview else {
 			return Vec::new();
 		};
 		let mut rows = Vec::with_capacity(self.items.len());
-		let mut ix = 0;
+		let mut start = 0;
 		for c in 0..preview.plan().commits.len() {
 			rows.push(PasteNode::Commit(c));
-			let shown = !self.collapsed_commits.contains(&c);
-			while self.items.get(ix).is_some_and(|i| i.commit == Some(c)) {
-				if shown {
-					rows.push(PasteNode::File(ix, 1));
-				}
-				ix += 1;
+			let len = self.items[start..]
+				.iter()
+				.take_while(|i| i.commit == Some(c))
+				.count();
+			if len > 0 && !self.collapsed_commits.contains(&c) {
+				let places: Vec<Placed> = (start..start + len)
+					.map(|ix| Placed(self.place_path(ix)))
+					.collect();
+				let mut entries: Vec<usize> = (0..len).collect();
+				let mut sink = CommitSink {
+					plan: self,
+					commit: c,
+					base: start,
+					rows: &mut rows,
+				};
+				DirTree { files: &places }.push(&mut sink, &mut entries, 0, 1);
 			}
+			start += len;
 		}
 		rows
 	}
@@ -3064,6 +3199,13 @@ impl PastePreviewPlan {
 		if !self.collapsed_commits.remove(&c) {
 			self.collapsed_commits.insert(c);
 		}
+		self.row_left_hidden(&before)
+	}
+
+	/// After a fold of a replay's rows: when the selected row went out of
+	/// view, the row to select instead (the next one shown, else the
+	/// previous). `before` is the order shown before the fold.
+	fn row_left_hidden(&self, before: &[usize]) -> Option<usize> {
 		let after = self.display_order();
 		if after.contains(&self.selected_item_idx) {
 			return None;
@@ -3082,10 +3224,13 @@ impl PastePreviewPlan {
 	/// The counts of the rows under a folder, skipped rows included at the
 	/// root (they show there).
 	pub fn counts_under(&self, key: &DirKey) -> PasteCounts {
-		tally(self.items.iter().filter(|it| {
-			it.dest_root == key.root
+		tally(self.items.iter().enumerate().filter_map(|(ix, it)| {
+			(it.dest_root == key.root
+				&& it.commit == key.commit
 				&& (key.path.is_empty()
-					|| (!it.planned_skip() && path_under(&it.path, &key.path)))
+					|| (!it.planned_skip()
+						&& path_under(self.place_path(ix), &key.path))))
+			.then_some(it)
 		}))
 	}
 
@@ -3585,10 +3730,16 @@ pub(crate) mod tests {
 		}
 	}
 
-	/// The file-mode tree as text: `R label files`, `D name files d<depth>`
-	/// and `F path d<depth>`, a `+` after a folded node.
+	/// The tree as text (a replay's too): `R label files`,
+	/// `D name files d<depth>`, `F path d<depth>` and `C commit`, a `+` after
+	/// a folded node.
 	fn shape(plan: &PastePreviewPlan) -> Vec<String> {
-		plan.tree_rows()
+		let nodes = if plan.whole_commit {
+			plan.commit_rows()
+		} else {
+			plan.tree_rows()
+		};
+		nodes
 			.iter()
 			.map(|r| match r {
 				PasteNode::Root {
@@ -3649,6 +3800,7 @@ pub(crate) mod tests {
 	/// The folder `path` ("" is the root row) of the plan's first written root.
 	fn key(plan: &PastePreviewPlan, path: &str) -> DirKey {
 		DirKey {
+			commit: None,
 			root: plan
 				.items
 				.iter()
@@ -5337,6 +5489,8 @@ pub(crate) mod tests {
 					let i = &plan.items[*ix];
 					format!("{} {}", header_label(i.op), i.path)
 				}
+				// The rename's two rows share the folder of the new path.
+				PasteNode::Dir { name, .. } => format!("D {name}"),
 				_ => "?".into(),
 			})
 			.collect();
@@ -5344,6 +5498,7 @@ pub(crate) mod tests {
 			shown,
 			[
 				"C0",
+				"D dir",
 				"DELETE old.txt",
 				"CREATE dir/new.txt",
 				"CREATE fresh.txt",
@@ -6861,6 +7016,7 @@ pub(crate) mod tests {
 					let i = &plan.items[*ix];
 					format!("{:?}:{}", i.action(), i.path)
 				}
+				PasteNode::Dir { name, .. } => format!("D {name}"),
 				_ => "?".into(),
 			})
 			.collect();
@@ -6868,6 +7024,7 @@ pub(crate) mod tests {
 			shape,
 			[
 				"C0",
+				"D dir",
 				"Delete:old.txt",
 				"Create:dir/new.txt",
 				"Create:fresh.txt",
@@ -6972,6 +7129,173 @@ pub(crate) mod tests {
 			.collect();
 		assert_eq!(shown, ["g1.txt", "g2.txt", "g10.txt", "g11.txt"]);
 		assert_eq!(plan.items[0].path, "g1.txt");
+	}
+
+	/// Two commits that both touch `src/`, one with a file outside it.
+	fn shared_folder_plan() -> (tempfile::TempDir, PastePreviewPlan) {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let added = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some(format!("{path}\n")),
+			not_copied: None,
+		};
+		let record = |message: &str, files| CommitRecord {
+			message: message.into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files,
+		};
+		let payload = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record(
+					"first",
+					vec![
+						added("src/a.txt"),
+						added("src/b.txt"),
+						added("top.txt"),
+					],
+				),
+				record("second", vec![added("src/c.txt")]),
+			],
+		});
+		let dir = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+			git_run(dir.path(), args);
+		}
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&payload,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		(dir, plan)
+	}
+
+	/// The folder `path` under commit `c` of a replay plan.
+	fn commit_dir(plan: &PastePreviewPlan, c: usize, path: &str) -> DirKey {
+		DirKey {
+			commit: Some(c),
+			root: plan.items[0].dest_root.clone(),
+			path: path.into(),
+		}
+	}
+
+	#[test]
+	fn commit_rows_nest_folders_and_a_rename_stays_under_its_new_path() {
+		let (_dir, plan) = mixed_plan();
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D dir 2 d1",
+				"F old.txt d2",
+				"F dir/new.txt d2",
+				"F fresh.txt d1",
+				"F img.bin d1",
+				"C 1",
+				"C 2",
+				"F a.txt d1",
+			]
+		);
+		// The deleted old path is placed where the new one is (#196).
+		let old = ix_of(&plan, "old.txt");
+		assert_eq!(plan.place_path(old), "dir/new.txt");
+		assert_eq!(plan.place_path(ix_of(&plan, "fresh.txt")), "fresh.txt");
+		let dir = commit_dir(&plan, 0, "dir");
+		assert_eq!(
+			plan.counts_under(&dir),
+			PasteCounts {
+				creates: 1,
+				deletes: 1,
+				..Default::default()
+			}
+		);
+		// What the folder row shows: both rows written, none toggleable.
+		let sum = plan.summary(&[old, ix_of(&plan, "dir/new.txt")]);
+		assert_eq!((sum.files, sum.included), (2, 2));
+		assert_eq!(sum.tick(), Tick::Locked);
+		assert_eq!(plan.dir_label(&dir), "0:dir");
+	}
+
+	#[test]
+	fn commit_folds_are_keyed_by_commit() {
+		let (_dir, mut plan) = shared_folder_plan();
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D src 2 d1",
+				"F src/a.txt d2",
+				"F src/b.txt d2",
+				"F top.txt d1",
+				"C 1",
+				"D src 1 d1",
+				"F src/c.txt d2",
+			]
+		);
+		let (a, top, c) = (
+			ix_of(&plan, "src/a.txt"),
+			ix_of(&plan, "top.txt"),
+			ix_of(&plan, "src/c.txt"),
+		);
+		let first = commit_dir(&plan, 0, "src");
+		assert_eq!(plan.dir_label(&commit_dir(&plan, 1, "src")), "1:src");
+		assert!(plan.has_dir_row(&first));
+		assert!(!plan.has_dir_row(&commit_dir(&plan, 2, "src")));
+
+		// Folding the first commit's `src` while its `a.txt` is selected
+		// names the row to move to; the cursor itself stays for the session.
+		plan.selected_item_idx = a;
+		assert_eq!(
+			plan.toggle_dir_collapsed(&first),
+			Some(PasteCursor::Item(top))
+		);
+		assert_eq!(plan.selected_item_idx, a);
+		assert_eq!(
+			shape(&plan),
+			[
+				"C 0",
+				"D src 2 d1+",
+				"F top.txt d1",
+				"C 1",
+				"D src 1 d1",
+				"F src/c.txt d2",
+			]
+		);
+		assert!(plan.display_order().contains(&c), "the other commit's");
+		// A folder under a folded header is not a row now.
+		plan.toggle_commit_collapsed(0);
+		assert!(!plan.has_dir_row(&first));
+		// Opening it again moves nothing.
+		plan.toggle_commit_collapsed(0);
+		plan.selected_item_idx = top;
+		assert_eq!(plan.toggle_dir_collapsed(&first), None);
+	}
+
+	#[test]
+	fn a_replays_folders_are_not_cursor_rows_and_cannot_be_toggled() {
+		let (_dir, mut plan) = shared_folder_plan();
+		assert!(plan
+			.cursor_rows()
+			.iter()
+			.all(|(c, ..)| matches!(c, PasteCursor::Item(_))));
+		let first = commit_dir(&plan, 0, "src");
+		assert_eq!(plan.nav_left(), TreeStep::Nothing);
+		assert_eq!(plan.nav_right(), TreeStep::Nothing);
+		assert_eq!(plan.set_dir_selected(&first), None);
+		assert!(plan.items.iter().all(|i| i.selected));
+		// A row left out of the replay is not counted as written.
+		plan.items[0].selected = false;
+		let sum = plan.summary(&[0, 1]);
+		assert_eq!((sum.files, sum.included), (2, 1));
 	}
 
 	#[test]

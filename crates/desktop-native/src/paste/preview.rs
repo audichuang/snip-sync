@@ -66,7 +66,7 @@ pub enum Nav {
 #[derive(Debug)]
 pub enum Folded {
 	NoPlan,
-	/// A key that does nothing at the cursor.
+	/// A fold of a folder that is not shown, which does nothing.
 	Ignored,
 	Kept,
 	Reselected(Nav),
@@ -526,6 +526,8 @@ impl PastePreview {
 	/// Folds or unfolds a folder. The fold grows the retained state (its
 	/// key), so unlike a commit fold it is admitted first and a refusal
 	/// undoes all of it, never leaving a cursor on a row nobody can see.
+	/// A key that names no row shown now (a click from a frame the plan has
+	/// left behind) does nothing.
 	pub fn toggle_dir_fold(
 		&mut self,
 		key: DirKey,
@@ -534,32 +536,49 @@ impl PastePreview {
 		let Some(plan) = self.plan.as_mut() else {
 			return Folded::NoPlan;
 		};
-		let was_folded = plan.collapsed_dirs.contains(&key);
-		let cursor_before = plan.cursor_dir.clone();
-		let hidden = plan.toggle_dir_collapsed(&key);
-		if hidden.is_some() {
-			plan.cursor_dir = Some(key.clone());
+		if !plan.has_dir_row(&key) {
+			return Folded::Ignored;
 		}
-		let detail = if hidden.is_some() {
-			None
+		let was_folded = plan.collapsed_dirs.contains(&key);
+		let (item_before, dir_before) =
+			(plan.selected_item_idx, plan.cursor_dir.clone());
+		let moved = plan.toggle_dir_collapsed(&key);
+		let (nav, moved_detail) = match moved {
+			Some(PasteCursor::Dir(on)) => {
+				plan.cursor_dir = Some(on);
+				(Some(Nav::MovedDir), None)
+			}
+			Some(PasteCursor::Item(ix)) => {
+				plan.selected_item_idx = ix;
+				plan.cursor_dir = None;
+				(Some(Nav::Moved(ix)), plan.detail_at(ix))
+			}
+			None => (None, None),
+		};
+		let detail = if nav.is_some() {
+			moved_detail.as_ref()
 		} else {
 			self.detail.as_ref()
 		};
 		let pool = self.pending.clone();
 		let mut pending = lock_pending(&pool);
 		match pending.admit_ui(ordinary, Some(plan), detail) {
-			Ok(()) if hidden.is_some() => {
-				self.detail = None;
-				Folded::Reselected(Nav::MovedDir)
-			}
-			Ok(()) => Folded::Kept,
+			Ok(()) => match nav {
+				Some(nav) => {
+					self.detail = moved_detail;
+					self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+					Folded::Reselected(nav)
+				}
+				None => Folded::Kept,
+			},
 			Err(e) => {
 				if was_folded {
 					plan.collapsed_dirs.insert(key);
 				} else {
 					plan.collapsed_dirs.remove(&key);
 				}
-				plan.cursor_dir = cursor_before;
+				plan.selected_item_idx = item_before;
+				plan.cursor_dir = dir_before;
 				Folded::Reselected(Nav::Refused(e))
 			}
 		}
@@ -879,6 +898,7 @@ mod tests {
 	fn dir_key(s: &PastePreview, path: &str) -> DirKey {
 		let plan = s.plan().unwrap();
 		DirKey {
+			commit: None,
 			root: plan.items[0].dest_root.clone(),
 			path: path.into(),
 		}
