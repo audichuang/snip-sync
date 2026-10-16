@@ -2429,7 +2429,8 @@ impl Made {
 	}
 
 	/// Removes the empty file made at `path`, if it is still that file
-	/// untouched (`Reserved::open_untouched`, the test its row wrote by).
+	/// untouched (`Reserved::is_untouched`, the test its row wrote by, asked
+	/// without write permission).
 	fn release_file(&self, path: &Path) {
 		let Some((_, reserved)) = self.files.iter().find(|(p, _)| p == path)
 		else {
@@ -2437,9 +2438,7 @@ impl Made {
 		};
 		// The handle is closed before the name is removed: on Windows the
 		// name of an open file lingers, and its folder is not empty yet.
-		let untouched = reserved
-			.open_untouched(path)
-			.is_ok_and(|file| file.is_some());
+		let untouched = reserved.is_untouched(path).unwrap_or(false);
 		if untouched {
 			let _ = fs::remove_file(path);
 		}

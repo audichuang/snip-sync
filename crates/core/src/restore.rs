@@ -390,14 +390,16 @@ impl Reserved {
 			&& links_of_file(file) == Some(1)
 	}
 
-	/// The file made, opened to write, when what is at `path` is still
-	/// that file untouched: by its name (a file, not a link) and by the
-	/// handle ([`Self::holds`]). `None` when it is not.
-	pub(crate) fn open_untouched(
-		&self,
+	/// Opens `path` without creating or truncating: by name a file (not a
+	/// link), and never through a link. `write` asks for write access;
+	/// without it the handle needs no permission to read or write the
+	/// file. `None` when there is nothing there, or when the file cannot be
+	/// opened that way for lack of permission: it is not the file made.
+	fn open_existing(
 		path: &Path,
+		write: bool,
 	) -> std::io::Result<Option<fs::File>> {
-		use std::io::ErrorKind::NotFound;
+		use std::io::ErrorKind::{NotFound, PermissionDenied};
 		match fs::symlink_metadata(path) {
 			Ok(info) if info.is_file() => {}
 			Ok(_) => return Ok(None),
@@ -405,16 +407,54 @@ impl Reserved {
 			Err(e) => return Err(e),
 		}
 		let mut options = fs::OpenOptions::new();
-		options.write(true);
+		if write {
+			options.write(true);
+		} else {
+			#[cfg(windows)]
+			{
+				use std::os::windows::fs::OpenOptionsExt;
+				// Attributes only: no read or write access needed.
+				options.access_mode(0);
+			}
+			#[cfg(not(windows))]
+			options.read(true);
+		}
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::OpenOptionsExt;
 			options.custom_flags(libc::O_NOFOLLOW);
 		}
-		let file = match options.open(path) {
-			Ok(file) => file,
-			Err(e) if e.kind() == NotFound => return Ok(None),
-			Err(e) => return Err(e),
+		match options.open(path) {
+			Ok(file) => Ok(Some(file)),
+			Err(e) if matches!(e.kind(), NotFound | PermissionDenied) => {
+				Ok(None)
+			}
+			Err(e) => Err(e),
+		}
+	}
+
+	/// Whether what is at `path` is still the file made, untouched
+	/// ([`Self::holds`]), asked through a handle that needs no write
+	/// permission: the Apply takes a file back on this.
+	pub(crate) fn is_untouched(&self, path: &Path) -> std::io::Result<bool> {
+		Ok(Self::open_existing(path, false)?
+			.is_some_and(|file| self.holds(&file, path)))
+	}
+
+	/// The file made, opened to write, when what is at `path` is still
+	/// that file untouched: asked first without write permission, so a
+	/// file replaced by one that cannot be written is simply not ours; then
+	/// through the writable handle itself, in case it was swapped between
+	/// the two opens. `None` when it is not.
+	pub(crate) fn open_untouched(
+		&self,
+		path: &Path,
+	) -> std::io::Result<Option<fs::File>> {
+		if !self.is_untouched(path)? {
+			return Ok(None);
+		}
+		let Some(file) = Self::open_existing(path, true)? else {
+			return Ok(None);
 		};
 		Ok(self.holds(&file, path).then_some(file))
 	}
