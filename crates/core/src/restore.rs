@@ -371,54 +371,109 @@ pub(crate) struct Reserved {
 	pub(crate) modified: Option<SystemTime>,
 }
 
-impl Reserved {
-	/// Whether the open `file` (opened at `path`) is still the file made,
-	/// untouched: the same object, a file, empty, not modified since, and
-	/// under no other name. The one test every step takes it by: its row
-	/// writes into it, and the Apply takes it back, only while this holds.
-	/// Anything the filesystem cannot say counts as touched.
-	fn holds(&self, file: &fs::File, path: &Path) -> bool {
-		let Ok(info) = file.metadata() else {
-			return false;
-		};
-		let key = DirKey::of_file(file).unwrap_or_else(|| DirKey::of(path));
-		key == self.key
-			&& info.is_file()
-			&& info.len() == 0
-			&& (self.modified.is_none()
-				|| info.modified().ok() == self.modified)
-			&& links_of_file(file) == Some(1)
+/// What the filesystem says a file is, taken without any right to read or
+/// write its content (see [`Seen::of_path`]) or from an open handle.
+struct Seen {
+	key: DirKey,
+	len: u64,
+	modified: Option<SystemTime>,
+	links: Option<u64>,
+}
+
+impl Seen {
+	/// From the open `file` (opened at `path`), as the writable handle is
+	/// read. `None` when it is not a file or the filesystem cannot say.
+	fn of_file(file: &fs::File, path: &Path) -> Option<Self> {
+		let info = file.metadata().ok()?;
+		info.is_file().then(|| Self {
+			key: DirKey::of_file(file).unwrap_or_else(|| DirKey::of(path)),
+			len: info.len(),
+			modified: info.modified().ok(),
+			links: links_of_file(file),
+		})
 	}
 
-	/// Opens `path` without creating or truncating: by name a file (not a
-	/// link), and never through a link. `write` asks for write access;
-	/// without it the handle needs no permission to read or write the
-	/// file. `None` when there is nothing there, or when the file cannot be
-	/// opened that way for lack of permission: it is not the file made.
-	fn open_existing(
-		path: &Path,
-		write: bool,
-	) -> std::io::Result<Option<fs::File>> {
-		use std::io::ErrorKind::{NotFound, PermissionDenied};
-		match fs::symlink_metadata(path) {
-			Ok(info) if info.is_file() => {}
+	/// The one identity pre-check, for every caller: what is at `path`
+	/// by name, a file (not a link) and never through a link, asked
+	/// WITHOUT any permission on its content, so a file umask left
+	/// write-only (or any mode) is told like another.
+	///
+	/// - Linux: an `O_PATH | O_NOFOLLOW` handle, fstat-ed. It pins the
+	///   object, so a caller may stat it again just before it acts.
+	/// - Other Unix (no `O_PATH`): `lstat`. Between this answer and the
+	///   caller's next step (a write open, an unlink) the name can still
+	///   be swapped; the write path re-checks on its writable handle
+	///   ([`Reserved::holds`]), but a take-back's `unlink` has a residual,
+	///   very small window here.
+	/// - Windows: a handle with access mode 0 (no read or write right).
+	///
+	/// `None` when there is nothing there or it is not a plain file.
+	fn of_path(path: &Path) -> std::io::Result<Option<Self>> {
+		use std::io::ErrorKind::NotFound;
+		let info = match fs::symlink_metadata(path) {
+			Ok(info) if info.is_file() => info,
 			Ok(_) => return Ok(None),
 			Err(e) if e.kind() == NotFound => return Ok(None),
 			Err(e) => return Err(e),
+		};
+		#[cfg(all(unix, not(target_os = "linux")))]
+		{
+			use std::os::unix::fs::MetadataExt;
+			Ok(Some(Self {
+				key: DirKey::Object(info.dev(), info.ino()),
+				len: info.len(),
+				modified: info.modified().ok(),
+				links: Some(info.nlink()),
+			}))
 		}
-		let mut options = fs::OpenOptions::new();
-		if write {
-			options.write(true);
-		} else {
+		#[cfg(any(target_os = "linux", windows))]
+		{
+			let _ = info;
+			let mut options = fs::OpenOptions::new();
 			#[cfg(windows)]
 			{
 				use std::os::windows::fs::OpenOptionsExt;
-				// Attributes only: no read or write access needed.
 				options.access_mode(0);
 			}
-			#[cfg(not(windows))]
-			options.read(true);
+			#[cfg(target_os = "linux")]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				// The access mode is ignored with `O_PATH`: no permission
+				// on the content is checked.
+				options
+					.read(true)
+					.custom_flags(libc::O_PATH | libc::O_NOFOLLOW);
+			}
+			match options.open(path) {
+				Ok(file) => Ok(Self::of_file(&file, path)),
+				Err(e) if e.kind() == NotFound => Ok(None),
+				Err(e) => Err(e),
+			}
 		}
+	}
+}
+
+impl Reserved {
+	/// Whether `seen` is still the file made, untouched: the same object,
+	/// empty, not modified since, and under no other name. The one test
+	/// every step takes it by: its row writes into it, and the Apply takes
+	/// it back, only while this holds. Anything the filesystem cannot say
+	/// counts as touched.
+	fn holds(&self, seen: &Seen) -> bool {
+		seen.key == self.key
+			&& seen.len == 0
+			&& (self.modified.is_none() || seen.modified == self.modified)
+			&& seen.links == Some(1)
+	}
+
+	/// Opens `path` to write without creating or truncating: by name a
+	/// file (not a link), and never through a link. `None` when there is
+	/// nothing there, or when it cannot be opened that way for lack of
+	/// permission: it is not the file made.
+	fn open_writable(path: &Path) -> std::io::Result<Option<fs::File>> {
+		use std::io::ErrorKind::{NotFound, PermissionDenied};
+		let mut options = fs::OpenOptions::new();
+		options.write(true);
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::OpenOptionsExt;
@@ -434,18 +489,18 @@ impl Reserved {
 	}
 
 	/// Whether what is at `path` is still the file made, untouched
-	/// ([`Self::holds`]), asked through a handle that needs no write
-	/// permission: the Apply takes a file back on this.
+	/// ([`Self::holds`]), asked without any permission on its content: the
+	/// Apply takes a file back on this.
 	pub(crate) fn is_untouched(&self, path: &Path) -> std::io::Result<bool> {
-		Ok(Self::open_existing(path, false)?
-			.is_some_and(|file| self.holds(&file, path)))
+		Ok(Seen::of_path(path)?.is_some_and(|seen| self.holds(&seen)))
 	}
 
 	/// The file made, opened to write, when what is at `path` is still
-	/// that file untouched: asked first without write permission, so a
-	/// file replaced by one that cannot be written is simply not ours; then
-	/// through the writable handle itself, in case it was swapped between
-	/// the two opens. `None` when it is not.
+	/// that file untouched: asked first without any permission, so a file
+	/// replaced by one that cannot be written is simply not ours; then
+	/// through the writable handle itself, which is the check that lets a
+	/// write through, in case it was swapped between the two. `None` when
+	/// it is not.
 	pub(crate) fn open_untouched(
 		&self,
 		path: &Path,
@@ -453,10 +508,12 @@ impl Reserved {
 		if !self.is_untouched(path)? {
 			return Ok(None);
 		}
-		let Some(file) = Self::open_existing(path, true)? else {
+		let Some(file) = Self::open_writable(path)? else {
 			return Ok(None);
 		};
-		Ok(self.holds(&file, path).then_some(file))
+		Ok(Seen::of_file(&file, path)
+			.is_some_and(|seen| self.holds(&seen))
+			.then_some(file))
 	}
 }
 

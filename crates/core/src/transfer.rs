@@ -2430,7 +2430,10 @@ impl Made {
 
 	/// Removes the empty file made at `path`, if it is still that file
 	/// untouched (`Reserved::is_untouched`, the test its row wrote by, asked
-	/// without write permission).
+	/// without any permission on the file's content). On macOS and other
+	/// Unix without `O_PATH` the check is an `lstat`, so a residual, very
+	/// small window remains between it and the unlink (Linux could narrow
+	/// it by stat-ing the `O_PATH` handle again just before).
 	fn release_file(&self, path: &Path) {
 		let Some((_, reserved)) = self.files.iter().find(|(p, _)| p == path)
 		else {
@@ -7280,7 +7283,7 @@ mod new_dir_tests {
 		assert!(result.errors.is_empty(), "{result:?}");
 		let path = ws.join("a.txt");
 		fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-		assert_eq!(fs::read_to_string(&path).unwrap(), "A\n");
+		assert_eq!(fs::read_to_string(&path).unwrap(), "A");
 	}
 
 	/// The same file, after a failed write: taking it back needs no read
