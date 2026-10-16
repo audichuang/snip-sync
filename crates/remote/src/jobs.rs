@@ -248,13 +248,14 @@ pub(crate) fn write_response<W: Write>(
 	// A paste plan or many-file metadata may exceed a frame; join its JSON.
 	// So may a reply that lists what happened to every file: an apply that
 	// wrote files must reach the master as a result, never as `TooLarge`.
-	// The master joins any chunked reply, so a master that predates the
-	// typed failures reassembles these too.
+	// Every master that can send a paste request joins chunked replies, so a
+	// master that predates the typed failures reassembles these too. `Repos`
+	// stays one frame: a scan needs only git views v2, masters before
+	// protocol 4 do not know `Joined`, and the scan is bounded anyway.
 	if matches!(
 		response,
 		Response::Imported(_)
 			| Response::Replayed(_)
-			| Response::Repos(_)
 			| Response::ImportPlanned(_)
 			| Response::ImportPrepared(_)
 			| Response::ReplayPlanned(_)
