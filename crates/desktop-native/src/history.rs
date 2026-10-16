@@ -2868,8 +2868,7 @@ impl WorkbenchModel {
 		};
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.commit_view.selected_commit_file = Some(path.to_string());
-		self.commit_view.commit_file_sel.clear();
+		self.hold_shown_commit_file(path, false);
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -2910,6 +2909,12 @@ impl WorkbenchModel {
 					res.map(|p| (p, psource)),
 				) {
 					app_log!("[APP:PREVIEW_LOADED: {}]", path);
+				} else if model.preview.is_some()
+					&& model.preview_error.is_none()
+				{
+					// Refused by the retained budget: the previous diff is
+					// still shown, so the selection must name it again.
+					model.restore_shown_selection();
 				} else {
 					model.preview_error_root = Some(err_root);
 				}
@@ -3172,10 +3177,7 @@ impl WorkbenchModel {
 		let host = self.git_host();
 		let identity = self.identity_for(&root);
 
-		self.selected_file = None;
-		self.selected_file_root = None;
-		self.commit_view.selected_commit_file = Some(path.clone());
-		self.commit_view.commit_file_sel.clear();
+		self.hold_shown_commit_file(&path, true);
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -3217,6 +3219,13 @@ impl WorkbenchModel {
 							lang,
 						)) {
 							app_log!("[APP:PREVIEW_LOADED: {}]", path);
+						} else if model.preview.is_some()
+							&& model.preview_error.is_none()
+						{
+							// Refused by the retained budget: the previous
+							// text is still shown, so the selection must
+							// name it again.
+							model.restore_shown_selection();
 						}
 					}
 					Ok(BlobText::Binary) => model.show_preview_error(Msg::new(

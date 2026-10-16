@@ -1121,6 +1121,11 @@ struct ShownSelection {
 	compare: Option<(String, String)>,
 	log_selection_expanded: bool,
 	log_branches_all: Vec<String>,
+	/// Set aside by a read of the commit view's own file list: only the
+	/// file selection (`file`, `source`, `root`, the view's selected file and
+	/// its multi-selection) is held, the rest of the commit state is still
+	/// on the model. `pending_from_log` is the flag that read replaced.
+	commit_file_only: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4016,6 +4021,11 @@ impl WorkbenchModel {
 		if idx >= self.repos.len() {
 			return;
 		}
+		// A read in flight is dropped by this reload, so the selection must
+		// name what is shown again before it is judged or kept: the model
+		// holds the dropped read's path, and the shown preview's commit
+		// state is in the snapshot.
+		self.restore_shown_selection();
 		// The log shows the workspace: a plain switch keeps it.
 		let reload_log = self.log_reloads_on_repo_switch(preserve_anchors);
 		// A Changes row is kept across a reload only when its shown preview
@@ -4543,11 +4553,20 @@ impl WorkbenchModel {
 		let file = self.selected_file.replace(path.to_string());
 		let file_source = self.selected_file_source.replace(source.clone());
 		let shown = self.preview.is_some() && self.preview_error.is_none();
+		// A commit file read left the commit state on the model: this read
+		// takes it, and the snapshot keeps that read's file selection.
+		let partial = match self.held_selection.take() {
+			Some(h) if h.commit_file_only.is_some() => Some(h),
+			other => {
+				self.held_selection = other;
+				None
+			}
+		};
 		if self.held_selection.is_some() {
 			// The earlier read took the rest already.
 			return;
 		}
-		let held = ShownSelection {
+		let mut held = ShownSelection {
 			file,
 			source: file_source,
 			root: self.selected_file_root.clone(),
@@ -4561,8 +4580,57 @@ impl WorkbenchModel {
 				&mut self.log_selection_expanded,
 			),
 			log_branches_all: std::mem::take(&mut self.log_branches_all),
+			commit_file_only: None,
 		};
+		if let Some(early) = partial {
+			held.file = early.file;
+			held.source = early.source;
+			held.root = early.root;
+			held.view.selected_commit_file = early.view.selected_commit_file;
+			held.view.commit_file_sel = early.view.commit_file_sel;
+		}
 		self.held_selection = shown.then_some(held);
+	}
+
+	/// Names `path` as the commit view's file and sets aside what the shown
+	/// preview's file selection was, unless an earlier read already did.
+	/// `clear_file` is for a read that leaves the working-file selection
+	/// (a commit tree's file). The commit, its list and its details stay: a
+	/// refusal puts the file selection back, a landed read releases it.
+	pub(crate) fn hold_shown_commit_file(
+		&mut self,
+		path: &str,
+		clear_file: bool,
+	) {
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		if shown && self.held_selection.is_none() {
+			self.held_selection = Some(ShownSelection {
+				file: self.selected_file.clone(),
+				source: self.selected_file_source.clone(),
+				root: self.selected_file_root.clone(),
+				commit: None,
+				view: crate::history::CommitView {
+					selected_commit_file: self
+						.commit_view
+						.selected_commit_file
+						.clone(),
+					commit_file_sel: self.commit_view.commit_file_sel.clone(),
+					..Default::default()
+				},
+				log_selected: Vec::new(),
+				range_head: None,
+				compare: None,
+				log_selection_expanded: false,
+				log_branches_all: Vec::new(),
+				commit_file_only: Some(self.preview_pending_from_log),
+			});
+		}
+		if clear_file {
+			self.selected_file = None;
+			self.selected_file_root = None;
+		}
+		self.commit_view.selected_commit_file = Some(path.to_string());
+		self.commit_view.commit_file_sel.clear();
 	}
 
 	/// Puts the held selection back; the shown preview is still its own.
@@ -4573,6 +4641,13 @@ impl WorkbenchModel {
 		self.selected_file = held.file;
 		self.selected_file_source = held.source;
 		self.selected_file_root = held.root;
+		if let Some(pending) = held.commit_file_only {
+			self.commit_view.selected_commit_file =
+				held.view.selected_commit_file;
+			self.commit_view.commit_file_sel = held.view.commit_file_sel;
+			self.preview_pending_from_log = pending;
+			return;
+		}
 		self.selected_commit = held.commit;
 		self.commit_view = held.view;
 		self.log_selected = held.log_selected;
