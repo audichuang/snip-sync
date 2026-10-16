@@ -19233,6 +19233,98 @@ mod tests {
 			});
 		}
 
+		/// A file the retained budget refuses leaves the previous text shown
+		/// and the selection naming it again, so the commit view must come
+		/// back with it (#230): the shown commit diff still belongs to its
+		/// own repository, not to the repository the refused file was in.
+		#[gpui::test]
+		fn a_file_the_budget_refuses_keeps_the_commit_view_of_the_shown_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			fs::write(beta.join("b.txt"), "beta content\n").unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta commit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta commit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			let shown_root = model.read_with(cx, |m, _| {
+				let root = m.preview_root().expect("a preview root");
+				assert!(root.ends_with("beta"), "the commit's repo: {root:?}");
+				root
+			});
+
+			// Nearly all of the retained budget is held by a queued paste,
+			// so the 128 KiB file cannot replace the commit diff.
+			model.update(cx, |m, _| {
+				m.paste
+					.enqueue(crate::paste::PasteRequest::Clipboard {
+						text: "n".repeat(
+							crate::paste::MAX_RETAINED_PREVIEW_BYTES
+								- 32 * 1024,
+						),
+						dest: PathBuf::new(),
+						roots: Vec::new(),
+						generation: 0,
+						remote: None,
+					})
+					.expect("the queued paste fits");
+			});
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(alpha),
+					"big.txt",
+					snip_core::transfer::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff stays");
+				assert!(m.selected_commit.is_some(), "selection restored");
+				assert!(
+					m.commit_view.commit_details.is_some(),
+					"details cleared while the selection came back",
+				);
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files cleared while the selection came back",
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(shown_root.as_path()),
+					"the shown diff must keep its own repository",
+				);
+			});
+		}
+
 		/// A search the Log cannot run hides the commits it replaced, so it
 		/// drops the selection too (#230): the right side must not show a
 		/// commit that is no longer listed.
@@ -19269,9 +19361,12 @@ mod tests {
 			click(cx, "log-search-input");
 			cx.simulate_input("(");
 			cx.simulate_keystrokes("enter");
-			settle_until(cx, "the failed reload", |cx| {
-				model.read_with(cx, |m, _| m.history_error.is_some())
-			});
+			settle_until(
+				cx,
+				"the failed reload (if the platform's regex accepts `(`, \
+				 search `[` instead)",
+				|cx| model.read_with(cx, |m, _| m.history_error.is_some()),
+			);
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.history_error.is_some(), "the search failed");
