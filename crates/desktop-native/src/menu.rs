@@ -283,8 +283,12 @@ impl WorkbenchModel {
 	fn paste_into_entry(&self, folder: Option<PathBuf>) -> MenuEntry {
 		let remote = self.remote.session.is_some();
 		let inside = folder.filter(|path| {
-			crate::paste::dest::folder_rel(&self.workspace_root, path, remote)
-				.is_some()
+			crate::paste::dest::WsRel::of_folder(
+				&self.workspace_root,
+				path,
+				remote,
+			)
+			.is_some()
 		});
 		item(
 			"paste-into",

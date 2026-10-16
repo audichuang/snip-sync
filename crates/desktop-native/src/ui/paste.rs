@@ -2,6 +2,7 @@
 
 use super::changes::{change_pad, tree_chevron};
 use super::*;
+use crate::paste::dest::WsRel;
 use crate::paste::{
 	commit_header_id, dir_control_id, DirControl, DirKey, DirSummary,
 	PasteCounts, RowControl, Tick,
@@ -1243,7 +1244,7 @@ impl WorkbenchModel {
 	/// folder itself, or a file's folder. Nothing for no selection, for
 	/// several (one cannot be guessed), for the commit tree browser, or for
 	/// a row that is no real entry.
-	fn paste_left_folder(&self) -> Option<String> {
+	fn paste_left_folder(&self) -> Option<WsRel> {
 		if self.rev_tree.is_some()
 			|| self.selected_count() != 1
 			|| self.project_targets().len() != 1
@@ -1276,7 +1277,7 @@ impl WorkbenchModel {
 			.split('/')
 			.filter(|part| !part.is_empty())
 			.fold(root, |path, part| path.join(part));
-		crate::paste::dest::folder_rel(
+		WsRel::of_folder(
 			&self.workspace_root,
 			&abs,
 			self.remote.session.is_some(),
@@ -1332,11 +1333,7 @@ impl WorkbenchModel {
 		let crumbs = folder.map(|folder| match &folder.rel {
 			Some(rel) => {
 				let mut names = vec![self.paste_workspace_name()];
-				names.extend(
-					rel.split('/')
-						.filter(|part| !part.is_empty())
-						.map(str::to_string),
-				);
+				names.extend(rel.parts().map(str::to_string));
 				let last = names.len() - 1;
 				let mut row = div()
 					.flex()
@@ -1346,18 +1343,8 @@ impl WorkbenchModel {
 					.flex_shrink()
 					.min_w_0();
 				for (i, name) in names.into_iter().enumerate() {
-					let upto: String = rel
-						.split('/')
-						.filter(|part| !part.is_empty())
-						.take(i)
-						.collect::<Vec<_>>()
-						.join("/");
-					let path = upto
-						.split('/')
-						.filter(|part| !part.is_empty())
-						.fold(self.workspace_root.clone(), |p, part| {
-							p.join(part)
-						});
+					let upto = rel.ancestor(i);
+					let path = upto.to_path(&self.workspace_root);
 					let full = crate::remote::display_path(session, &path);
 					let id = format!("paste-dest-crumb:{i}");
 					let goes = enabled && i != last;
@@ -1417,7 +1404,7 @@ impl WorkbenchModel {
 		            label: &'static str,
 		            on: bool,
 		            tab: isize,
-		            rel: Option<String>,
+		            rel: WsRel,
 		            via: &'static str,
 		            cx: &mut Context<Self>| {
 			button(
@@ -1429,24 +1416,20 @@ impl WorkbenchModel {
 			)
 			.when(enabled, |b| {
 				b.on_click(cx.listener(move |this, _, _, cx| {
-					this.paste_into_rel(rel.as_deref().unwrap_or(""), via, cx)
+					this.paste_into_rel(&rel, via, cx)
 				}))
 			})
 			.children(probe(log, id))
 		};
-		let at = |rel: &str| current_rel.as_deref() == Some(rel);
+		let at = |rel: &WsRel| current_rel.as_ref() == Some(rel);
 
 		// The pinned repo, when it is a folder of the workspace of its own.
 		let repo_rel = self
 			.repo_root()
 			.and_then(|root| {
-				crate::paste::dest::folder_rel(
-					&self.workspace_root,
-					&root,
-					remote,
-				)
+				WsRel::of_folder(&self.workspace_root, &root, remote)
 			})
-			.filter(|rel| !rel.is_empty());
+			.filter(|rel| !rel.is_root());
 		let left_rel = self.paste_left_folder();
 
 		let status = if let Some(err) = editing
@@ -1509,9 +1492,9 @@ impl WorkbenchModel {
 			.child(chip(
 				"paste-dest-root",
 				"paste_dest_root",
-				at(""),
+				at(&WsRel::root()),
 				53,
-				Some(String::new()),
+				WsRel::root(),
 				"root",
 				cx,
 			))
@@ -1521,7 +1504,7 @@ impl WorkbenchModel {
 					"paste_dest_repo",
 					at(&rel),
 					54,
-					Some(rel.clone()),
+					rel.clone(),
 					"repo",
 					cx,
 				)
@@ -1532,7 +1515,7 @@ impl WorkbenchModel {
 					"paste_dest_left",
 					at(&rel),
 					55,
-					Some(rel.clone()),
+					rel.clone(),
 					"left",
 					cx,
 				)

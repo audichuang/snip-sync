@@ -28899,87 +28899,136 @@ mod tests {
 			#[cfg(unix)]
 			fn spaced_ws() -> (tempfile::TempDir, PathBuf) {
 				let (tmp, ws) = multi_repo_ws();
-				for name in ["docs ", " docs", "   ", "lead ", "lead"] {
+				for name in ["docs ", " docs", "   ", " lead", "lead"] {
 					fs::create_dir(ws.join(name)).unwrap();
 				}
-				fs::create_dir(ws.join("lead ").join("inner")).unwrap();
+				fs::create_dir(ws.join(" lead").join("inner")).unwrap();
 				(tmp, ws)
 			}
 
 			/// Every folder a file system names is data: what the Project
 			/// menu hands over is the folder it was opened on, never its
-			/// trimmed spelling. `docs ` is not `docs`, and a name of spaces
-			/// is a folder, not the workspace.
+			/// trimmed spelling. ` docs` is not `docs`, and the paste is
+			/// written there.
 			#[cfg(unix)]
 			#[gpui::test]
-			fn paste_into_a_folder_named_with_spaces_lands_in_that_folder(
+			fn paste_into_a_folder_named_with_a_leading_space_lands_in_it(
 				cx: &mut TestAppContext,
 			) {
 				let Some(_clip) = clipboard() else { return };
 				let (_tmp, ws) = spaced_ws();
 				let (model, cx) = open_ready(cx, &ws);
-				for name in ["docs ", " docs", "   "] {
-					clip::write_text("// FILE: x.txt\nX\n").unwrap();
-					right_click_probed(
-						&model,
-						cx,
-						&format!("ws-tree-row:{name}"),
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row: docs");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some(" docs"));
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join(" docs").join("x.txt")).as_deref(),
+					Some("X")
+				);
+				for elsewhere in ["docs", "docs ", "", "repoA"] {
+					assert!(
+						!ws.join(elsewhere).join("x.txt").exists(),
+						"written into {elsewhere:?}"
 					);
-					click_probed(&model, cx, "menu-item:paste-into");
-					landed(&model, cx);
-					assert_eq!(
-						plan_destination(&model, cx),
-						ws.join(name),
-						"{name:?}"
-					);
-					assert_eq!(
-						folder(&model, cx).1.as_deref(),
-						Some(name),
-						"{name:?}"
-					);
-					apply_with_enter(&model, cx);
-					assert_eq!(
-						file(&ws.join(name).join("x.txt")).as_deref(),
-						Some("X"),
-						"{name:?}"
-					);
-					for elsewhere in ["docs", "", "repoA"] {
-						assert!(
-							!ws.join(elsewhere).join("x.txt").exists(),
-							"{name:?} was written into {elsewhere:?}"
-						);
-					}
-					fs::remove_file(ws.join(name).join("x.txt")).unwrap();
 				}
 			}
 
-			/// The breadcrumb names the folders it came from: a segment is
-			/// a folder to go back to, and `lead ` is not `lead`.
+			/// The engine trims the end of a destination root, so a folder
+			/// whose name ends with a space cannot be written into (the CLI
+			/// fails "unsafe path" there too). The bar says so at once and
+			/// the plan stays where it was: the paste is never redirected to
+			/// `docs`, and a name of spaces is not the workspace folder.
 			#[cfg(unix)]
 			#[gpui::test]
-			fn a_breadcrumb_segment_with_a_trailing_space_goes_to_that_folder(
+			fn a_folder_ending_with_a_space_is_refused_and_nothing_is_redirected(
 				cx: &mut TestAppContext,
 			) {
 				let Some(_clip) = clipboard() else { return };
 				let (_tmp, ws) = spaced_ws();
 				let (model, cx) = open_ready(cx, &ws);
 				preview(&model, cx, "// FILE: x.txt\nX\n");
-				let inner = ws.join("lead ").join("inner");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				for name in ["docs ", "   "] {
+					right_click_probed(
+						&model,
+						cx,
+						&format!("ws-tree-row:{name}"),
+					);
+					click_probed(&model, cx, "menu-item:paste-into");
+					settle(cx);
+					let said = model
+						.read_with(cx, |m, _| m.paste.dest_refusal().cloned())
+						.unwrap_or_else(|| panic!("{name:?}: no refusal"));
+					assert_eq!(said.key, "paste_err_destination", "{name:?}");
+					assert!(
+						said.render(crate::i18n::Locale::En)
+							.contains("ends with a space"),
+						"{name:?}"
+					);
+					assert!(probed(&model, cx, "paste-dest-status"));
+					assert!(paste_focused(&model, cx));
+					assert_eq!(plan_destination(&model, cx), first, "{name:?}");
+					assert!(executable(&model, cx), "{name:?}");
+				}
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X"));
+				for elsewhere in ["docs", "docs ", "   ", ""] {
+					assert!(
+						!ws.join(elsewhere).join("x.txt").exists(),
+						"written into {elsewhere:?}"
+					);
+				}
+			}
+
+			/// With no preview open, the menu of such a folder opens none.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn paste_into_a_folder_ending_with_a_space_opens_no_preview(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs ");
+				click_probed(&model, cx, "menu-item:paste-into");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(!ws.join("docs").join("x.txt").exists());
+				assert!(!ws.join("docs ").join("x.txt").exists());
+			}
+
+			/// The breadcrumb names the folders it came from: a segment is
+			/// a folder to go back to, and ` lead` is not `lead`.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn a_breadcrumb_segment_with_a_leading_space_goes_to_that_folder(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let inner = ws.join(" lead").join("inner");
 				model
 					.update(cx, |m, cx| m.paste_dest_picked(inner.clone(), cx));
 				landed(&model, cx);
 				assert_eq!(plan_destination(&model, cx), inner);
 				assert_eq!(
 					folder(&model, cx).1.as_deref(),
-					Some("lead /inner")
+					Some(" lead/inner")
 				);
 				click_probed(&model, cx, "paste-dest-crumb:1");
 				landed(&model, cx);
-				assert_eq!(plan_destination(&model, cx), ws.join("lead "));
-				assert_eq!(folder(&model, cx).1.as_deref(), Some("lead "));
+				assert_eq!(plan_destination(&model, cx), ws.join(" lead"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some(" lead"));
 				apply_with_enter(&model, cx);
 				assert_eq!(
-					file(&ws.join("lead ").join("x.txt")).as_deref(),
+					file(&ws.join(" lead").join("x.txt")).as_deref(),
 					Some("X")
 				);
 				assert!(!ws.join("lead").join("x.txt").exists());
@@ -28988,27 +29037,29 @@ mod tests {
 			/// The Project selection is a folder of the file system too.
 			#[cfg(unix)]
 			#[gpui::test]
-			fn the_left_chip_keeps_the_spaces_of_the_selected_folder(
+			fn the_left_chip_keeps_the_leading_space_of_the_selected_folder(
 				cx: &mut TestAppContext,
 			) {
 				let Some(_clip) = clipboard() else { return };
 				let (_tmp, ws) = spaced_ws();
 				let (model, cx) = open_ready(cx, &ws);
-				click_probed(&model, cx, "ws-tree-row:docs ");
+				click_probed(&model, cx, "ws-tree-row: docs");
 				preview(&model, cx, "// FILE: x.txt\nX\n");
 				assert!(probed(&model, cx, "paste-dest-left"));
 				click_probed(&model, cx, "paste-dest-left");
 				landed(&model, cx);
-				assert_eq!(plan_destination(&model, cx), ws.join("docs "));
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
 				apply_with_enter(&model, cx);
 				assert_eq!(
-					file(&ws.join("docs ").join("x.txt")).as_deref(),
+					file(&ws.join(" docs").join("x.txt")).as_deref(),
 					Some("X")
 				);
 				assert!(!ws.join("docs").join("x.txt").exists());
 			}
 
-			/// The folder the OS dialog returns is a name, not typed text.
+			/// The folder the OS dialog returns is a name, not typed text:
+			/// ` docs` is that folder; `docs ` and `   ` are refused, not
+			/// read as `docs` and the workspace.
 			#[cfg(unix)]
 			#[gpui::test]
 			fn a_folder_picked_in_the_dialog_keeps_its_spaces(
@@ -29018,21 +29069,35 @@ mod tests {
 				let (_tmp, ws) = spaced_ws();
 				let (model, cx) = open_ready(cx, &ws);
 				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				model.update(cx, |m, cx| {
+					m.paste_dest_picked(ws.join(" docs"), cx)
+				});
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
 				for name in ["docs ", "   "] {
 					model.update(cx, |m, cx| {
 						m.paste_dest_picked(ws.join(name), cx)
 					});
-					landed(&model, cx);
+					settle(cx);
+					assert!(
+						model.read_with(cx, |m, _| m
+							.paste
+							.dest_refusal()
+							.is_some_and(|e| e.key == "paste_err_destination")),
+						"{name:?}"
+					);
 					assert_eq!(
 						plan_destination(&model, cx),
-						ws.join(name),
+						ws.join(" docs"),
 						"{name:?}"
 					);
 				}
+				assert_ne!(first, ws.join(" docs"));
 			}
 
 			/// What is typed is text: the spaces around it are not part of
-			/// the path. The field opened on a folder with spaces in its
+			/// the path. The field opened on a folder with a space in its
 			/// name, left as it is, still names that folder.
 			#[cfg(unix)]
 			#[gpui::test]
@@ -29044,15 +29109,15 @@ mod tests {
 				let (model, cx) = open_ready(cx, &ws);
 				preview(&model, cx, "// FILE: x.txt\nX\n");
 				model.update(cx, |m, cx| {
-					m.paste_dest_picked(ws.join("docs "), cx)
+					m.paste_dest_picked(ws.join(" docs"), cx)
 				});
 				landed(&model, cx);
 				click_probed(&model, cx, "paste-dest-edit");
-				assert_eq!(editor_text(&model, cx), "docs ");
+				assert_eq!(editor_text(&model, cx), " docs");
 				cx.simulate_keystrokes("enter");
 				settle(cx);
 				assert!(!editor_open(&model, cx));
-				assert_eq!(plan_destination(&model, cx), ws.join("docs "));
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
 
 				click_probed(&model, cx, "paste-dest-edit");
 				cx.simulate_keystrokes("cmd-a");
@@ -29061,6 +29126,19 @@ mod tests {
 				landed(&model, cx);
 				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
 				assert_eq!(folder(&model, cx).1.as_deref(), Some("docs"));
+
+				// A typed name that only ends with a space once its slash is
+				// gone is the same refusal as the gesture's.
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs /");
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert_eq!(
+					editor_error(&model, cx).map(|e| e.key),
+					Some("paste_err_destination")
+				);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
 			}
 
 			/// Opens the destination editor over a fresh preview.
@@ -29294,7 +29372,12 @@ mod tests {
 				// Turns the probes on.
 				probed_point(&model, cx, "paste-dest-root");
 				model.update(cx, |m, cx| {
-					m.paste_into_rel("missing", "crumb", cx)
+					m.paste_into_rel(
+						&crate::paste::dest::WsRel::parse_typed("missing")
+							.unwrap(),
+						"crumb",
+						cx,
+					)
 				});
 				settle(cx);
 				let said = model.read_with(cx, |m, _| {
@@ -29476,7 +29559,10 @@ mod tests {
 			) -> (PathBuf, Option<String>) {
 				model.read_with(cx, |m, _| {
 					let f = m.paste.folder().expect("a destination folder");
-					(f.path.clone(), f.rel.clone())
+					(
+						f.path.clone(),
+						f.rel.as_ref().map(|r| r.as_str().to_string()),
+					)
 				})
 			}
 		}

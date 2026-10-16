@@ -13,7 +13,7 @@ use gpui::{Context, PathPromptOptions};
 
 use crate::i18n::{self, Msg};
 use crate::overlay::{CloseWhy, DropScope, OverlayKind, ReturnFocus};
-use crate::paste::dest::{folder_rel, DestEdit, DestFolder};
+use crate::paste::dest::{DestEdit, DestFolder, WsRel};
 use crate::WorkbenchModel;
 
 /// A refusal in the one wording the engine and the worker use for a path
@@ -54,16 +54,22 @@ impl WorkbenchModel {
 		DestFolder::new(&self.workspace_root, path, self.remote_paste())
 	}
 
-	/// The tree path of the workspace folder `rel` ("" is the workspace).
-	fn folder_path(&self, rel: &str) -> PathBuf {
-		rel.split('/')
-			.filter(|part| !part.is_empty())
-			.fold(self.workspace_root.clone(), |path, part| path.join(part))
+	/// The folder a person typed: the text is read as a path inside the
+	/// workspace ([`WsRel::parse_typed`] trims it), then judged like any
+	/// other. Only the typed field goes through here.
+	pub(crate) fn resolve_typed_folder(
+		&self,
+		typed: &str,
+	) -> Result<DestFolder, Msg> {
+		match WsRel::parse_typed(typed) {
+			Ok(rel) => self.resolve_paste_folder(&rel),
+			Err(shown) => Err(not_under_workspace(&shown)),
+		}
 	}
 
-	/// The folder the user named by `typed`, a path inside the workspace
-	/// ("" or "." is the workspace itself), or why it cannot be one. Every
-	/// gesture of the destination bar goes through here.
+	/// The folder `rel` names, or why it cannot be one. Every gesture of the
+	/// destination bar goes through here, with a place it read off the file
+	/// system: a name is data and is never trimmed or rewritten.
 	///
 	/// A local folder is checked now: it must exist, be a folder, and stay
 	/// inside the workspace with its links followed, so a refused name
@@ -74,29 +80,22 @@ impl WorkbenchModel {
 	// then keep the rules equal to `pasteserve::destination`.
 	pub(crate) fn resolve_paste_folder(
 		&self,
-		typed: &str,
+		rel: &WsRel,
 	) -> Result<DestFolder, Msg> {
-		let typed = typed.trim();
-		let text = if cfg!(windows) {
-			typed.replace('\\', "/")
-		} else {
-			typed.to_string()
-		};
-		let absolute = Path::new(typed).is_absolute()
-			|| text.starts_with('/')
-			|| (cfg!(windows) && text.as_bytes().get(1) == Some(&b':'));
-		if absolute {
-			return Err(not_under_workspace(typed));
+		let typed = rel.as_str();
+		let path = rel.to_path(&self.workspace_root);
+		// The engine cannot write into it (see `WsRel::ends_with_space`):
+		// said now, not as a failed Apply after a plan that looked ready.
+		if rel.ends_with_space() {
+			return Err(Msg::with_key_arg(
+				"paste_err_destination",
+				[
+					typed.to_string(),
+					"err_dest_name_ends_with_space".to_string(),
+				],
+				1,
+			));
 		}
-		let rel = text.trim_end_matches('/');
-		let rel = if rel == "." { "" } else { rel };
-		if rel
-			.split('/')
-			.any(|part| !rel.is_empty() && matches!(part, "" | "." | ".."))
-		{
-			return Err(not_under_workspace(typed));
-		}
-		let path = self.folder_path(rel);
 		if !self.remote_paste() {
 			let root = &self.workspace_root;
 			let inside = |p: &Path| {
@@ -117,15 +116,15 @@ impl WorkbenchModel {
 		}
 		Ok(DestFolder {
 			path,
-			rel: Some(rel.to_string()),
+			rel: Some(rel.clone()),
 		})
 	}
 
-	/// The folder of workspace-relative `rel`, as a gesture of the bar names
-	/// it; a refusal goes to the status line.
+	/// The folder at `rel`, as a gesture of the bar names it; a refusal goes
+	/// to the status line.
 	pub(crate) fn paste_into_rel(
 		&mut self,
-		rel: &str,
+		rel: &WsRel,
 		via: &'static str,
 		cx: &mut Context<Self>,
 	) {
@@ -240,7 +239,8 @@ impl WorkbenchModel {
 		path: PathBuf,
 		cx: &mut Context<Self>,
 	) {
-		let rel = folder_rel(&self.workspace_root, &path, self.remote_paste());
+		let rel =
+			WsRel::of_folder(&self.workspace_root, &path, self.remote_paste());
 		let Some(rel) = rel else {
 			let shown = path.display().to_string();
 			self.refuse_paste_folder(not_under_workspace(&shown), "menu", cx);
@@ -263,7 +263,7 @@ impl WorkbenchModel {
 	/// The folder the OS dialog returned. Outside the workspace it is
 	/// refused: the destination bar only names folders inside it.
 	pub fn paste_dest_picked(&mut self, abs: PathBuf, cx: &mut Context<Self>) {
-		let rel = folder_rel(&self.workspace_root, &abs, false);
+		let rel = WsRel::of_folder(&self.workspace_root, &abs, false);
 		match rel {
 			Some(rel) => self.paste_into_rel(&rel, "browse", cx),
 			None => {
@@ -337,9 +337,9 @@ impl WorkbenchModel {
 			.paste
 			.folder()
 			.and_then(|f| f.rel.clone())
-			.unwrap_or_default();
+			.unwrap_or_else(WsRel::root);
 		self.paste_dest_input.update(cx, |input, cx| {
-			input.set_text(&rel, cx);
+			input.set_text(rel.as_str(), cx);
 			input.select_all_text(cx);
 		});
 		if self.overlays.is_open(OverlayKind::PasteDestField) {
@@ -367,7 +367,19 @@ impl WorkbenchModel {
 			return;
 		}
 		let typed = self.paste_dest_input.read(cx).text().to_string();
-		match self.resolve_paste_folder(&typed) {
+		// The field opened on the folder's own name, and left as it is, is
+		// still that folder: a name with a space at its end is no typing.
+		let untouched = self
+			.paste
+			.folder()
+			.and_then(|f| f.rel.as_ref())
+			.filter(|rel| rel.as_str() == typed)
+			.cloned();
+		let resolved = match untouched {
+			Some(rel) => self.resolve_paste_folder(&rel),
+			None => self.resolve_typed_folder(&typed),
+		};
+		match resolved {
 			Ok(folder) => self.retarget_paste(folder, "input", cx),
 			Err(err) => {
 				app_log!(
