@@ -23,7 +23,7 @@
 //! made without asking.)
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -116,6 +116,59 @@ impl FolderId {
 	}
 }
 
+/// Which file a target path writes: the folder that exists nearest above
+/// it, told by its object, and the names below that folder, folded when its
+/// filesystem folds. Two targets with one `TargetId` are one file, however
+/// their paths are spelled (two cases on a filesystem that folds, a symlink,
+/// the macOS data volume's firmlink). A target that exists is read through
+/// symlinks to the file it is, then named in its folder, so two hard links
+/// stay two files.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TargetId(FolderId);
+
+/// The folder `path` is written in that exists now (the anchor) and the
+/// names from there to the target, outermost first.
+fn target_anchor(path: &Path) -> (PathBuf, Vec<OsString>) {
+	if fs::symlink_metadata(path).is_ok() {
+		let resolved =
+			dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+		return match (resolved.parent(), resolved.file_name()) {
+			(Some(parent), Some(name)) => {
+				(parent.to_path_buf(), vec![name.to_os_string()])
+			}
+			_ => (resolved, Vec::new()),
+		};
+	}
+	let mut names: Vec<OsString> = Vec::new();
+	let mut cur = path;
+	loop {
+		match fs::symlink_metadata(cur) {
+			Err(e)
+				if matches!(
+					e.kind(),
+					std::io::ErrorKind::NotFound
+						| std::io::ErrorKind::NotADirectory
+				) =>
+			{
+				match (cur.file_name(), cur.parent()) {
+					(Some(name), Some(parent)) => {
+						names.push(name.to_os_string());
+						cur = parent;
+					}
+					_ => break,
+				}
+			}
+			_ => break,
+		}
+	}
+	names.reverse();
+	(cur.to_path_buf(), names)
+}
+
+fn target_id(at: FolderId, names: &[OsString]) -> TargetId {
+	TargetId(names.iter().fold(at, |id, name| id.child(name)))
+}
+
 /// Which folder to make a path is, read off the disk as it is now: Apply's
 /// own answer, apart from what planning recorded. The nearest existing
 /// folder above the path is the anchor, told by its object; the names below
@@ -148,17 +201,28 @@ impl LiveFolders {
 		if names.is_empty() {
 			return None;
 		}
-		let key = DirKey::of(cur);
-		let folds = *self.folds.entry(key.clone()).or_insert_with(|| {
-			fs_is_case_insensitive(
-				&dunce::canonicalize(cur).unwrap_or_else(|_| cur.to_path_buf()),
-			)
-		});
-		let mut id = FolderId::at(key, folds);
+		let mut id = self.at(cur);
 		for name in names.into_iter().rev() {
 			id = id.child(name);
 		}
 		Some(id)
+	}
+
+	/// Which file `path` writes, as the disk is now ([`TargetId`]).
+	pub(crate) fn target_id(&mut self, path: &Path) -> TargetId {
+		let (anchor, names) = target_anchor(path);
+		target_id(self.at(&anchor), &names)
+	}
+
+	/// The existing folder `dir`, with whether names below it fold.
+	fn at(&mut self, dir: &Path) -> FolderId {
+		let key = DirKey::of(dir);
+		let folds = *self.folds.entry(key.clone()).or_insert_with(|| {
+			fs_is_case_insensitive(
+				&dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+			)
+		});
+		FolderId::at(key, folds)
 	}
 }
 
@@ -259,6 +323,14 @@ impl NewFolderNames {
 		let anchor = Anchor { key, folds };
 		self.anchors.insert(existing.to_path_buf(), anchor.clone());
 		anchor
+	}
+
+	/// Which file `path` writes ([`TargetId`]), its folder told as this
+	/// plan tells every existing folder.
+	pub(crate) fn target_id(&mut self, path: &Path) -> TargetId {
+		let (anchor, names) = target_anchor(path);
+		let a = self.anchor(&anchor);
+		target_id(FolderId::at(a.key, a.folds), &names)
 	}
 
 	/// The folders of a placed destination, anchored at `anchor` (a folder

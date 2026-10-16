@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
-use crate::foldernames::{DirKey, FolderId, LiveFolders, NewFolderNames};
+use crate::foldernames::{
+	DirKey, FolderId, LiveFolders, NewFolderNames, TargetId,
+};
 use crate::format::{
 	self, BorrowedPayloadOptions, ChangeType, ParsedEntry, PayloadFile,
 };
@@ -1887,6 +1889,7 @@ impl TransferImportPlan {
 		let _locks =
 			lock_destination_repos(directories, &RunOptions::default())?;
 		self.destination_freshness.revalidate()?;
+		self.refuse_one_target_written_twice(selection)?;
 
 		// Stale outranks a missing consent: a plan that changed is previewed
 		// again, and the agreement to the old one is not carried over.
@@ -1927,6 +1930,52 @@ impl TransferImportPlan {
 			> 0;
 		result.created_dirs = finish_new_dirs(&made, wrote);
 		Ok(result)
+	}
+
+	/// Planning refuses two writes to one file; this is the same check on
+	/// the rows `selection` keeps, as the disk is now, for a plan that did
+	/// not come from planning here (a peer's, `from_parts`) or a disk that
+	/// moved two spellings together since. Nothing is written yet.
+	fn refuse_one_target_written_twice(
+		&self,
+		selection: &RestoreSelection,
+	) -> Result<(), TransferError> {
+		let mut live = LiveFolders::default();
+		let mut targets: HashMap<TargetId, String> = HashMap::new();
+		let creates =
+			self.create_operations()
+				.iter()
+				.enumerate()
+				.filter(|(i, op)| {
+					!selection.unchecked_creates.contains(i)
+						&& (!op.existed
+							|| (selection.overwrite_existing
+								&& !selection.skip_existing))
+				});
+		let deletes = self
+			.delete_operations()
+			.iter()
+			.enumerate()
+			.filter(|(i, _)| !selection.unchecked_deletes.contains(i));
+		let rows = creates
+			.map(|(_, op)| ("create", &op.absolute_path, &op.relative_path))
+			.chain(deletes.map(|(_, op)| {
+				("delete", &op.absolute_path, &op.relative_path)
+			}));
+		for (what, path, rel) in rows {
+			let current = format!("{what} {rel}");
+			if let Some(prev) =
+				targets.insert(live.target_id(path), current.clone())
+			{
+				return Err(TransferError::TargetCollision {
+					path: path.clone(),
+					msg: format!(
+						"previous was '{prev}', current is '{current}'"
+					),
+				});
+			}
+		}
+		Ok(())
 	}
 
 	/// The levels of the placed tails (`placed_tails`) that a create
@@ -2706,73 +2755,7 @@ fn root_basename(path: &Path) -> String {
 		.to_string()
 }
 
-/// Resolves target identity across symlinks and platform case folding.
-fn canonical_target_identity(path: &Path) -> String {
-	if let Ok(c) = dunce::canonicalize(path) {
-		return paths::path_key(&c.to_string_lossy());
-	}
-	let mut current = path.to_path_buf();
-	let mut trail = Vec::new();
-	while !current.exists() {
-		if let Some(name) = current.file_name() {
-			trail.push(name.to_os_string());
-		}
-		if !current.pop() {
-			break;
-		}
-	}
-	let canonical_ancestor = dunce::canonicalize(&current).unwrap_or(current);
-	let mut full = canonical_ancestor;
-	for segment in trail.into_iter().rev() {
-		full.push(segment);
-	}
-	paths::path_key(&full.to_string_lossy())
-}
-
 pub(crate) use crate::fscase::fs_is_case_insensitive;
-
-fn op_is_case_insensitive(
-	op_root: Option<&Path>,
-	op_absolute: &Path,
-	canonical_dest_roots: &[CanonicalRootId],
-	root_case_insensitive: &HashMap<PathBuf, bool>,
-	primary: Option<&CanonicalRootId>,
-) -> bool {
-	if let Some(r) = op_root {
-		if let Some(&ci) = root_case_insensitive.get(r) {
-			return ci;
-		}
-		for cr in canonical_dest_roots {
-			if cr.path() == r
-				|| paths::path_key(&cr.path().to_string_lossy())
-					== paths::path_key(&r.to_string_lossy())
-			{
-				if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-					return ci;
-				}
-			}
-		}
-	}
-	for cr in canonical_dest_roots {
-		if op_absolute.starts_with(cr.path()) {
-			if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-				return ci;
-			}
-		}
-	}
-	if let Some(p) = primary {
-		if let Some(&ci) = root_case_insensitive.get(p.path()) {
-			return ci;
-		}
-	}
-	if let Some(cr) = canonical_dest_roots.first() {
-		if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-			return ci;
-		}
-	}
-	// No root was asked: the safe side, as for a filesystem that cannot be told.
-	true
-}
 
 // ---------------------------------------------------------------------------
 // Core Public APIs
@@ -4458,67 +4441,62 @@ pub fn plan_import_parsed_with(
 		));
 	}
 
-	// Reject if two entries map to the same target file (including symlinks and case aliases)
-	let mut target_identities: HashMap<String, String> = HashMap::new();
-	for op in &combined_creates {
+	// A folder to make that two paths spell two ways is one folder. What a
+	// create was before that is kept for a refusal, which names the paths
+	// as written.
+	let mut as_written: Vec<Option<(PathBuf, String)>> =
+		Vec::with_capacity(combined_creates.len());
+	for op in &mut combined_creates {
 		cancelled_err(opts, "plan-import")?;
-		let is_ci = op_is_case_insensitive(
-			Some(&op.root_path),
-			&op.absolute_path,
-			&canonical_dest_roots,
-			&root_case_insensitive,
-			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
-		);
-		let mut identity = canonical_target_identity(&op.absolute_path);
-		if is_ci {
-			identity = identity.to_lowercase();
+		let mut before = None;
+		if !op.existed {
+			let (path, rel) =
+				(op.absolute_path.clone(), op.relative_path.clone());
+			folder_names.unify(op);
+			if op.absolute_path != path {
+				before = Some((path, rel));
+			}
 		}
-		if let Some(prev) = target_identities
-			.insert(identity.clone(), format!("create {}", op.relative_path))
+		as_written.push(before);
+	}
+
+	// Reject two writes to one target file. After every step that moves a
+	// target (routing, the restore base, a folder's tail, the unified
+	// spelling above), so it sees the paths Apply writes, and by the file
+	// they are (`TargetId`: symlinks, case aliases, two spellings of one
+	// folder), not by how they read.
+	let mut targets: HashMap<TargetId, String> = HashMap::new();
+	for (op, before) in combined_creates.iter().zip(&as_written) {
+		cancelled_err(opts, "plan-import")?;
+		let (path, rel) = before
+			.as_ref()
+			.map_or((&op.absolute_path, &op.relative_path), |(path, rel)| {
+				(path, rel)
+			});
+		let current = format!("create {rel}");
+		if let Some(prev) = targets
+			.insert(folder_names.target_id(&op.absolute_path), current.clone())
 		{
 			return Err(TransferError::TargetCollision {
-				path: op.absolute_path.clone(),
-				msg: format!(
-					"previous was '{prev}', current is 'create {}'",
-					op.relative_path
-				),
+				path: path.clone(),
+				msg: format!("previous was '{prev}', current is '{current}'"),
 			});
 		}
 	}
 	for op in &combined_deletes {
 		cancelled_err(opts, "plan-import")?;
-		let is_ci = op_is_case_insensitive(
-			None,
-			&op.absolute_path,
-			&canonical_dest_roots,
-			&root_case_insensitive,
-			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
-		);
-		let mut identity = canonical_target_identity(&op.absolute_path);
-		if is_ci {
-			identity = identity.to_lowercase();
-		}
-		if let Some(prev) = target_identities
-			.insert(identity.clone(), format!("delete {}", op.relative_path))
+		let current = format!("delete {}", op.relative_path);
+		if let Some(prev) = targets
+			.insert(folder_names.target_id(&op.absolute_path), current.clone())
 		{
 			return Err(TransferError::TargetCollision {
 				path: op.absolute_path.clone(),
-				msg: format!(
-					"previous was '{prev}', current is 'delete {}'",
-					op.relative_path
-				),
+				msg: format!("previous was '{prev}', current is '{current}'"),
 			});
 		}
 	}
-
-	// A folder to make that two paths spell two ways is one folder. After
-	// the collision checks, so a refusal still names the paths as written.
-	for op in &mut combined_creates {
-		cancelled_err(opts, "plan-import")?;
-		if !op.existed {
-			folder_names.unify(op);
-		}
-	}
+	drop(targets);
+	drop(as_written);
 
 	let restore_plan = RestorePlan {
 		roots: destination_roots.to_vec(),
