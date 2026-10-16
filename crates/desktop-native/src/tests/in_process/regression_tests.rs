@@ -239,3 +239,45 @@ fn fuzz_regression_switching_the_repo_leaves_the_log_no_preview_to_own(
 		invariants::assert_holds(m, cx, &[L6]);
 	});
 }
+
+/// O7: a Log dropdown is part of the Log panel, so hiding the panel closes
+/// it. Alt+9 (and the panel's hide button, Shift+Esc in the Log, and the
+/// paste preview taking the Log's place) left the dropdown open over no panel
+/// (found by `fuzz_local_workbench_keeps_derived_state`: open the Date
+/// chip, then Alt+9).
+#[gpui::test]
+fn fuzz_regression_hiding_the_log_closes_its_dropdown(cx: &mut TestAppContext) {
+	use crate::overlay::OverlayKind;
+	use crate::ui::LogMenu;
+	let (_ws, model, cx) = commit_shown(cx);
+	let dropdown_open = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| {
+			m.overlays.is_open(OverlayKind::LogMenu(LogMenu::Date))
+		})
+	};
+	for hide in ["alt-9", "button", "paste"] {
+		click_probed(&model, cx, "log-filter-date");
+		assert!(dropdown_open(cx), "{hide}: the dropdown opens");
+		overlays::assert_overlay_panels_match(cx, &model);
+		match hide {
+			"alt-9" => cx.simulate_keystrokes("alt-9"),
+			"button" => click_probed(&model, cx, "btn-log-hide"),
+			_ => {
+				model.update(cx, |m, _| {
+					m.test_clipboard = Some("// FILE: x.txt\nx\n".into())
+				});
+				cx.simulate_keystrokes("ctrl-v");
+			}
+		}
+		settle(cx);
+		model.read_with(cx, |m, _| {
+			assert!(!m.bottom_visible, "{hide}: the Log is hidden")
+		});
+		assert!(!dropdown_open(cx), "{hide}: its dropdown went with it");
+		overlays::assert_overlay_panels_match(cx, &model);
+		// Back to a bare state for the next way to hide it.
+		model.update_in(cx, |m, _, cx| m.cancel_paste_preview(cx));
+		model.update(cx, |m, _| m.bottom_visible = true);
+		settle(cx);
+	}
+}
