@@ -2627,7 +2627,6 @@ fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
 #[test]
 fn a_path_with_no_file_name_is_not_the_missing_destination_on_either_side() {
 	let _serial = serial();
-	let route = new_dirs_route(&[("p", "not/yet")]);
 	for raw in [".", "/", "p/", "p/."] {
 		let tmp = tempfile::tempdir().unwrap();
 		let ws = tmp.path().join("ws");
@@ -2642,18 +2641,24 @@ fn a_path_with_no_file_name_is_not_the_missing_destination_on_either_side() {
 			dest: local.join("not/yet"),
 			bound: Some(local.clone()),
 		};
-		for (name, target, dir) in
-			[("worker", &remote, &ws), ("local", &here, &local)]
-		{
+		let (there, on_disk) = (new_dirs_route(&[("p", "not/yet")]), &local);
+		let here_route = PasteRoute {
+			prefixes: vec![("p".to_string(), on_disk.join("not/yet"))],
+			..there.clone()
+		};
+		for (name, target, dir, route) in [
+			("worker", &remote, &ws, &there),
+			("local", &here, &local, &here_route),
+		] {
 			let opts = RunOptions::default();
-			let plan = target.plan_files(&text, &route, &opts, None).unwrap();
+			let plan = target.plan_files(&text, route, &opts, None).unwrap();
 			assert!(
 				plan.restore_plan().create_operations.is_empty(),
 				"{name} {raw:?}: planned {:?}",
 				plan.restore_plan().create_operations
 			);
 			let result = target
-				.apply_files(&text, &route, &plan, &confirm(&plan))
+				.apply_files(&text, route, &plan, &confirm(&plan))
 				.unwrap();
 			assert_eq!(result.created_count, 0, "{name} {raw:?}");
 			assert!(

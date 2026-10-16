@@ -8946,7 +8946,9 @@ fn test_planning_does_not_touch_the_folders_it_reads() {
 		let (anchor_before, ws_before) = (age(&anchor), age(&ws));
 		let mapping = ImportMapping::with_primary(placed(&dest));
 		let text = "// file: a.txt\nA\n// file: sub/b.txt\nB\n";
-		let plan = plan_import(text, "", &[anchor.clone()], &mapping).unwrap();
+		let plan =
+			plan_import(text, "", std::slice::from_ref(&anchor), &mapping)
+				.unwrap();
 		assert_eq!(plan.create_operations().len(), 2);
 		assert_eq!(
 			fs::metadata(&anchor).unwrap().modified().unwrap(),
@@ -8975,7 +8977,7 @@ fn test_an_empty_destination_still_folds_case_without_a_probe_file() {
 	let result = plan_import(
 		"// file: B.txt\nB\n// file: b.txt\nb\n",
 		"",
-		&[empty.clone()],
+		std::slice::from_ref(&empty),
 		&mapping,
 	);
 	assert_eq!(result.is_err(), ci, "{result:?}");

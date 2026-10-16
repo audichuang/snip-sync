@@ -2641,6 +2641,11 @@ fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
 	Ok(c1 == c2)
 }
 
+/// Whether the filesystem holding `root` folds case, by reading only: a name
+/// that exists is looked up under its other case, first among `root`'s own
+/// entries, then `root` and its ancestors by their own names. Nothing is made
+/// to probe with: planning is read-only, and a probe file made and removed in
+/// an empty folder is a write a watcher sees and nobody agreed to.
 fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
 	if let Ok(entries) = fs::read_dir(root) {
 		for entry in entries.flatten() {
@@ -2666,37 +2671,48 @@ fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
 		}
 	}
 
-	let pid = std::process::id();
-	let nanos = SystemTime::now()
-		.duration_since(SystemTime::UNIX_EPOCH)
-		.map(|d| d.as_nanos())
-		.unwrap_or(0);
-	let probe_name = format!(".snip-case-probe-{pid}-{nanos}");
-	let probe_path = root.join(&probe_name);
-	let swapped_name = format!(".SNIP-CASE-PROBE-{pid}-{nanos}");
-	let swapped_path = root.join(&swapped_name);
-
-	let probe_file = fs::OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.open(&probe_path);
-
-	match probe_file {
-		Ok(f) => {
-			drop(f);
-			let is_ci = match fs::symlink_metadata(&swapped_path) {
-				Ok(_) => {
-					is_same_file(&probe_path, &swapped_path).unwrap_or(true)
-				}
-				Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-				Err(_) => cfg!(any(windows, target_os = "macos")),
-			};
-			let _ = fs::remove_file(&probe_path);
-			let _ = fs::remove_file(&swapped_path);
-			Ok(is_ci)
+	// Nothing in `root` to compare: its own name, then its parents', each
+	// looked up beside itself. A folder on another device than `root` (a
+	// mount point) says nothing about it, and ends the walk.
+	let mut cur = root;
+	while let (Some(name), Some(parent)) = (cur.file_name(), cur.parent()) {
+		if !same_device(root, parent) {
+			break;
 		}
-		Err(e) => Err(e),
+		if let Some(swapped) = swap_ascii_case(&name.to_string_lossy()) {
+			let swapped_path = parent.join(swapped);
+			match fs::symlink_metadata(&swapped_path) {
+				Ok(_) => {
+					if let Ok(same) = is_same_file(cur, &swapped_path) {
+						return Ok(same);
+					}
+				}
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {
+					return Ok(false);
+				}
+				Err(_) => {}
+			}
+		}
+		cur = parent;
 	}
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"no name to compare under its other case",
+	))
+}
+
+#[cfg(unix)]
+fn same_device(a: &Path, b: &Path) -> bool {
+	use std::os::unix::fs::MetadataExt;
+	match (fs::metadata(a), fs::metadata(b)) {
+		(Ok(a), Ok(b)) => a.dev() == b.dev(),
+		_ => false,
+	}
+}
+
+#[cfg(not(unix))]
+fn same_device(_: &Path, _: &Path) -> bool {
+	true
 }
 
 fn op_is_case_insensitive(
@@ -4003,6 +4019,97 @@ fn route_candidates(
 	out
 }
 
+/// One spelling for each folder a plan has to make, on a filesystem that
+/// folds case: the first spelling asked for. The keys fold case the way the
+/// target-collision check does (`to_lowercase`); a difference only Unicode
+/// normalization makes is out of scope (porting-notes).
+#[derive(Default)]
+struct NewFolderNames {
+	spelled: HashMap<String, PathBuf>,
+}
+
+impl NewFolderNames {
+	/// `folder` as it is spelled for good.
+	fn spell(&mut self, folder: PathBuf) -> PathBuf {
+		let key = folder.to_string_lossy().to_lowercase();
+		self.spelled.entry(key).or_insert(folder).clone()
+	}
+
+	/// Moves `op` into the spellings of the folders it needs made: the
+	/// folders on its path below the first one that does not exist.
+	fn unify(&mut self, op: &mut restore::CreateOperation) {
+		let Some(parent) = op.absolute_path.parent() else {
+			return;
+		};
+		if fs::symlink_metadata(parent).is_ok() {
+			return;
+		}
+		let (Ok(below), Some(file)) = (
+			parent.strip_prefix(&op.root_path),
+			op.absolute_path.file_name(),
+		) else {
+			return;
+		};
+		let mut cur = op.root_path.clone();
+		let mut exists = true;
+		for name in below.components() {
+			let next = cur.join(name);
+			if exists && fs::symlink_metadata(&next).is_ok() {
+				cur = next;
+				continue;
+			}
+			exists = false;
+			cur = self.spell(next);
+		}
+		let absolute = cur.join(file);
+		let Ok(rel) = absolute.strip_prefix(&op.root_path) else {
+			return;
+		};
+		op.relative_path = rel
+			.components()
+			.map(|c| c.as_os_str().to_string_lossy())
+			.collect::<Vec<_>>()
+			.join("/");
+		op.absolute_path = absolute;
+	}
+}
+
+/// The folders each destination (the primary one, then the prefixes in the
+/// order of their names) names below its anchor, shallow to deep, under the
+/// spellings in `names` where the anchor's filesystem folds case.
+fn named_folder_chains(
+	mapping: &ImportMapping,
+	root_case_insensitive: &HashMap<PathBuf, bool>,
+	names: &mut NewFolderNames,
+) -> Vec<Vec<PathBuf>> {
+	let mut prefixes: Vec<(&String, &PlacedRoot)> =
+		mapping.prefix_destinations.iter().collect();
+	prefixes.sort_by_key(|(prefix, _)| *prefix);
+	mapping
+		.primary_destination
+		.iter()
+		.chain(prefixes.into_iter().map(|(_, placed)| placed))
+		.map(|placed| {
+			let folds = root_case_insensitive
+				.get(placed.anchor().path())
+				.copied()
+				.unwrap_or(false);
+			if !folds {
+				return placed.new_chain();
+			}
+			let mut cur = placed.anchor().path().to_path_buf();
+			placed
+				.tail()
+				.iter()
+				.map(|name| {
+					cur = names.spell(cur.join(name));
+					cur.clone()
+				})
+				.collect()
+		})
+		.collect()
+}
+
 /// `rest` below a placed folder's tail (`tail/rest`), or `rest` itself when
 /// the folder exists.
 fn with_tail<'a>(
@@ -4017,21 +4124,19 @@ fn with_tail<'a>(
 	}
 }
 
-/// Where an entry that no prefix claims lands under the primary destination:
-/// its path, under the restore base's directory when it is relative, below
-/// the destination's tail.
+/// The path an entry that no prefix claims has below the primary
+/// destination (its tail comes in front of it later): the entry's path,
+/// under the restore base's directory when it is relative.
 fn primary_relative<'a>(
-	primary: &PlacedRoot,
 	mapping: &ImportMapping,
 	entry_path: &'a str,
 ) -> std::borrow::Cow<'a, str> {
-	let rel = match &mapping.primary_prefix {
+	match &mapping.primary_prefix {
 		Some(p) if restore::is_relative(entry_path) => {
 			std::borrow::Cow::Owned(format!("{p}/{entry_path}"))
 		}
 		_ => std::borrow::Cow::Borrowed(entry_path),
-	};
-	with_tail(&primary.tail_rel(), rel)
+	}
 }
 
 /// The same import engine, consuming entries already parsed with
@@ -4089,6 +4194,15 @@ pub fn plan_import_parsed_with(
 			.or_insert_with(|| fs_is_case_insensitive(root.path()));
 	}
 
+	// The folders the user named, each under one spelling. On a filesystem
+	// that folds case `new` and `NEW` are one folder, and every place that
+	// tells folders apart (what is agreed to, what is recorded as named,
+	// what is made) goes by this one: the first spelling met, the named
+	// folders first.
+	let mut folder_names = NewFolderNames::default();
+	let named_chains =
+		named_folder_chains(mapping, &root_case_insensitive, &mut folder_names);
+
 	let route_candidates = route_candidates(&canonical_dest_roots, mapping);
 	let dest_root_paths: Vec<&Path> =
 		route_candidates.iter().map(|c| c.path.as_path()).collect();
@@ -4105,12 +4219,20 @@ pub fn plan_import_parsed_with(
 
 	for (entry_index, entry) in entries.into_iter().enumerate() {
 		cancelled_err(opts, "plan-import")?;
-		let (target_root, rel_path) = if let Some(em) =
+		// Where the entry lands: the anchor, the names below it that a folder
+		// still to be made adds, and the path the route leaves for the file
+		// itself. The last is checked on its own before the tail joins it, so
+		// a path that names no file cannot become the folder it is under.
+		let (target_root, tail, rel_path) = if let Some(em) =
 			mapping.entry_destinations.get(&entry.path)
 		{
 			let rel =
 				em.relative_path.as_deref().unwrap_or(entry.path.as_str());
-			(&em.root, std::borrow::Cow::Borrowed(rel))
+			(
+				&em.root,
+				std::borrow::Cow::Borrowed(""),
+				std::borrow::Cow::Borrowed(rel),
+			)
 		} else {
 			let normalized = paths::normalize_system_path(&entry.path);
 			if paths::is_absolute_path(&normalized) {
@@ -4143,7 +4265,11 @@ pub fn plan_import_parsed_with(
 								.unwrap_or(false)
 					});
 					match matched_root {
-						Some(c) => (&c.anchor, with_tail(&c.tail, rel)),
+						Some(c) => (
+							&c.anchor,
+							std::borrow::Cow::Borrowed(c.tail.as_str()),
+							std::borrow::Cow::Owned(rel),
+						),
 						None => {
 							skipped_operations.push(SkippedOperation {
 								raw_path: entry.path.clone(),
@@ -4165,7 +4291,8 @@ pub fn plan_import_parsed_with(
 				} else if let Some(ref primary) = mapping.primary_destination {
 					(
 						primary.anchor(),
-						with_tail(&primary.tail_rel(), entry.path.as_str()),
+						std::borrow::Cow::Owned(primary.tail_rel()),
+						std::borrow::Cow::Borrowed(entry.path.as_str()),
 					)
 				} else {
 					skipped_operations.push(SkippedOperation {
@@ -4188,11 +4315,16 @@ pub fn plan_import_parsed_with(
 				}
 				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
 					// Prefix consumed EXACTLY ONCE
-					(dest.anchor(), with_tail(&dest.tail_rel(), rest))
+					(
+						dest.anchor(),
+						std::borrow::Cow::Owned(dest.tail_rel()),
+						std::borrow::Cow::Borrowed(rest),
+					)
 				} else if let Some(ref primary) = mapping.primary_destination {
 					(
 						primary.anchor(),
-						primary_relative(primary, mapping, &entry.path),
+						std::borrow::Cow::Owned(primary.tail_rel()),
+						primary_relative(mapping, &entry.path),
 					)
 				} else {
 					skipped_operations.push(SkippedOperation {
@@ -4206,7 +4338,8 @@ pub fn plan_import_parsed_with(
 			} else if let Some(ref primary) = mapping.primary_destination {
 				(
 					primary.anchor(),
-					primary_relative(primary, mapping, &entry.path),
+					std::borrow::Cow::Owned(primary.tail_rel()),
+					primary_relative(mapping, &entry.path),
 				)
 			} else {
 				skipped_operations.push(SkippedOperation {
@@ -4231,7 +4364,9 @@ pub fn plan_import_parsed_with(
 			continue;
 		}
 
-		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
+		// The file's own path: non-empty, no `..`, at least one name. Below
+		// a folder to make it is what keeps the file below that folder.
+		let Some(file_path) = sanitize_relative_path(&rel_path) else {
 			skipped_operations.push(SkippedOperation {
 				raw_path: entry.path.clone(),
 				relative_path: None,
@@ -4240,6 +4375,7 @@ pub fn plan_import_parsed_with(
 			});
 			continue;
 		};
+		let sanitized = with_tail(&tail, file_path).into_owned();
 
 		if paths::has_git_segment(&sanitized) {
 			skipped_operations.push(SkippedOperation {
@@ -4343,6 +4479,25 @@ pub fn plan_import_parsed_with(
 		}
 	}
 
+	// A folder to make that two paths spell two ways is one folder. After
+	// the collision checks, so a refusal still names the paths as written.
+	for op in &mut combined_creates {
+		cancelled_err(opts, "plan-import")?;
+		if op.existed {
+			continue;
+		}
+		let is_ci = op_is_case_insensitive(
+			Some(&op.root_path),
+			&op.absolute_path,
+			&canonical_dest_roots,
+			&root_case_insensitive,
+			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
+		);
+		if is_ci {
+			folder_names.unify(op);
+		}
+	}
+
 	let restore_plan = RestorePlan {
 		roots: destination_roots.to_vec(),
 		create_operations: combined_creates,
@@ -4360,15 +4515,9 @@ pub fn plan_import_parsed_with(
 	// Only when there are some, so a plan without a tail is what it was.
 	if let Some(missing) = &destination_freshness.missing_dirs {
 		let mut requested = HashSet::new();
-		for placed in mapping
-			.primary_destination
-			.iter()
-			.chain(mapping.prefix_destinations.values())
-		{
-			for dir in placed.new_chain() {
-				if missing.contains(&dir) {
-					requested.insert(dir);
-				}
+		for dir in named_chains.into_iter().flatten() {
+			if missing.contains(&dir) {
+				requested.insert(dir);
 			}
 		}
 		if !requested.is_empty() {
