@@ -4295,6 +4295,73 @@ pub(crate) mod tests {
 		assert_eq!(of("/elsewhere/x"), None);
 	}
 
+	/// A row's place in the tree is the place Apply acts on: its root joined
+	/// with its path is its destination file, for a create, an overwrite and a
+	/// delete alike, even where one destination root lies inside another.
+	/// The folder row that holds a row's path then holds the row, so
+	/// unchecking it unchecks the create and the delete beside each other.
+	#[test]
+	fn a_row_in_a_nested_root_sits_where_apply_acts_and_follows_its_folder() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(tmp.path()).unwrap().join("dest");
+		let sub = dest.join("sub");
+		fs::create_dir_all(&sub).unwrap();
+		fs::write(sub.join("gone.txt"), "old\n").unwrap();
+		fs::write(sub.join("over.txt"), "old\n").unwrap();
+		// `p/` is routed into dest/sub; `sub/` keeps its relative path
+		// under dest, so those rows are written into the same folder from
+		// the outer root.
+		let raw = "// FILE: p/a.txt\nA\n\
+			// FILE: sub/new.txt\nN\n\
+			// FILE: sub/over.txt\nO\n\
+			// FILE: [DELETED] sub/gone.txt\n// This file has been deleted in this change\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			&dest,
+			&[dest.clone(), sub.clone()],
+			1,
+		)
+		.unwrap();
+		plan.choose_prefix_destination("p", &sub).unwrap();
+		plan.choose_keep_relative("sub").unwrap();
+		plan.rebuild_file_plan_with(&RunOptions::default()).unwrap();
+
+		let written: Vec<&PasteItem> =
+			plan.items.iter().filter(|i| !i.planned_skip()).collect();
+		assert_eq!(written.len(), 4, "{:?}", plan.items);
+		for item in &written {
+			assert_eq!(
+				item.dest_root.join(&item.path),
+				item.dest_path,
+				"{:?} {:?} is shown where Apply does not act",
+				item.op,
+				item.path
+			);
+		}
+		let gone = &plan.items[ix_of(&plan, "sub/gone.txt")];
+		assert!(gone.is_delete());
+		assert_eq!(gone.dest_root, dest);
+
+		let folder = DirKey {
+			commit: None,
+			root: dest.clone(),
+			path: "sub".into(),
+		};
+		assert_eq!(plan.set_dir_selected(&folder), Some(false));
+		let selected = |path: &str| plan.items[ix_of(&plan, path)].selected;
+		assert!(!selected("sub/new.txt"));
+		assert!(!selected("sub/over.txt"));
+		assert!(
+			!selected("sub/gone.txt"),
+			"the folder's own delete stays checked beside its creates"
+		);
+		assert!(
+			selected("a.txt"),
+			"a row of the inner root is not in dest/sub"
+		);
+		assert_eq!(plan.counts().deletes, 0);
+	}
+
 	#[test]
 	fn folder_include_is_tri_state_and_ignores_sibling_prefixes() {
 		let (_dir, mut plan) = tree_plan(
