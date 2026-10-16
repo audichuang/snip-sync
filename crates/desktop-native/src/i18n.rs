@@ -34,6 +34,11 @@ pub struct Msg {
 	/// An argument that is itself a message, worded with the message.
 	/// Boxed: `Msg` sits in many enums that must stay small.
 	pub inner: Option<Box<(usize, Msg)>>,
+	/// An argument that is a flat list of messages (a list's rest), worded
+	/// one by one and joined by the dictionary's separator. Flat, so a long
+	/// list never nests: rendering, cloning and dropping do not recurse
+	/// once per item.
+	pub list: Option<Box<(usize, Vec<Msg>)>>,
 }
 
 impl Msg {
@@ -43,13 +48,56 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: None,
+			list: None,
 		}
 	}
 
-	/// Text with no wording of its own (an error from a tool, a path): it
-	/// shows as it is, in either language.
-	pub fn raw(text: impl Into<String>) -> Self {
-		Self::new("err_raw", [text.into()])
+	/// `headline` followed by one datum (a path, git's stderr, the OS's
+	/// text) the headline does not word itself. This is the only way to
+	/// build `reason_detail`, so a string can reach the screen only as the
+	/// trailing data of a worded headline, never as a message of its own.
+	/// An empty datum leaves the headline bare, so a wire reason whose path
+	/// was withheld never shows an empty slot.
+	///
+	/// A headline without arguments is carried as a key argument and a
+	/// headline with arguments is nested; either way the result holds at
+	/// most one nested message, which is all a retained error is budgeted
+	/// for (`history::ERROR_RETAINED_RESERVE`).
+	pub fn detail(headline: Msg, datum: impl Into<String>) -> Msg {
+		let datum = datum.into();
+		if datum.is_empty() {
+			return headline;
+		}
+		if headline.args.is_empty()
+			&& headline.key_args.is_empty()
+			&& headline.inner.is_none()
+		{
+			Self::with_key_arg(
+				"reason_detail",
+				[headline.key.to_string(), datum],
+				0,
+			)
+		} else {
+			Self::with_msg_arg(
+				"reason_detail",
+				[String::new(), datum],
+				0,
+				headline,
+			)
+		}
+	}
+
+	/// This message with argument `index` replaced by a message of its own,
+	/// worded with it. For a message that already has key arguments.
+	pub fn nest(mut self, index: usize, inner: Msg) -> Msg {
+		self.inner = Some(Box::new((index, inner)));
+		self
+	}
+
+	/// Argument `index` is a list of messages, joined when drawn.
+	pub fn and_list_arg(mut self, index: usize, list: Vec<Msg>) -> Msg {
+		self.list = Some(Box::new((index, list)));
+		self
 	}
 
 	/// Argument `index` is a message: it is worded in the language the
@@ -65,6 +113,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: Vec::new(),
 			inner: Some(Box::new((index, inner))),
+			list: None,
 		}
 	}
 
@@ -78,6 +127,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: vec![index],
 			inner: None,
+			list: None,
 		}
 	}
 
@@ -91,6 +141,7 @@ impl Msg {
 			args: args.into_args(),
 			key_args: indices.into_iter().collect(),
 			inner: None,
+			list: None,
 		}
 	}
 
@@ -103,6 +154,15 @@ impl Msg {
 			.map(|arg| arg.capacity())
 			.chain(self.inner.iter().map(|boxed| {
 				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
+			}))
+			.chain(self.list.iter().map(|boxed| {
+				std::mem::size_of::<(usize, Vec<Msg>)>()
+					+ boxed.1.capacity() * std::mem::size_of::<Msg>()
+					+ boxed
+						.1
+						.iter()
+						.map(Msg::heap_bytes)
+						.fold(0usize, usize::saturating_add)
 			}))
 			.chain([
 				self.key_args.capacity() * std::mem::size_of::<usize>(),
@@ -121,6 +181,19 @@ impl Msg {
 					self.inner.as_deref().filter(|(at, _)| *at == i)
 				{
 					inner.render(loc)
+				} else if let Some((_, list)) =
+					self.list.as_deref().filter(|(at, _)| *at == i)
+				{
+					let sep = tf("restore_err_join", loc, &["\u{1}", "\u{2}"]);
+					let sep = sep
+						.split_once('\u{1}')
+						.and_then(|(_, rest)| rest.split_once('\u{2}'))
+						.map_or("; ", |(sep, _)| sep)
+						.to_string();
+					list.iter()
+						.map(|m| m.render(loc))
+						.collect::<Vec<_>>()
+						.join(&sep)
 				} else if self.key_args.contains(&i) {
 					let translated = t(s, loc);
 					if !translated.is_empty() {
@@ -463,7 +536,6 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
 			"paste_err_plan" => "無法建立貼上計畫: {}",
 			"paste_err_destination" => "無法使用貼上目的地「{}」: {}",
-			"paste_err_destination_detail" => "無法使用貼上目的地「{0}」: {1}：{2}",
 			"paste_err_destination_not_dir" => "貼上目的地「{}」不是資料夾",
 			"paste_outcome_unknown" => "連線中斷，無法確認貼上是否完成；請重新整理確認",
 			"preview_memory_limit" => "預覽資料超過 32 MiB 上限，未載入這次變更。請縮小預覽範圍。",
@@ -481,12 +553,67 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[二進位檔案，無法顯示文字預覽: {}]",
 			"error_preview" => "預覽「{}」失敗: {}",
 			"error_open_repo" => "開啟儲存庫失敗: {}",
-			"err_raw" => "{}",
 			"err_not_under_workspace" => "這個路徑不在目前的工作區內",
 			"err_tree_budget" => "清單超過樹狀檢視的容量上限",
 			"err_no_new_side_text" => "新版本沒有可顯示的文字",
 			"err_folder_not_utf8" => "資料夾名稱不是有效的 UTF-8，無法開啟",
 			"err_local_host_remote_root" => "本機的 Git 來源無法開啟遠端儲存庫「{}」",
+			"reason_detail" => "{0}：{1}",
+			"remote_refused_stale" => "目的地在預覽後已變更，請重新預覽",
+			"remote_refused_collision" => "貼上的多個項目會寫到同一個檔案",
+			"err_start_failed" => "無法在那台機器啟動 snip",
+			"err_disconnected" => "與遠端的連線中斷",
+			"err_protocol" => "無法解讀遠端的回應，兩台機器的 snip-sync 版本可能不一致",
+			"err_worker_outdated" => "{0} 上的 snip-sync 太舊（協定 {1}，這裡需要 {2}）；請在那台機器更新",
+			"err_timed_out" => "操作逾時，請稍後再試",
+			"err_cancelled" => "操作已取消",
+			"err_git_missing" => "找不到 git；請安裝 git 並確認它在 PATH 上",
+			"err_git_failed" => "git 執行失敗",
+			"err_git_busy" => "同時執行的 Git 作業太多，請稍後再試",
+			"err_worker_restart" => "遠端有 Git 程序無法清理，需要重新啟動那台機器上的 worker",
+			"err_too_large" => "檔案或結果過大",
+			"err_patch_too_large" => "差異過大，無法顯示",
+			"err_verify_limit" => "儲存庫過大，無法確認它是否都在共享資料夾之內",
+			"err_not_repo" => "不在 Git 儲存庫內",
+			"err_inside_parent_repo" => "位於上層儲存庫之內，本身不是儲存庫根目錄",
+			"err_invalid_revision" => "無效的版本",
+			"err_shallow" => "儲存庫是淺層複製，本機沒有這個 commit 的父 commit；請執行 {0} 取得完整歷史後再試",
+			"err_internal" => "內部錯誤",
+			"err_io" => "讀寫失敗",
+			"err_not_found" => "找不到檔案或資料夾",
+			"err_permission_denied" => "沒有存取權限",
+			"err_empty_selection" => "沒有選取任何檔案或變更",
+			"err_unsafe_path" => "路徑不安全（超出根目錄或含有無效字元）",
+			"err_not_regular" => "已存在且不是一般檔案，貼上不會覆寫它",
+			"err_outside_root" => "不在任何來源或目的地根目錄之內",
+			"err_collision" => "多個項目都會寫到同一個位置",
+			"err_staged_and_working" => "同一個檔案同時被選為已暫存與工作區版本",
+			"err_ambiguous_roots" => "多個根目錄同名",
+			"err_payload_too_large" => "內容超過上限（上限 {0} 位元組，實際 {1}）",
+			"err_source_changed" => "來源在讀取後已變更，請重新選取",
+			"err_dest_repo_changed" => "目的地儲存庫在預覽後已變更（HEAD、分支或索引），請重新預覽",
+			"err_preview_expired" => "預覽已失效，請重新預覽",
+			"err_cross_repo_commits" => "不支援跨儲存庫重放 commit",
+			"err_discontinuous" => "選取的 commit 不連續：從 {1} 沿第一個父 commit 往回走不到 {0}",
+			"err_not_enough_commits" => "要求 {0} 個 commit，但 HEAD 沿第一個父 commit 只有 {1} 個",
+			"err_not_commit_payload" => "這不是 snip-sync 的 commit 內容",
+			"err_invalid_payload" => "commit 內容無效",
+			"err_invalid_payload_syntax" => "commit 內容無效：不是合法的 JSON",
+			"err_invalid_payload_syntax_at" => "commit 內容無效：JSON 語法錯誤（第 {0} 行第 {1} 欄）",
+			"err_invalid_payload_data" => "commit 內容無效：欄位缺漏或型別不符",
+			"err_invalid_payload_data_at" => "commit 內容無效：欄位缺漏或型別不符（第 {0} 行第 {1} 欄）",
+			"err_invalid_payload_eof" => "commit 內容無效：內容在結尾前就中斷了",
+			"err_invalid_payload_eof_at" => "commit 內容無效：內容在結尾前就中斷了（第 {0} 行第 {1} 欄）",
+			"err_invalid_payload_io" => "commit 內容無法寫出",
+			"err_invalid_payload_preview_row" => "commit 內容沒有這個預覽項目",
+			"err_outside_scope" => "「{0}」在開啟的資料夾之外；要重放整個儲存庫，請開啟儲存庫根目錄",
+			"err_unverifiable" => "不是 UTF-8 或無法驗證，重放不會覆寫它",
+			"err_submodule_not_checked_out" => "子模組尚未取出（未初始化或已移除）",
+			"err_submodule_unreadable" => "無法讀取子模組",
+			"err_scan_errors_omitted" => "另有 {0} 個掃描錯誤未列出",
+			"err_depth_limited_omitted" => "另有 {0} 個目錄因深度上限未掃描",
+			"err_graph_layout" => "無法繪製 commit 圖",
+			"remote_restore_waiting" => "等待其他作業結束後再重新連線",
 			"err_repo_outside_session" => "儲存庫「{0}」不在遠端工作階段的根目錄「{1}」之下",
 			"tree_read_dir_failed" => "無法讀取目錄: {}",
 			"tree_dir_changed" => "目錄在讀取期間改變了，請重試",
@@ -522,6 +649,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_commit_files_truncated_min" => "此選取至少變更 {} 個檔案，只列出前 {} 個",
 			"status_paste_done" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}、失敗 {}",
 			"status_paste_partial" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}，{} 個檔案失敗：{}",
+			"status_paste_partial_more" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}，{} 個檔案失敗：{}；另有：{}",
+			"restore_err_file" => "「{}」：{}",
+			"restore_err_join" => "{}；{}",
+			"restore_err_unknown" => "原因不明",
+			"scan_errors_count" => "{} 個掃描錯誤",
 			"submodule" => "子模組",
 			"tip_browse_tree" => "瀏覽此 commit 的完整檔案樹（唯讀）",
 			"tip_changes" => "變更工具視窗 (Alt+0)",
@@ -589,8 +721,14 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"remote_start_key_login" => "ssh 無法免密碼登入；請先設定金鑰登入（ssh-copy-id）",
 			"remote_start_no_answer" => "那台機器上的 worker 沒有及時回應；請檢查它的負載與連線後再試一次",
 			"remote_start_closed" => "遠端在 snip 啟動前就關閉了連線",
+			"remote_start_no_command" => "沒有可用來啟動遠端 worker 的指令；請檢查這台主機的 ssh 設定",
+			"remote_start_cannot_run" => "無法執行啟動遠端 worker 的程式；請確認它已安裝且可執行",
+			"cond_gitmodules_not_file" => "無法讀取子模組：.gitmodules 不是一般檔案（可能是資料夾或連結）",
+			"cond_path_not_in_source" => "這個路徑不在目前選擇的 Git 來源中",
+			"cond_path_not_utf8" => "遇到檔名不是 UTF-8 的路徑，這個系統無法處理",
+			"cond_commit_path_not_utf8" => "這個 commit 的資料夾內有檔名不是 UTF-8 的路徑，無法顯示",
+			"cond_git_path_output" => "git 回報的儲存庫路徑格式不符預期",
 			"remote_not_found" => "找不到遠端的資料夾或檔案，請確認路徑是否存在",
-			"remote_start_detail" => "{0}：{1}",
 			"remote_refused_forbidden" => "遠端拒絕存取這個位置（在工作區之外，或沒有讀取權限）",
 			"remote_refused_unsupported" => "遠端不支援這個操作",
 			"remote_refused_bad_request" => "遠端無法理解這個請求",
@@ -906,7 +1044,6 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_err_nothing" => "Clipboard payload contains no files",
 			"paste_err_plan" => "Could not build the paste plan: {}",
 			"paste_err_destination" => "Cannot use paste destination \"{}\": {}",
-			"paste_err_destination_detail" => "Cannot use paste destination \"{0}\": {1}: {2}",
 			"paste_err_destination_not_dir" => "Paste destination \"{}\" is not a directory",
 			"paste_outcome_unknown" => "The connection was lost; whether the paste finished is unknown. Refresh to check.",
 			"preview_memory_limit" => "Preview data exceeds the 32 MiB limit. This change was not loaded. Choose a smaller preview.",
@@ -924,12 +1061,67 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[Binary file, cannot display text preview: {}]",
 			"error_preview" => "Failed to preview '{}': {}",
 			"error_open_repo" => "Failed to open repository: {}",
-			"err_raw" => "{}",
 			"err_not_under_workspace" => "This path is not under the workspace",
 			"err_tree_budget" => "The listing exceeds the tree view budget",
 			"err_no_new_side_text" => "The new side has no text to show",
 			"err_folder_not_utf8" => "Folder name is not valid UTF-8 and cannot be opened",
 			"err_local_host_remote_root" => "The local Git source cannot open remote repository '{}'",
+			"reason_detail" => "{0}: {1}",
+			"remote_refused_stale" => "The destination changed after the preview; preview again",
+			"remote_refused_collision" => "Several entries of the paste land on the same file",
+			"err_start_failed" => "Could not start snip on that machine",
+			"err_disconnected" => "The connection to the remote broke",
+			"err_protocol" => "The remote's reply could not be read; the snip-sync versions on the two machines may differ",
+			"err_worker_outdated" => "snip-sync on {0} is too old (protocol {1}, this needs {2}); update it there",
+			"err_timed_out" => "The operation timed out; try again later",
+			"err_cancelled" => "The operation was cancelled",
+			"err_git_missing" => "git was not found; install git and make sure it is on PATH",
+			"err_git_failed" => "git failed",
+			"err_git_busy" => "Too many Git operations are running; try again later",
+			"err_worker_restart" => "A Git process on the remote could not be cleaned up; restart the worker there",
+			"err_too_large" => "The file or result is too large",
+			"err_patch_too_large" => "The diff is too large to show",
+			"err_verify_limit" => "The repository is too large to verify that it stays inside the shared folder",
+			"err_not_repo" => "Not inside a Git repository",
+			"err_inside_parent_repo" => "Inside a parent repository, not a repository root",
+			"err_invalid_revision" => "Invalid revision",
+			"err_shallow" => "The repository is shallow, so this commit's parent is not available locally; run {0} and try again",
+			"err_internal" => "Internal error",
+			"err_io" => "A read or write failed",
+			"err_not_found" => "File or folder not found",
+			"err_permission_denied" => "Permission denied",
+			"err_empty_selection" => "Nothing is selected",
+			"err_unsafe_path" => "Unsafe path (escapes the root or has invalid characters)",
+			"err_not_regular" => "Exists and is not a regular file; paste does not overwrite it",
+			"err_outside_root" => "Not under any source or destination root",
+			"err_collision" => "Several entries land on the same place",
+			"err_staged_and_working" => "The same file is selected as both staged and working",
+			"err_ambiguous_roots" => "Several roots share a name",
+			"err_payload_too_large" => "The content is over the limit ({0} bytes allowed, {1} found)",
+			"err_source_changed" => "The source changed after it was read; select again",
+			"err_dest_repo_changed" => "The destination repository changed after the preview (HEAD, branch or index); preview again",
+			"err_preview_expired" => "The preview is no longer valid; preview again",
+			"err_cross_repo_commits" => "Replaying commits across repositories is not supported",
+			"err_discontinuous" => "The commits are not contiguous: following first parents back from {1} never reaches {0}",
+			"err_not_enough_commits" => "Asked for {0} commits, but HEAD has only {1} along its first parents",
+			"err_not_commit_payload" => "This is not a snip-sync commits payload",
+			"err_invalid_payload" => "The commits payload is invalid",
+			"err_invalid_payload_syntax" => "The commits payload is invalid: not valid JSON",
+			"err_invalid_payload_syntax_at" => "The commits payload is invalid: JSON syntax error (line {0}, column {1})",
+			"err_invalid_payload_data" => "The commits payload is invalid: a field is missing or has the wrong type",
+			"err_invalid_payload_data_at" => "The commits payload is invalid: a field is missing or has the wrong type (line {0}, column {1})",
+			"err_invalid_payload_eof" => "The commits payload is invalid: it ends too early",
+			"err_invalid_payload_eof_at" => "The commits payload is invalid: it ends too early (line {0}, column {1})",
+			"err_invalid_payload_io" => "The commits payload could not be written out",
+			"err_invalid_payload_preview_row" => "The commits payload has no such preview row",
+			"err_outside_scope" => "'{0}' is outside the opened folder; open the repository root to replay the whole repository",
+			"err_unverifiable" => "Not UTF-8 or cannot be verified; replay does not overwrite it",
+			"err_submodule_not_checked_out" => "The submodule is not checked out (not initialized, or removed)",
+			"err_submodule_unreadable" => "The submodule could not be read",
+			"err_scan_errors_omitted" => "{0} more scan errors are not listed",
+			"err_depth_limited_omitted" => "{0} more directories were not scanned (depth limit)",
+			"err_graph_layout" => "Could not draw the commit graph",
+			"remote_restore_waiting" => "Waiting for the other operation to finish before reconnecting",
 			"err_repo_outside_session" => "Repository '{0}' is not under the remote session root '{1}'",
 			"tree_read_dir_failed" => "Cannot read directory: {}",
 			"tree_dir_changed" => "The directory changed while it was read; try again",
@@ -965,6 +1157,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_commit_files_truncated_min" => "This selection changes at least {} files; showing the first {}",
 			"status_paste_done" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}, errors {}",
 			"status_paste_partial" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}; {} files failed: {}",
+			"status_paste_partial_more" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}; {} files failed: {}; also: {}",
+			"restore_err_file" => "\"{}\": {}",
+			"restore_err_join" => "{}; {}",
+			"restore_err_unknown" => "unknown reason",
+			"scan_errors_count" => "{} scan error(s)",
 			"submodule" => "Submodule",
 			"tip_browse_tree" => "Browse full file tree of this commit (read-only)",
 			"tip_changes" => "Changes tool window (Alt+0)",
@@ -1032,8 +1229,14 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"remote_start_key_login" => "ssh could not log in without a password; set up key login (ssh-copy-id) first",
 			"remote_start_no_answer" => "The worker on that machine did not answer in time; check its load and connection, then try again",
 			"remote_start_closed" => "The remote end closed the connection before snip started",
+			"remote_start_no_command" => "There is no command to start the remote worker; check this host's ssh settings",
+			"remote_start_cannot_run" => "The program that starts the remote worker could not be run; check that it is installed and executable",
+			"cond_gitmodules_not_file" => "Cannot read submodules: .gitmodules is not a regular file (it may be a folder or a link)",
+			"cond_path_not_in_source" => "This path is not in the selected Git source",
+			"cond_path_not_utf8" => "A path whose name is not UTF-8 cannot be handled on this system",
+			"cond_commit_path_not_utf8" => "This commit's folder holds a path whose name is not UTF-8, so it cannot be shown",
+			"cond_git_path_output" => "The repository paths git reported are not in the expected form",
 			"remote_not_found" => "The remote folder or file was not found; check that the path exists",
-			"remote_start_detail" => "{0}: {1}",
 			"remote_refused_forbidden" => "The remote refused access to this location (outside the workspace, or not readable)",
 			"remote_refused_unsupported" => "The remote does not support this operation",
 			"remote_refused_bad_request" => "The remote could not understand this request",
@@ -1198,6 +1401,11 @@ mod tests {
 			"status_history_loaded",
 			"status_paste_done",
 			"status_paste_partial",
+			"status_paste_partial_more",
+			"restore_err_file",
+			"restore_err_join",
+			"restore_err_unknown",
+			"scan_errors_count",
 			"paste_diff_same",
 			"paste_diff_binary",
 			"paste_diff_too_large",
@@ -1267,8 +1475,14 @@ mod tests {
 			"remote_start_key_login",
 			"remote_start_no_answer",
 			"remote_start_closed",
+			"remote_start_no_command",
+			"remote_start_cannot_run",
+			"cond_gitmodules_not_file",
+			"cond_path_not_in_source",
+			"cond_path_not_utf8",
+			"cond_commit_path_not_utf8",
+			"cond_git_path_output",
 			"remote_not_found",
-			"remote_start_detail",
 			"remote_refused_forbidden",
 			"remote_refused_unsupported",
 			"remote_refused_bad_request",
@@ -1281,7 +1495,6 @@ mod tests {
 			"remote_refused_busy",
 			"remote_refused_cancelled",
 			"remote_refused_outside_share",
-			"err_raw",
 			"err_not_under_workspace",
 			"err_tree_budget",
 			"err_no_new_side_text",
@@ -1343,7 +1556,6 @@ mod tests {
 			"paste_err_plan",
 			"paste_err_destination",
 			"paste_err_destination_not_dir",
-			"paste_err_destination_detail",
 			"paste_commit_count",
 			"commit_no_message",
 			"commit_empty_note",

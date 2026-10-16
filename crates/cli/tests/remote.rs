@@ -1078,3 +1078,42 @@ fn cli_master_connects_past_login_banner() {
 	let out = m.ok(&["ls", "anyhost", s(&ws)]);
 	assert_eq!(out.trim(), "banner_test.txt");
 }
+
+/// A scan row whose text is a diagnostic of ours reaches the master as the
+/// CLI prints it locally: the worker withholds what git or the OS said,
+/// never a fixed product message (develop's text, byte for byte).
+#[test]
+fn cli_master_repos_keeps_a_fixed_diagnostic_and_withholds_git_output() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws_dir = tmp.path().join("ws");
+	let repo = ws_dir.join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	git(&repo, &["init"]);
+	std::fs::create_dir(repo.join(".gitmodules")).unwrap();
+
+	let m = Master::new(tmp.path());
+	let out = m.ok(&["repos", "anyhost", s(&ws_dir)]);
+	assert!(
+		out.lines().any(|l| l
+			== "repo\terror: submodules: unexpected git output: \
+			    .gitmodules is not a file"),
+		"{out}"
+	);
+
+	// Raw git output stays on the worker: a broken index makes git print
+	// its own words, which a master must never see.
+	let broken = ws_dir.join("broken");
+	std::fs::create_dir_all(&broken).unwrap();
+	git(&broken, &["init"]);
+	std::fs::write(broken.join(".git/index"), "not an index").unwrap();
+	let out = m.ok(&["repos", "anyhost", s(&ws_dir)]);
+	let row = out
+		.lines()
+		.find(|l| l.starts_with("broken\terror: "))
+		.unwrap_or_else(|| panic!("no error row for the broken repo: {out}"));
+	assert!(row.ends_with("failed (details withheld)"), "{row}");
+	assert!(!row.contains("index"), "git's own words reached us: {row}");
+}

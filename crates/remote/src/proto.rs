@@ -716,6 +716,16 @@ pub enum Response {
 		/// field ignores it and reads a plain `TooLarge`.
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		patch: bool,
+		/// Why, beyond the code. A peer that does not know the field
+		/// ignores it; one that does not understand its value reads
+		/// `None` and words the code. Absent when `None`, so a frame
+		/// without a reason is byte-identical to an old worker's.
+		#[serde(
+			default,
+			deserialize_with = "snip_core::reason::lenient",
+			skip_serializing_if = "Option::is_none"
+		)]
+		reason: Option<Reason>,
 	},
 }
 
@@ -745,6 +755,15 @@ pub enum GitReply {
 pub struct RepoScan {
 	pub repos: Vec<ScannedRepo>,
 	pub errors: Vec<(String, String)>,
+	/// Why each of `errors` failed, index-aligned with it. Shorter than
+	/// `errors` or absent (an old worker): the rows past its end have no
+	/// reason, and their text is all there is.
+	#[serde(
+		default,
+		deserialize_with = "snip_core::reason::lenient_vec",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub error_reasons: Vec<Option<Reason>>,
 	pub error_overflow: usize,
 	pub depth_limited: Vec<String>,
 	pub depth_overflow: usize,
@@ -758,6 +777,14 @@ pub struct ScannedRepo {
 	pub name: String,
 	pub kind: FoundKind,
 	pub summary: Result<StatusSummary, String>,
+	/// Why `summary` is an error, when it is. Absent from an old worker's
+	/// frame and omitted when `None`.
+	#[serde(
+		default,
+		deserialize_with = "snip_core::reason::lenient",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub reason: Option<Reason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,35 +825,8 @@ pub struct Stat {
 	pub modified: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-	/// Outside the workspace, or not readable.
-	Forbidden,
-	NotFound,
-	Unsupported,
-	BadRequest,
-	TooLarge,
-	Io,
-	VersionMismatch,
-	/// Target folder is not a valid git repository.
-	NotARepository,
-	/// Revision argument is invalid or malformed.
-	InvalidRevision,
-	/// Worker operation timed out.
-	Timeout,
-	/// Worker has reached concurrency limits.
-	Busy,
-	/// Worker operation was cancelled.
-	Cancelled,
-	/// Repository escapes shared boundary.
-	OutsideShare,
-	/// The paste destination changed since the preview; the message is
-	/// the local paste's wording.
-	Stale,
-	/// Two entries of a paste land on one file.
-	Collision,
-}
+/// Moved to core so `GitError` can name it; the wire spelling is unchanged.
+pub use snip_core::reason::{ErrorCode, Reason, StaleChange};
 
 pub fn write_frame<T: Serialize>(
 	w: &mut impl Write,
@@ -1058,6 +1058,261 @@ mod tests {
 		TargetFileFreshness,
 	};
 	use snip_core::workspace::ChangeCounts;
+
+	/// What a worker or master built before `reason` decodes: the same enum
+	/// shape without the field. serde ignores unknown keys, so this stays
+	/// the old peer.
+	#[derive(Debug, PartialEq, Deserialize)]
+	#[serde(tag = "reply", rename_all = "snake_case")]
+	enum OldResponse {
+		Error {
+			code: ErrorCode,
+			message: String,
+			#[serde(default)]
+			patch: bool,
+		},
+		Replayed {
+			created: Vec<String>,
+			failure: Option<OldFailure>,
+		},
+		Repos {
+			repos: Vec<OldScanned>,
+			errors: Vec<(String, String)>,
+		},
+	}
+	#[derive(Debug, PartialEq, Deserialize)]
+	struct OldScanned {
+		rel: String,
+		summary: Result<StatusSummary, String>,
+	}
+	#[derive(Debug, PartialEq, Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct OldFailure {
+		index: usize,
+		message: String,
+		error: String,
+	}
+
+	fn error_with(reason: Option<Reason>) -> Response {
+		Response::Error {
+			code: ErrorCode::Busy,
+			message: "busy".into(),
+			patch: false,
+			reason,
+		}
+	}
+
+	/// `reason` is additive on `Response::Error`, through the real tagged
+	/// enum (serde buffers the frame to read the tag, then hands
+	/// `deserialize_with` a buffered deserializer).
+	#[test]
+	fn error_reason_is_compatible_in_both_directions() {
+		// Old decoder, new frame: the key is ignored.
+		let new =
+			serde_json::to_string(&error_with(Some(Reason::RepoBusy))).unwrap();
+		assert!(new.contains("\"reason\""), "{new}");
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Error {
+				code: ErrorCode::Busy,
+				message: "busy".into(),
+				patch: false
+			}
+		);
+		// New decoder, old frame: no reason.
+		let old = r#"{"reply":"error","code":"busy","message":"busy"}"#;
+		assert_eq!(
+			serde_json::from_str::<Response>(old).unwrap(),
+			error_with(None)
+		);
+		// No reason is byte-identical to the frame an old worker wrote.
+		assert_eq!(serde_json::to_string(&error_with(None)).unwrap(), old);
+		// Round trips, including a reason that carries data.
+		for reason in [
+			Reason::RepoBusy,
+			Reason::DestinationChanged {
+				change: StaleChange::Created { rel: "a/b".into() },
+			},
+			Reason::PayloadTooLarge {
+				limit: 1,
+				actual: 2,
+				path: Some("a".into()),
+			},
+		] {
+			let r = error_with(Some(reason));
+			let wire = serde_json::to_string(&r).unwrap();
+			assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), r);
+		}
+	}
+
+	/// A newer peer's reason is not an error: the frame still decodes, the
+	/// reason reads as `None`, and the code words it.
+	#[test]
+	fn error_reason_from_a_newer_peer_reads_as_none() {
+		for reason in [
+			r#"{"r":"from_the_future"}"#,
+			// A known variant whose nested tag is unknown.
+			r#"{"r":"start","start":{"k":"from_the_future"},"detail":""}"#,
+			r#"{"r":"destination_changed","change":{"r":"from_the_future"}}"#,
+			r#""not even an object""#,
+			"null",
+		] {
+			let frame = format!(
+				r#"{{"reply":"error","code":"busy","message":"busy","reason":{reason}}}"#
+			);
+			assert_eq!(
+				serde_json::from_str::<Response>(&frame)
+					.unwrap_or_else(|e| panic!("{reason}: {e}")),
+				error_with(None),
+				"{reason}"
+			);
+		}
+	}
+
+	fn replayed(reason: Option<Reason>) -> Response {
+		Response::Replayed(snip_core::commits::ReplayResult {
+			created: vec!["abc".into()],
+			failure: Some(snip_core::commits::ReplayFailure {
+				index: 1,
+				message: "m".into(),
+				error: "e".into(),
+				layout_conflict: None,
+				conflict_path: None,
+				reason,
+			}),
+		})
+	}
+
+	/// The same four cases through `ReplayResult`, which travels in
+	/// `Response::Replayed`.
+	#[test]
+	fn replay_failure_reason_is_compatible_in_both_directions() {
+		let new =
+			serde_json::to_string(&replayed(Some(Reason::EmptySelection)))
+				.unwrap();
+		assert!(new.contains("\"reason\""), "{new}");
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Replayed {
+				created: vec!["abc".into()],
+				failure: Some(OldFailure {
+					index: 1,
+					message: "m".into(),
+					error: "e".into()
+				}),
+			}
+		);
+		let old = serde_json::to_string(&replayed(None)).unwrap();
+		assert!(!old.contains("reason"), "{old}");
+		assert_eq!(
+			serde_json::from_str::<Response>(&old).unwrap(),
+			replayed(None)
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&new).unwrap(),
+			replayed(Some(Reason::EmptySelection))
+		);
+		for reason in [
+			r#"{"r":"from_the_future"}"#,
+			r#"{"r":"unsafe_path","path":7}"#,
+			r#"{"r":"source_changed","change":{"r":"from_the_future"}}"#,
+		] {
+			let frame = old.replace(
+				r#""layoutConflict":null"#,
+				&format!(r#""layoutConflict":null,"reason":{reason}"#),
+			);
+			assert!(frame.contains(reason), "{frame}");
+			assert_eq!(
+				serde_json::from_str::<Response>(&frame)
+					.unwrap_or_else(|e| panic!("{reason}: {e}")),
+				replayed(None),
+				"{reason}"
+			);
+		}
+	}
+
+	fn scanned(
+		reason: Option<Reason>,
+		error_reasons: Vec<Option<Reason>>,
+	) -> Response {
+		Response::Repos(RepoScan {
+			repos: vec![ScannedRepo {
+				rel: "sub".into(),
+				utf8: true,
+				name: "sub".into(),
+				kind: FoundKind::UninitializedSubmodule,
+				summary: Err("Submodule not checked out".into()),
+				reason,
+			}],
+			errors: vec![
+				("a".into(), "first".into()),
+				("b".into(), "second".into()),
+			],
+			error_reasons,
+			error_overflow: 0,
+			depth_limited: Vec::new(),
+			depth_overflow: 0,
+			status: ScanStatus::Complete,
+		})
+	}
+
+	/// The scan rows' reasons are additive, through the real tagged
+	/// `Response`: an old master reads the same rows, an old worker's frame
+	/// has none, and a reason a newer worker added costs only its own row.
+	#[test]
+	fn scan_reasons_are_compatible_in_both_directions() {
+		let new = serde_json::to_string(&scanned(
+			Some(Reason::SubmoduleNotCheckedOut),
+			vec![Some(Reason::TimedOut), None],
+		))
+		.unwrap();
+		assert!(
+			new.contains("\"reason\"") && new.contains("\"error_reasons\""),
+			"{new}"
+		);
+		assert_eq!(
+			serde_json::from_str::<OldResponse>(&new).unwrap(),
+			OldResponse::Repos {
+				repos: vec![OldScanned {
+					rel: "sub".into(),
+					summary: Err("Submodule not checked out".into())
+				}],
+				errors: vec![
+					("a".into(), "first".into()),
+					("b".into(), "second".into())
+				],
+			}
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&new).unwrap(),
+			scanned(
+				Some(Reason::SubmoduleNotCheckedOut),
+				vec![Some(Reason::TimedOut), None]
+			)
+		);
+		// Without reasons the frame is the one an old worker wrote.
+		let old = serde_json::to_string(&scanned(None, Vec::new())).unwrap();
+		assert!(
+			!old.contains("reason") && !old.contains("error_reasons"),
+			"{old}"
+		);
+		assert_eq!(
+			serde_json::from_str::<Response>(&old).unwrap(),
+			scanned(None, Vec::new())
+		);
+		// A reason the receiver does not know reads as none, per element.
+		let future = new
+			.replace(
+				r#""reason":{"r":"submodule_not_checked_out"}"#,
+				r#""reason":{"r":"from_the_future"}"#,
+			)
+			.replace(r#"{"r":"timed_out"}"#, r#"{"r":"from_the_future"}"#);
+		assert_ne!(future, new);
+		assert_eq!(
+			serde_json::from_str::<Response>(&future).unwrap(),
+			scanned(None, vec![None, None])
+		);
+	}
 
 	/// `folders_only` is an additive field: a request without it (every
 	/// request an older master sends) reads as the whole listing.
@@ -1294,11 +1549,13 @@ mod tests {
 				code: ErrorCode::Stale,
 				message: "stale destination in '/w': gone".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Collision,
 				message: "target collision".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Repos(RepoScan {
 				repos: vec![ScannedRepo {
@@ -1311,8 +1568,10 @@ mod tests {
 						branch: None,
 						changes: ChangeCounts::default(),
 					}),
+					reason: None,
 				}],
 				errors: vec![("err_path".into(), "error message".into())],
+				error_reasons: vec![Some(Reason::TimedOut)],
 				error_overflow: 0,
 				depth_limited: vec!["depth_path".into()],
 				depth_overflow: 0,
@@ -1323,31 +1582,37 @@ mod tests {
 				code: ErrorCode::NotARepository,
 				message: "not a git repo".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::InvalidRevision,
 				message: "invalid rev".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Timeout,
 				message: "timed out".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Busy,
 				message: "busy".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::Cancelled,
 				message: "cancelled".into(),
 				patch: false,
+				reason: None,
 			},
 			Response::Error {
 				code: ErrorCode::OutsideShare,
 				message: "outside share".into(),
 				patch: false,
+				reason: None,
 			},
 		];
 		for res in &responses {
@@ -1528,6 +1793,22 @@ mod tests {
 		};
 		assert_eq!(result.planned_skipped_count, 0);
 		assert_eq!(result.total_skipped(), 2);
+		assert!(result.failures.is_empty());
+		// A failure carries its reason; one a newer peer added costs that
+		// reason, not the frame.
+		let new: Response = serde_json::from_str(r#"{"reply":"imported","createdCount":0,"overwrittenCount":0,"skippedExistingCount":0,"deletedCount":0,"errors":["a: x","b: y"],"failures":[{"path":"a","reason":{"r":"unsafe_path","path":""}},{"path":"b","reason":{"r":"from_the_future"}}]}"#).unwrap();
+		let Response::Imported(result) = new else {
+			panic!("wrong result")
+		};
+		assert_eq!(result.failures.len(), 2);
+		assert_eq!(
+			result.failures[0].reason,
+			Some(snip_core::reason::Reason::UnsafePath {
+				path: String::new()
+			})
+		);
+		assert_eq!(result.failures[1].reason, None);
+		round_trip_check(&Response::Imported(result));
 	}
 
 	#[test]
@@ -2045,6 +2326,52 @@ mod prepared_metadata_tests {
 			}
 		}
 		assert!(count > 1);
+		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
+	}
+	/// A restore result whose JSON passes a frame (thousands of long failed
+	/// paths beside a success) is joined from chunks, and arrives whole.
+	#[test]
+	fn imported_larger_than_a_frame_is_joined_whole() {
+		use snip_core::restore::{RestoreExecutionResult, RestoreFailure};
+		let mut result = RestoreExecutionResult {
+			created_count: 1,
+			..Default::default()
+		};
+		for i in 0..24_000 {
+			let path = format!("{i:05}{}", "p".repeat(175));
+			result.errors.push(format!("{path}: denied"));
+			result.failures.push(RestoreFailure {
+				path,
+				reason: Some(snip_core::reason::Reason::UnsafePath {
+					path: String::new(),
+				}),
+			});
+		}
+		// What develop sent for the same result: no typed failures.
+		let mut legacy = result.clone();
+		legacy.failures.clear();
+		let expected = Response::Imported(result);
+		let new_len = serde_json::to_string(&expected).unwrap().len();
+		let old_len = serde_json::to_string(&Response::Imported(legacy))
+			.unwrap()
+			.len();
+		assert!(new_len > MAX_FRAME, "the fixture must pass a frame");
+		assert!(
+			new_len < old_len * 3,
+			"typed failures stay a small factor of the legacy lines"
+		);
+		let mut bytes = Vec::new();
+		crate::jobs::write_response(&mut bytes, &expected).unwrap();
+		let mut reader = std::io::Cursor::new(bytes);
+		let mut json = String::new();
+		loop {
+			match read_frame::<Response>(&mut reader).unwrap().unwrap() {
+				Response::Chunk { data } => json.push_str(&data),
+				Response::Joined => break,
+				other => panic!("not delivered whole: {other:?}"),
+			}
+		}
+		assert!(json.len() <= JOINED_MAX);
 		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
 	}
 }

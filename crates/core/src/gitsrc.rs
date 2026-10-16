@@ -26,6 +26,7 @@ use crate::format::{
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
 use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
+use crate::reason::{io_reason, Reason};
 use crate::settings::Settings;
 use crate::workspace::RepoIdentity;
 
@@ -42,7 +43,8 @@ pub const UNREADABLE_FILE_MARKER: &str = "// Unable to read file content";
 /// It follows `start_message`'s wording classes, so the CLI and the GUI
 /// agree; the remote crate's `ConnectFailureKind` (`kind`) drives retry policy instead and
 /// classifies differently, so the two are not interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StartReason {
 	/// snip is missing on that machine or too old for `serve --stdio`.
 	NoWorker,
@@ -52,6 +54,51 @@ pub enum StartReason {
 	NoAnswer,
 	/// The far end closed before snip started.
 	Closed,
+	/// There was no command to run (an empty ssh command line).
+	NoCommand,
+	/// The command could not be run at all (missing program, no permission);
+	/// the OS's words trail it as data.
+	CannotRun,
+}
+
+/// A condition the user can cause that surfaces as unexpected git output:
+/// fixed, never git's or the OS's words, so a front end words it in its own
+/// language. `Display` is the English text the CLI prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Condition {
+	/// `.gitmodules` exists but is a folder or a link, not a file.
+	GitmodulesNotFile,
+	/// The path is in no revision or working tree of this Git source.
+	PathNotInSource,
+	/// A path git printed is not UTF-8 (a platform that needs it).
+	PathNotUtf8,
+	/// A path in a commit's folder is not UTF-8.
+	CommitPathNotUtf8,
+	/// `rev-parse --git-path` did not print the ten lines asked for.
+	GitPathOutput,
+}
+
+impl Condition {
+	pub fn text(self) -> &'static str {
+		match self {
+			Self::GitmodulesNotFile => ".gitmodules is not a file",
+			Self::PathNotInSource => "Path is not in this Git source",
+			Self::PathNotUtf8 => "path is not UTF-8",
+			Self::CommitPathNotUtf8 => {
+				"unsupported non-UTF-8 path in commit directory"
+			}
+			Self::GitPathOutput => {
+				"rev-parse --git-path output must be exactly 10 lines"
+			}
+		}
+	}
+}
+
+impl std::fmt::Display for Condition {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.text())
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -111,29 +158,184 @@ pub enum GitError {
 		"Repository history is shallow, so the parent of {0} is not available locally. Run 'git fetch --unshallow' and try again."
 	)]
 	Shallow(String),
+	/// Git's output was not what we parse. `what` is our fixed label of the
+	/// check that failed; `output` is git's own bytes (an object id, a
+	/// format name), the only data: withheld where a worker withholds
+	/// details. A sentence of ours never goes into `output`: a message that
+	/// is ours alone is a [`GitError::Diagnostic`], and one the user can
+	/// cause has a type ([`GitError::Condition`], [`GitError::NotAFile`]).
+	#[error("unexpected git output: {what}: {output}")]
+	Malformed { what: &'static str, output: String },
+	/// A revision path names something that is not a file (`kind` is git's
+	/// object type, such as "tree"). The same `Display` shape as
+	/// [`GitError::Malformed`]; a front end words it from `spec`.
+	#[error("unexpected git output: '{spec}' is a {kind}, not a file")]
+	NotAFile { spec: String, kind: String },
+	/// The same failure with a fixed diagnostic of ours ("raw diff record"),
+	/// the same `Display` bytes as [`GitError::Malformed`]. Safe to send
+	/// verbatim: it holds nothing git or the OS said.
 	#[error("unexpected git output: {0}")]
-	Malformed(String),
+	Diagnostic(&'static str),
+	/// The same `Display` bytes for a condition the user can cause: typed,
+	/// so a front end words it instead of printing the English.
+	#[error("unexpected git output: {0}")]
+	Condition(Condition),
 	#[error("outside the shared folder: {what}")]
 	OutsideBoundary { what: &'static str },
 	#[error("repository too large to verify: {what}")]
 	VerifyLimit { what: &'static str },
-	#[error("{0}")]
-	Host(String),
-	/// A remote worker's refusal that has no variant of its own. `code` is
-	/// the worker's error code in its wire spelling (`snake_case`), so a
-	/// front end can word it without parsing `message`.
+	/// A failure on the far side of a remote worker (or of the transport to
+	/// it) that has no variant of its own. `message` is the English text the
+	/// CLI prints; `reason` is what a front end words.
+	/// `reason` is boxed: `Reason` is large and `GitError` rides in many
+	/// `Result`s (use [`GitError::remote`]).
 	#[error("{message}")]
-	HostRefused { code: String, message: String },
-	/// A remote worker that did not start: the known cause, the transport's
-	/// stderr and the English text the CLI prints.
-	#[error("{message}")]
-	HostStart {
-		reason: StartReason,
-		detail: String,
+	Remote {
+		reason: Box<Reason>,
 		message: String,
 	},
 	#[error(transparent)]
 	Io(#[from] io::Error),
+}
+
+/// A full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
+#[doc(hidden)]
+pub fn full_oid(text: &str) -> Result<String, GitError> {
+	if (text.len() != 40 && text.len() != 64)
+		|| !text.bytes().all(|b| b.is_ascii_hexdigit())
+	{
+		return Err(GitError::Malformed {
+			what: "rev-parse returned invalid commit OID",
+			output: text.to_string(),
+		});
+	}
+	Ok(text.to_string())
+}
+
+/// The empty tree of the object format `rev-parse --show-object-format`
+/// printed.
+#[doc(hidden)]
+pub fn empty_tree_of(format: &str) -> Result<String, GitError> {
+	match format {
+		"sha256" => Ok(SHA256_EMPTY_TREE.into()),
+		"sha1" => Ok(EMPTY_TREE.into()),
+		other => Err(GitError::Malformed {
+			what: "unknown object format",
+			output: other.to_string(),
+		}),
+	}
+}
+
+impl GitError {
+	/// A [`GitError::Remote`] (the reason is boxed, so build it here).
+	pub fn remote(reason: Reason, message: impl Into<String>) -> Self {
+		Self::Remote {
+			reason: Box::new(reason),
+			message: message.into(),
+		}
+	}
+
+	/// The `Display` text without what git or the OS said: a failed run or
+	/// a failed cleanup keeps its fixed command label and loses its stderr
+	/// or message. What a worker sends where it withholds details.
+	pub fn withheld_text(&self) -> String {
+		match self {
+			Self::Failed { args, .. } => {
+				format!("git {args} failed (details withheld)")
+			}
+			Self::Cleanup { args, .. } => {
+				format!("cleaning up git {args} failed (details withheld)")
+			}
+			Self::Malformed { .. } | Self::NotAFile { .. } => {
+				"unexpected git output (details withheld)".to_string()
+			}
+			Self::Remote { .. } => {
+				"remote git failure (details withheld)".to_string()
+			}
+			Self::Io(_) => "I/O error (details withheld)".to_string(),
+			// Nothing in these carries stderr or OS text: Display as is.
+			Self::NotFound
+			| Self::Diagnostic(_)
+			| Self::Condition(_)
+			| Self::Timeout { .. }
+			| Self::Cancelled { .. }
+			| Self::QueueTimeout { .. }
+			| Self::QueueFull { .. }
+			| Self::WorktreeBusy { .. }
+			| Self::OutputLimit { .. }
+			| Self::PatchLimit { .. }
+			| Self::OutputHeldOpen { .. }
+			| Self::NestedProcess { .. }
+			| Self::NotARepository(_)
+			| Self::ToplevelAbove(_)
+			| Self::InvalidRevision(_)
+			| Self::Shallow(_)
+			| Self::OutsideBoundary { .. }
+			| Self::VerifyLimit { .. } => self.to_string(),
+		}
+	}
+
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::NotFound => Reason::GitMissing,
+			Self::Failed { stderr, .. } => Reason::GitFailed {
+				stderr: stderr.clone(),
+			},
+			Self::Timeout { .. } => Reason::TimedOut,
+			Self::Cancelled { .. } => Reason::Cancelled,
+			Self::QueueTimeout { .. } | Self::QueueFull { .. } => {
+				Reason::GitBusy
+			}
+			Self::WorktreeBusy { .. } => Reason::RepoBusy,
+			Self::OutputLimit { .. } => Reason::TooLarge,
+			Self::PatchLimit { .. } => Reason::PatchTooLarge,
+			// The detail is data only (the command, what git printed), not
+			// the English sentence around it: a front end words the
+			// sentence.
+			Self::OutputHeldOpen { args } | Self::NestedProcess { args } => {
+				Reason::Internal {
+					detail: args.clone(),
+					condition: None,
+				}
+			}
+			Self::Cleanup { args, message } => Reason::Internal {
+				detail: format!("{args}: {message}"),
+				condition: None,
+			},
+			Self::Malformed { output, .. } => Reason::Internal {
+				detail: output.clone(),
+				condition: None,
+			},
+			Self::NotAFile { spec, .. } => {
+				Reason::NotRegularFile { path: spec.clone() }
+			}
+			Self::Diagnostic(text) => Reason::Internal {
+				detail: (*text).to_string(),
+				condition: None,
+			},
+			Self::Condition(condition) => Reason::Internal {
+				detail: String::new(),
+				condition: Some(*condition),
+			},
+			Self::NotARepository(p) => Reason::NotARepository {
+				path: p.display().to_string(),
+			},
+			Self::ToplevelAbove(p) => Reason::InsideParentRepo {
+				path: p.display().to_string(),
+			},
+			Self::InvalidRevision(rev) => {
+				Reason::InvalidRevision { rev: rev.clone() }
+			}
+			Self::Shallow(sha) => Reason::Shallow { sha: sha.clone() },
+			// `what` is an internal English noun ("git dir", "index"): dropped.
+			Self::OutsideBoundary { .. } => Reason::OutsideShare,
+			Self::VerifyLimit { .. } => Reason::VerifyLimit,
+			Self::Remote { reason, .. } => (**reason).clone(),
+			Self::Io(e) => io_reason(e, ""),
+		}
+	}
 }
 
 /// Runs the system git CLI inside one repository, never through a shell.
@@ -171,7 +373,7 @@ pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, GitError> {
 	{
 		std::str::from_utf8(bytes)
 			.map(PathBuf::from)
-			.map_err(|_| GitError::Malformed("path is not UTF-8".into()))
+			.map_err(|_| GitError::Condition(Condition::PathNotUtf8))
 	}
 }
 
@@ -412,9 +614,10 @@ impl Git {
 			});
 		}
 		// Exactly one terminating newline: a path may end in another.
-		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
-			GitError::Malformed("rev-parse --show-toplevel output".into())
-		})?;
+		let top = out
+			.stdout
+			.strip_suffix(b"\n")
+			.ok_or(GitError::Diagnostic("rev-parse --show-toplevel output"))?;
 		let top_path = path_from_git_bytes(top)?;
 		if let Some(ref b) = canonical_boundary {
 			let canonical_top = dunce::canonicalize(&top_path)?;
@@ -643,18 +846,10 @@ impl Git {
 				}
 				let text = std::str::from_utf8(&out.stdout)
 					.map_err(|_| {
-						GitError::Malformed("rev-parse output not utf-8".into())
+						GitError::Diagnostic("rev-parse output not utf-8")
 					})?
 					.trim();
-				// Full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
-				if (text.len() != 40 && text.len() != 64)
-					|| !text.bytes().all(|b| b.is_ascii_hexdigit())
-				{
-					return Err(GitError::Malformed(format!(
-						"rev-parse returned invalid commit OID: {text}"
-					)));
-				}
-				Ok(text.to_string())
+				full_oid(text)
 			}
 			Err(e) if is_quiet_miss(&e) => {
 				Err(GitError::InvalidRevision(rev.to_string()))
@@ -698,17 +893,9 @@ impl Git {
 			});
 		}
 		let format = std::str::from_utf8(&out.stdout)
-			.map_err(|_| {
-				GitError::Malformed("rev-parse output not utf-8".into())
-			})?
+			.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?
 			.trim();
-		match format {
-			"sha256" => Ok(SHA256_EMPTY_TREE.into()),
-			"sha1" => Ok(EMPTY_TREE.into()),
-			other => Err(GitError::Malformed(format!(
-				"unknown object format: {other}"
-			))),
-		}
+		empty_tree_of(format)
 	}
 
 	/// The symbolic ref HEAD points at, `None` when detached.
@@ -835,7 +1022,7 @@ impl<'a> RawZ<'a> {
 	}
 
 	pub(crate) fn next_entry(&mut self) -> Result<Option<RawEntry>, GitError> {
-		let bad = || GitError::Malformed("raw diff record".into());
+		let bad = || GitError::Diagnostic("raw diff record");
 		let header = loop {
 			match self.fields.next() {
 				None => return Ok(None),
@@ -993,7 +1180,7 @@ fn unmerged(
 	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
 	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-		let bad = || GitError::Malformed("ls-files -u record".into());
+		let bad = || GitError::Diagnostic("ls-files -u record");
 		let tab = rec.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
 		let stage = match rec[..tab].last() {
 			Some(b @ b'1'..=b'3') => usize::from(b - b'1'),
@@ -1370,7 +1557,7 @@ pub fn read_changed_file_for(
 	let max = max.min(opts.max_stdout as u64);
 	read_changes(git, source, vec![change], Some(max), opts)?
 		.pop()
-		.ok_or_else(|| GitError::Malformed("no file read".into()))
+		.ok_or(GitError::Diagnostic("no file read"))
 }
 
 /// A working-tree file, at most `max` bytes when given. Unreadable is
@@ -1708,6 +1895,79 @@ pub fn collect_payload_with_selection<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+
+	/// The CLI's bytes of the typed producers are what `Malformed(String)`
+	/// printed, and only git's own bytes become data.
+	#[test]
+	fn malformed_producers_keep_their_display_and_type_only_git_bytes() {
+		let e = full_oid("zzz").unwrap_err();
+		assert_eq!(
+			e.to_string(),
+			"unexpected git output: rev-parse returned invalid commit OID: zzz"
+		);
+		assert_eq!(
+			e.reason(),
+			Reason::Internal {
+				detail: "zzz".into(),
+				condition: None
+			}
+		);
+		assert!(full_oid(&"a".repeat(40)).is_ok());
+		assert!(full_oid(&"A".repeat(64)).is_ok());
+
+		let e = empty_tree_of("sha512").unwrap_err();
+		assert_eq!(
+			e.to_string(),
+			"unexpected git output: unknown object format: sha512"
+		);
+		assert_eq!(
+			e.reason(),
+			Reason::Internal {
+				detail: "sha512".into(),
+				condition: None
+			}
+		);
+		assert!(
+			empty_tree_of("sha1").is_ok() && empty_tree_of("sha256").is_ok()
+		);
+	}
+
+	#[test]
+	fn remote_displays_its_message_and_reasons_as_given() {
+		let e = GitError::remote(
+			Reason::Protocol,
+			"unexpected reply from the worker",
+		);
+		assert_eq!(e.to_string(), "unexpected reply from the worker");
+		assert_eq!(e.reason(), Reason::Protocol);
+	}
+
+	#[test]
+	fn git_error_reasons_follow_the_variant_not_the_text() {
+		assert_eq!(
+			GitError::QueueFull { args: "x".into() }.reason(),
+			Reason::GitBusy
+		);
+		assert_eq!(
+			GitError::VerifyLimit { what: "refs" }.reason(),
+			Reason::VerifyLimit
+		);
+		assert_eq!(
+			GitError::OutsideBoundary { what: "index" }.reason(),
+			Reason::OutsideShare
+		);
+		assert_eq!(
+			GitError::Shallow("abc".into()).reason(),
+			Reason::Shallow { sha: "abc".into() }
+		);
+		assert_eq!(
+			GitError::Io(io::Error::from(io::ErrorKind::PermissionDenied))
+				.reason(),
+			Reason::PermissionDenied {
+				path: String::new()
+			}
+		);
+	}
 
 	#[test]
 	fn open_outside_a_repository_says_so() {

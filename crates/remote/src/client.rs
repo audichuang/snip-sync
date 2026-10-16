@@ -20,6 +20,7 @@ use snip_core::gitsrc::{GitError, GitSource};
 use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
+use snip_core::reason::{Reason, StaleChange};
 
 use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
@@ -463,7 +464,8 @@ impl Connection {
 				code,
 				message,
 				patch,
-			})) => Err(refusal(code, message, patch)),
+				reason,
+			})) => Err(refusal(code, message, patch, reason)),
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				let cause = match &reply {
@@ -768,6 +770,11 @@ pub(crate) enum StartCause {
 }
 
 /// The known reason the worker did not start, when there is one.
+///
+/// A deliberate exception to "no meaning read back from an error's English
+/// text" (#225): this and [`start_failure_kind`] classify a foreign tool's
+/// stderr (ssh, the remote shell) at the place the error is produced, where
+/// the exit status still exists. Every consumer receives the typed result.
 pub(crate) fn start_reason(
 	cause: &StartCause,
 	code: Option<i32>,
@@ -815,6 +822,10 @@ pub(crate) fn start_message(
 		),
 		(Some(StartReason::Closed), _) => {
 			"the remote end closed the connection before snip started".into()
+		}
+		// Built by `spawn` with its own message, never classified here.
+		(Some(StartReason::NoCommand | StartReason::CannotRun), _) => {
+			stderr.to_string()
 		}
 		// The stream's own message: a banner, an out-of-step frame.
 		(None, StartCause::BadData(message)) => message,
@@ -883,7 +894,13 @@ type Started = (
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let (program, args) = argv.split_first().ok_or_else(|| {
-		RemoteError::Connect("no command to start the worker".into())
+		// The same text the CLI always printed, typed for a front end.
+		RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(StartReason::NoCommand),
+			detail: String::new(),
+			message: "no command to start the worker".into(),
+		}
 	})?;
 	let mut child = Command::new(program)
 		.args(args)
@@ -892,10 +909,14 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 		.stderr(Stdio::piped())
 		.spawn()
 		.map_err(|err| {
-			RemoteError::Connect(format!(
-				"cannot run {}: {err}",
-				program.to_string_lossy()
-			))
+			let program = program.to_string_lossy();
+			RemoteError::Start {
+				kind: ConnectFailureKind::WorkerUnavailable,
+				reason: Some(StartReason::CannotRun),
+				// Data only: the program and what the OS said.
+				detail: format!("{program}: {err}"),
+				message: format!("cannot run {program}: {err}"),
+			}
 		})?;
 	let stdin: ChildStdin = child.stdin.take().expect("piped stdin");
 	let stdout = child.stdout.take().expect("piped stdout");
@@ -1078,7 +1099,8 @@ pub(crate) fn exchange(
 								code,
 								message,
 								patch,
-							}) => Err(refusal(code, message, patch)),
+								reason,
+							}) => Err(refusal(code, message, patch, reason)),
 							Ok(
 								Response::Chunk { .. }
 								| Response::Joined
@@ -1114,8 +1136,9 @@ pub(crate) fn exchange(
 						code,
 						message,
 						patch,
+						reason,
 					} => {
-						return Err(refusal(code, message, patch));
+						return Err(refusal(code, message, patch, reason));
 					}
 					response => return Ok(response),
 				}
@@ -1445,7 +1468,7 @@ impl PreparedImportLease {
 			self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		match &*state {
 			PreparedImportState::Ready(_) => {}
-			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
+			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into(), reason: None }),
 			PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
 			PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
 		}
@@ -1527,6 +1550,9 @@ fn prepared_stale(message: &str) -> RemoteError {
 	RemoteError::Refused {
 		code: ErrorCode::Stale,
 		message: message.into(),
+		reason: Some(Box::new(Reason::DestinationChanged {
+			change: StaleChange::Preview,
+		})),
 	}
 }
 
@@ -2057,6 +2083,7 @@ impl Client {
 				Err(RemoteError::Refused {
 					code: ErrorCode::Stale,
 					message,
+					..
 				}) if message == crate::prepared::TOKEN_GONE => call(
 					&mut connection,
 					&Request::ImportApply {
@@ -2296,6 +2323,7 @@ impl Client {
 				Err(RemoteError::Refused {
 					code: ErrorCode::Stale,
 					message,
+					..
 				}) if message == crate::prepared::TOKEN_GONE => call(
 					&mut connection,
 					&Request::ReplayApply {
@@ -2611,7 +2639,7 @@ pub(crate) fn runs_git(request: &Request) -> bool {
 }
 
 fn unexpected_reply() -> GitError {
-	GitError::Host("unexpected reply from the worker".into())
+	GitError::remote(Reason::Protocol, "unexpected reply from the worker")
 }
 
 /// Client-side implementation of `RepoView` over `Client::git`.
@@ -2902,20 +2930,30 @@ pub(crate) fn refusal(
 	code: ErrorCode,
 	message: String,
 	patch: bool,
+	reason: Option<Reason>,
 ) -> RemoteError {
 	if patch && code == ErrorCode::TooLarge {
 		RemoteError::PatchTooLarge { message }
 	} else {
-		RemoteError::Refused { code, message }
+		RemoteError::Refused {
+			code,
+			message,
+			reason: reason.map(Box::new),
+		}
 	}
 }
 
+// The code-keyed arms below decide from the code alone, which is sound only
+// while the worker sends no reason for those codes (`Reason::beside_code`
+// answers `None` for InvalidRevision, Cancelled and Timeout). TooLarge is
+// the one code a reason refines (VerifyLimit), so its arm checks the reason.
 impl From<RemoteError> for GitError {
 	fn from(err: RemoteError) -> Self {
 		match err {
 			RemoteError::Refused {
 				code: ErrorCode::InvalidRevision,
 				message,
+				..
 			} => GitError::InvalidRevision(message),
 			// The worker names neither path nor limit; its limit is the
 			// preview limit, and the caller knows the path.
@@ -2925,11 +2963,17 @@ impl From<RemoteError> for GitError {
 			},
 			RemoteError::Refused {
 				code: ErrorCode::TooLarge,
+				ref reason,
 				..
-			} => GitError::OutputLimit {
-				args: "remote view".into(),
-				limit: 0,
-			},
+			} if reason
+				.as_deref()
+				.is_none_or(|r| matches!(r, Reason::TooLarge)) =>
+			{
+				GitError::OutputLimit {
+					args: "remote view".into(),
+					limit: 0,
+				}
+			}
 			RemoteError::Refused {
 				code: ErrorCode::Cancelled,
 				..
@@ -2946,24 +2990,9 @@ impl From<RemoteError> for GitError {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
-			RemoteError::Start {
-				reason: Some(reason),
-				detail,
-				message,
-				..
-			} => GitError::HostStart {
-				reason,
-				detail,
-				message,
-			},
-			RemoteError::Refused { code, message } => GitError::HostRefused {
-				code: serde_json::to_value(code)
-					.ok()
-					.and_then(|v| v.as_str().map(str::to_owned))
-					.unwrap_or_default(),
-				message,
-			},
-			other => GitError::Host(other.to_string()),
+			// The rest has no typed variant of its own: the CLI prints the
+			// error's text, a front end words the reason.
+			other => GitError::remote(other.reason(), other.to_string()),
 		}
 	}
 }
@@ -2972,6 +3001,40 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 	use crate::proto::write_frame;
+
+	/// A worker that cannot be started for a reason of ours is typed, with
+	/// the CLI's text unchanged and the OS's words as data only.
+	#[test]
+	fn a_command_that_cannot_start_is_typed() {
+		let Err(error) = spawn(&[]) else {
+			panic!("an empty command started")
+		};
+		assert_eq!(error.to_string(), "no command to start the worker");
+		assert_eq!(
+			error.reason(),
+			Reason::Start {
+				start: Some(StartReason::NoCommand),
+				detail: String::new(),
+			}
+		);
+		let missing = std::env::temp_dir().join("snip-no-such-program-225");
+		let Err(error) = spawn(&[missing.clone().into_os_string()]) else {
+			panic!("a missing program started")
+		};
+		let program = missing.to_string_lossy();
+		assert!(
+			error
+				.to_string()
+				.starts_with(&format!("cannot run {program}: ")),
+			"{error}"
+		);
+		let Reason::Start { start, detail } = error.reason() else {
+			panic!("{error:?}")
+		};
+		assert_eq!(start, Some(StartReason::CannotRun));
+		assert!(detail.starts_with(&format!("{program}: ")), "{detail}");
+		assert!(!error.is_restore_retryable());
+	}
 
 	struct PreparedWrites(Arc<Mutex<Vec<u8>>>);
 	impl IoWrite for PreparedWrites {
@@ -3216,6 +3279,7 @@ mod tests {
 				code: ErrorCode::Stale,
 				message: "expired; preview again".into(),
 				patch: false,
+				reason: None,
 			}),
 		] {
 			let unknown = response.is_none();
@@ -3254,6 +3318,7 @@ mod tests {
 			code: ErrorCode::Busy,
 			message: "busy".into(),
 			patch: false,
+			reason: None,
 		}));
 		assert!(matches!(
 			join_prepared(first),
@@ -3292,6 +3357,7 @@ mod tests {
 		let refusal: Result<(), RemoteError> = Err(RemoteError::Refused {
 			code: ErrorCode::Stale,
 			message: "expired; preview again".into(),
+			reason: None,
 		});
 		fixture
 			.lease
@@ -3686,7 +3752,8 @@ mod tests {
 		for code in [ErrorCode::Busy, ErrorCode::Timeout] {
 			assert!(RemoteError::Refused {
 				code,
-				message: "irrelevant".into()
+				message: "irrelevant".into(),
+				reason: None,
 			}
 			.is_transient_read_failure());
 		}
@@ -3702,10 +3769,12 @@ mod tests {
 			RemoteError::Refused {
 				code: ErrorCode::Forbidden,
 				message: "Connection reset".into(),
+				reason: None,
 			},
 			RemoteError::Refused {
 				code: ErrorCode::BadRequest,
 				message: "bad".into(),
+				reason: None,
 			},
 		] {
 			assert!(!error.is_transient_read_failure(), "{error:?}");
@@ -3762,6 +3831,7 @@ mod tests {
 			let error = RemoteError::Refused {
 				code,
 				message: String::new(),
+				reason: None,
 			};
 			assert!(error.is_restore_retryable(), "{error:?}");
 		}
@@ -3769,6 +3839,7 @@ mod tests {
 			let error = RemoteError::Refused {
 				code,
 				message: String::new(),
+				reason: None,
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
 		}
@@ -3948,6 +4019,7 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 			patch: false,
+			reason: None,
 		}]);
 		let mut frames = 0;
 		let err = exchange(
@@ -3960,7 +4032,7 @@ mod tests {
 		.unwrap_err();
 
 		match err {
-			RemoteError::Refused { code, message } => {
+			RemoteError::Refused { code, message, .. } => {
 				assert_eq!(code, ErrorCode::NotFound);
 				assert_eq!(message, "missing");
 			}
@@ -3974,6 +4046,7 @@ mod tests {
 			code: ErrorCode::TooLarge,
 			message: "big".into(),
 			patch,
+			reason: None,
 		}
 	}
 
@@ -4053,6 +4126,7 @@ mod tests {
 		let err1 = RemoteError::Refused {
 			code: ErrorCode::InvalidRevision,
 			message: "bad rev".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err1),
@@ -4062,6 +4136,7 @@ mod tests {
 		let err2 = RemoteError::Refused {
 			code: ErrorCode::Cancelled,
 			message: "stop".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err2),
@@ -4077,6 +4152,7 @@ mod tests {
 		let err4 = RemoteError::Refused {
 			code: ErrorCode::Timeout,
 			message: "slow".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err4),
@@ -4096,19 +4172,43 @@ mod tests {
 			have: 1,
 			need: 2,
 		};
-		assert!(matches!(GitError::from(err6), GitError::Host(_)));
+		let g6 = GitError::from(err6);
+		assert!(
+			matches!(
+				&g6,
+				GitError::Remote { reason, .. }
+					if matches!(**reason, Reason::WorkerTooOld {
+						have: 1,
+						need: 2,
+						..
+					})
+			),
+			"{g6:?}"
+		);
 
 		let err7 = RemoteError::Io(io::Error::other("disk error"));
-		assert!(matches!(GitError::from(err7), GitError::Host(_)));
+		let g7 = GitError::from(err7);
+		assert_eq!(g7.to_string(), "disk error");
+		assert!(matches!(
+			g7,
+			GitError::Remote { reason, .. }
+				if matches!(*reason, Reason::Disconnected { .. })
+		));
 
 		let err8 = RemoteError::Refused {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err8),
-			GitError::HostRefused { ref code, ref message }
-				if code == "not_found" && message == "missing"
+			GitError::Remote {
+				ref reason,
+				ref message,
+			} if matches!(
+				**reason,
+				Reason::Refused { code: ErrorCode::NotFound }
+			) && message == "missing"
 		));
 
 		// A worker that did not start keeps its known cause for the GUI, and
@@ -4123,10 +4223,14 @@ mod tests {
 		assert!(
 			matches!(
 				git,
-				GitError::HostStart {
-					reason: StartReason::NoWorker,
-					..
-				}
+				GitError::Remote { ref reason, .. }
+					if matches!(
+						**reason,
+						Reason::Start {
+							start: Some(StartReason::NoWorker),
+							..
+						}
+					)
 			),
 			"{git:?}"
 		);
@@ -4137,16 +4241,76 @@ mod tests {
 			detail: "boom".into(),
 			message: "boom".into(),
 		};
-		assert!(matches!(GitError::from(unknown), GitError::Host(_)));
+		assert!(matches!(
+			GitError::from(unknown),
+			GitError::Remote { reason, .. }
+				if matches!(*reason, Reason::Start { start: None, .. })
+		));
+
+		// A worker's own reason rides through to the Git view's error, and
+		// without one the code words it.
+		let typed = refusal(
+			ErrorCode::Busy,
+			"busy".into(),
+			false,
+			Some(Reason::GitBusy),
+		);
+		assert_eq!(typed.reason(), Reason::GitBusy);
+		assert!(matches!(
+			GitError::from(typed),
+			GitError::Remote { reason, message }
+				if *reason == Reason::GitBusy && message == "busy"
+		));
+		let bare = refusal(ErrorCode::Busy, "busy".into(), false, None);
+		assert_eq!(
+			bare.reason(),
+			Reason::Refused {
+				code: ErrorCode::Busy
+			}
+		);
+		// A diff over its limit keeps its own variant whatever the reason.
+		assert!(matches!(
+			refusal(
+				ErrorCode::TooLarge,
+				"m".into(),
+				true,
+				Some(Reason::PatchTooLarge)
+			),
+			RemoteError::PatchTooLarge { .. }
+		));
 
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,
 			message: "refs payload exceeded frame limit".into(),
+			reason: None,
 		};
 		assert!(matches!(
 			GitError::from(err_too_large),
 			GitError::OutputLimit { ref args, limit }
 				if args == "remote view" && limit == 0
+		));
+		// TooLarge with a reason that refines it is not the output limit:
+		// the worker's "repository too large to verify" keeps its sentence.
+		let verify = refusal(
+			ErrorCode::TooLarge,
+			"repository too large to verify".into(),
+			false,
+			Some(Reason::VerifyLimit),
+		);
+		assert!(matches!(
+			GitError::from(verify),
+			GitError::Remote { reason, .. }
+				if *reason == Reason::VerifyLimit
+		));
+		let plain = refusal(
+			ErrorCode::TooLarge,
+			"m".into(),
+			false,
+			Some(Reason::TooLarge),
+		);
+		assert!(matches!(
+			GitError::from(plain),
+			GitError::OutputLimit { .. }
 		));
 	}
 
@@ -4161,6 +4325,7 @@ mod tests {
 		let refused = RemoteError::Refused {
 			code: ErrorCode::Unsupported,
 			message: "no".into(),
+			reason: None,
 		};
 
 		// reused + 0 frames + ConnectionReset -> true

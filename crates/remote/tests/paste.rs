@@ -253,7 +253,7 @@ fn a_destination_changed_after_the_preview_is_refused_and_nothing_is_written() {
 		&planned.expect(),
 		None,
 	);
-	let Err(RemoteError::Refused { code, message }) = res else {
+	let Err(RemoteError::Refused { code, message, .. }) = res else {
 		panic!("expected stale, got {res:?}");
 	};
 	assert_eq!(code, ErrorCode::Stale);
@@ -661,7 +661,7 @@ fn commit_file_previews_match_local_virtual_baselines_without_writing() {
 				&RunOptions::default(),
 			)
 			.unwrap_err();
-		assert!(error.stale_reason().is_some(), "{error:?}");
+		assert!(error.is_stale(), "{error:?}");
 		fs::write(dst.join("common.txt"), "changed externally\n").unwrap();
 	}
 }
@@ -933,7 +933,7 @@ fn prepared_replay_requests_keep_the_token_through_checks_and_consume_it_on_appl
 
 	// The consumed token is gone for good.
 	match apply(&client, &token, &p.digest) {
-		Err(RemoteError::Refused { code, message }) => {
+		Err(RemoteError::Refused { code, message, .. }) => {
 			assert_eq!(code, ErrorCode::Stale);
 			assert!(message.contains("expired, was consumed"), "{message}");
 		}
@@ -1389,6 +1389,7 @@ fn a_paste_target_refuses_a_changed_destination_as_stale_on_both_sides() {
 		fs::write(dir.join("a.txt"), "external\n").unwrap();
 	}
 	let sel = unchecked(&[]);
+	let mut reasons = Vec::new();
 	for (name, target, plan) in
 		[("local", &local, &lp), ("remote", &remote, &rp)]
 	{
@@ -1398,8 +1399,25 @@ fn a_paste_target_refuses_a_changed_destination_as_stale_on_both_sides() {
 			.unwrap_or_else(|| {
 				panic!("the {name} target wrote over a changed destination")
 			});
-		assert!(err.stale_reason().is_some(), "{name}: {err:?}");
+		assert!(err.is_stale(), "{name}: {err:?}");
+		// Local and remote say what changed the same way: as data, from the
+		// engine, not read back out of a sentence. Over the wire it is the
+		// worker's own reason, relative to the destination.
+		assert!(
+			matches!(
+				err.reason(),
+				snip_remote::Reason::DestinationChanged {
+					change: snip_remote::StaleChange::Created { .. }
+						| snip_remote::StaleChange::Modified { .. }
+				}
+			),
+			"{name}: {:?}",
+			err.reason()
+		);
+		reasons.push(err.reason());
 	}
+	let (lr, rr) = (reasons[0].clone(), reasons[1].clone());
+	assert_eq!(lr, rr, "local and remote name the same change");
 	assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "external\n");
 	assert_eq!(
 		fs::read_to_string(local_real.join("a.txt")).unwrap(),
@@ -1429,7 +1447,7 @@ fn a_local_target_never_applies_a_workers_plan() {
 	let err = local
 		.apply_files(&text, &route, &plan, &unchecked(&[]))
 		.expect_err("a local target applied a worker's plan");
-	assert!(err.stale_reason().is_some(), "{err:?}");
+	assert!(err.is_stale(), "{err:?}");
 	assert!(!ws.join("n.txt").exists());
 }
 

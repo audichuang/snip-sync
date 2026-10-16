@@ -12,8 +12,10 @@ use snip_core::gitview::{
 	LocalRepo, Read, ReadProfile, RepoView, StatusSummary, MAX_CHANGE_ROWS,
 	MAX_COMMIT_FILES, SERVED_MAX_STDOUT,
 };
+use snip_core::reason::{Failure, Reason};
 use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
+use crate::codeless;
 use crate::proto::{
 	valid_log_query, valid_rel_path, valid_rev, valid_tips, ErrorCode,
 	GitQuery, GitReply, RepoScan, Response, ScannedRepo, REMOTE_MAX_LOG_LIMIT,
@@ -22,15 +24,81 @@ use crate::worker::{io_error, SharedRoot};
 
 pub(crate) static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn sanitize_scan_error(msg: &str, share: &Path) -> String {
-	let text = if let Some(idx) = msg.find(" failed:") {
-		format!("{} failed (details withheld)", &msg[..idx])
-	} else if msg.starts_with("failed:") {
-		"git failed (details withheld)".to_string()
-	} else {
-		msg.to_string()
+/// A scan row as the worker sends it: what git or the OS said is
+/// withheld by the row's reason, never by looking for words in its text.
+/// The text is the old masters' and the CLI's; the reason, emptied of every
+/// path and detail, is what a new master words.
+///
+/// An exhaustive match: a reason that can carry git's or the OS's own words
+/// must be listed under `Withhold` to send only the producer's withheld
+/// text, so a new variant does not compile until it is decided.
+fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
+	enum Policy {
+		/// The producer's fixed text (command label and context), never
+		/// the message; `fallback` where it built none.
+		Withhold(&'static str),
+		/// The message, with the share's path scrubbed out.
+		Scrub,
+	}
+	let policy = match &failure.reason {
+		Reason::GitFailed { .. } => Policy::Withhold("git failed"),
+		// The text of an invariant break may be git's own output.
+		Reason::Internal { .. } => Policy::Withhold("unexpected git failure"),
+		Reason::Refused { .. }
+		| Reason::Start { .. }
+		| Reason::Disconnected { .. }
+		| Reason::Protocol
+		| Reason::WorkerTooOld { .. }
+		| Reason::TimedOut
+		| Reason::Cancelled
+		| Reason::GitMissing
+		| Reason::GitBusy
+		| Reason::RepoBusy
+		| Reason::WorkerNeedsRestart
+		| Reason::TooLarge
+		| Reason::PatchTooLarge
+		| Reason::VerifyLimit
+		| Reason::NotARepository { .. }
+		| Reason::InsideParentRepo { .. }
+		| Reason::InvalidRevision { .. }
+		| Reason::Shallow { .. }
+		| Reason::OutsideShare
+		| Reason::Io { .. }
+		| Reason::NotFound { .. }
+		| Reason::PermissionDenied { .. }
+		| Reason::EmptySelection
+		| Reason::UnsafePath { .. }
+		| Reason::NotRegularFile { .. }
+		| Reason::OutsideRoot { .. }
+		| Reason::Collision { .. }
+		| Reason::StagedAndWorking { .. }
+		| Reason::AmbiguousRoots { .. }
+		| Reason::PayloadTooLarge { .. }
+		| Reason::SourceChanged { .. }
+		| Reason::DestinationChanged { .. }
+		| Reason::CrossRepoCommits
+		| Reason::Discontinuous { .. }
+		| Reason::NotEnoughCommits { .. }
+		| Reason::NotCommitPayload
+		| Reason::InvalidPayload { .. }
+		| Reason::OutsideScope { .. }
+		| Reason::Unverifiable { .. }
+		| Reason::SubmoduleNotCheckedOut
+		| Reason::SubmoduleUnreadable { .. }
+		| Reason::ScanErrorsOmitted { .. }
+		| Reason::DepthLimitedOmitted { .. } => Policy::Scrub,
 	};
-	scrub(&text, share)
+	let text = match policy {
+		Policy::Withhold(fallback) => scrub(
+			&failure
+				.withheld
+				.clone()
+				.unwrap_or_else(|| format!("{fallback} (details withheld)")),
+			share,
+		),
+		Policy::Scrub => scrub(&failure.message, share),
+	};
+	(text, codeless::scan_reason(failure.reason.clone()))
 }
 
 /// Answers a ScanRepos request within the shared root.
@@ -49,6 +117,7 @@ pub(crate) fn scan(
 					code: ErrorCode::BadRequest,
 					message: "invalid folder".into(),
 					patch: false,
+					reason: None,
 				};
 			}
 			let resolved = match snip_core::browser::inside(&root.path, u) {
@@ -60,6 +129,7 @@ pub(crate) fn scan(
 					code: ErrorCode::NotFound,
 					message: "not a directory".into(),
 					patch: false,
+					reason: None,
 				};
 			}
 			Some(resolved)
@@ -83,6 +153,7 @@ pub(crate) fn scan(
 		return Response::Repos(RepoScan {
 			repos: Vec::new(),
 			errors: Vec::new(),
+			error_reasons: Vec::new(),
 			error_overflow: 0,
 			depth_limited: Vec::new(),
 			depth_overflow: 0,
@@ -110,6 +181,7 @@ pub(crate) fn scan(
 
 	let mut repos = Vec::with_capacity(ws_scan.repos.len());
 	let mut errors = Vec::with_capacity(ws_scan.errors.len());
+	let mut error_reasons = Vec::with_capacity(ws_scan.errors.len());
 
 	for r in ws_scan.repos {
 		let r_root = dunce::canonicalize(&r.root).unwrap_or(r.root);
@@ -125,13 +197,20 @@ pub(crate) fn scan(
 						.collect::<Vec<_>>()
 						.join("/")
 				};
-				let summary = match r.summary {
-					Ok(s) => Ok(StatusSummary {
-						head: s.head,
-						branch: s.branch,
-						changes: s.changes,
-					}),
-					Err(msg) => Err(sanitize_scan_error(&msg, &root.path)),
+				let (summary, reason) = match r.summary {
+					Ok(s) => (
+						Ok(StatusSummary {
+							head: s.head,
+							branch: s.branch,
+							changes: s.changes,
+						}),
+						None,
+					),
+					Err(failure) => {
+						let (text, reason) =
+							sanitize_scan_error(&failure, &root.path);
+						(Err(text), Some(reason))
+					}
 				};
 				repos.push(ScannedRepo {
 					rel,
@@ -139,6 +218,7 @@ pub(crate) fn scan(
 					name: r.name,
 					kind: r.kind,
 					summary,
+					reason,
 				});
 			}
 			Err(_) => {
@@ -150,11 +230,13 @@ pub(crate) fn scan(
 						&root.path,
 					),
 				));
+				error_reasons
+					.push(Some(codeless::scan_reason(Reason::OutsideShare)));
 			}
 		}
 	}
 
-	for (err_path, err_msg) in ws_scan.errors {
+	for (err_path, failure) in ws_scan.errors {
 		let canon_path = dunce::canonicalize(&err_path).unwrap_or(err_path);
 		let rel = match canon_path.strip_prefix(&canonical_share) {
 			Ok(rel_path) => {
@@ -170,7 +252,9 @@ pub(crate) fn scan(
 			}
 			Err(_) => ".".to_string(),
 		};
-		errors.push((rel, sanitize_scan_error(&err_msg, &root.path)));
+		let (text, reason) = sanitize_scan_error(&failure, &root.path);
+		errors.push((rel, text));
+		error_reasons.push(Some(reason));
 	}
 
 	let depth_limited: Vec<String> = ws_scan
@@ -198,6 +282,7 @@ pub(crate) fn scan(
 	Response::Repos(RepoScan {
 		repos,
 		errors,
+		error_reasons,
 		error_overflow: ws_scan.error_overflow,
 		depth_limited,
 		depth_overflow: ws_scan.depth_overflow,
@@ -720,6 +805,10 @@ pub(crate) fn map_git_error_with_leaked(
 	leaked: usize,
 ) -> Response {
 	let mut patch = false;
+	// What the worker may tell the master beyond the code: `beside_code` empties
+	// every path and stderr, and is `None` where the code says it all. A
+	// permit leak is the worker's own state, so it overrides the busy group.
+	let mut reason = err.reason().beside_code();
 	let (code, message) = match err {
 		GitError::NotARepository(_) | GitError::ToplevelAbove(_) => {
 			(ErrorCode::NotARepository, "not a git repository".into())
@@ -739,6 +828,7 @@ pub(crate) fn map_git_error_with_leaked(
 						"[worker] Git permit leak detected; restart required"
 					);
 				}
+				reason = Some(Reason::WorkerNeedsRestart);
 				(
 					ErrorCode::Busy,
 					"a Git process on the worker could not be cleaned up and the worker needs a restart".into(),
@@ -781,6 +871,7 @@ pub(crate) fn map_git_error_with_leaked(
 		code,
 		message,
 		patch,
+		reason,
 	}
 }
 
@@ -794,13 +885,7 @@ pub(crate) fn handle_git_view(
 ) -> Response {
 	let view = match open_repo(root, repo, read, cache) {
 		Ok(v) => v,
-		Err((code, message)) => {
-			return Response::Error {
-				code,
-				message,
-				patch: false,
-			}
-		}
+		Err(reply) => return *reply,
 	};
 	match answer(&view, query, read) {
 		Ok(reply) => Response::Git(reply),
@@ -813,7 +898,15 @@ fn open_repo(
 	repo: &str,
 	read: &Read,
 	cache: &Mutex<RepoCache>,
-) -> Result<LocalRepo, (ErrorCode, String)> {
+) -> Result<LocalRepo, Box<Response>> {
+	let refused = |code, message: &str| {
+		Box::new(Response::Error {
+			code,
+			message: message.into(),
+			patch: false,
+			reason: None,
+		})
+	};
 	let cached_id = {
 		let mut c = cache
 			.lock()
@@ -830,24 +923,24 @@ fn open_repo(
 		match snip_core::browser::inside(&root.path, repo) {
 			Ok(p) => p,
 			Err(err) => {
-				if err.kind() == std::io::ErrorKind::PermissionDenied
-					|| err.to_string().contains("leaves the workspace")
-				{
-					return Err((
+				// `inside` pairs "leaves the workspace" with
+				// PermissionDenied, so the kind is all there is to read.
+				if err.kind() == std::io::ErrorKind::PermissionDenied {
+					return Err(refused(
 						ErrorCode::OutsideShare,
-						"this repository is outside the shared folder".into(),
+						"this repository is outside the shared folder",
 					));
 				}
-				return Err((
+				return Err(refused(
 					ErrorCode::NotARepository,
-					"not a git repository".into(),
+					"not a git repository",
 				));
 			}
 		}
 	};
 
 	if !dir.is_dir() {
-		return Err((ErrorCode::NotARepository, "not a git repository".into()));
+		return Err(refused(ErrorCode::NotARepository, "not a git repository"));
 	}
 
 	match LocalRepo::open_served(&dir, read) {
@@ -860,10 +953,7 @@ fn open_repo(
 			}
 			Ok(view)
 		}
-		Err(err) => match map_git_error(err, &root.path) {
-			Response::Error { code, message, .. } => Err((code, message)),
-			_ => unreachable!(),
-		},
+		Err(err) => Err(Box::new(map_git_error(err, &root.path))),
 	}
 }
 
@@ -973,10 +1063,127 @@ mod tests {
 	#[test]
 	fn sanitize_scan_error_withholds_failed_stderr() {
 		let share = Path::new("/var/workspace");
-		let msg = "git status failed: fatal: not a git repository: /Volumes/My Drive/secret/.git";
+		let secret =
+			"fatal: not a git repository: /Volumes/My Drive/secret/.git";
+		let failed = || GitError::Failed {
+			args: "status".into(),
+			stderr: secret.into(),
+			code: Some(128),
+		};
+		let gone = |f: &Failure| sanitize_scan_error(f, share);
+		let git_failed = Reason::GitFailed {
+			stderr: String::new(),
+		};
+		// The words the CLI and old masters saw, label and context kept.
+		for (context, text) in [
+			("", "git status failed (details withheld)"),
+			(
+				"repository identity: ",
+				"repository identity: git status failed (details withheld)",
+			),
+			(
+				"submodules: ",
+				"submodules: git status failed (details withheld)",
+			),
+		] {
+			let f = Failure::git(context, &failed());
+			assert!(f.message.contains(secret), "the CLI keeps git's words");
+			assert_eq!(
+				gone(&f),
+				(text.to_string(), git_failed.clone()),
+				"context {context:?}"
+			);
+		}
+		// A cleanup failure keeps its label and loses its message.
+		let cleanup = Failure::git(
+			"",
+			&GitError::Cleanup {
+				args: "log".into(),
+				message: "/Volumes/secret".into(),
+			},
+		);
 		assert_eq!(
-			sanitize_scan_error(msg, share),
-			"git status failed (details withheld)"
+			gone(&cleanup).0,
+			"cleaning up git log failed (details withheld)"
+		);
+		// The other invariant breaks keep their fixed text.
+		let held =
+			Failure::git("", &GitError::OutputHeldOpen { args: "log".into() });
+		assert_eq!(
+			gone(&held).0,
+			"git log exited but a detached process kept its output open"
+		);
+		// Unexpected git output keeps no output.
+		let malformed = Failure::git(
+			"",
+			&GitError::Malformed {
+				what: "label",
+				output: secret.into(),
+			},
+		);
+		assert!(malformed.message.contains(secret));
+		assert_eq!(
+			gone(&malformed).0,
+			"unexpected git output (details withheld)"
+		);
+		// A diagnostic of ours holds nothing git said: sent verbatim, as the
+		// CLI prints it.
+		let fixed = Failure::git("", &GitError::Diagnostic("raw diff record"));
+		assert_eq!(gone(&fixed).0, "unexpected git output: raw diff record");
+		assert_eq!(fixed.message, "unexpected git output: raw diff record");
+		// A condition the user causes is typed: the same verbatim text, and
+		// the reason keeps the condition after the scrub.
+		let typed = Failure::git(
+			"",
+			&GitError::Condition(
+				snip_core::gitsrc::Condition::GitmodulesNotFile,
+			),
+		);
+		assert_eq!(
+			gone(&typed).0,
+			"unexpected git output: .gitmodules is not a file"
+		);
+		assert_eq!(
+			typed.reason.clone().scrubbed(),
+			Reason::Internal {
+				detail: String::new(),
+				condition: Some(
+					snip_core::gitsrc::Condition::GitmodulesNotFile
+				),
+			}
+		);
+		// A row built without the producer's text never sends its message.
+		let bare = Failure::new(
+			secret,
+			Reason::GitFailed {
+				stderr: secret.into(),
+			},
+		);
+		assert_eq!(gone(&bare).0, "git failed (details withheld)");
+		let bare = Failure::new(
+			secret,
+			Reason::Internal {
+				detail: secret.into(),
+				condition: None,
+			},
+		);
+		assert_eq!(gone(&bare).0, "unexpected git failure (details withheld)");
+		// The row is withheld by its reason: the same words under another
+		// reason are only scrubbed.
+		let other = Failure::new(
+			"git status failed: x",
+			Reason::Io {
+				detail: "/Volumes/secret".into(),
+			},
+		);
+		assert_eq!(
+			gone(&other),
+			(
+				"git status failed: x".to_string(),
+				Reason::Io {
+					detail: String::new()
+				}
+			)
 		);
 	}
 
@@ -1289,6 +1496,153 @@ mod tests {
 		.is_err());
 	}
 
+	/// Every Git error a worker maps names its reason for the master, and
+	/// the whole reply, serialized, names no path of the worker's machine.
+	#[test]
+	fn map_git_error_sends_a_scrubbed_reason() {
+		let share = Path::new("/workspace");
+		let secret = "/opt/secret/repo";
+		let cases: Vec<(GitError, Option<Reason>)> = vec![
+			(
+				GitError::WorktreeBusy {
+					args: secret.into(),
+				},
+				Some(Reason::RepoBusy),
+			),
+			(
+				GitError::QueueFull {
+					args: secret.into(),
+				},
+				Some(Reason::GitBusy),
+			),
+			(
+				GitError::QueueTimeout {
+					args: secret.into(),
+				},
+				Some(Reason::GitBusy),
+			),
+			(
+				GitError::OutputLimit {
+					args: secret.into(),
+					limit: 1,
+				},
+				Some(Reason::TooLarge),
+			),
+			(
+				GitError::PatchLimit {
+					path: secret.into(),
+					limit: 1,
+				},
+				Some(Reason::PatchTooLarge),
+			),
+			(
+				GitError::VerifyLimit { what: "index" },
+				Some(Reason::VerifyLimit),
+			),
+			(
+				GitError::Failed {
+					args: secret.into(),
+					stderr: format!("fatal: {secret}"),
+					code: Some(128),
+				},
+				Some(Reason::GitFailed {
+					stderr: String::new(),
+				}),
+			),
+			(
+				GitError::Malformed {
+					what: "label",
+					output: format!("{secret} odd"),
+				},
+				Some(Reason::Internal {
+					detail: String::new(),
+					condition: None,
+				}),
+			),
+			(
+				GitError::Cleanup {
+					args: "x".into(),
+					message: secret.into(),
+				},
+				Some(Reason::Internal {
+					detail: String::new(),
+					condition: None,
+				}),
+			),
+			(
+				GitError::Shallow("abc123".into()),
+				Some(Reason::Shallow {
+					sha: "abc123".into(),
+				}),
+			),
+			(GitError::NotFound, Some(Reason::GitMissing)),
+			// The code says it all: no reason is sent.
+			(GitError::NotARepository(secret.into()), None),
+			(GitError::ToplevelAbove(secret.into()), None),
+			(GitError::InvalidRevision(format!("{secret}/x")), None),
+			(
+				GitError::OutsideBoundary {
+					what: "object store",
+				},
+				None,
+			),
+			(
+				GitError::Timeout {
+					args: secret.into(),
+					secs: 1,
+				},
+				None,
+			),
+			(
+				GitError::Cancelled {
+					args: secret.into(),
+				},
+				None,
+			),
+			(
+				GitError::Io(std::io::Error::other(format!("{secret} broke"))),
+				None,
+			),
+		];
+		for (err, want) in cases {
+			let label = format!("{err:?}");
+			let reply = map_git_error_with_leaked(err, share, 0);
+			let wire = serde_json::to_string(&reply).unwrap();
+			assert!(!wire.contains("secret"), "{label}: {wire}");
+			let Response::Error { reason, .. } = reply else {
+				panic!("{label}: expected Error");
+			};
+			assert_eq!(reason, want, "{label}");
+		}
+		// A leaked permit is the worker's own state: it overrides the busy
+		// group so the master says "restart the worker".
+		for busy in [
+			GitError::QueueFull { args: "x".into() },
+			GitError::QueueTimeout { args: "x".into() },
+			GitError::WorktreeBusy { args: "x".into() },
+		] {
+			let Response::Error { code, reason, .. } =
+				map_git_error_with_leaked(busy, share, 1)
+			else {
+				panic!("expected Error");
+			};
+			assert_eq!(code, ErrorCode::Busy);
+			assert_eq!(reason, Some(Reason::WorkerNeedsRestart));
+		}
+		// The patch flag stays for a master that predates the reason.
+		let Response::Error { patch, .. } = map_git_error_with_leaked(
+			GitError::PatchLimit {
+				path: String::new(),
+				limit: 1,
+			},
+			share,
+			0,
+		) else {
+			panic!("expected Error");
+		};
+		assert!(patch);
+	}
+
 	#[test]
 	fn map_git_error_table() {
 		let share = Path::new("/workspace");
@@ -1461,13 +1815,15 @@ mod tests {
 				code,
 				message,
 				patch,
+				reason,
 			} = serde_json::from_str(&wire).expect("deserialize")
 			else {
 				panic!("expected Error");
 			};
 			assert_eq!(code, ErrorCode::TooLarge);
-			let back =
-				GitError::from(crate::client::refusal(code, message, patch));
+			let back = GitError::from(crate::client::refusal(
+				code, message, patch, reason,
+			));
 			assert_eq!(
 				matches!(back, GitError::PatchLimit { .. }),
 				want_patch,
@@ -1504,7 +1860,10 @@ mod tests {
 		));
 
 		// Host
-		let r = map_git_error(GitError::Host("host error".into()), share);
+		let r = map_git_error(
+			GitError::remote(snip_core::reason::Reason::Protocol, "host error"),
+			share,
+		);
 		assert!(matches!(
 			r,
 			Response::Error {

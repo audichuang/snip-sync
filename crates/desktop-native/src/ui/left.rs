@@ -332,8 +332,11 @@ impl WorkbenchModel {
 				)
 			})
 			.when(is_project && !self.discovery_errors.is_empty(), |d| {
-				let err_msg =
-					format!("{} scan error(s)", self.discovery_errors.len());
+				let err_msg = crate::i18n::Msg::new(
+					"scan_errors_count",
+					[self.discovery_errors.len().to_string()],
+				)
+				.render(self.locale);
 				d.child(
 					div()
 						.id(SharedString::from("discovery-error"))

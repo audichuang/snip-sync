@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use snip_core::gitrun::{CancelToken, GitPool};
 use snip_core::gitsrc::{Git, GitSource};
 use snip_core::gitview::ReadProfile;
+use snip_core::reason::Reason;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
 	changed_items, copy_selection, plan_commit_export_exact_with,
@@ -24,6 +25,28 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Response {
 		code,
 		message: message.into(),
 		patch: false,
+		reason: None,
+	}
+}
+
+/// A refusal that carries an engine error's reason, scrubbed by
+/// [`Reason::beside_code`] so it names no path of this machine. The code and
+/// the message stay what they were (the CLI's bytes); a cancelled job says
+/// so by its code alone.
+fn refused_err(
+	code: ErrorCode,
+	message: impl Into<String>,
+	reason: Reason,
+) -> Response {
+	Response::Error {
+		code,
+		message: message.into(),
+		patch: false,
+		reason: if code == ErrorCode::Cancelled {
+			None
+		} else {
+			reason.beside_code()
+		},
 	}
 }
 
@@ -97,7 +120,13 @@ pub(crate) fn export(
 				std::slice::from_ref(&dir),
 			) {
 				Ok(whole) => whole,
-				Err(err) => return refused(ErrorCode::Io, err.to_string()),
+				Err(err) => {
+					return refused_err(
+						ErrorCode::Io,
+						err.to_string(),
+						err.reason(),
+					)
+				}
 			};
 			selection_skipped += whole.skipped;
 			export.extend(whole.sel.items);
@@ -118,7 +147,13 @@ pub(crate) fn export(
 			// An empty folder selected as a whole, with nothing under it.
 			return refused(ErrorCode::BadRequest, "nothing to copy");
 		}
-		Err(err) => return refused(ErrorCode::BadRequest, err.to_string()),
+		Err(err) => {
+			return refused_err(
+				ErrorCode::BadRequest,
+				err.to_string(),
+				err.reason(),
+			)
+		}
 	};
 	match copy_selection(sel, settings, file_limit, &options(cancel), |_| {}) {
 		Ok(mut out) => {
@@ -126,9 +161,9 @@ pub(crate) fn export(
 			Response::Copied(out)
 		}
 		Err(err) if cancel.is_cancelled() => {
-			refused(ErrorCode::Cancelled, err.to_string())
+			refused_err(ErrorCode::Cancelled, err.to_string(), err.reason())
 		}
-		Err(err) => refused(ErrorCode::Io, err.to_string()),
+		Err(err) => refused_err(ErrorCode::Io, err.to_string(), err.reason()),
 	}
 }
 
@@ -154,7 +189,13 @@ pub(crate) fn export_changes(
 	let opts = options(cancel);
 	let git = match Git::open_with(&dir, &opts) {
 		Ok(git) => git,
-		Err(err) => return refused(ErrorCode::NotARepository, err.to_string()),
+		Err(err) => {
+			return refused_err(
+				ErrorCode::NotARepository,
+				err.to_string(),
+				err.reason(),
+			)
+		}
 	};
 	// Local copy_git: commit/range sources resolve against the repository
 	// root (their paths are repo-relative); working/staged keep the opened
@@ -177,7 +218,7 @@ pub(crate) fn export_changes(
 			} else {
 				ErrorCode::Io
 			};
-			return refused(code, err.to_string());
+			return refused_err(code, err.to_string(), err.reason());
 		}
 	};
 	if changed.items.is_empty() {
@@ -189,7 +230,13 @@ pub(crate) fn export_changes(
 		changed.items,
 	) {
 		Ok(sel) => sel,
-		Err(err) => return refused(ErrorCode::BadRequest, err.to_string()),
+		Err(err) => {
+			return refused_err(
+				ErrorCode::BadRequest,
+				err.to_string(),
+				err.reason(),
+			)
+		}
 	};
 	let sel = if graph {
 		sel.with_filter_root(Some(dir))
@@ -199,9 +246,9 @@ pub(crate) fn export_changes(
 	match copy_selection(sel, settings, file_limit, &opts, |_| {}) {
 		Ok(out) => Response::Copied(out),
 		Err(err) if cancel.is_cancelled() => {
-			refused(ErrorCode::Cancelled, err.to_string())
+			refused_err(ErrorCode::Cancelled, err.to_string(), err.reason())
 		}
-		Err(err) => refused(ErrorCode::Io, err.to_string()),
+		Err(err) => refused_err(ErrorCode::Io, err.to_string(), err.reason()),
 	}
 }
 
@@ -235,7 +282,13 @@ pub(crate) fn export_commits(
 	let opts = options(cancel);
 	let git = match Git::open_with(&dir, &opts) {
 		Ok(git) => git,
-		Err(err) => return refused(ErrorCode::NotARepository, err.to_string()),
+		Err(err) => {
+			return refused_err(
+				ErrorCode::NotARepository,
+				err.to_string(),
+				err.reason(),
+			)
+		}
 	};
 	match plan_commit_export_exact_with(
 		&git,
@@ -246,8 +299,86 @@ pub(crate) fn export_commits(
 	) {
 		Ok(export) => Response::CommitsCopied(export.outcome()),
 		Err(err) if cancel.is_cancelled() => {
-			refused(ErrorCode::Cancelled, err.to_string())
+			refused_err(ErrorCode::Cancelled, err.to_string(), err.reason())
 		}
-		Err(err) => refused(ErrorCode::Io, err.to_string()),
+		Err(err) => refused_err(ErrorCode::Io, err.to_string(), err.reason()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::process::Command;
+
+	fn git(dir: &std::path::Path, args: &[&str]) -> String {
+		let out = Command::new("git")
+			.arg("-C")
+			.arg(dir)
+			.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+			.args(["-c", "commit.gpgsign=false"])
+			.args(args)
+			.output()
+			.unwrap();
+		assert!(out.status.success(), "git {args:?}");
+		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	}
+
+	/// A remote ExportCommits refusal carries the engine's Reason, as a
+	/// local copy does, and the serialized frame names no path of the
+	/// worker's machine.
+	#[test]
+	fn export_commits_refusal_carries_scrubbed_reason() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = tmp.path();
+		git(dir, &["init", "-q"]);
+		let mut shas = Vec::new();
+		for n in 0..3 {
+			std::fs::write(dir.join("f.txt"), format!("{n}")).unwrap();
+			git(dir, &["add", "."]);
+			git(dir, &["commit", "-q", "-m", &format!("c{n}")]);
+			shas.push(git(dir, &["rev-parse", "HEAD"]));
+		}
+		let root = SharedRoot::new(dir).unwrap();
+		let cancel = CancelToken::new();
+
+		// A selection that skips the middle commit is not a chain.
+		let resp = export_commits(
+			&root,
+			"",
+			&shas[2],
+			&[shas[0].clone(), shas[2].clone()],
+			&cancel,
+		);
+		let Response::Error {
+			code,
+			reason: Some(reason),
+			..
+		} = &resp
+		else {
+			panic!("expected a typed refusal, got {resp:?}");
+		};
+		assert_eq!(*code, ErrorCode::Io);
+		assert!(matches!(reason, Reason::Discontinuous { .. }), "{reason:?}");
+		let wire = serde_json::to_string(&resp).unwrap();
+		let shown = root.path.display().to_string();
+		assert!(!wire.contains(&shown), "{wire}");
+
+		// A payload over the limit keeps its own reason too.
+		let err = snip_core::commits::CommitError::PayloadLimit {
+			limit: 1,
+			actual: 2,
+		};
+		let resp = refused_err(ErrorCode::Io, err.to_string(), err.reason());
+		assert!(matches!(
+			resp,
+			Response::Error {
+				reason: Some(Reason::PayloadTooLarge { .. }),
+				..
+			}
+		));
+		// A cancelled job says so by its code alone.
+		let resp =
+			refused_err(ErrorCode::Cancelled, "cancelled", Reason::Cancelled);
+		assert!(matches!(resp, Response::Error { reason: None, .. }));
 	}
 }

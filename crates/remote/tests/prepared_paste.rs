@@ -624,6 +624,7 @@ fn expired_prepared_token_with_a_changed_destination_refuses_as_stale() {
 	let PasteError::Remote(snip_remote::RemoteError::Refused {
 		code: snip_remote::ErrorCode::Stale,
 		message,
+		..
 	}) = &error
 	else {
 		panic!("expected a stale refusal, got {error:?}");

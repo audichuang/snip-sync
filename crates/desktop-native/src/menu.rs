@@ -15,7 +15,7 @@ use snip_core::transfer::SourceKind;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::i18n::t;
+use crate::i18n::{t, Msg};
 use crate::icons::{icon, Icon};
 use crate::theme::*;
 use crate::tree::FlattenedTreeRow;
@@ -812,10 +812,14 @@ impl WorkbenchModel {
 						.and_then(|(prog, args)| spawn_detached(&prog, &args));
 					match result {
 						Ok(()) => app_log!("[APP:REVEAL: {}]", path.display()),
-						Err(e) => self.set_status(
+						Err(e) => self.set_status_msg(Msg::with_msg_arg(
 							"status_reveal_failed",
-							[e.to_string()],
-						),
+							[String::new()],
+							0,
+							crate::reason::reason_msg(
+								&snip_core::reason::io_reason(&e, ""),
+							),
+						)),
 					}
 				}
 			}

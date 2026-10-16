@@ -37,6 +37,7 @@ use snip_core::format::{self, ChangeType};
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::paths;
+use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{
 	self, RestoreBase, RestoreBaseSuggestion, RestoreSelection, SkipReason,
 };
@@ -351,8 +352,14 @@ fn test_stagedvsworking_conflict() {
 
 	let err = selection.unwrap_err();
 	match err {
-		TransferError::StagedWorkingConflict { path, .. } => {
+		TransferError::StagedWorkingConflict { ref path, .. } => {
 			assert_eq!(path, "file.txt");
+			assert_eq!(
+				err.reason(),
+				Reason::StagedAndWorking {
+					path: "file.txt".into()
+				}
+			);
 		}
 		other => panic!("expected StagedWorkingConflict, got: {other:?}"),
 	}
@@ -463,8 +470,9 @@ previewed content
 	// Applying the previewed plan must fail stale and write nothing!
 	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
 	match err {
-		TransferError::StaleDestination { reason, .. } => {
+		TransferError::StaleDestination { reason, change, .. } => {
 			assert!(reason.contains("HEAD commit changed"));
+			assert_eq!(change, StaleChange::Repository);
 		}
 		other => panic!("expected StaleDestination, got {other:?}"),
 	}
@@ -496,8 +504,9 @@ content
 
 	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
 	match err {
-		TransferError::StaleDestination { reason, .. } => {
+		TransferError::StaleDestination { reason, change, .. } => {
 			assert!(reason.contains("index changed"));
+			assert_eq!(change, StaleChange::Repository);
 		}
 		other => panic!("expected StaleDestination, got {other:?}"),
 	}
@@ -530,11 +539,66 @@ fn test_working_file_content_hash_change_detects_samesize_edits() {
 
 	let err = snapshot.revalidate().unwrap_err();
 	match err {
-		TransferError::StaleSource { reason, .. } => {
+		TransferError::StaleSource { reason, change, .. } => {
 			assert!(reason.contains("modified or deleted"));
+			assert_eq!(
+				change,
+				StaleChange::Modified {
+					rel: "file.txt".into()
+				}
+			);
 		}
 		other => panic!("expected StaleSource, got {other:?}"),
 	}
+}
+
+#[test]
+fn test_destination_file_created_or_deleted_afterpreview_names_the_change() {
+	let dst = TestRepo::new("dest-repo");
+	dst.write("existing.txt", "original content");
+	dst.commit("commit 1");
+
+	let clipboard_text = "\
+// file: existing.txt
+updated by paste
+// file: fresh.txt
+new by paste
+";
+	let mapping = ImportMapping::with_primary(dst.canonical_id());
+	let plan = || {
+		plan_import(
+			clipboard_text,
+			"// file: $FILE_PATH",
+			&[dst.path().to_path_buf()],
+			&mapping,
+		)
+		.unwrap()
+	};
+	let changed = |err: TransferError| match err {
+		TransferError::StaleDestination { change, .. } => change,
+		other => panic!("expected StaleDestination, got {other:?}"),
+	};
+
+	let import_plan = plan();
+	dst.write("fresh.txt", "someone was faster");
+	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		changed(err),
+		StaleChange::Created {
+			rel: "fresh.txt".into()
+		}
+	);
+	std::fs::remove_file(dst.path().join("fresh.txt")).unwrap();
+
+	let import_plan = plan();
+	std::fs::remove_file(dst.path().join("existing.txt")).unwrap();
+	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		changed(err),
+		StaleChange::Deleted {
+			rel: "existing.txt".into()
+		}
+	);
 }
 
 #[test]
@@ -560,8 +624,14 @@ updated by paste
 
 	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
 	match err {
-		TransferError::StaleDestination { reason, .. } => {
+		TransferError::StaleDestination { reason, change, .. } => {
 			assert!(reason.contains("modified externally"));
+			assert_eq!(
+				change,
+				StaleChange::Modified {
+					rel: "target.txt".into()
+				}
+			);
 		}
 		other => panic!("expected StaleDestination, got {other:?}"),
 	}
@@ -661,10 +731,25 @@ fn test_commit_selection_crossrepo_and_discontinuous_rejected() {
 	let err = plan_commit_export(&g1, Some((&side_tip, &main_tip)), None)
 		.unwrap_err();
 	match err {
-		TransferError::DiscontinuousCommits { at, base, tip, .. } => {
-			assert_eq!(base, side_tip);
-			assert_eq!(tip, main_tip);
+		TransferError::DiscontinuousCommits {
+			ref at,
+			ref base,
+			ref tip,
+			ref first_parent,
+		} => {
+			assert_eq!(base, &side_tip);
+			assert_eq!(tip, &main_tip);
 			assert!(!at.is_empty());
+			// The commit that breaks the chain reaches the reason.
+			assert_eq!(
+				err.reason(),
+				Reason::Discontinuous {
+					base: base.clone(),
+					tip: tip.clone(),
+					at: at.clone(),
+					first_parent: first_parent.clone(),
+				}
+			);
 		}
 		other => panic!("expected DiscontinuousCommits, got: {other:?}"),
 	}
@@ -831,8 +916,9 @@ content
 
 	let err = import_plan.apply(&RestoreSelection::default()).unwrap_err();
 	match err {
-		TransferError::StaleDestination { reason, .. } => {
+		TransferError::StaleDestination { reason, change, .. } => {
 			assert!(reason.contains("branch/ref changed"));
+			assert_eq!(change, StaleChange::Repository);
 		}
 		other => {
 			panic!("expected StaleDestination with ref change, got {other:?}")
@@ -1997,10 +2083,12 @@ fn test_serialized_overhead_limit_and_bounded_reads() {
 			limit,
 			actual,
 			reason,
+			path,
 		} => {
 			assert_eq!(limit, 50);
 			assert!(actual > 200);
 			assert!(reason.contains("serialized wrapper overhead"));
+			assert_eq!(path, None, "the wrapper is no file");
 		}
 		other => panic!("expected PayloadLimitExceeded, got {other:?}"),
 	}
@@ -2085,9 +2173,23 @@ fn test_aggregate_many_files_tiny_budget_stops_early_before_retaining() {
 	let err =
 		plan_export(&selection, &Settings::default(), Some(2500)).unwrap_err();
 	match err {
-		TransferError::PayloadLimitExceeded { limit, actual, .. } => {
+		TransferError::PayloadLimitExceeded {
+			limit,
+			actual,
+			ref path,
+			..
+		} => {
 			assert_eq!(limit, 2500);
 			assert!(actual > 2500);
+			// The user has to know which file to deselect.
+			let named = path.as_deref().unwrap_or_default();
+			assert!(named.contains("f_"), "no file named: {path:?}");
+			match err.reason() {
+				Reason::PayloadTooLarge { path: p, .. } => {
+					assert_eq!(p.as_deref(), Some(named))
+				}
+				other => panic!("wrong reason: {other:?}"),
+			}
 		}
 		other => panic!("expected PayloadLimitExceeded, got: {other:?}"),
 	}
@@ -3412,11 +3514,14 @@ fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_is_malformed() {
 
 	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
 	match err {
-		TransferError::Git(gitsrc::GitError::Malformed(msg)) => {
-			assert!(msg.contains("not a file"), "unexpected message: {msg}");
+		TransferError::Git(e @ gitsrc::GitError::NotAFile { .. }) => {
+			assert!(
+				e.to_string().ends_with("is a commit, not a file"),
+				"unexpected message: {e}"
+			);
 		}
 		other => panic!(
-			"expected TransferError::Git(GitError::Malformed), got {other:?}"
+			"expected TransferError::Git(GitError::NotAFile), got {other:?}"
 		),
 	}
 }
@@ -3986,7 +4091,13 @@ fn commit_replay_apply_refuses_a_destination_changed_after_preview() {
 	let bytes_before = fs::read(repo.path().join("a.txt")).unwrap();
 	let err = preview.apply().unwrap_err();
 	assert!(
-		matches!(err, TransferError::StaleDestination { .. }),
+		matches!(
+			&err,
+			TransferError::StaleDestination {
+				change: StaleChange::Modified { rel },
+				..
+			} if rel == "a.txt"
+		),
 		"{err:?}"
 	);
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
@@ -4040,7 +4151,13 @@ fn commit_replay_apply_refuses_a_destination_changed_after_preview() {
 	let bytes_b_before = fs::read(repo.path().join("b.txt")).unwrap();
 	let err = preview.apply().unwrap_err();
 	assert!(
-		matches!(err, TransferError::StaleDestination { .. }),
+		matches!(
+			&err,
+			TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			} if rel == "b.txt"
+		),
 		"{err:?}"
 	);
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);

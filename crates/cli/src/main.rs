@@ -665,7 +665,7 @@ fn format_paste_error(err: PasteError) -> String {
 			 Check the destination (snip remote changes / ls) before pasting again."
 		),
 		e if e.is_collision() => format!("Snipcode refused to paste: {e}"),
-		e if e.stale_reason().is_some() => format!(
+		e if e.is_stale() => format!(
 			"Snipcode refused to paste: {e}; re-run to inspect updated destinations"
 		),
 		e if e.is_repo_busy() => format!(
@@ -979,6 +979,7 @@ mod tests {
 		let refused = |code, message: &str| RemoteError::Refused {
 			code,
 			message: message.into(),
+			reason: None,
 		};
 		const COLLISION: &str =
 			"target collision: multiple operations target 'a.txt': two entries";
@@ -1001,7 +1002,7 @@ mod tests {
 			format!("Snipcode refused to paste: {COLLISION}")
 		);
 		assert_eq!(
-			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into() }),
+			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into(), change: snip_core::reason::StaleChange::Modified { rel: "a".into() } }),
 			"Snipcode refused to paste: stale destination in '/r': target file 'a' was modified externally after preview; re-run to inspect updated destinations"
 		);
 		assert_eq!(
@@ -1024,10 +1025,18 @@ mod tests {
 		);
 		let stale_text = format!("Snipcode refused to paste: {STALE}; re-run to inspect updated destinations");
 		assert_eq!(remote(refused(ErrorCode::Stale, STALE)), stale_text);
+		// A worker says the repository is busy by its reason; the same words
+		// from one that sends none (an old worker) are only a busy refusal.
+		let repo_busy = RemoteError::Refused {
+			code: ErrorCode::Busy,
+			message: BUSY.into(),
+			reason: Some(Box::new(snip_core::reason::Reason::RepoBusy)),
+		};
 		assert_eq!(
-			remote(refused(ErrorCode::Busy, BUSY)),
+			remote(repo_busy),
 			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
 		);
+		assert_eq!(remote(refused(ErrorCode::Busy, BUSY)), BUSY);
 		assert_eq!(
 			remote(refused(ErrorCode::Busy, "too many callers")),
 			"too many callers"

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use snip_core::commits::{CommitsPayload, ReplayResult};
 use snip_core::gitrun::RunOptions;
-use snip_core::gitsrc::GitError;
+use snip_core::reason::{Reason, StaleChange};
 use snip_core::restore::{
 	suggest_restore_base, FsProbe, RestoreBaseSuggestion,
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
@@ -74,9 +74,10 @@ pub(crate) fn import_mapping<E>(
 	Ok((mapping, roots))
 }
 
-/// How `GitError::WorktreeBusy` prints, so a worker's refusal is known.
-/// A unit test renders the real `GitError` and checks it still contains
-/// this, so the copy cannot drift from core's `#[error]` unnoticed.
+/// How `GitError::WorktreeBusy` prints. Nothing reads a refusal's meaning
+/// from it any more (a worker says `Reason::RepoBusy`); a unit test renders
+/// the real `GitError` and checks it still contains this, so the copy cannot
+/// drift from core's `#[error]` unnoticed.
 pub const REPO_BUSY_TEXT: &str = "another paste is writing to this repository";
 
 /// A remote commit preview's retained worker payload (protocol 8). Clones
@@ -243,40 +244,38 @@ pub enum PasteError {
 }
 
 impl PasteError {
-	/// A stale destination's reason, without the `stale destination in
-	/// '<root>': ` prefix the worker's message starts with.
-	pub fn stale_reason(&self) -> Option<String> {
+	/// Why this failed, as data for a front end to word; the `Display` text
+	/// stays the CLI's. A worker's own reason wins, and one that sent none
+	/// (an old worker) is worded by its code.
+	pub fn reason(&self) -> Reason {
 		match self {
-			Self::Local(TransferError::StaleDestination { reason, .. }) => {
-				Some(reason.clone())
+			Self::Destination { path, source } => {
+				snip_core::reason::io_reason(source, &path.to_string_lossy())
 			}
-			Self::Remote(RemoteError::Refused {
-				code: ErrorCode::Stale,
-				message,
-			}) => Some(
-				message
-					.strip_prefix("stale destination in '")
-					.and_then(|rest| rest.split_once("': "))
-					.map_or(message.as_str(), |(_, reason)| reason)
-					.to_string(),
-			),
-			_ => None,
+			Self::Local(err) => err.reason(),
+			Self::Remote(err) | Self::OutcomeUnknown(err) => err.reason(),
+			Self::NoReplayResult => Reason::Protocol,
 		}
 	}
 
+	/// The destination changed after the preview, as the engine or a worker
+	/// said by its type: never read back from the message text.
+	pub fn is_stale(&self) -> bool {
+		matches!(
+			self,
+			Self::Local(TransferError::StaleDestination { .. })
+				| Self::Remote(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					..
+				})
+		)
+	}
+
 	/// Another paste (another tab, process or worker) holds the
-	/// repository's write lock.
+	/// repository's write lock. A worker says so by its reason; an old one
+	/// sends none, and then a busy refusal is only "busy".
 	pub fn is_repo_busy(&self) -> bool {
-		match self {
-			Self::Local(TransferError::Git(GitError::WorktreeBusy {
-				..
-			})) => true,
-			Self::Remote(RemoteError::Refused {
-				code: ErrorCode::Busy,
-				message,
-			}) => message.contains(REPO_BUSY_TEXT),
-			_ => false,
-		}
+		self.reason() == Reason::RepoBusy
 	}
 
 	/// Two entries reach one file.
@@ -289,19 +288,6 @@ impl PasteError {
 					..
 				})
 		)
-	}
-
-	/// The engine's own refusal, in the local paste's words. `None` when no
-	/// engine answered: a folder that does not resolve, or a worker that
-	/// could not be reached.
-	pub fn refusal(&self) -> Option<String> {
-		match self {
-			Self::Local(err) => Some(err.paste_message()),
-			Self::Remote(RemoteError::Refused { message, .. }) => {
-				Some(message.clone())
-			}
-			_ => None,
-		}
 	}
 }
 
@@ -478,6 +464,7 @@ impl PasteTarget {
 								.unwrap_or_default(),
 							reason: "the plan was made on another machine"
 								.into(),
+							change: StaleChange::Preview,
 						},
 					));
 				}
@@ -633,6 +620,7 @@ mod tests {
 	use std::cell::RefCell;
 	use std::fs;
 
+	use snip_core::gitsrc::GitError;
 	use snip_core::restore::RestoreBase;
 
 	use super::*;
@@ -757,6 +745,7 @@ mod tests {
 			RemoteError::Refused {
 				code: ErrorCode::Stale,
 				message: "x".into(),
+				reason: None,
 			},
 			RemoteError::Connect("x".into()),
 			RemoteError::WorkerTooOld {
@@ -776,27 +765,48 @@ mod tests {
 			root: "/r".into(),
 			reason: "target file 'a' was created externally after preview"
 				.into(),
+			change: StaleChange::Created { rel: "a".into() },
 		});
+		assert!(local_stale.is_stale());
 		assert_eq!(
-			local_stale.stale_reason().as_deref(),
-			Some("target file 'a' was created externally after preview")
+			local_stale.reason(),
+			Reason::DestinationChanged {
+				change: StaleChange::Created { rel: "a".into() }
+			}
 		);
+		// A worker's reason wins; one that sent none (an old worker) is
+		// still stale by its code, worded by the code alone.
 		let remote_stale = PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Stale,
 			message: "stale destination in '/w': target file 'a' was created externally after preview".into(),
+			reason: Some(Box::new(Reason::DestinationChanged {
+				change: StaleChange::Created { rel: "a".into() },
+			})),
 		});
-		assert_eq!(
-			remote_stale.stale_reason().as_deref(),
-			Some("target file 'a' was created externally after preview")
-		);
-		let odd = PasteError::Remote(RemoteError::Refused {
+		assert!(remote_stale.is_stale());
+		assert_eq!(remote_stale.reason(), local_stale.reason());
+		let old_stale = PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Stale,
 			message: "odd".into(),
+			reason: None,
 		});
-		assert_eq!(odd.stale_reason().as_deref(), Some("odd"));
+		assert!(old_stale.is_stale());
+		assert_eq!(
+			old_stale.reason(),
+			Reason::Refused {
+				code: ErrorCode::Stale
+			}
+		);
+		assert!(!PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Busy,
+			message: "m".into(),
+			reason: None,
+		})
+		.is_stale());
 
-		// The busy message is rendered from the real error, as the worker
-		// sends it; REPO_BUSY_TEXT must not be used to build it.
+		// The busy text is pinned to core's real error, as the worker sends
+		// it. Nothing reads it back: a Busy refusal is "repo busy" only by
+		// its reason, so the same words without one are not.
 		let busy =
 			TransferError::Git(GitError::WorktreeBusy { args: "x".into() })
 				.paste_message();
@@ -810,18 +820,27 @@ mod tests {
 		.is_repo_busy());
 		assert!(PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Busy,
+			message: "m".into(),
+			reason: Some(Box::new(Reason::RepoBusy)),
+		})
+		.is_repo_busy());
+		assert!(!PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Busy,
 			message: busy,
+			reason: None,
 		})
 		.is_repo_busy());
 		assert!(!PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Busy,
 			message: "too many callers".into(),
+			reason: Some(Box::new(Reason::GitBusy)),
 		})
 		.is_repo_busy());
 
 		assert!(PasteError::Remote(RemoteError::Refused {
 			code: ErrorCode::Collision,
 			message: "c".into(),
+			reason: None,
 		})
 		.is_collision());
 		assert!(PasteError::Local(TransferError::TargetCollision {
@@ -829,28 +848,6 @@ mod tests {
 			msg: "m".into(),
 		})
 		.is_collision());
-
-		assert!(PasteError::Local(TransferError::UnsafePath("x".into()))
-			.refusal()
-			.is_some());
-		assert!(PasteError::Remote(RemoteError::Refused {
-			code: ErrorCode::Stale,
-			message: "m".into(),
-		})
-		.refusal()
-		.is_some());
-		assert!(PasteError::Remote(RemoteError::Connect("x".into()))
-			.refusal()
-			.is_none());
-		assert!(PasteError::OutcomeUnknown(RemoteError::TimedOut)
-			.refusal()
-			.is_none());
-		assert!(PasteError::Destination {
-			path: "/p".into(),
-			source: io::Error::new(io::ErrorKind::NotFound, "n"),
-		}
-		.refusal()
-		.is_none());
 
 		assert_eq!(
 			PasteError::Local(TransferError::SpecialFile("p".into()))

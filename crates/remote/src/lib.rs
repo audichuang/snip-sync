@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
+pub(crate) mod codeless;
 pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
@@ -36,6 +37,7 @@ pub use proto::{
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
+pub use snip_core::reason::{Reason, StaleChange};
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
 /// Typed reason a transport ended before the worker's hello. Keep this
@@ -71,7 +73,14 @@ pub enum RemoteError {
 	},
 	/// The worker answered with an error.
 	#[error("{message}")]
-	Refused { code: ErrorCode, message: String },
+	Refused {
+		code: ErrorCode,
+		message: String,
+		/// Why, beyond the code; `None` from a worker that sends none (an
+		/// old one) or whose code says it all. Boxed: `Reason` is large and
+		/// this error travels in every `Result`.
+		reason: Option<Box<Reason>>,
+	},
 	/// A `TooLarge` refusal whose file is fine: the diff built from it is
 	/// over the limit (#214). The same wire code as [`Self::Refused`].
 	#[error("{message}")]
@@ -100,6 +109,41 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => {
+				Reason::TimedOut
+			}
+			Self::Io(e) => Reason::Disconnected {
+				detail: e.to_string(),
+			},
+			Self::Connect(detail) => Reason::Start {
+				start: None,
+				detail: detail.clone(),
+			},
+			Self::Start { reason, detail, .. } => Reason::Start {
+				start: *reason,
+				detail: detail.clone(),
+			},
+			// A worker's own reason wins; without one the code words it.
+			Self::Refused { code, reason, .. } => match reason {
+				Some(r) => (**r).clone(),
+				None => Reason::Refused { code: *code },
+			},
+			Self::PatchTooLarge { .. } => Reason::PatchTooLarge,
+			Self::Protocol(_) => Reason::Protocol,
+			Self::Cancelled => Reason::Cancelled,
+			Self::TimedOut | Self::Stalled { .. } => Reason::TimedOut,
+			Self::WorkerTooOld { worker, have, need } => Reason::WorkerTooOld {
+				worker: worker.clone(),
+				have: *have,
+				need: *need,
+			},
+		}
+	}
+
 	/// Whether a caller may schedule another *read* attempt. This does
 	/// not authorize retrying a write whose outcome may be unknown.
 	pub fn is_transient_read_failure(&self) -> bool {

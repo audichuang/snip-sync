@@ -318,7 +318,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | 日誌 | 意思 |
 |---|---|
 | `[APP:REMOTE_HOST_LISTED: host=<主機> folders=N path=<路徑>]` | 列出主機上某個資料夾的子資料夾 |
-| `[APP:REMOTE_HOST_FAILED: host=<主機> <訊息>]` | 連不上或列不出 |
+| `[APP:REMOTE_HOST_FAILED: host=<主機> <英文訊息>]` | 連不上或列不出 |
 | `[APP:REMOTE_OPENED: <主機> ▸ <名稱> generation=N]` | 開啟遠端工作區 |
 | `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: host=<主機> path=<路徑>]`、`[APP:REMOTE_RETRY: attempt=N]` | 開啟失敗；啟動時從 `open-tabs.json` 還原遠端分頁並在背景連線；還原失敗後的背景重試（5、10、20、40 秒，之後每 60 秒） |
 | `[APP:WS_TABS_RESTORED: count=N skipped=N]` | 啟動時讀到 `open-tabs.json`：還原後的分頁數、略過的（找不到的本機資料夾）數 |

@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Check how a raw message can be built in the non-test code of
-# crates/desktop-native/src. A raw message shows as it is in either language,
-# so an English literal there leaks into the zh-TW UI (#222). Each of these
-# needs '// ALLOWED-RAW: <reason>' (a non-empty reason) on the same or the
-# previous line:
-#   - any reference to `Msg::raw` / `Self::raw` (call or function value);
-#   - the literal key "err_raw" outside i18n.rs (`Msg::new("err_raw", ..)`).
-# These are rejected outright, since they reach `raw` under a name or in a
-# place this check does not look: aliasing Msg (`Msg as X`, `type X = Msg`) and
-# `impl Msg` outside i18n.rs.
+# Guard the one way text reaches the zh-TW UI (#222, #225). A message is a
+# dictionary key plus data; every failure is worded by `reason_msg`, and data
+# that trails a headline goes through `Msg::detail`. `Msg::raw` is gone, so
+# the compiler refuses it. This check rejects the ways around that, in the
+# non-test code of crates/desktop-native/src:
+#   - any reference to `Msg::raw` / `Self::raw` (call or function value), or a
+#     `fn raw`, so the constructor cannot come back;
+#   - the literal keys "err_raw", "reason_detail" and "remote_start_detail"
+#     outside i18n.rs: `Msg::new("reason_detail", [english, ""])` would print
+#     any string as it is, which is `raw` again under another name;
+#   - aliasing Msg (`Msg as X`, `type X = Msg`) and `impl Msg` outside i18n.rs,
+#     which would reach those constructors under a name this check cannot see.
+# There is nothing to allow: a string with no wording of its own is a Reason.
 #
-# This catches raw messages written by accident, not code written to dodge it
-# (a macro that builds the name, say). Removing Msg::raw itself (#225) is what
-# makes the compiler refuse them.
+# This catches a backdoor written by accident, not code written to dodge it
+# (a macro that builds the name, say).
 #
 # Usage: check_msg_raw.sh [ROOT]   (ROOT defaults to the repository root)
 
@@ -27,12 +29,8 @@ if [[ ! -d "$SRC" ]]; then
 	exit 1
 fi
 
-allowed() {
-	[[ "$1" =~ ALLOWED-RAW:[[:space:]]*[^[:space:]] ]]
-}
-
 I18N="$SRC/i18n.rs"
-PATTERN='(Msg|Self)[>[:space:]]*::[[:space:]]*raw([^A-Za-z0-9_]|$)|Msg[[:space:]]+as[[:space:]]|=[[:space:]]*([A-Za-z_0-9]+::)*Msg[[:space:]]*;|impl([[:space:]]*<[^>]*>)?[[:space:]]+Msg([^A-Za-z0-9_]|$)|"err_raw"'
+PATTERN='(Msg|Self)[>[:space:]]*::[[:space:]]*raw([^A-Za-z0-9_]|$)|fn[[:space:]]+raw([^A-Za-z0-9_]|$)|Msg[[:space:]]+as[[:space:]]|=[[:space:]]*([A-Za-z_0-9]+::)*Msg[[:space:]]*;|impl([[:space:]]*<[^>]*>)?[[:space:]]+Msg([^A-Za-z0-9_]|$)|"err_raw"|"reason_detail"|"remote_start_detail"'
 
 reject() {
 	echo "ERROR: $1 at ${file}:${line_num}: ${line_content}" >&2
@@ -41,43 +39,44 @@ reject() {
 }
 
 while IFS=: read -r file line_num line_content; do
-	# Only the `mod tests` block counts as test code; it may build raw messages.
+	# Only the `mod tests` block counts as test code.
 	tests_start=$(grep -nE '^(pub(\([a-z]+\))? )?mod tests \{' "$file" | head -1 | cut -d: -f1 || true)
 	if [[ -n "$tests_start" ]] && [[ "$line_num" -ge "$tests_start" ]]; then
 		continue
 	fi
 
+	if [[ "$line_content" =~ (Msg|Self)[\>[:space:]]*::[[:space:]]*raw([^A-Za-z0-9_]|$) ]] ||
+		[[ "$line_content" =~ fn[[:space:]]+raw([^A-Za-z0-9_]|$) ]]; then
+		reject "raw message constructor" "Msg::raw is gone: give the text a Reason (reason_msg), or trail it as data with Msg::detail."
+		continue
+	fi
+	if [[ "$line_content" =~ \"err_raw\" ]]; then
+		reject "the err_raw key" "A string with no wording of its own is a Reason, not a message."
+		continue
+	fi
+	if [[ "$file" == "$I18N" ]]; then
+		# i18n.rs defines the keys, their wording and the builders.
+		continue
+	fi
+	if [[ "$line_content" =~ \"reason_detail\"|\"remote_start_detail\" ]]; then
+		reject "detail key outside i18n.rs" "Build it with Msg::detail(headline, datum): the key prints any string as it is."
+		continue
+	fi
 	if [[ "$line_content" =~ Msg[[:space:]]+as[[:space:]] ]] ||
 		[[ "$line_content" =~ =[[:space:]]*([A-Za-z_0-9]+::)*Msg[[:space:]]*\; ]]; then
-		reject "Msg is aliased" "Do not alias Msg: check_msg_raw cannot see Msg::raw under another name."
+		reject "Msg is aliased" "Do not alias Msg: this check cannot see a constructor under another name."
 		continue
 	fi
-	if [[ "$file" != "$I18N" ]] &&
-		[[ "$line_content" =~ impl([[:space:]]*\<[^\>]*\>)?[[:space:]]+Msg([^A-Za-z0-9_]|$) ]]; then
-		reject "impl Msg outside i18n.rs" "Self::raw would be reachable from a second impl block."
+	if [[ "$line_content" =~ impl([[:space:]]*\<[^\>]*\>)?[[:space:]]+Msg([^A-Za-z0-9_]|$) ]]; then
+		reject "impl Msg outside i18n.rs" "A second impl block could define a raw-text constructor this check cannot see."
 		continue
-	fi
-	if [[ "$file" == "$I18N" ]] && [[ ! "$line_content" =~ (Msg|Self)[\>[:space:]]*::[[:space:]]*raw ]]; then
-		# i18n.rs defines the key and its wording.
-		continue
-	fi
-	prev_line=""
-	if [[ "$line_num" -gt 1 ]]; then
-		prev_line=$(sed -n "$((line_num - 1))p" "$file")
-	fi
-	if ! allowed "$line_content" && ! allowed "$prev_line"; then
-		echo "ERROR: Unallowlisted raw message construction in product code at ${file}:${line_num}:" >&2
-		echo "  ${line_content}" >&2
-		echo "  Preceding line: ${prev_line}" >&2
-		echo "  Use a translated key, or add '// ALLOWED-RAW: <reason>' (reason required) on the same or previous line." >&2
-		ERRORS=$((ERRORS + 1))
 	fi
 done < <(grep -rnE --include='*.rs' "$PATTERN" "$SRC" || true)
 
 if [ "$ERRORS" -ne 0 ]; then
-	echo "FAILED: Found $ERRORS unallowlisted, aliased or out-of-place raw message construction(s)." >&2
+	echo "FAILED: Found $ERRORS raw-text backdoor(s) in desktop product code." >&2
 	exit 1
 fi
 
-echo "check_msg_raw: every raw message construction in crates/desktop-native/src product code is allowlisted with a reason."
+echo "check_msg_raw: no raw-text message path in crates/desktop-native/src product code."
 exit 0

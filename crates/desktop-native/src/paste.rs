@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use snip_core::commits::{
 	self, FilePlan, LayoutConflict, NotCopiedReason, ReplayAction,
-	ReplaySkipReason,
+	ReplayFailure, ReplaySkipReason,
 };
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
@@ -33,6 +33,7 @@ use snip_remote::{
 
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
+use crate::reason::reason_msg;
 use crate::syntax::Language;
 
 pub mod preview;
@@ -368,6 +369,9 @@ impl PastePending {
 	}
 }
 
+// One input is held per worker and moved, never copied; its size is counted
+// by `bytes`, so a boxed variant would only move the same bytes.
+#[allow(clippy::large_enum_variant)]
 enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
@@ -772,10 +776,55 @@ impl PasteApplyResult {
 			}
 			return Msg::new("status_paste_done", counts);
 		}
+		let failures = self.failures();
+		let first = restore_failure_msg(&failures[0]);
 		let mut args = counts.to_vec();
-		args.push(f.errors.join("; "));
-		Msg::new("status_paste_partial", args)
+		args.push(String::new());
+		if failures.len() == 1 {
+			return Msg::with_msg_arg("status_paste_partial", args, 5, first);
+		}
+		// The first is the headline's own argument; every other failure
+		// follows it, path and cause, worded when drawn.
+		args.push(String::new());
+		let rest = failures[1..].iter().map(restore_failure_msg).collect();
+		Msg::with_msg_arg("status_paste_partial_more", args, 5, first)
+			.and_list_arg(6, rest)
 	}
+
+	/// The failures as data. A worker that predates typed failures sent
+	/// only its text, kept here as the data trailing a generic headline.
+	fn failures(&self) -> Vec<snip_core::restore::RestoreFailure> {
+		let f = &self.files;
+		if f.failures.len() == f.errors.len() {
+			return f.failures.clone();
+		}
+		f.errors
+			.iter()
+			.map(|text| snip_core::restore::RestoreFailure {
+				path: String::new(),
+				reason: Some(snip_core::reason::Reason::Io {
+					detail: text.clone(),
+				}),
+			})
+			.collect()
+	}
+}
+
+/// One failed file: its path, then why.
+fn restore_failure_msg(f: &snip_core::restore::RestoreFailure) -> Msg {
+	let why = f
+		.reason
+		.as_ref()
+		.map_or_else(|| Msg::new("restore_err_unknown", []), reason_msg);
+	if f.path.is_empty() {
+		return why;
+	}
+	Msg::with_msg_arg(
+		"restore_err_file",
+		[f.path.clone(), String::new()],
+		1,
+		why,
+	)
 }
 
 /// A paste into a remote workspace: its worker plans and writes through
@@ -798,9 +847,10 @@ impl RemotePaste {
 	/// The workspace folder (relative to the workspace) of a tree path.
 	fn rel(&self, path: &Path) -> Result<String, Msg> {
 		crate::remote::remote_rel(&self.session.root, path).ok_or_else(|| {
-			Msg::new(
+			Msg::with_key_arg(
 				"paste_err_destination",
-				[self.shown(path), "not in the remote workspace".into()],
+				[self.shown(path), "err_not_under_workspace".into()],
+				1,
 			)
 		})
 	}
@@ -841,85 +891,26 @@ fn paste_target(
 }
 
 /// A destination the paste could not resolve or reach, named as the user
-/// knows it.
+/// knows it. Worded when drawn, in the language then in force: a plan
+/// outlives a switch of language.
 fn destination_msg(
 	remote: Option<&RemotePaste>,
 	path: &Path,
 	err: PasteError,
 ) -> Msg {
+	// A local folder that did not resolve is named by its own path: a
+	// prefix's folder is not the destination.
+	if let PasteError::Destination { path, source } = &err {
+		return destination_error(path, source);
+	}
 	let shown =
 		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
-	let why = match err {
-		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => match e {
-			// Worded when drawn, in the language then in force: a plan
-			// outlives a switch of language.
-			RemoteError::Start {
-				reason: Some(reason),
-				detail,
-				..
-			} => return start_destination_msg(shown, reason, detail),
-			// A worker refusal is worded by its code, like a start
-			// reason; the worker's own OS or protocol English is never
-			// shown (#213).
-			RemoteError::Refused { code, message } => {
-				match crate::remote::refusal_key(code) {
-					Some(key) => {
-						return Msg::with_key_arg(
-							"paste_err_destination",
-							[shown, key.to_string()],
-							1,
-						);
-					}
-					None => crate::remote::describe(RemoteError::Refused {
-						code,
-						message,
-					}),
-				}
-			}
-			other => crate::remote::describe(other),
-		},
-		PasteError::Local(e) => e.to_string(),
-		PasteError::Destination { source, .. } => source.to_string(),
-		// Worded as the app always did: a protocol error of the worker.
-		PasteError::NoReplayResult => crate::remote::describe(
-			RemoteError::Protocol(PasteError::NoReplayResult.to_string()),
-		),
-	};
-	Msg::new("paste_err_destination", [shown, why])
-}
-
-/// A destination whose worker did not start, for a known reason. The
-/// reason travels as its dictionary key, so the message is worded in the
-/// language in force when it is drawn.
-fn start_destination_msg(
-	shown: String,
-	reason: snip_core::gitsrc::StartReason,
-	detail: String,
-) -> Msg {
-	let key = crate::remote::start_reason_key(reason);
-	// The transport's detail is only the useful part of a key login.
-	if detail.is_empty()
-		|| !matches!(reason, snip_core::gitsrc::StartReason::KeyLogin)
-	{
-		Msg::with_key_arg("paste_err_destination", [shown, key.into()], 1)
-	} else {
-		Msg::with_key_arg(
-			"paste_err_destination_detail",
-			[shown, key.into(), detail],
-			1,
-		)
-	}
-}
-
-/// A stale destination's reason as the message the app shows.
-fn stale_reason_msg(reason: String) -> Msg {
-	if reason.contains("created") {
-		Msg::new("stale_created", [reason])
-	} else if reason.contains("deleted") {
-		Msg::new("stale_deleted", [reason])
-	} else {
-		Msg::new("stale_modified", [reason])
-	}
+	Msg::with_msg_arg(
+		"paste_err_destination",
+		[shown, String::new()],
+		1,
+		reason_msg(&err.reason()),
+	)
 }
 
 /// A file Apply's failure, worded as before for each target.
@@ -931,12 +922,10 @@ fn file_apply_msg(
 	if err.is_repo_busy() {
 		return repo_busy();
 	}
-	if let Some(reason) = err.stale_reason() {
-		return stale_reason_msg(reason);
-	}
 	match err {
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
-		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		PasteError::Local(e) => reason_msg(&e.reason()),
+		other if other.is_stale() => reason_msg(&other.reason()),
 		other => destination_msg(remote, dest, other),
 	}
 }
@@ -948,27 +937,33 @@ fn commit_msg(
 	err: PasteError,
 	applying: bool,
 ) -> Msg {
-	if let Some(reason) = err.stale_reason() {
-		return stale_reason_msg(reason);
+	if err.is_stale() {
+		return reason_msg(&err.reason());
 	}
 	match err {
 		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
 			..
 		})) => repo_busy(),
 		PasteError::Local(TransferError::Git(e)) if applying => {
-			Msg::new("error_open_repo", [e.to_string()])
+			Msg::with_msg_arg(
+				"error_open_repo",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
 		}
-		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
-		// Kept as before: any other worker refusal of a replay, Busy
-		// included, reads as a repository error (see Risks). A code with a
-		// wording of its own shows that wording, never the worker's text.
-		PasteError::Remote(RemoteError::Refused { code, message }) => {
-			match crate::remote::refusal_key(code) {
-				Some(key) => {
-					Msg::with_key_arg("error_open_repo", [key.to_string()], 0)
-				}
-				None => Msg::new("error_open_repo", [message]),
-			}
+		PasteError::Local(e) => reason_msg(&e.reason()),
+		// Kept on purpose (design Risk 1): any other worker refusal of a
+		// replay, Busy included, reads as a repository error, not as
+		// paste_repo_busy. A refusal is worded by its reason, never by the
+		// worker's text.
+		PasteError::Remote(e @ RemoteError::Refused { .. }) => {
+			Msg::with_msg_arg(
+				"error_open_repo",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
 		}
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
 		other => destination_msg(remote, dest, other),
@@ -1093,6 +1088,16 @@ pub(crate) fn layout_conflict_key(conflict: LayoutConflict) -> &'static str {
 	}
 }
 
+/// Why a replay stopped. A worker that sent no reason (an old one) is worded
+/// by the generic I/O cause: the failure's English text is never shown.
+fn replay_failure_reason(fail: &ReplayFailure) -> snip_core::reason::Reason {
+	fail.reason
+		.clone()
+		.unwrap_or(snip_core::reason::Reason::Refused {
+			code: snip_remote::ErrorCode::Io,
+		})
+}
+
 pub(crate) fn layout_conflict_cause_key(
 	conflict: LayoutConflict,
 ) -> &'static str {
@@ -1130,10 +1135,12 @@ fn root_name(path: &Path) -> String {
 
 /// A destination that could not be opened or captured, named by path so the
 /// status says which directory was refused (the OS error alone does not).
-fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
-	Msg::new(
+fn destination_error(dest: &Path, err: &std::io::Error) -> Msg {
+	Msg::with_msg_arg(
 		"paste_err_destination",
-		[dest.display().to_string(), err.to_string()],
+		[dest.display().to_string(), String::new()],
+		1,
+		reason_msg(&snip_core::reason::io_reason(err, "")),
 	)
 }
 
@@ -1663,8 +1670,14 @@ impl PastePreviewPlan {
 		limit: usize,
 		remote: Option<RemotePaste>,
 	) -> Result<Self, Msg> {
-		let payload = commits::parse_commit_payload(raw_text)
-			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
+		let payload = commits::parse_commit_payload(raw_text).map_err(|e| {
+			Msg::with_msg_arg(
+				"paste_err_plan",
+				[String::new()],
+				0,
+				reason_msg(&e.reason()),
+			)
+		})?;
 		// The write scope is the folder the user pasted into: the worker
 		// holds the replay to it the same way.
 		let target = paste_target(remote.as_ref(), dest)?;
@@ -1947,28 +1960,45 @@ impl PastePreviewPlan {
 		let file_plan =
 			match target.plan_files(&self.raw_payload, &route, opts, None) {
 				Ok(plan) => plan,
-				Err(PasteError::Destination { path, source }) => {
-					return Err(destination_error(&path, &source));
+				// No engine answered: the destination did not resolve or the
+				// worker could not be reached.
+				Err(
+					err @ (PasteError::Destination { .. }
+					| PasteError::Remote(
+						RemoteError::Io(_)
+						| RemoteError::Connect(_)
+						| RemoteError::Start { .. }
+						| RemoteError::PatchTooLarge { .. }
+						| RemoteError::Protocol(_)
+						| RemoteError::Cancelled
+						| RemoteError::TimedOut
+						| RemoteError::Stalled { .. }
+						| RemoteError::WorkerTooOld { .. },
+					)
+					| PasteError::OutcomeUnknown(_)
+					| PasteError::NoReplayResult),
+				) => {
+					return Err(destination_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						err,
+					));
 				}
-				Err(err) => match err.refusal() {
-					Some(message) => {
-						if crate::e2e_on() && err.is_collision() {
-							app_log!(
-								"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-							);
-						}
-						self.error =
-							Some(Msg::new("paste_err_plan", [message]));
-						return Ok(());
+				// An engine refused the plan, locally or on the worker.
+				Err(err) => {
+					if crate::e2e_on() && err.is_collision() {
+						app_log!(
+							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+						);
 					}
-					None => {
-						return Err(destination_msg(
-							self.remote.as_ref(),
-							&self.destination,
-							err,
-						));
-					}
-				},
+					self.error = Some(Msg::with_msg_arg(
+						"paste_err_plan",
+						[String::new()],
+						0,
+						reason_msg(&err.reason()),
+					));
+					return Ok(());
+				}
 			};
 		let base = self
 			.retained_bytes()
@@ -2431,9 +2461,15 @@ impl PastePreviewPlan {
 		}
 
 		let Some(ref import_plan) = self.import_plan else {
-			return Err(Msg::new(
+			// An invariant break: Apply without a plan.
+			return Err(Msg::with_msg_arg(
 				"paste_err_plan",
-				["no active import plan".into()],
+				[String::new()],
+				0,
+				reason_msg(&snip_core::reason::Reason::Internal {
+					detail: String::new(),
+					condition: None,
+				}),
 			));
 		};
 
@@ -2525,44 +2561,39 @@ impl PastePreviewPlan {
 				if subject_is_key {
 					key_args.push(1);
 				}
-				let (cause_arg, cause_is_key) = match fail.layout_conflict {
+				let (cause_arg, cause) = match fail.layout_conflict {
+					// A layout conflict words itself by its key.
 					Some(conflict) => {
-						(layout_conflict_cause_key(conflict), true)
+						key_args.push(2);
+						(layout_conflict_cause_key(conflict).to_string(), None)
 					}
-					None => (fail.error.as_str(), false),
+					// Any other refusal by its reason. A worker that sent
+					// none (an old one) is worded by the generic I/O cause.
+					None => (
+						String::new(),
+						Some(reason_msg(&replay_failure_reason(&fail))),
+					),
 				};
-				if cause_is_key {
-					key_args.push(2);
-				}
-				let msg = if key_args.is_empty() {
-					Msg::new(
-						"commit_replay_refused",
-						[
-							(fail.index + 1).to_string(),
-							subject_arg.to_string(),
-							cause_arg.to_string(),
-						],
-					)
-				} else {
-					Msg::with_key_args(
-						"commit_replay_refused",
-						[
-							(fail.index + 1).to_string(),
-							subject_arg.to_string(),
-							cause_arg.to_string(),
-						],
-						key_args,
-					)
-				};
-				return Err(msg);
+				let msg = Msg::with_key_args(
+					"commit_replay_refused",
+					[
+						(fail.index + 1).to_string(),
+						subject_arg.to_string(),
+						cause_arg,
+					],
+					key_args,
+				);
+				return Err(match cause {
+					Some(cause) => msg.nest(2, cause),
+					None => msg,
+				});
 			}
 			let created = short_shas(&replay_res.created, usize::MAX);
 			return Err(match fail.layout_conflict {
 				Some(conflict) => {
-					let path = fail
-						.conflict_path
-						.as_deref()
-						.unwrap_or(fail.error.as_str());
+					let subject =
+						fail.message.lines().next().unwrap_or("").trim();
+					let path = fail.conflict_path.as_deref().unwrap_or(subject);
 					Msg::with_key_arg(
 						"commit_replay_partial_refused",
 						[
@@ -2574,9 +2605,12 @@ impl PastePreviewPlan {
 						3,
 					)
 				}
-				None => {
-					Msg::new("commit_replay_partial", [created, fail.error])
-				}
+				None => Msg::with_msg_arg(
+					"commit_replay_partial",
+					[created, String::new()],
+					1,
+					reason_msg(&replay_failure_reason(&fail)),
+				),
 			});
 		}
 		Ok(PasteApplyResult {
@@ -2587,6 +2621,7 @@ impl PastePreviewPlan {
 				skipped_existing_count: 0,
 				planned_skipped_count: 0,
 				errors: Vec::new(),
+				failures: Vec::new(),
 			},
 			created_commits: replay_res.created,
 		})
@@ -2594,7 +2629,7 @@ impl PastePreviewPlan {
 }
 
 #[cfg(test)]
-mod zh_leaks_tests;
+pub(crate) mod zh_leaks_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2618,15 +2653,56 @@ pub(crate) mod tests {
 	}
 
 	#[test]
+	fn apply_status_of_an_old_peer_keeps_every_error_line() {
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: vec![
+					"alpha broke".into(),
+					"beta broke".into(),
+					"gamma broke".into(),
+				],
+				failures: Vec::new(),
+			},
+			created_commits: Vec::new(),
+		};
+		let msg = result.status();
+		for locale in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = msg.render(locale);
+			for line in ["alpha broke", "beta broke", "gamma broke"] {
+				assert!(text.contains(line), "{line} missing: {text}");
+			}
+			assert!(!text.contains(": ;") && !text.contains(", ,"), "{text}");
+			assert!(!text.ends_with("：") && !text.ends_with(": "), "{text}");
+		}
+	}
+
+	#[test]
 	fn apply_status_lists_each_failed_path_not_only_the_count() {
-		let result = |errors: Vec<String>| PasteApplyResult {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		let result = |failures: Vec<(&str, Reason)>| PasteApplyResult {
 			files: RestoreExecutionResult {
 				created_count: 2,
 				overwritten_count: 1,
 				skipped_existing_count: 0,
 				planned_skipped_count: 0,
 				deleted_count: 0,
-				errors,
+				errors: failures
+					.iter()
+					.map(|(p, _)| format!("{p}: english"))
+					.collect(),
+				failures: failures
+					.into_iter()
+					.map(|(path, r)| RestoreFailure {
+						path: path.into(),
+						reason: Some(r),
+					})
+					.collect(),
 			},
 			created_commits: Vec::new(),
 		};
@@ -2634,20 +2710,158 @@ pub(crate) mod tests {
 		assert_eq!(ok.key, "status_paste_done");
 
 		let partial = result(vec![
-			"a/x.txt: Permission denied".into(),
-			"b/y.txt: unsafe path".into(),
+			(
+				"a/x.txt",
+				Reason::PermissionDenied {
+					path: "a/x.txt".into(),
+				},
+			),
+			(
+				"b/y.txt",
+				Reason::UnsafePath {
+					path: "b/y.txt".into(),
+				},
+			),
 		])
 		.status();
-		assert_eq!(partial.key, "status_paste_partial");
-		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
-			let text = partial.render(loc);
-			assert!(
-				text.contains(
-					"a/x.txt: Permission denied; b/y.txt: unsafe path"
-				),
-				"{text}"
-			);
+		assert_eq!(partial.key, "status_paste_partial_more");
+		let zh = partial.render(crate::i18n::Locale::ZhTw);
+		let en = partial.render(crate::i18n::Locale::En);
+		for text in [&zh, &en] {
+			assert!(text.contains("a/x.txt"), "{text}");
+			assert!(text.contains("b/y.txt"), "{text}");
 			assert!(!text.contains("{}"), "{text}");
+			assert!(!text.contains("english"), "{text}");
+		}
+		assert!(zh.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)));
+
+		let one = result(vec![(
+			"a/x.txt",
+			Reason::UnsafePath {
+				path: "a/x.txt".into(),
+			},
+		)])
+		.status();
+		assert_eq!(one.key, "status_paste_partial");
+		assert!(one.render(crate::i18n::Locale::ZhTw).contains("a/x.txt"));
+	}
+
+	#[test]
+	fn apply_status_keeps_path_and_cause_of_every_failure() {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		let failures = vec![
+			RestoreFailure {
+				path: "a.txt".into(),
+				reason: Some(Reason::PermissionDenied {
+					path: "a.txt".into(),
+				}),
+			},
+			RestoreFailure {
+				path: "b.txt".into(),
+				reason: Some(Reason::Io {
+					detail: "No space left on device".into(),
+				}),
+			},
+			RestoreFailure {
+				path: "c.txt".into(),
+				reason: Some(Reason::UnsafePath {
+					path: "c.txt".into(),
+				}),
+			},
+		];
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: failures.iter().map(|f| f.path.clone()).collect(),
+				failures: failures.clone(),
+			},
+			created_commits: Vec::new(),
+		};
+		let status = result.status();
+		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = status.render(loc);
+			for f in &failures {
+				let line = restore_failure_msg(f).render(loc);
+				assert!(text.contains(&line), "{line} missing: {text}");
+				assert!(text.contains(&f.path), "{text}");
+			}
+			assert!(text.contains("No space left on device"), "{text}");
+			assert!(!text.contains("{}"), "{text}");
+		}
+		let zh = status.render(crate::i18n::Locale::ZhTw);
+		let en = status.render(crate::i18n::Locale::En);
+		assert_ne!(zh, en);
+	}
+
+	#[test]
+	fn apply_status_of_thousands_of_failures_does_not_recurse() {
+		use snip_core::reason::Reason;
+		use snip_core::restore::RestoreFailure;
+		const N: usize = 20_000;
+		let failures: Vec<RestoreFailure> = (0..N)
+			.map(|i| RestoreFailure {
+				path: format!("f{i}.txt"),
+				reason: Some(Reason::Io {
+					detail: "No space left on device".into(),
+				}),
+			})
+			.collect();
+		let result = PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 0,
+				overwritten_count: 0,
+				skipped_existing_count: 0,
+				planned_skipped_count: 0,
+				deleted_count: 0,
+				errors: failures.iter().map(|f| f.path.clone()).collect(),
+				failures,
+			},
+			created_commits: Vec::new(),
+		};
+		// Default test thread: any per-failure recursion overflows it.
+		let status = result.status();
+		let copy = status.clone();
+		assert!(copy.heap_bytes() > 0);
+		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = status.render(loc);
+			assert!(text.contains("f0.txt"), "{loc:?}");
+			assert!(text.contains(&format!("f{}.txt", N - 1)), "{loc:?}");
+		}
+		drop(copy);
+		drop(status);
+	}
+
+	#[test]
+	fn a_missing_prefix_folder_is_named_not_the_destination() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("dest");
+		std::fs::create_dir(&dest).unwrap();
+		let bad = tmp.path().join("gone-prefix");
+		{
+			let route = PasteRoute {
+				prefixes: vec![("src".into(), bad.clone())],
+				..Default::default()
+			};
+			let err = PasteTarget::Local { dest: dest.clone() }
+				.plan_files(
+					"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
+					&route,
+					&RunOptions::default(),
+					None,
+				)
+				.expect_err("the prefix folder does not resolve");
+			let msg = destination_msg(None, &dest, err);
+			assert_eq!(msg.args[0], bad.display().to_string(), "{msg:?}");
+			for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+				let text = msg.render(loc);
+				assert!(text.contains(&bad.display().to_string()), "{text}");
+				assert!(!text.contains(&dest.display().to_string()), "{text}");
+			}
 		}
 	}
 
@@ -2751,10 +2965,27 @@ pub(crate) mod tests {
 			message: "stale destination in '/w': target file 'a' was created \
 			          externally after preview"
 				.into(),
+			reason: Some(Box::new(snip_remote::Reason::DestinationChanged {
+				change: snip_remote::StaleChange::Created { rel: "a".into() },
+			})),
 		};
 		assert_eq!(
 			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
 			"stale_created"
+		);
+		// A worker that sends no reason (an old one) still refuses as stale,
+		// worded by its code; the kind of change is not guessed from its
+		// sentence.
+		let old = RemoteError::Refused {
+			code: ErrorCode::Stale,
+			message: "stale destination in '/w': target file 'a' was created \
+			          externally after preview"
+				.into(),
+			reason: None,
+		};
+		assert_eq!(
+			file_apply_msg(Some(&remote), &dest, PasteError::Remote(old)).key,
+			"remote_refused_stale"
 		);
 		// Never reached the worker: nothing can have been written.
 		assert_eq!(
@@ -2829,17 +3060,32 @@ pub(crate) mod tests {
 				Some(&remote),
 				PasteError::Remote(RemoteError::Refused {
 					code: ErrorCode::Busy,
-					message: busy_git().paste_message()
+					message: busy_git().paste_message(),
+					reason: Some(Box::new(snip_remote::Reason::RepoBusy)),
 				})
 			),
 			"paste_repo_busy"
+		);
+		// The same words from a worker that sends no reason are a plain
+		// busy refusal: nothing reads the sentence.
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: busy_git().paste_message(),
+					reason: None,
+				})
+			),
+			"paste_err_destination"
 		);
 		assert_eq!(
 			key(
 				Some(&remote),
 				PasteError::Remote(RemoteError::Refused {
 					code: ErrorCode::Busy,
-					message: "too many callers".into()
+					message: "too many callers".into(),
+					reason: None,
 				})
 			),
 			"paste_err_destination"
@@ -2851,21 +3097,26 @@ pub(crate) mod tests {
 					root: "/r".into(),
 					reason:
 						"target file 'a' was deleted externally after preview"
-							.into()
+							.into(),
+					change: snip_core::reason::StaleChange::Deleted {
+						rel: "a".into()
+					}
 				})
 			),
 			"stale_deleted"
 		);
-		// The old `stale_msg` other arm: the error's Display, not paste_message.
+		// A local error that is not a stale one is worded by its reason, not
+		// as an external modification and not by its Display.
 		let special = file_apply_msg(
 			None,
 			&dest,
 			PasteError::Local(TransferError::SpecialFile("p".into())),
 		);
-		assert_eq!(special.key, "stale_modified");
 		assert_eq!(
-			special.args[0],
-			TransferError::SpecialFile("p".into()).to_string()
+			special,
+			reason_msg(&snip_core::reason::Reason::NotRegularFile {
+				path: "p".into()
+			})
 		);
 	}
 
@@ -2890,7 +3141,11 @@ pub(crate) mod tests {
 			commit_msg(r, &dest, e, applying).key
 		};
 		let refused = |code, message: String| {
-			PasteError::Remote(RemoteError::Refused { code, message })
+			PasteError::Remote(RemoteError::Refused {
+				code,
+				message,
+				reason: None,
+			})
 		};
 		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
 		// reads as a repository error, not as paste_repo_busy. Changing this
@@ -2906,11 +3161,18 @@ pub(crate) mod tests {
 		assert_eq!(
 			key(
 				Some(&remote),
-				refused(
-					ErrorCode::Stale,
-					"stale destination in '/w': target file 'a' was created externally after preview"
-						.into()
-				),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					message: "stale destination in '/w': target file 'a' was created externally after preview"
+						.into(),
+					reason: Some(Box::new(
+						snip_remote::Reason::DestinationChanged {
+							change: snip_remote::StaleChange::Created {
+								rel: "a".into()
+							}
+						}
+					)),
+				}),
 				false
 			),
 			"stale_created"
@@ -2947,7 +3209,7 @@ pub(crate) mod tests {
 			}))
 		};
 		assert_eq!(key(None, cancelled(), true), "error_open_repo");
-		assert_eq!(key(None, cancelled(), false), "stale_modified");
+		assert_eq!(key(None, cancelled(), false), "err_cancelled");
 	}
 
 	/// Every user-facing surface that shows a remote refusal words it by
@@ -3009,6 +3271,7 @@ pub(crate) mod tests {
 		let refused = |code| RemoteError::Refused {
 			code,
 			message: raw.into(),
+			reason: None,
 		};
 		for code in all {
 			if !worded(code) {

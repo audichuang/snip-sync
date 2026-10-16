@@ -1930,7 +1930,7 @@ fn git_view_on_a_non_repo_share_is_not_the_parent() {
 		None,
 	);
 	match res {
-		Err(RemoteError::Refused { code, message }) => {
+		Err(RemoteError::Refused { code, message, .. }) => {
 			assert_eq!(code, ErrorCode::NotARepository);
 			assert!(
 				!message.contains("dirty_outside_secret.txt"),
@@ -2185,6 +2185,27 @@ fn scan_with_outside_missing_submodule_gitdir_hides_outside_paths() {
 			"scan error row for {rel} leaked outside path: {err_msg}"
 		);
 	}
+	// Every failed row says why, as data, and the data leaks no path either.
+	assert!(
+		scan_res
+			.repos
+			.iter()
+			.all(|r| r.summary.is_ok() == r.reason.is_none()),
+		"{:?}",
+		scan_res.repos
+	);
+	assert_eq!(scan_res.error_reasons.len(), scan_res.errors.len());
+	assert!(scan_res.error_reasons.iter().all(Option::is_some));
+	let reasons = serde_json::to_string(&(
+		scan_res.repos.iter().map(|r| &r.reason).collect::<Vec<_>>(),
+		&scan_res.error_reasons,
+	))
+	.unwrap();
+	assert!(
+		!reasons.contains("outside_secret_zone")
+			&& !reasons.contains(tmp.path().to_str().unwrap()),
+		"a scan reason leaked a path: {reasons}"
+	);
 }
 
 #[cfg(unix)]

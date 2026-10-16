@@ -529,7 +529,7 @@ mod tests {
 			name: name.into(),
 			kind: crate::RepoEntryKind::Main,
 			identity: None,
-			summary: Err("unavailable".into()),
+			summary: Err(crate::test_failure("unavailable")),
 		};
 		let repos = [
 			repo("billing", "/west/billing"),

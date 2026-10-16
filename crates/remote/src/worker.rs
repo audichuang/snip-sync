@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use snip_core::reason::{io_reason, Reason};
 use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
 use crate::proto::{
@@ -1001,10 +1002,21 @@ fn serve_copy(
 }
 
 fn error(code: ErrorCode, message: String) -> Response {
+	error_with(code, message, None)
+}
+
+/// An error reply that also says why. `reason` must already have gone
+/// through [`Reason::beside_code`]: it never carries a path or git's stderr.
+pub(crate) fn error_with(
+	code: ErrorCode,
+	message: String,
+	reason: Option<Reason>,
+) -> Response {
 	Response::Error {
 		code,
 		message,
 		patch: false,
+		reason,
 	}
 }
 
@@ -1019,9 +1031,10 @@ fn map_admit_error(code: ErrorCode) -> Response {
 						"[worker] Git permit leak detected; restart required"
 					);
 				}
-				error(
+				error_with(
 					ErrorCode::Busy,
 					"a Git process on the worker could not be cleaned up and the worker needs a restart".into(),
+					Some(Reason::WorkerNeedsRestart),
 				)
 			} else {
 				error(
@@ -1059,10 +1072,12 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 		io::ErrorKind::NotFound => ErrorCode::NotFound,
 		io::ErrorKind::PermissionDenied => ErrorCode::Forbidden,
 		io::ErrorKind::InvalidInput => ErrorCode::Forbidden,
-		_ if err.to_string().contains("exceeds 1 MiB") => ErrorCode::TooLarge,
+		io::ErrorKind::FileTooLarge => ErrorCode::TooLarge,
 		_ => ErrorCode::Io,
 	};
-	error(code, err.to_string())
+	// The code says it all for most kinds, so the reason is usually `None`;
+	// going through `beside_code` keeps a new kind from skipping the scrub.
+	error_with(code, err.to_string(), io_reason(&err, "").beside_code())
 }
 
 impl State {
@@ -1270,6 +1285,37 @@ fn stat(path: &Path) -> Result<Response, Response> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The code comes from the error's kind, never from its message: a file
+	/// over the preview limit is `TooLarge` whatever the text says.
+	#[test]
+	fn io_error_codes_come_from_the_kind_not_the_text() {
+		let code = |kind, text: &str| {
+			let Response::Error { code, reason, .. } =
+				io_error(io::Error::new(kind, text))
+			else {
+				panic!("expected Error");
+			};
+			// Never the message: a reason holds no OS text or path.
+			let wire = serde_json::to_string(&reason).unwrap();
+			assert!(!wire.contains(text), "{kind:?}: {wire}");
+			code
+		};
+		assert_eq!(
+			code(io::ErrorKind::FileTooLarge, "unrelated words"),
+			ErrorCode::TooLarge
+		);
+		// The old text guess is gone: these words on another kind are Io.
+		assert_eq!(
+			code(io::ErrorKind::Other, "Preview exceeds 1 MiB"),
+			ErrorCode::Io
+		);
+		assert_eq!(
+			code(io::ErrorKind::PermissionDenied, "Path leaves the workspace"),
+			ErrorCode::Forbidden
+		);
+		assert_eq!(code(io::ErrorKind::NotFound, "x"), ErrorCode::NotFound);
+	}
 
 	#[test]
 	fn shared_root_id_is_stable_through_a_symlinked_spelling() {

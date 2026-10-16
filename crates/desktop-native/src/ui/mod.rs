@@ -1972,7 +1972,7 @@ mod tests {
 			name: rel.rsplit('/').next().unwrap().to_string(),
 			kind: crate::RepoEntryKind::Main,
 			identity: None,
-			summary: Err("mock".into()),
+			summary: Err(crate::test_failure("mock")),
 		};
 		let repos = vec![repo("app"), repo("app/sub"), repo("group/lib")];
 		// The user-given spelling does not match Git's resolved roots.
@@ -1990,7 +1990,7 @@ mod tests {
 			name: r.name.clone(),
 			kind: crate::RepoEntryKind::Main,
 			identity: None,
-			summary: Err("mock".into()),
+			summary: Err(crate::test_failure("mock")),
 		}));
 		in_home[0].root = root.path().to_path_buf();
 		let placed = placed_repos(&in_home, root.path());

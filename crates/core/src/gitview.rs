@@ -10,7 +10,9 @@ use crate::browser::{
 };
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, GitPool, RunOptions};
-use crate::gitsrc::{self, ChangedPaths, Git, GitError, GitSource};
+use crate::gitsrc::{self, ChangedPaths, Condition, Git, GitError, GitSource};
+pub use crate::reason::Failure;
+use crate::reason::Reason;
 use crate::workspace::{
 	declared_submodules, status_details, summarize_with_details,
 	summarize_with_identity, ChangeCounts, DiscoveredRepo, Discovery,
@@ -106,6 +108,12 @@ pub enum FoundKind {
 	UninitializedSubmodule,
 }
 
+/// An error row of a git read: the text the CLI prints and the reason a
+/// front end words.
+fn git_failure(e: &GitError) -> Failure {
+	Failure::git("", e)
+}
+
 /// One repository a workspace scan found; a failed read stays an error row.
 #[derive(Debug, Clone)]
 pub struct FoundRepo {
@@ -113,7 +121,7 @@ pub struct FoundRepo {
 	pub name: String,
 	pub kind: FoundKind,
 	pub identity: Option<RepoIdentity>,
-	pub summary: Result<RepoSummary, String>,
+	pub summary: Result<RepoSummary, Failure>,
 }
 
 pub fn change_list_with(
@@ -537,14 +545,11 @@ pub(crate) fn check_repo_boundary(
 			limit: opts.max_stdout,
 		});
 	}
-	let stdout = std::str::from_utf8(&out.stdout).map_err(|_| {
-		GitError::Malformed("rev-parse output not utf-8".into())
-	})?;
+	let stdout = std::str::from_utf8(&out.stdout)
+		.map_err(|_| GitError::Diagnostic("rev-parse output not utf-8"))?;
 	let lines: Vec<&str> = stdout.lines().collect();
 	if lines.len() != 10 {
-		return Err(GitError::Malformed(
-			"rev-parse --git-path output must be exactly 10 lines".into(),
-		));
+		return Err(GitError::Condition(Condition::GitPathOutput));
 	}
 
 	const PATH_WHATS: [&str; 10] = [
@@ -630,7 +635,21 @@ pub fn identify_repos(
 	boundary: Option<&Path>,
 	budget: &ScanBudget,
 	opts: &RunOptions,
-) -> (Vec<FoundRepo>, Vec<(PathBuf, String)>) {
+) -> (Vec<FoundRepo>, Vec<(PathBuf, Failure)>) {
+	let (list, errors, _) =
+		identify_repos_stopped(found, boundary, budget, opts);
+	(list, errors)
+}
+
+/// [`identify_repos`], and the budget stop that left repos unread, if any:
+/// callers read that, never the "not read" text of a row.
+pub fn identify_repos_stopped(
+	found: Vec<DiscoveredRepo>,
+	boundary: Option<&Path>,
+	budget: &ScanBudget,
+	opts: &RunOptions,
+) -> (Vec<FoundRepo>, Vec<(PathBuf, Failure)>, Option<ScanStatus>) {
+	let mut stopped: Option<ScanStatus> = None;
 	let mut seen_identities: HashSet<(PathBuf, PathBuf)> = HashSet::new();
 	let mut seen_roots: HashSet<PathBuf> = HashSet::new();
 	let mut list = Vec::new();
@@ -641,9 +660,12 @@ pub fn identify_repos(
 	let mut iter = found.into_iter().enumerate();
 	while let Some((idx, r)) = iter.next() {
 		if let Some(stop) = budget.stop(idx) {
+			stopped = Some(stop);
 			let err_msg = match stop {
-				ScanStatus::Cancelled => "not read: cancelled".to_string(),
-				_ => "not read: time limit".to_string(),
+				ScanStatus::Cancelled => {
+					Failure::new("not read: cancelled", Reason::Cancelled)
+				}
+				_ => Failure::new("not read: time limit", Reason::TimedOut),
 			};
 			let name = r
 				.path
@@ -695,7 +717,7 @@ pub fn identify_repos(
 							name,
 							kind: FoundKind::Main,
 							identity: None,
-							summary: Err(err.to_string()),
+							summary: Err(git_failure(&err)),
 						});
 					}
 					continue;
@@ -713,8 +735,9 @@ pub fn identify_repos(
 								name,
 								kind: FoundKind::Main,
 								identity: None,
-								summary: Err(format!(
-									"repository identity: {err}"
+								summary: Err(Failure::git(
+									"repository identity: ",
+									&err,
 								)),
 							});
 						}
@@ -728,7 +751,7 @@ pub fn identify_repos(
 							name,
 							kind: FoundKind::Main,
 							identity: None,
-							summary: Err(e.to_string()),
+							summary: Err(git_failure(&e)),
 						});
 					}
 					continue;
@@ -757,8 +780,8 @@ pub fn identify_repos(
 			.file_name()
 			.map(|n| n.to_string_lossy().into_owned())
 			.unwrap_or(name);
-		let summary =
-			summarize_with_identity(&git, &id, opts).map_err(|e| e.to_string());
+		let summary = summarize_with_identity(&git, &id, opts)
+			.map_err(|e| git_failure(&e));
 
 		list.push(FoundRepo {
 			root: root.clone(),
@@ -771,7 +794,7 @@ pub fn identify_repos(
 		let submodules = match declared_submodules(&git, opts) {
 			Ok(submodules) => submodules,
 			Err(err) => {
-				errors.push((root, format!("submodules: {err}")));
+				errors.push((root, Failure::git("submodules: ", &err)));
 				Vec::new()
 			}
 		};
@@ -809,9 +832,10 @@ pub fn identify_repos(
 						name: subm.name,
 						kind: FoundKind::UninitializedSubmodule,
 						identity: None,
-						summary: Err(
-							"Submodule not checked out (uninitialized)".into(),
-						),
+						summary: Err(Failure::new(
+							"Submodule not checked out (uninitialized)",
+							Reason::SubmoduleNotCheckedOut,
+						)),
 					});
 				}
 				SubmoduleState::Unreadable(reason)
@@ -822,7 +846,10 @@ pub fn identify_repos(
 						name: subm.name,
 						kind: FoundKind::UninitializedSubmodule,
 						identity: None,
-						summary: Err(format!("Submodule unreadable: {reason}")),
+						summary: Err(Failure::new(
+							format!("Submodule unreadable: {reason}"),
+							Reason::SubmoduleUnreadable { detail: reason },
+						)),
 					});
 				}
 				_ => {}
@@ -830,7 +857,7 @@ pub fn identify_repos(
 		}
 	}
 
-	(list, errors)
+	(list, errors, stopped)
 }
 
 pub fn identify_repo(
@@ -851,11 +878,11 @@ pub fn identify_repo(
 					RepoKind::Main => FoundKind::Main,
 				};
 				let summary = summarize_with_identity(&git, &id, opts)
-					.map_err(|err| err.to_string());
+					.map_err(|err| git_failure(&err));
 				(id.toplevel.clone(), kind, Some(id), summary)
 			}
 			Err(err) => {
-				(path.clone(), FoundKind::Main, None, Err(err.to_string()))
+				(path.clone(), FoundKind::Main, None, Err(git_failure(&err)))
 			}
 		}
 	} else {
@@ -872,19 +899,19 @@ pub fn identify_repo(
 							RepoKind::Main => FoundKind::Main,
 						};
 						let summary = summarize_with_identity(&git, &id, opts)
-							.map_err(|err| err.to_string());
+							.map_err(|err| git_failure(&err));
 						(id.toplevel.clone(), kind, Some(id), summary)
 					}
 					Err(err) => (
 						root,
 						FoundKind::Main,
 						None,
-						Err(format!("repository identity: {err}")),
+						Err(Failure::git("repository identity: ", &err)),
 					),
 				}
 			}
 			Err(err) => {
-				(path.clone(), FoundKind::Main, None, Err(err.to_string()))
+				(path.clone(), FoundKind::Main, None, Err(git_failure(&err)))
 			}
 		}
 	};
@@ -908,7 +935,7 @@ pub const MAX_SCAN_NOTES: usize = 64;
 #[derive(Debug, Clone)]
 pub struct WorkspaceScan {
 	pub repos: Vec<FoundRepo>,
-	pub errors: Vec<(PathBuf, String)>, // <= MAX_SCAN_NOTES
+	pub errors: Vec<(PathBuf, Failure)>, // <= MAX_SCAN_NOTES
 	pub error_overflow: usize,
 	pub depth_limited: Vec<PathBuf>, // <= MAX_SCAN_NOTES
 	pub depth_overflow: usize,
@@ -931,7 +958,10 @@ pub fn scan_repos_within(
 		Err(e) => {
 			return WorkspaceScan {
 				repos: Vec::new(),
-				errors: vec![(root.to_path_buf(), e.to_string())],
+				errors: vec![(
+					root.to_path_buf(),
+					Failure::io(&e, &root.display().to_string()),
+				)],
 				error_overflow: 0,
 				depth_limited: Vec::new(),
 				depth_overflow: 0,
@@ -947,7 +977,10 @@ pub fn scan_repos_within(
 				Err(e) => {
 					return WorkspaceScan {
 						repos: Vec::new(),
-						errors: vec![(u.to_path_buf(), e.to_string())],
+						errors: vec![(
+							u.to_path_buf(),
+							Failure::io(&e, &u.display().to_string()),
+						)],
 						error_overflow: 0,
 						depth_limited: Vec::new(),
 						depth_overflow: 0,
@@ -960,7 +993,10 @@ pub fn scan_repos_within(
 					repos: Vec::new(),
 					errors: vec![(
 						u.to_path_buf(),
-						"outside the shared folder".to_string(),
+						Failure::new(
+							"outside the shared folder",
+							Reason::OutsideShare,
+						),
 					)],
 					error_overflow: 0,
 					depth_limited: Vec::new(),
@@ -978,7 +1014,10 @@ pub fn scan_repos_within(
 		Err(e) => {
 			return WorkspaceScan {
 				repos: Vec::new(),
-				errors: vec![(start, e.to_string())],
+				errors: vec![(
+					start.clone(),
+					Failure::io(&e, &start.display().to_string()),
+				)],
 				error_overflow: 0,
 				depth_limited: Vec::new(),
 				depth_overflow: 0,
@@ -998,7 +1037,8 @@ fn finish_scan(
 ) -> WorkspaceScan {
 	// Identified as a local workspace's repos are: a worktree whose main
 	// repository is elsewhere is still served.
-	let (repos, id_errors) = identify_repos(page.repos, None, budget, opts);
+	let (repos, id_errors, stopped) =
+		identify_repos_stopped(page.repos, None, budget, opts);
 
 	let mut all_errors = page.errors;
 	all_errors.extend(id_errors);
@@ -1022,14 +1062,10 @@ fn finish_scan(
 		};
 
 	let mut status = page.status;
-	if status == ScanStatus::Complete
-		&& repos.iter().any(|r| {
-			r.summary
-				.as_ref()
-				.err()
-				.is_some_and(|msg| msg.starts_with("not read: "))
-		}) {
-		status = budget.stop(0).unwrap_or(ScanStatus::TimedOut);
+	if status == ScanStatus::Complete {
+		if let Some(stop) = stopped {
+			status = stop;
+		}
 	}
 
 	WorkspaceScan {
@@ -1686,7 +1722,10 @@ mod tests {
 		);
 		assert_eq!(sub_entries[0].kind, FoundKind::UninitializedSubmodule);
 		assert!(sub_entries[0].identity.is_none());
-		assert!(sub_entries[0].summary.is_err());
+		assert_eq!(
+			sub_entries[0].summary.as_ref().unwrap_err().reason,
+			Reason::SubmoduleNotCheckedOut
+		);
 
 		#[cfg(unix)]
 		{
@@ -1775,21 +1814,39 @@ mod tests {
 			),
 			cancel: None,
 		};
-		let (list, errors) =
-			identify_repos(disc, None, &budget, &RunOptions::default());
+		let (list, errors, stopped) = identify_repos_stopped(
+			disc.clone(),
+			None,
+			&budget,
+			&RunOptions::default(),
+		);
+		// The stop is data, not a row's text.
+		assert_eq!(stopped, Some(ScanStatus::TimedOut));
+		let stop_reason = Reason::TimedOut;
+		let (_, _, unstopped) = identify_repos_stopped(
+			disc,
+			None,
+			&ScanBudget::visits(usize::MAX),
+			&RunOptions::default(),
+		);
+		assert_eq!(unstopped, None);
 		assert!(errors.is_empty());
 		assert_eq!(list.len(), 2);
 		assert_eq!(list[0].root, PathBuf::from("/nonexistent/repo1"));
 		assert_eq!(list[0].name, "repo1");
 		assert_eq!(list[0].kind, FoundKind::Main);
 		assert!(list[0].identity.is_none());
-		assert!(list[0].summary.as_ref().unwrap_err().contains("not read"));
+		let not_read = list[0].summary.as_ref().unwrap_err();
+		assert!(not_read.message.contains("not read"));
+		assert_eq!(not_read.reason, stop_reason);
 
 		assert_eq!(list[1].root, PathBuf::from("/nonexistent/repo2"));
 		assert_eq!(list[1].name, "repo2");
 		assert_eq!(list[1].kind, FoundKind::Main);
 		assert!(list[1].identity.is_none());
-		assert!(list[1].summary.as_ref().unwrap_err().contains("not read"));
+		let not_read = list[1].summary.as_ref().unwrap_err();
+		assert!(not_read.message.contains("not read"));
+		assert_eq!(not_read.reason, stop_reason);
 	}
 
 	#[test]
@@ -2369,7 +2426,7 @@ mod tests {
 		let head = git.resolve_commit_with("HEAD", &opts).unwrap();
 
 		// For Working and Staged, passing listed = Some(...) for unmodified file
-		// must return GitError::Malformed("Path is not in this Git source")
+		// must return GitError::Condition(Condition::PathNotInSource)
 		let err_work = repo
 			.preview(
 				&GitSource::Working,
@@ -2379,7 +2436,10 @@ mod tests {
 			)
 			.unwrap_err();
 		assert!(
-			matches!(&err_work, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			matches!(
+				&err_work,
+				GitError::Condition(Condition::PathNotInSource)
+			),
 			"expected Malformed, got {err_work:?}"
 		);
 
@@ -2392,7 +2452,10 @@ mod tests {
 			)
 			.unwrap_err();
 		assert!(
-			matches!(&err_stage, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			matches!(
+				&err_stage,
+				GitError::Condition(Condition::PathNotInSource)
+			),
 			"expected Malformed, got {err_stage:?}"
 		);
 
@@ -3765,8 +3828,18 @@ mod tests {
 		assert!(found.identity.is_none());
 		let err_msg = found.summary.as_ref().unwrap_err();
 		assert!(
-			err_msg.starts_with("repository identity: "),
+			err_msg.message.starts_with("repository identity: "),
 			"expected 'repository identity: ...', got '{err_msg}'"
+		);
+		assert!(
+			matches!(
+				err_msg.reason,
+				Reason::NotFound { .. }
+					| Reason::Io { .. }
+					| Reason::GitFailed { .. }
+			),
+			"typed by the failure, not its text: {:?}",
+			err_msg.reason
 		);
 	}
 
@@ -4044,7 +4117,7 @@ mod tests {
 			.unwrap();
 		assert!(shared_row.summary.is_err());
 		let shared_err = shared_row.summary.as_ref().unwrap_err();
-		assert!(!shared_err.contains(&outside_str));
+		assert!(!shared_err.message.contains(&outside_str));
 
 		let wt_row = bounded_list
 			.iter()
@@ -4052,13 +4125,13 @@ mod tests {
 			.unwrap();
 		assert!(wt_row.summary.is_err());
 		let wt_err = wt_row.summary.as_ref().unwrap_err();
-		assert!(!wt_err.contains(&outside_str));
+		assert!(!wt_err.message.contains(&outside_str));
 
 		let empty_row =
 			bounded_list.iter().find(|r| r.name == "empty_git").unwrap();
 		assert!(empty_row.summary.is_err());
 		let empty_err = empty_row.summary.as_ref().unwrap_err();
-		assert!(!empty_err.contains(&outside_str));
+		assert!(!empty_err.message.contains(&outside_str));
 
 		// Boundary-less call over the same list
 		let (unbounded_list, _) =
@@ -4218,10 +4291,10 @@ mod tests {
 		assert_eq!(scan.status, ScanStatus::TimedOut);
 		assert_eq!(scan.repos.len(), 2);
 		assert!(scan.repos.iter().any(|r| {
-			r.summary
-				.as_ref()
-				.err()
-				.is_some_and(|msg| msg.contains("not read: time limit"))
+			r.summary.as_ref().err().is_some_and(|f| {
+				f.message.contains("not read: time limit")
+					&& f.reason == Reason::TimedOut
+			})
 		}));
 	}
 
