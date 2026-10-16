@@ -8153,12 +8153,20 @@ mod tests {
 						&& matches!(m.remote.message, Some((false, _)))
 				})
 			});
-			model.read_with(cx, |m, _| {
+			model.read_with(cx, |m, cx| {
 				assert!(m.remote.session.is_none());
 				assert!(
 					m.overlays
 						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
 					"the menu stays open"
+				);
+				// M2 of `invariants`: a listed host browse keeps its client.
+				// A lane cannot reach this path (opening a workspace is out of
+				// its scope), so the invariant is held here.
+				crate::invariants::assert_holds(
+					m,
+					cx,
+					&[crate::invariants::Invariant::M2],
 				);
 				let back =
 					client_of(m).expect("the browse got its client back");
@@ -20126,6 +20134,23 @@ mod tests {
 			let (_ext_tmp, ext) = external_repo("ext");
 			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
 			repos_settled(&model, cx, 1);
+			// A paste preview with a mapping row stays open through every
+			// change, so R4 (it has seen every repo) is not vacuous.
+			model.update(cx, |m, _| {
+				m.test_clipboard = Some("// FILE: zzz/one.txt\n1\n".into())
+			});
+			cx.simulate_keystrokes("ctrl-v");
+			settle_until(cx, "the preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(
+					!m.paste.plan().unwrap().prefix_choices.is_empty(),
+					"the preview offers a mapping row"
+				)
+			});
 			let b = scanned_entry(&repo(ws.path(), "b", &[]));
 			let c = scanned_entry(&repo(ws.path(), "c", &[]));
 			let c_key = crate::repo_key(&c);

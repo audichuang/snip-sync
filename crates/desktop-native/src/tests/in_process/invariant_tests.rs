@@ -991,6 +991,10 @@ enum FsEdit {
 		repo: &'static str,
 		branch: &'static str,
 	},
+	/// A new repo appears in the workspace folder (a clone, an `init`).
+	NewRepo {
+		name: &'static str,
+	},
 }
 
 /// One gesture of a lane. A run is the list of them, so a failure can be
@@ -1036,6 +1040,8 @@ enum ActKind {
 	Fs,
 	Clipboard,
 	Paste,
+	/// Adds the external repo by hand: open the field, type its path, submit.
+	AddRepo,
 	Fault,
 }
 
@@ -1064,6 +1070,8 @@ fn weights(lane: Lane) -> &'static [(ActKind, u32)] {
 			(ActKind::Advance, 14),
 			(ActKind::Clipboard, 8),
 			(ActKind::Paste, 12),
+			(ActKind::AddRepo, 6),
+			(ActKind::Fs, 5),
 		],
 		Lane::Remote => &[
 			(ActKind::Click, 36),
@@ -1253,6 +1261,12 @@ struct Env {
 	just_pasted: bool,
 	/// The step before armed a fault.
 	just_faulted: bool,
+	/// The step before changed the workspace folder.
+	just_fs: bool,
+	/// The step before typed the external repo's path into the add field.
+	just_typed_add_repo: bool,
+	/// The ids the frame before the last gesture drew.
+	last_frame: std::collections::BTreeSet<String>,
 }
 
 impl Env {
@@ -1294,6 +1308,16 @@ impl Env {
 				*pick(rng, &[50, 200, 1000]).expect("a delay"),
 			);
 		}
+		// A repo that appeared is found by the next Refresh.
+		if self.lane == Lane::Paste && self.just_fs && rng.random_bool(0.6) {
+			return Step::Key("ctrl-r".into());
+		}
+		// The path just typed into the add-repo field is submitted next.
+		if self.just_typed_add_repo {
+			if c.fields.iter().any(|f| f.0 == "input-add-repo") {
+				return Step::Submit("input-add-repo".into());
+			}
+		}
 		// A fault waits for a request it matches: the gesture after it is
 		// mostly one that sends requests.
 		if self.lane == Lane::Remote
@@ -1326,6 +1350,24 @@ impl Env {
 					id: control.id.clone(),
 					mods: Mods::None,
 					button: Button::Left,
+				};
+			}
+		}
+		// What the last gesture brought on screen (a dropdown's items, a
+		// panel's controls) is what a user presses next, more often than not.
+		if kind == ActKind::Click && rng.random_bool(0.4) {
+			let fresh: Vec<&Control> = c
+				.clicks
+				.iter()
+				.filter(|x| !self.last_frame.contains(&x.id))
+				.collect();
+			if let Some(control) = pick(rng, &fresh) {
+				let (mods, button) =
+					*pick(rng, &control.gestures).expect("a gesture");
+				return Step::Click {
+					id: control.id.clone(),
+					mods,
+					button,
 				};
 			}
 		}
@@ -1394,6 +1436,11 @@ impl Env {
 					*pick(rng, &[10, 50, 200, 1000]).expect("a delay"),
 				)
 			}
+			ActKind::Fs if self.lane == Lane::Paste => {
+				return Step::Fs(FsEdit::NewRepo {
+					name: *pick(rng, &["c", "d", "e"]).expect("a name"),
+				});
+			}
 			ActKind::Fs => {
 				let repos = ["alpha", "beta", "gamma"];
 				let repo = *pick(rng, &repos).expect("a repo");
@@ -1429,6 +1476,25 @@ impl Env {
 						button: Button::Left,
 					},
 					_ => Step::Key("ctrl-v".into()),
+				}
+			}
+			ActKind::AddRepo => {
+				if c.fields.iter().any(|f| f.0 == "input-add-repo") {
+					if let Some(ext) = &self.external {
+						return Step::Type {
+							id: "input-add-repo".into(),
+							text: ext.display().to_string(),
+						};
+					}
+				}
+				if let Some(btn) =
+					c.clicks.iter().find(|x| x.id == "btn-add-repo")
+				{
+					return Step::Click {
+						id: btn.id.clone(),
+						mods: Mods::None,
+						button: Button::Left,
+					};
 				}
 			}
 			ActKind::Fault => {
@@ -1559,6 +1625,11 @@ impl Env {
 			}
 			FsEdit::Checkout { repo, branch } => {
 				run(repo, &["checkout", "-q", branch]);
+			}
+			FsEdit::NewRepo { name } => {
+				if !self.ws.join(name).exists() {
+					lane_repo(&self.ws, name, &[]);
+				}
 			}
 		}
 	}
@@ -1705,9 +1776,14 @@ fn drive(
 		let cands = gather(model, cx, &keys);
 		unclassified.extend(cands.unclassified.iter().cloned());
 		let step = env.choose(&mut rng, &cands);
+		env.last_frame =
+			drawn(model, cx).into_iter().map(|(id, _)| id).collect();
 		env.just_pasted = matches!(&step, Step::Key(k) if k == "ctrl-v")
 			|| matches!(&step, Step::Click { id, .. } if id == "btn-paste");
 		env.just_faulted = matches!(&step, Step::Fault(_));
+		env.just_fs = matches!(&step, Step::Fs(_));
+		env.just_typed_add_repo =
+			matches!(&step, Step::Type { id, .. } if id == "input-add-repo");
 		steps.push(step.clone());
 		env.apply(model, cx, &step);
 		if std::env::var_os("FUZZ_TRACE").is_some() {
@@ -1828,6 +1904,9 @@ fn env(lane: Lane, ws: &Path) -> Env {
 		last_browse: None,
 		just_pasted: false,
 		just_faulted: false,
+		last_frame: Default::default(),
+		just_typed_add_repo: false,
+		just_fs: false,
 	}
 }
 
