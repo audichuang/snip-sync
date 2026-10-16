@@ -472,12 +472,16 @@ fn lost_prepared_apply_answer_is_unknown_and_never_resent_or_fallen_back() {
 		send.send(target.apply_files(text, &route, &plan, &selection()))
 			.unwrap();
 	});
+	// Both files are made empty before the first write (`create_new`);
+	// only the first has its content when the worker is held.
+	let content =
+		|name: &str| fs::read(workspace.path().join(name)).unwrap_or_default();
 	wait(
 		"the first committed file before the connection is cut",
-		|| workspace.path().join("a.txt").is_file(),
+		|| content("a.txt") == b"first",
 	);
 	assert!(
-		!workspace.path().join("b.txt").exists(),
+		content("b.txt").is_empty(),
 		"the real worker must be held between writes"
 	);
 	fs::write(fixture.dir.path().join(format!("exit-{pid}")), "cut").unwrap();
@@ -493,7 +497,9 @@ fn lost_prepared_apply_answer_is_unknown_and_never_resent_or_fallen_back() {
 		fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
 		"first"
 	);
-	assert!(!workspace.path().join("b.txt").exists());
+	// The worker died holding the second row: it never got its content
+	// (the empty file it made for it stays).
+	assert!(content("b.txt").is_empty());
 	let events = fixture.events();
 	assert_eq!(
 		events

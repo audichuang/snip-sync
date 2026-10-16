@@ -1128,6 +1128,7 @@ impl ApplyToken {
 			| Reason::AmbiguousRoots { .. }
 			| Reason::PayloadTooLarge { .. }
 			| Reason::SourceChanged { .. }
+			| Reason::NewDirsNotConfirmed { .. }
 			| Reason::CrossRepoCommits
 			| Reason::Discontinuous { .. }
 			| Reason::NotEnoughCommits { .. }
@@ -1176,8 +1177,11 @@ fn paste_target(
 	dest: &Path,
 ) -> Result<PasteTarget, Msg> {
 	Ok(match remote {
+		// The app never makes folders that do not exist: `allow_new_dirs`
+		// stays off, so `bound` is not read.
 		None => PasteTarget::Local {
 			dest: dest.to_path_buf(),
+			bound: None,
 		},
 		Some(r) => PasteTarget::Remote {
 			client: r.session.client.clone(),
@@ -1499,10 +1503,26 @@ fn header_label(op: PlannedOp) -> &'static str {
 	}
 }
 
+/// A root's last name, read as written with `/` and `\` both separating:
+/// a worker's path is not taken apart by this machine's rules (on Unix `\`
+/// is part of a name, and a Windows worker's whole root was one name).
 fn root_name(path: &Path) -> String {
-	path.file_name()
-		.map(|n| n.to_string_lossy().into_owned())
-		.unwrap_or_else(|| path.display().to_string())
+	let text = path.to_string_lossy();
+	match text
+		.trim_end_matches(['/', '\\'])
+		.rsplit(['/', '\\'])
+		.next()
+	{
+		Some(name) if !name.is_empty() => name.to_string(),
+		_ => path.display().to_string(),
+	}
+}
+
+/// `path` as text with `/` separators and no trailing one: how a worker's
+/// paths are compared here, whatever OS wrote them.
+fn slashed(path: &Path) -> String {
+	let text = path.to_string_lossy().replace('\\', "/");
+	text.trim_end_matches('/').to_string()
 }
 
 /// A destination that could not be opened or captured, named by path so the
@@ -1553,14 +1573,22 @@ struct RootGroup {
 /// The root a path lies in. With one root inside another (a prefix mapped to
 /// a folder of the destination) it is the inner one, where a write to that
 /// path would be shown too.
+/// Compared as text, as [`plan_root_of`] does, so a worker's Windows paths
+/// read the same on any master.
 fn innermost_root<'a>(
 	roots: &'a [PathBuf],
 	path: &Path,
 ) -> Option<&'a PathBuf> {
+	let path = slashed(path);
 	roots
 		.iter()
-		.filter(|r| path.starts_with(r))
-		.max_by_key(|r| r.components().count())
+		.map(|r| (r, slashed(r)))
+		.filter(|(_, r)| {
+			path.strip_prefix(r.as_str())
+				.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+		})
+		.max_by_key(|(_, r)| r.len())
+		.map(|(r, _)| r)
 }
 
 /// The root a planned file's `relative` path is relative to: the one of
@@ -1572,10 +1600,6 @@ fn plan_root_of<'a>(
 	absolute: &Path,
 	relative: &str,
 ) -> Option<&'a PathBuf> {
-	let slashed = |p: &Path| {
-		let text = p.to_string_lossy().replace('\\', "/");
-		text.trim_end_matches('/').to_string()
-	};
 	let absolute = slashed(absolute);
 	// The name must start right after a separator: `sub` + `g.txt` is not
 	// the file `subg.txt`.
@@ -3687,6 +3711,7 @@ impl PastePreviewPlan {
 			skip_existing: false,
 			unchecked_creates,
 			unchecked_deletes,
+			..Default::default()
 		};
 
 		// Run confirmed plan directly through shared transfer engine with freshness check
@@ -3827,6 +3852,7 @@ impl PastePreviewPlan {
 				planned_skipped_count: 0,
 				errors: Vec::new(),
 				failures: Vec::new(),
+				..Default::default()
 			},
 			created_commits: replay_res.created,
 		})
@@ -3872,6 +3898,7 @@ pub(crate) mod tests {
 					"gamma broke".into(),
 				],
 				failures: Vec::new(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3908,6 +3935,7 @@ pub(crate) mod tests {
 						reason: Some(r),
 					})
 					.collect(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3986,6 +4014,7 @@ pub(crate) mod tests {
 				deleted_count: 0,
 				errors: failures.iter().map(|f| f.path.clone()).collect(),
 				failures: failures.clone(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -4029,6 +4058,7 @@ pub(crate) mod tests {
 				deleted_count: 0,
 				errors: failures.iter().map(|f| f.path.clone()).collect(),
 				failures,
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -4056,14 +4086,17 @@ pub(crate) mod tests {
 				prefixes: vec![("src".into(), bad.clone())],
 				..Default::default()
 			};
-			let err = PasteTarget::Local { dest: dest.clone() }
-				.plan_files(
-					"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
-					&route,
-					&RunOptions::default(),
-					None,
-				)
-				.expect_err("the prefix folder does not resolve");
+			let err = PasteTarget::Local {
+				dest: dest.clone(),
+				bound: None,
+			}
+			.plan_files(
+				"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
+				&route,
+				&RunOptions::default(),
+				None,
+			)
+			.expect_err("the prefix folder does not resolve");
 			let msg = destination_msg(None, &dest, err);
 			assert_eq!(msg.args[0], bad.display().to_string(), "{msg:?}");
 			for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
@@ -4612,6 +4645,26 @@ pub(crate) mod tests {
 		assert_eq!(of("/w/dest/subway/a.txt"), Some(&roots[0]));
 		assert_eq!(of("/w/other/x"), Some(&roots[2]));
 		assert_eq!(of("/elsewhere/x"), None);
+	}
+
+	/// A Windows worker's roots, on a master of any OS: a delete's root and
+	/// a root's label are read from the worker's spelling, not taken apart
+	/// by this machine's path rules (on Unix `\` is part of a name).
+	#[test]
+	fn a_windows_workers_roots_are_named_and_matched_on_any_master() {
+		let roots: Vec<PathBuf> =
+			[r"C:\w\dest", r"C:\w\dest\sub", r"C:\w\other"]
+				.map(Into::into)
+				.into();
+		let of = |p: &str| innermost_root(&roots, Path::new(p));
+		assert_eq!(of(r"C:\w\dest\a.txt"), Some(&roots[0]));
+		assert_eq!(of(r"C:\w\dest\sub\a.txt"), Some(&roots[1]));
+		assert_eq!(of(r"C:\w\dest\subway\a.txt"), Some(&roots[0]));
+		assert_eq!(of(r"C:\w\other\x"), Some(&roots[2]));
+		assert_eq!(of(r"C:\elsewhere\x"), None);
+		assert_eq!(root_name(Path::new(r"C:\w\dest")), "dest");
+		assert_eq!(root_name(Path::new(r"C:\w\dest\")), "dest");
+		assert_eq!(root_name(Path::new("/w/dest")), "dest");
 	}
 
 	/// A row's place in the tree is the place Apply acts on: its root joined

@@ -59,7 +59,7 @@ Hindsight 記錄:2026-09-30 架構深化時「合併兩條 export pipeline」被
 
 **非目標**
 - 不改剪貼簿線上格式,不動 `fixtures/clipboard-contract.json`(它歸 ClipCodeVSCode 管)。
-- 不改 GUI 的互動與畫面,除非第 3 節 D4(GUI 採用 restore-base 建議,目前決定不改)、D8(絕對路徑匯入修正)與 D10(不分大小寫檔案系統的新目標碰撞)——後兩者經共用 core 函式 `plan_import_with` 改變 GUI 貼上行為,於階段 5b 落地;階段 4 起 root 內的目錄 symlink 在共用的 `expand_folder_items` 展開為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致)。
+- 不改 GUI 的互動與畫面(D4 的落點部分已由 ADR 0004 取代,#241),除非第 3 節 D4(GUI 採用 restore-base 建議,目前決定不改)、D8(絕對路徑匯入修正)與 D10(不分大小寫檔案系統的新目標碰撞)——後兩者經共用 core 函式 `plan_import_with` 改變 GUI 貼上行為,於階段 5b 落地;階段 4 起 root 內的目錄 symlink 在共用的 `expand_folder_items` 展開為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致)。
 - 不重寫 `restore::plan_restore`:它仍是 `plan_import_with` 每筆 entry 的規劃器,也是 contract 測試的對象。
 - 舊函式(`collect_copy_files`、`collect_payload`)不急著刪,先降級為測試 oracle;全部遷完、穩定一個版本後再評估移除。
 
@@ -98,8 +98,8 @@ transfer 沒有 Range 來源;拿 `Commit` 硬湊會讓刪除檔讀到 B 的 pare
 
 CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`);GUI 用每個 prefix 一個選擇,而且有 `clipcode-root` 時完全不做。`ImportMapping` 兩種都表達得出來(Strip → `map_prefix`;Add → `map_entry`)。
 
-- **建議**:core 新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)` 這一個轉換;CLI `--adjust-paths` 經它建 mapping。GUI **第一步不改**,只在第 6 階段後另開一張單決定要不要把 restore-base 建議當成預設選項(那是 GUI 行為變更,要另外驗收)。
-- 這樣 F10 的「兩套實作」先收斂成「一個 mapping 型別、兩個 UI 產生方式」;落點差異在 GUI 那張單解決。
+- **建議**:core 新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)` 這一個轉換;CLI `--adjust-paths` 經它建 mapping。GUI **第一步不改**,只在第 6 階段後另開一張單決定要不要把 restore-base 建議當成預設選項(那是 GUI 行為變更,要另外驗收)。(落點的部分已由 ADR 0004 取代(#241):目的資料夾與導入路徑可以不存在,由 `PlacedRoot` 在引擎裡處理。)
+- 這樣 F10 的「兩套實作」先收斂成「一個 mapping 型別、兩個 UI 產生方式」;落點差異在 GUI 那張單解決(已由 ADR 0004 取代:#241 在引擎裡以 `PlacedRoot` 解決)。
 
 ### D5 — 貼 commits 的旗標語意
 
@@ -204,7 +204,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 - 範圍:`transfer::plan_import_with`(`crates/core/src/transfer.rs`)。
   - D8:每筆 entry 在 `sanitize_relative_path` 之前先解析絕對路徑(root 內部 → 相對;`cross_machine_suffix_candidate` → 相對;絕對 [DELETED] 對不到任何 root → 以 unsafe/unresolved 跳過、不刪任何檔;絕對寫入對不到 root → 維持照原樣放主 root,磁碟機代號 → `UNRESOLVED_PATH`),行為對齊 `restore::plan_restore`/TS。GUI 行為因共用 core 函式一併修正(修正先前絕對路徑 payload 巢狀寫入與巢狀刪除的 bug)。
-  - D10:探測目的端(root)檔案系統是否不分大小寫,若是,`TargetCollision` 的身分檢查(`canonical_target_identity`/`path_key`)對新目標路徑也摺疊大小寫,消除 macOS 等平台上的 gap。
+  - D10:探測目的端(root)檔案系統是否不分大小寫,若是,`TargetCollision` 的身分檢查(現為 `foldernames.rs` 的 `TargetId`,#241)對新目標路徑也摺疊大小寫,消除 macOS 等平台上的 gap。
 - 測試:
   - `crates/core/tests/transfer_planning.rs`:root 內部絕對寫入、跨機器後綴、絕對 [DELETED] 對不到 root 被拒且不刪任何檔、磁碟機代號 `UNRESOLVED_PATH`、root 以 symlink 拼寫的版本;D10 的 `[NEW] B.txt`+`[NEW] b.txt` 與 `D/x.txt`+`d/x.txt` 在不分大小寫 FS 上觸發 `TargetCollision`,測試先探測 FS,Linux 等區分大小寫 FS 則斷言兩檔都建立。
   - GUI regression:`crates/desktop-native/src/paste.rs` 單元測試或 `tests::in_process`(貼上含 root 內部絕對路徑 / 絕對 [DELETED] 的 payload)。

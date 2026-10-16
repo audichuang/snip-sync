@@ -141,6 +141,13 @@ pub enum RemoteCommand {
 		/// Apply the suggested folder-level path adjustment.
 		#[arg(long)]
 		adjust_paths: bool,
+		/// Send the entries under `PREFIX/` to the folder PATH (inside the
+		/// workspace, relative to --in; `.` is --in itself). Repeatable.
+		#[arg(long = "map", value_name = "PREFIX=PATH")]
+		map: Vec<String>,
+		/// Make the folders --in and --map name that do not exist yet.
+		#[arg(long)]
+		create_dirs: bool,
 		/// Read the payload from stdin instead of the clipboard.
 		#[arg(long)]
 		stdin: bool,
@@ -544,9 +551,12 @@ pub fn run(
 			overwrite,
 			skip_existing,
 			adjust_paths,
+			map,
+			create_dirs,
 			stdin,
 			..
 		} => {
+			let maps = remote_maps(&repo, &crate::parse_maps(&map));
 			let text = crate::read_paste_text(stdin)?;
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
@@ -555,6 +565,9 @@ pub fn run(
 				overwrite,
 				skip_existing,
 				adjust_paths,
+				maps,
+				create_dirs,
+				repo: None,
 			};
 			let target = snip_remote::PasteTarget::Remote {
 				client: Arc::new(c),
@@ -604,4 +617,32 @@ pub fn run(
 			Ok(())
 		}
 	}
+}
+
+/// A remote `--map` folder: PATH under the folder `--in` names, inside the
+/// workspace, merged by name: `.` is `--in` itself, and an `--in` of `""` with
+/// `lib/x` is `lib/x`. An absolute PATH or a `..` would leave it: a usage error.
+fn remote_maps(
+	dest: &str,
+	maps: &[(String, String)],
+) -> Vec<(String, std::path::PathBuf)> {
+	maps.iter()
+		.map(|(prefix, path)| {
+			let absolute = std::path::Path::new(path).is_absolute()
+				|| path.starts_with(['/', '\\']);
+			let names: Vec<&str> = path
+				.split(['/', '\\'])
+				.filter(|n| !n.is_empty() && *n != ".")
+				.collect();
+			if absolute || names.contains(&"..") {
+				crate::usage(format!(
+					"--map {prefix}={path}: a remote folder must stay inside --in"
+				));
+			}
+			let mut rel: Vec<&str> =
+				dest.split('/').filter(|n| !n.is_empty()).collect();
+			rel.extend(names);
+			(prefix.clone(), std::path::PathBuf::from(rel.join("/")))
+		})
+		.collect()
 }

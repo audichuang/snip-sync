@@ -489,6 +489,26 @@ if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/a.txt'"; then
 else
 	bad "a paste out of the workspace  rc=$rc err=$err"
 fi
+# A destination folder that does not exist yet is a folder to make: refused
+# until the user agrees (--create-dirs), then made inside the workspace.
+err=$("$SNIP" remote paste h "$WD/pastews" --in not/yet --apply --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && grep -q -- '--create-dirs' <<<"$err" && w <<<"test ! -e '$WD/pastews/not'"; then
+	ok "a paste into a missing folder without --create-dirs is refused and makes nothing  ($err)"
+else
+	bad "a paste into a missing folder without --create-dirs  rc=$rc err=$err"
+fi
+"$SNIP" remote paste h "$WD/pastews" --in not/yet --apply --create-dirs --stdin <"$MASTER/payload.txt" >/dev/null 2>&1
+check "--create-dirs makes the folder and pastes into it" test "$?" = 0
+check "the pasted file landed in the new folder" w <<<"test -f '$WD/pastews/not/yet/a.txt'"
+# A worker that cannot make folders says it is too old, not "no such folder".
+err=$(SNIP_REMOTE_EXEC="$SNIP_REMOTE_EXEC --max-protocol 8" "$SNIP" remote paste h "$WD/pastews" --in old/missing --dry-run --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && grep -qi 'too old' <<<"$err" && w <<<"test ! -e '$WD/pastews/old'"; then
+	ok "an older worker refuses a missing folder as too old  ($err)"
+else
+	bad "an older worker and a missing folder  rc=$rc err=$err"
+fi
 
 # Two connections paste into one repository: the one that holds it (paused
 # after its first write) makes the other refuse at once, writing nothing.

@@ -145,6 +145,7 @@ fn unchecked(creates: &[usize]) -> RestoreSelection {
 		skip_existing: false,
 		unchecked_creates: creates.iter().copied().collect::<BTreeSet<_>>(),
 		unchecked_deletes: BTreeSet::new(),
+		..Default::default()
 	}
 }
 
@@ -515,7 +516,10 @@ fn paste_targets_keep_protected_reasons_and_count_all_skips_once() {
 				)
 			} else {
 				(
-					PasteTarget::Local { dest: ws.clone() },
+					PasteTarget::Local {
+						dest: ws.clone(),
+						bound: None,
+					},
 					PasteRoute {
 						prefixes: vec![("target".into(), repo.clone())],
 						..Default::default()
@@ -596,7 +600,10 @@ fn commit_file_previews_match_local_virtual_baselines_without_writing() {
 	let w = worker(None);
 	let (client, workspace) = open(&w, &dst);
 	let targets = [
-		PasteTarget::Local { dest: dst.clone() },
+		PasteTarget::Local {
+			dest: dst.clone(),
+			bound: None,
+		},
 		PasteTarget::Remote {
 			client: Arc::new(client),
 			workspace,
@@ -1189,17 +1196,21 @@ fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
 		client.call_with(&req, None, Duration::from_secs(3))
 	});
 	// The worker's first write is on disk before the cut: the pause sits
-	// between the two files, not before the first.
+	// between the two files, not before the first. Both files are there
+	// from before the first write (made empty, `create_new`); only the
+	// first has its content.
+	let content = |name: &str| fs::read(ws.join(name)).unwrap_or_default();
 	let deadline = Instant::now() + Duration::from_secs(10);
-	while !ws.join("a.txt").exists() && Instant::now() < deadline {
+	while content("a.txt") != b"first" && Instant::now() < deadline {
 		std::thread::sleep(Duration::from_millis(10));
 	}
-	assert!(
-		ws.join("a.txt").exists(),
+	assert_eq!(
+		content("a.txt"),
+		b"first",
 		"the worker must commit its first write"
 	);
 	assert!(
-		!ws.join("b.txt").exists(),
+		content("b.txt").is_empty(),
 		"the hold sits between the two writes"
 	);
 
@@ -1220,11 +1231,12 @@ fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
 	);
 	// Lifted, the worker finishes the apply it already started.
 	let resume = Instant::now() + Duration::from_secs(10);
-	while !ws.join("b.txt").exists() && Instant::now() < resume {
+	while content("b.txt") != b"second" && Instant::now() < resume {
 		std::thread::sleep(Duration::from_millis(10));
 	}
-	assert!(
-		ws.join("b.txt").exists(),
+	assert_eq!(
+		content("b.txt"),
+		b"second",
 		"the worker finishes after the hold lifts"
 	);
 }
@@ -1265,6 +1277,7 @@ fn a_paste_target_writes_the_same_files_locally_and_on_a_worker() {
 	let (client, id) = open(&w, &ws);
 	let local = PasteTarget::Local {
 		dest: local_dest.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1327,7 +1340,10 @@ fn a_refused_plan_notes_the_same_restore_base_locally_and_on_a_worker() {
 	);
 	let w = worker(None);
 	let (client, id) = open(&w, &ws);
-	let local = PasteTarget::Local { dest: local_dest };
+	let local = PasteTarget::Local {
+		dest: local_dest,
+		bound: None,
+	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
 		workspace: id,
@@ -1404,6 +1420,7 @@ fn a_paste_target_replays_the_same_commits_locally_and_on_a_worker() {
 	init_repo(&local);
 	let local_target = PasteTarget::Local {
 		dest: local.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1442,6 +1459,7 @@ fn a_paste_target_refuses_a_changed_destination_as_stale_on_both_sides() {
 	let (client, id) = open(&w, &ws);
 	let local = PasteTarget::Local {
 		dest: local_dest.clone(),
+		bound: None,
 	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
@@ -1508,7 +1526,10 @@ fn a_local_target_never_applies_a_workers_plan() {
 	let plan = remote
 		.plan_files(&text, &route, &RunOptions::default(), None)
 		.unwrap();
-	let local = PasteTarget::Local { dest: ws.clone() };
+	let local = PasteTarget::Local {
+		dest: ws.clone(),
+		bound: None,
+	};
 	let err = local
 		.apply_files(&text, &route, &plan, &unchecked(&[]))
 		.expect_err("a local target applied a worker's plan");
@@ -1656,7 +1677,10 @@ fn a_paste_target_refuses_a_changed_repo_under_a_non_repo_destination_on_both_si
 	let opts = RunOptions::default();
 	let w = worker(None);
 	let (client, id) = open(&w, &ws);
-	let local = PasteTarget::Local { dest: local_dest };
+	let local = PasteTarget::Local {
+		dest: local_dest,
+		bound: None,
+	};
 	let remote = PasteTarget::Remote {
 		client: Arc::new(client),
 		workspace: id,
@@ -2132,5 +2156,1047 @@ fn an_ancestor_or_prefix_folder_replaced_after_a_remote_preview_is_stale_on_a_wo
 		assert!(!ext.join("b/selected/new.txt").exists(), "{what}");
 		assert!(!ext.join("x.txt").exists(), "{what}");
 		assert!(!ws.join("primary/y.txt").exists(), "{what}");
+	}
+}
+
+/// #241 guard (R3/R4): a worker that was not asked for folders that may not
+/// exist (the app's paste, or an older protocol) still refuses a missing
+/// destination (`NotFound`: the folder does not resolve), and makes nothing.
+#[test]
+fn a_worker_refuses_a_missing_folder_it_was_not_asked_to_make() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "x");
+	let before: Vec<_> = fs::read_dir(&ws).unwrap().collect();
+	assert!(before.is_empty());
+	for max_protocol in [None, Some(8)] {
+		let w = worker(max_protocol);
+		let (client, id) = open(&w, &ws);
+		let planned = client.import_plan(
+			&id,
+			"not/yet",
+			&text,
+			&PasteMapping::default(),
+			None,
+		);
+		assert_eq!(refused(planned), ErrorCode::NotFound);
+		let remote = PasteTarget::Remote {
+			client: Arc::new(client),
+			workspace: id,
+			dest: "not/yet".into(),
+		};
+		match remote.plan_files(
+			&text,
+			&PasteRoute::default(),
+			&RunOptions::default(),
+			None,
+		) {
+			Err(PasteError::Remote(RemoteError::Refused {
+				code: ErrorCode::NotFound,
+				..
+			})) => {}
+			other => panic!("expected a NotFound refusal, got {other:?}"),
+		}
+		assert!(
+			fs::read_dir(&ws).unwrap().next().is_none(),
+			"the worker made a folder it was not asked to"
+		);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #241: a destination or prefix folder that does not exist yet
+// ---------------------------------------------------------------------------
+
+fn tree(dir: &Path) -> Vec<PathBuf> {
+	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let path = entry.unwrap().path();
+			out.push(path.clone());
+			if path.is_dir() {
+				walk(&path, out);
+			}
+		}
+	}
+	let mut out = Vec::new();
+	walk(dir, &mut out);
+	out.sort();
+	out
+}
+
+fn new_dirs_route(prefixes: &[(&str, &str)]) -> PasteRoute {
+	PasteRoute {
+		prefixes: prefixes
+			.iter()
+			.map(|(p, f)| (p.to_string(), PathBuf::from(f)))
+			.collect(),
+		allow_new_dirs: true,
+		..Default::default()
+	}
+}
+
+fn remote_target(client: Client, id: String, dest: &str) -> PasteTarget {
+	PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: dest.into(),
+	}
+}
+
+fn confirm(plan: &FilePastePlan) -> RestoreSelection {
+	RestoreSelection {
+		confirmed_placed: plan
+			.new_dirs_for(&RestoreSelection::default())
+			.placed
+			.into_iter()
+			.collect(),
+		..Default::default()
+	}
+}
+
+fn not_confirmed(err: PasteError, count: u64) {
+	match err {
+		PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::BadRequest,
+			reason: Some(reason),
+			..
+		}) => assert_eq!(
+			*reason,
+			snip_core::reason::Reason::NewDirsNotConfirmed { count }
+		),
+		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+	}
+}
+
+/// R1: a worker plans a folder that is not there without making it, wants
+/// the user's agreement to make it, and makes it with it: through a prepared
+/// preview, and through the direct re-plan Apply.
+#[test]
+fn a_worker_plans_a_missing_destination_and_makes_it_only_when_agreed() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let real = dunce::canonicalize(&ws).unwrap();
+	let text = entry("a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "not/yet");
+	let route = new_dirs_route(&[]);
+	let before = tree(&ws);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	assert_eq!(tree(&ws), before, "planning must not write");
+	assert!(plan.uses_prepared_import());
+	assert_eq!(
+		plan.new_dirs().requested,
+		vec![real.join("not"), real.join("not/yet")]
+	);
+	not_confirmed(
+		target
+			.apply_files(&text, &route, &plan, &RestoreSelection::default())
+			.unwrap_err(),
+		2,
+	);
+	assert_eq!(tree(&ws), before, "a refused apply must not write");
+
+	// A refused apply used the one-use preview up: preview again.
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let result = target
+		.apply_files(&text, &route, &plan, &confirm(&plan))
+		.unwrap();
+	assert_eq!(result.created_count, 1);
+	assert_eq!(result.created_dirs, 2);
+	assert_eq!(fs::read_to_string(ws.join("not/yet/a.txt")).unwrap(), "A");
+
+	// The same without a retained preview: the worker plans again.
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = new_dirs_route(&[]).mapping();
+	let planned = client
+		.import_plan(&id, "not/yet", &text, &mapping, None)
+		.unwrap();
+	assert!(tree(&ws).is_empty());
+	let none = client.import_apply(
+		&id,
+		"not/yet",
+		&text,
+		&mapping,
+		&RestoreSelection::default(),
+		&planned.expect(),
+		None,
+	);
+	assert_eq!(refused(none), ErrorCode::BadRequest);
+	assert!(tree(&ws).is_empty());
+	let agreed = RestoreSelection {
+		confirmed_placed: planned.plan.new_dirs().placed.into_iter().collect(),
+		..Default::default()
+	};
+	let result = client
+		.import_apply(
+			&id,
+			"not/yet",
+			&text,
+			&mapping,
+			&agreed,
+			&planned.expect(),
+			None,
+		)
+		.unwrap();
+	assert_eq!(result.created_dirs, 2);
+	assert_eq!(fs::read_to_string(ws.join("not/yet/a.txt")).unwrap(), "A");
+}
+
+/// A worker's preview raced: `new` is made after planning checked the
+/// tails and before it told the named folders from the others (primary
+/// `new/sub`, prefix `q` at `NEW/SUB` on a filesystem that folds case, so
+/// planning took `SUB` for an incidental folder). The Apply that follows is
+/// refused, unagreed, and makes nothing: the master's snapshot carries the
+/// tails as they were placed, and the worker's own plan checks its own.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_folder_made_while_a_worker_plans_does_not_take_consent_away() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let real = dunce::canonicalize(&ws).unwrap();
+	fs::write(real.join(".case-probe"), "").unwrap();
+	assert!(
+		real.join(".CASE-PROBE").exists(),
+		"needs a filesystem that folds case"
+	);
+	fs::remove_file(real.join(".case-probe")).unwrap();
+	let text = entry("q/b.txt", "B");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = new_dirs_route(&[("q", "NEW/SUB")]).mapping();
+	let planned = {
+		let new = real.join("new");
+		let _hook =
+			snip_core::transfer::test_hooks::after_tail_check(move || {
+				fs::create_dir_all(&new).unwrap()
+			});
+		client
+			.import_plan(&id, "new/sub", &text, &mapping, None)
+			.unwrap()
+	};
+	let result = client.import_apply(
+		&id,
+		"new/sub",
+		&text,
+		&mapping,
+		&RestoreSelection::default(),
+		&planned.expect(),
+		None,
+	);
+	assert!(
+		matches!(refused(result), ErrorCode::Stale | ErrorCode::BadRequest),
+		"an unagreed Apply must be refused"
+	);
+	assert_eq!(tree(&ws), vec![ws.join("new")]);
+}
+
+/// R2: the same payload into the same missing folder writes the same bytes
+/// locally and on a worker.
+#[test]
+fn a_missing_destination_is_pasted_the_same_locally_and_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local = tmp.path().join("local");
+	fs::create_dir_all(&ws).unwrap();
+	fs::create_dir_all(&local).unwrap();
+	let text = [entry("a.txt", "A"), entry("sub/b.txt", "B")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = remote_target(client, id, "not/yet");
+	let here = PasteTarget::Local {
+		dest: local.join("not/yet"),
+		bound: Some(local.clone()),
+	};
+	let route = new_dirs_route(&[]);
+	let opts = RunOptions::default();
+	let lp = here.plan_files(&text, &route, &opts, None).unwrap();
+	let rp = remote.plan_files(&text, &route, &opts, None).unwrap();
+	let rels = |p: &FilePastePlan| {
+		p.restore_plan()
+			.create_operations
+			.iter()
+			.map(|o| o.relative_path.clone())
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(rels(&lp), rels(&rp));
+	let lres = here.apply_files(&text, &route, &lp, &confirm(&lp)).unwrap();
+	let rres = remote
+		.apply_files(&text, &route, &rp, &confirm(&rp))
+		.unwrap();
+	assert_eq!(lres, rres);
+	for rel in ["not/yet/a.txt", "not/yet/sub/b.txt"] {
+		assert_eq!(
+			fs::read(ws.join(rel)).unwrap(),
+			fs::read(local.join(rel)).unwrap(),
+			"{rel}"
+		);
+	}
+	// A local folder outside the bound is refused as such.
+	let outside = tmp.path().join("outside");
+	fs::create_dir_all(&outside).unwrap();
+	let there = PasteTarget::Local {
+		dest: outside.join("new"),
+		bound: Some(local.clone()),
+	};
+	match there.plan_files(&text, &route, &opts, None) {
+		Err(err @ PasteError::Destination { .. }) => assert!(matches!(
+			err.reason(),
+			snip_core::reason::Reason::OutsideRoot { .. }
+		)),
+		other => panic!("expected a refused destination, got {other:?}"),
+	}
+}
+
+/// R4: a new worker on an older protocol refuses a missing folder, planning
+/// nothing and making nothing, whatever the master asked.
+#[test]
+fn a_worker_on_protocol_8_refuses_a_missing_folder_even_when_asked() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(Some(8));
+	let (client, id) = open(&w, &ws);
+	let text = entry("a.txt", "A");
+	let mapping = new_dirs_route(&[]).mapping();
+	assert!(mapping.allow_new_dirs);
+	assert_eq!(
+		refused(client.import_plan(&id, "not/yet", &text, &mapping, None)),
+		ErrorCode::NotFound
+	);
+	assert!(tree(&ws).is_empty());
+}
+
+/// R5: through a paste target that same worker is "too old" when the folder
+/// asked for is missing, and is refused as before for any other reason.
+#[test]
+fn a_worker_too_old_for_new_folders_says_so_only_when_a_folder_is_missing() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("sub")).unwrap();
+	let w = worker(Some(8));
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "not/yet");
+	let text = entry("a.txt", "A");
+	let opts = RunOptions::default();
+	match target.plan_files(&text, &new_dirs_route(&[]), &opts, None) {
+		Err(PasteError::Remote(RemoteError::WorkerTooOld {
+			have: 8,
+			need: 9,
+			..
+		})) => {}
+		other => panic!("expected WorkerTooOld, got {other:?}"),
+	}
+	// A prefix folder that is missing is the same.
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "sub");
+	match target.plan_files(
+		&text,
+		&new_dirs_route(&[("p", "nope")]),
+		&opts,
+		None,
+	) {
+		Err(PasteError::Remote(RemoteError::WorkerTooOld {
+			need: 9, ..
+		})) => {}
+		other => panic!("expected WorkerTooOld, got {other:?}"),
+	}
+	// Every folder exists and the refusal is about something else.
+	match target.plan_files(
+		&text,
+		&new_dirs_route(&[("a/b", "sub")]),
+		&opts,
+		None,
+	) {
+		Err(PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::BadRequest,
+			..
+		})) => {}
+		other => panic!("expected the plain refusal, got {other:?}"),
+	}
+	assert!(tree(&ws).iter().all(|p| p.starts_with(ws.join("sub"))));
+}
+
+/// R6: the agreement is checked against the rows that are kept: unchecking
+/// the row that needs a folder drops the need for it.
+#[test]
+fn consent_is_checked_against_the_rows_that_are_kept() {
+	let _serial = serial();
+	let text = [entry("a.txt", "A"), entry("p/b.txt", "B")].concat();
+	for prepared in [true, false] {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		fs::create_dir_all(&ws).unwrap();
+		let real = dunce::canonicalize(&ws).unwrap();
+		let w = worker(None);
+		let (client, id) = open(&w, &ws);
+		let route = new_dirs_route(&[("p", "newp")]);
+		let mapping = route.mapping();
+		let client = Arc::new(client);
+		let target = PasteTarget::Remote {
+			client: client.clone(),
+			workspace: id.clone(),
+			dest: "not".into(),
+		};
+		// Previews, and applies, one way or the other. A refused Apply uses
+		// a retained preview up, so each Apply has a preview of its own.
+		let apply = |sel: &RestoreSelection| -> Result<_, PasteError> {
+			if prepared {
+				let plan = target.plan_files(
+					&text,
+					&route,
+					&RunOptions::default(),
+					None,
+				)?;
+				assert!(plan.uses_prepared_import());
+				target.apply_files(&text, &route, &plan, sel)
+			} else {
+				let planned = client
+					.import_plan(&id, "not", &text, &mapping, None)
+					.map_err(PasteError::Remote)?;
+				client
+					.import_apply(
+						&id,
+						"not",
+						&text,
+						&mapping,
+						sel,
+						&planned.expect(),
+						None,
+					)
+					.map_err(PasteError::Remote)
+			}
+		};
+		let import = client
+			.import_plan(&id, "not", &text, &mapping, None)
+			.unwrap()
+			.plan;
+		assert_eq!(
+			import.new_dirs().requested,
+			vec![real.join("newp"), real.join("not")],
+			"prepared: {prepared}"
+		);
+		let index = import
+			.create_operations()
+			.iter()
+			.position(|o| o.relative_path.ends_with("b.txt"))
+			.unwrap();
+		// Agreed to the destination only, the prefix row kept: refused.
+		let only_dest = RestoreSelection {
+			confirmed_placed: [0].into(),
+			..Default::default()
+		};
+		not_confirmed(apply(&only_dest).unwrap_err(), 1);
+		assert!(tree(&ws).is_empty(), "prepared: {prepared}");
+		// The prefix row unchecked: the destination alone is enough.
+		let dropped = RestoreSelection {
+			unchecked_creates: [index].into(),
+			..only_dest
+		};
+		let result = apply(&dropped).unwrap();
+		assert_eq!(result.created_count, 1, "prepared: {prepared}");
+		assert_eq!(result.created_dirs, 1, "prepared: {prepared}");
+		assert!(ws.join("not/a.txt").exists());
+		assert!(!ws.join("newp").exists(), "prepared: {prepared}");
+	}
+}
+
+/// R7: what a master sends back is checked and never trusted as a place to
+/// make anything.
+#[test]
+fn a_masters_snapshot_and_agreement_cannot_make_a_worker_write_elsewhere() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let evil = tmp.path().join("evil");
+	fs::create_dir_all(&ws).unwrap();
+	let real = dunce::canonicalize(&ws).unwrap();
+	let text = entry("a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = new_dirs_route(&[]).mapping();
+	let planned = client
+		.import_plan(&id, "not", &text, &mapping, None)
+		.unwrap();
+	let agreed = RestoreSelection {
+		confirmed_placed: [0].into(),
+		..Default::default()
+	};
+	let send = |expect: &snip_remote::ImportExpect, sel: &RestoreSelection| {
+		client.import_apply(&id, "not", &text, &mapping, sel, expect, None)
+	};
+
+	// A requested folder outside the workspace is not one this paste could
+	// have recorded.
+	let mut forged = planned.expect();
+	forged.freshness.requested_dirs = Some([evil.clone()].into());
+	assert_eq!(refused(send(&forged, &agreed)), ErrorCode::BadRequest);
+
+	// So is a placed tail outside it.
+	let mut forged = planned.expect();
+	forged.freshness.placed = Some(vec![vec![evil.join("x")]]);
+	assert_eq!(refused(send(&forged, &agreed)), ErrorCode::BadRequest);
+
+	// A tail that is not the one the worker places again is stale.
+	let mut moved = planned.expect();
+	moved.freshness.placed = Some(vec![vec![real.join("other")]]);
+	assert_eq!(refused(send(&moved, &agreed)), ErrorCode::Stale);
+
+	// A shrunken list is not the plan the worker makes again.
+	let mut shrunk = planned.expect();
+	shrunk.freshness.requested_dirs = Some(Default::default());
+	assert_eq!(refused(send(&shrunk, &agreed)), ErrorCode::Stale);
+	assert!(tree(&ws).is_empty());
+
+	// An agreement naming a place the plan does not have is only an
+	// agreement: the worker makes what it plans, nothing the master names.
+	let wide = RestoreSelection {
+		confirmed_placed: [0, 7].into(),
+		..Default::default()
+	};
+	let result = send(&planned.expect(), &wide).unwrap();
+	assert_eq!(result.created_dirs, 1);
+	assert!(!evil.exists());
+	assert!(ws.join("not/a.txt").exists());
+}
+
+// ---------------------------------------------------------------------------
+// #241 review: a path below the folder, planning that writes nothing, one
+// identity for a new folder
+// ---------------------------------------------------------------------------
+
+/// R7: a payload path that names no file below the folder to make is
+/// skipped, on a worker and locally, and the folder is never made as a file.
+#[test]
+fn a_path_with_no_file_name_is_not_the_missing_destination_on_either_side() {
+	let _serial = serial();
+	for raw in [".", "/", "p/", "p/."] {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let local = tmp.path().join("local");
+		fs::create_dir_all(&ws).unwrap();
+		fs::create_dir_all(&local).unwrap();
+		let text = entry(raw, "BODY");
+		let w = worker(None);
+		let (client, id) = open(&w, &ws);
+		let remote = remote_target(client, id, "not/yet");
+		let here = PasteTarget::Local {
+			dest: local.join("not/yet"),
+			bound: Some(local.clone()),
+		};
+		let (there, on_disk) = (new_dirs_route(&[("p", "not/yet")]), &local);
+		let here_route = PasteRoute {
+			prefixes: vec![("p".to_string(), on_disk.join("not/yet"))],
+			..there.clone()
+		};
+		for (name, target, dir, route) in [
+			("worker", &remote, &ws, &there),
+			("local", &here, &local, &here_route),
+		] {
+			let opts = RunOptions::default();
+			let plan = target.plan_files(&text, route, &opts, None).unwrap();
+			assert!(
+				plan.restore_plan().create_operations.is_empty(),
+				"{name} {raw:?}: planned {:?}",
+				plan.restore_plan().create_operations
+			);
+			let result = target
+				.apply_files(&text, route, &plan, &confirm(&plan))
+				.unwrap();
+			assert_eq!(result.created_count, 0, "{name} {raw:?}");
+			assert!(
+				tree(dir).is_empty(),
+				"{name} {raw:?}: wrote {:?}",
+				tree(dir)
+			);
+		}
+	}
+}
+
+/// R10: when the restore base is Add, a path with no file name in the payload
+/// is not the folder Add names, on a worker and locally: it is skipped, and
+/// the files beside it land where Add puts them.
+#[test]
+fn add_does_not_turn_a_path_without_a_file_name_into_its_folder_on_either_side()
+{
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local = tmp.path().join("local");
+	for root in [&ws, &local] {
+		fs::create_dir_all(root.join("proj/src/lib")).unwrap();
+	}
+	let text = [
+		entry("lib/a.rs", "A"),
+		entry("lib/b.rs", "B"),
+		entry(".", "DOT"),
+		entry("./", "SLASH"),
+		entry("c.txt", "C"),
+	]
+	.concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = remote_target(client, id, "proj");
+	let here = PasteTarget::Local {
+		dest: local.join("proj"),
+		bound: None,
+	};
+	let route = PasteRoute {
+		adjust_paths: true,
+		..Default::default()
+	};
+	let expected = ["src/c.txt", "src/lib/a.rs", "src/lib/b.rs"];
+	for (name, target, dir) in
+		[("worker", &remote, &ws), ("local", &here, &local)]
+	{
+		let mut base = None;
+		let mut note = |s: &snip_core::restore::RestoreBaseSuggestion| {
+			base = Some(s.base.clone())
+		};
+		let plan = target
+			.plan_files(&text, &route, &RunOptions::default(), Some(&mut note))
+			.unwrap();
+		assert_eq!(
+			base,
+			Some(snip_core::restore::RestoreBase::Add {
+				prefix: "src".into()
+			}),
+			"{name}"
+		);
+		let mut planned: Vec<String> = plan
+			.restore_plan()
+			.create_operations
+			.iter()
+			.map(|op| op.relative_path.clone())
+			.collect();
+		planned.sort();
+		assert_eq!(planned, expected, "{name}");
+		let result = target
+			.apply_files(&text, &route, &plan, &RestoreSelection::default())
+			.unwrap();
+		assert_eq!(result.created_count, 3, "{name}");
+		for rel in expected {
+			assert!(dir.join("proj").join(rel).is_file(), "{name} {rel}");
+		}
+		assert!(dir.join("proj/src/lib").is_dir(), "{name}");
+	}
+}
+
+/// R8: a worker's planning does not write into the empty folder it only
+/// reads, the mtime the proof: a probe file made and removed there moves it.
+#[cfg(unix)]
+#[test]
+fn a_worker_plans_a_missing_destination_without_touching_its_anchor() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "new");
+	let old = std::time::SystemTime::UNIX_EPOCH
+		+ std::time::Duration::from_secs(1_000_000_000);
+	let handle = fs::File::open(&ws).unwrap();
+	handle.set_modified(old).unwrap();
+	drop(handle);
+	let before = fs::metadata(&ws).unwrap().modified().unwrap();
+	let text = entry("a.txt", "A");
+	let route = new_dirs_route(&[]);
+	target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	assert_eq!(
+		fs::metadata(&ws).unwrap().modified().unwrap(),
+		before,
+		"the worker's planning wrote into the anchor"
+	);
+	assert!(tree(&ws).is_empty());
+}
+
+/// R9: two spellings of one new folder on a worker: both are listed and
+/// agreed to, the folder is made once (the second `mkdir` meets the
+/// worker's own folder), and both files land.
+#[test]
+fn a_worker_makes_one_folder_of_two_spellings_of_it() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("base")).unwrap();
+	let ci = {
+		let probe = ws.join("probe_x");
+		fs::write(&probe, "x").unwrap();
+		let ci = ws.join("PROBE_X").exists();
+		fs::remove_file(&probe).unwrap();
+		ci
+	};
+	let text = [entry("p/a.txt", "A"), entry("q/b.txt", "B")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "base");
+	let route = new_dirs_route(&[("p", "new"), ("q", "NEW")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let asked = plan.new_dirs().requested;
+	assert_eq!(asked.len(), 2, "{asked:?}");
+	let result = target
+		.apply_files(&text, &route, &plan, &confirm(&plan))
+		.unwrap();
+	assert_eq!(result.created_count, 2);
+	assert_eq!(result.created_dirs, if ci { 1 } else { 2 });
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "A");
+	let second = if ci { "new/b.txt" } else { "NEW/b.txt" };
+	assert_eq!(fs::read_to_string(ws.join(second)).unwrap(), "B");
+}
+
+// ---------------------------------------------------------------------------
+// #241: the worker's Apply asks the filesystem, not the name key
+// ---------------------------------------------------------------------------
+
+/// Asserts that the filesystem under `dir` folds case.
+#[cfg(any(target_os = "macos", windows))]
+fn assert_folds_case(dir: &Path) {
+	let probe = dir.join("probe_x");
+	fs::write(&probe, "x").unwrap();
+	assert!(
+		dir.join("PROBE_X").exists(),
+		"needs a filesystem that folds case"
+	);
+	fs::remove_file(&probe).unwrap();
+}
+
+/// The destination `new` is not made yet; `q` is the workspace itself,
+/// and the payload reaches `new` as `q/NEW`. With the name key switched
+/// off the worker cannot tell the two names apart, and still makes
+/// nothing without consent: the folder that exists after its own folders
+/// are made is the filesystem's answer.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_worker_does_not_make_the_named_folder_through_a_case_alias_without_the_key(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	assert_folds_case(&ws);
+	let _keys = snip_core::transfer::test_hooks::distinct_name_keys();
+	let text = entry("q/NEW/a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "new");
+	let route = new_dirs_route(&[("q", "")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let err = target
+		.apply_files(&text, &route, &plan, &RestoreSelection::default())
+		.unwrap_err();
+	not_confirmed(err, 1);
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// Two rows that are one file on the worker's filesystem (`a.txt` and
+/// `A.txt` where case folds), with the name key switched off: the worker
+/// meets the second at `create_new` and writes neither.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_worker_does_not_write_one_file_twice_without_the_key() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	assert_folds_case(&ws);
+	let _keys = snip_core::transfer::test_hooks::distinct_name_keys();
+	let text =
+		[entry("sub/a.txt", "FIRST"), entry("SUB/A.txt", "SECOND")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "");
+	let route = new_dirs_route(&[]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let sel = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	match target.apply_files(&text, &route, &plan, &sel) {
+		Err(PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Collision,
+			..
+		})) => {}
+		other => panic!("expected a collision, got {other:?}"),
+	}
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// A fresh HFS+ volume (`hdiutil`), detached when dropped: HFS+ ignores
+/// some characters (U+200C among them), which no name key of ours knows.
+#[cfg(target_os = "macos")]
+struct Hfs {
+	mount: PathBuf,
+	_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "macos")]
+impl Hfs {
+	fn new() -> Option<Self> {
+		use std::process::Command;
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		let image = path.join("vol.dmg");
+		let mount = path.join("mnt");
+		fs::create_dir(&mount).unwrap();
+		let made = Command::new("hdiutil")
+			.args(["create", "-quiet", "-size", "8m", "-fs", "HFS+"])
+			.args(["-volname", "snip241"])
+			.arg(&image)
+			.status()
+			.is_ok_and(|s| s.success())
+			&& Command::new("hdiutil")
+				.args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+				.arg(&mount)
+				.arg(&image)
+				.status()
+				.is_ok_and(|s| s.success());
+		if !made {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"hdiutil could not make an HFS+ volume"
+			);
+			eprintln!("skipped: hdiutil could not make an HFS+ volume");
+			return None;
+		}
+		Some(Self { mount, _dir: dir })
+	}
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Hfs {
+	fn drop(&mut self) {
+		let _ = std::process::Command::new("hdiutil")
+			.args(["detach", "-quiet", "-force"])
+			.arg(&self.mount)
+			.status();
+	}
+}
+
+/// On a worker's HFS+ workspace, `A/a.txt` and `A<U+200C>/a.txt` are one
+/// file the preview shows as two; the worker's Apply meets the second at
+/// `create_new` and writes neither.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_on_hfs_does_not_write_one_file_twice_through_an_ignored_character()
+{
+	let _serial = serial();
+	let Some(hfs) = Hfs::new() else { return };
+	let ws = hfs.mount.join("ws");
+	fs::create_dir(&ws).unwrap();
+	let text = [
+		entry("A/a.txt", "FIRST"),
+		entry("A\u{200C}/a.txt", "SECOND"),
+	]
+	.concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "");
+	let route = new_dirs_route(&[]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	assert_eq!(plan.restore_plan().create_operations.len(), 2);
+	let sel = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	match target.apply_files(&text, &route, &plan, &sel) {
+		Err(PasteError::Remote(RemoteError::Refused {
+			code: ErrorCode::Collision,
+			..
+		})) => {}
+		other => panic!("expected a collision, got {other:?}"),
+	}
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// On a worker's HFS+ workspace, the destination `A` (not made yet)
+/// reached as `q/A<U+200C>` through `q` (the workspace itself): nothing is
+/// made without consent.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_on_hfs_does_not_make_the_named_folder_through_an_ignored_character()
+{
+	let _serial = serial();
+	let Some(hfs) = Hfs::new() else { return };
+	let ws = hfs.mount.join("ws");
+	fs::create_dir(&ws).unwrap();
+	let text = entry("q/A\u{200C}/a.txt", "A");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let target = remote_target(client, id, "A");
+	let route = new_dirs_route(&[("q", "")]);
+	let plan = target
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let err = target
+		.apply_files(&text, &route, &plan, &RestoreSelection::default())
+		.unwrap_err();
+	not_confirmed(err, 1);
+	assert!(tree(&ws).is_empty(), "{:?}", tree(&ws));
+}
+
+/// How someone else changes `b.txt` on the worker after its Apply made it
+/// empty and before its row writes.
+#[derive(Clone, Copy)]
+enum Interloper {
+	/// Writes into the empty file itself (the same object).
+	WritesInto(&'static [u8]),
+	/// Renames another file over it (a new object at the name).
+	RenamesOver(&'static [u8]),
+}
+
+impl Interloper {
+	fn run(self, target: &Path) {
+		match self {
+			Self::WritesInto(bytes) => fs::write(target, bytes).unwrap(),
+			Self::RenamesOver(bytes) => {
+				let other = target.with_file_name("other.tmp");
+				fs::write(&other, bytes).unwrap();
+				fs::rename(&other, target).unwrap();
+			}
+		}
+	}
+
+	fn bytes(self) -> &'static [u8] {
+		match self {
+			Self::WritesInto(b) | Self::RenamesOver(b) => b,
+		}
+	}
+}
+
+/// Two new files through a worker, held after the first write
+/// (`SNIP_E2E_PASTE_HOLD`) while the interloper changes the second one's
+/// reservation. Returns the result and `b.txt`'s bytes.
+fn worker_apply_with_reservation_changed(
+	selection: RestoreSelection,
+	how: Interloper,
+) -> (RestoreExecutionResult, Vec<u8>) {
+	use std::time::{Duration, Instant};
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let hold = tmp.path().join("paste-hold");
+	let text = [entry("a.txt", "first"), entry("b.txt", "second")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+
+	fs::write(&hold, b"").unwrap();
+	std::env::set_var("SNIP_E2E_PASTE_HOLD", &hold);
+	let call = std::thread::spawn(move || {
+		client.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&selection,
+			&planned.expect(),
+			None,
+		)
+	});
+	let content = |name: &str| fs::read(ws.join(name)).unwrap_or_default();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while content("a.txt") != b"first" && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	let first = content("a.txt");
+	let reserved = ws.join("b.txt").is_file() && content("b.txt").is_empty();
+	if first == b"first" && reserved {
+		how.run(&ws.join("b.txt"));
+	}
+	fs::remove_file(&hold).unwrap();
+	let answer = call.join().expect("the call thread must end");
+	std::env::remove_var("SNIP_E2E_PASTE_HOLD");
+	assert_eq!(first, b"first", "the worker must commit its first write");
+	assert!(reserved, "b.txt is reserved, empty, when the hold starts");
+	let result = answer.unwrap();
+	assert_eq!(content("a.txt"), b"first");
+	assert!(!ws.join("other.tmp").exists());
+	(result, content("b.txt"))
+}
+
+fn assert_worker_reservation_kept(
+	result: &RestoreExecutionResult,
+	b: &[u8],
+	how: Interloper,
+) {
+	assert!(result.errors.is_empty(), "{result:?}");
+	assert_eq!(result.created_count, 1, "{result:?}");
+	assert_eq!(result.overwritten_count, 0, "{result:?}");
+	assert_eq!(result.skipped_existing_count, 1, "{result:?}");
+	assert_eq!(b, how.bytes(), "what someone else put there is kept");
+}
+
+#[test]
+fn a_worker_keeps_a_reserved_file_someone_else_wrote() {
+	let _serial = serial();
+	let worker_default = RestoreSelection {
+		overwrite_existing: true,
+		skip_existing: true,
+		..Default::default()
+	};
+	for selection in [RestoreSelection::default(), worker_default] {
+		for how in [
+			Interloper::WritesInto(b"external\n"),
+			Interloper::RenamesOver(b"replaced\n"),
+		] {
+			let (result, b) =
+				worker_apply_with_reservation_changed(selection.clone(), how);
+			assert_worker_reservation_kept(&result, &b, how);
+		}
+	}
+}
+
+#[test]
+fn a_worker_overwrites_a_reserved_file_someone_else_wrote_only_when_allowed() {
+	let _serial = serial();
+	let selection = unchecked(&[]);
+	for how in [
+		Interloper::WritesInto(b"external\n"),
+		Interloper::RenamesOver(b"replaced\n"),
+	] {
+		let (result, b) =
+			worker_apply_with_reservation_changed(selection.clone(), how);
+		assert!(result.errors.is_empty(), "{result:?}");
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.overwritten_count, 1, "{result:?}");
+		assert_eq!(b, b"second");
+	}
+	for how in [
+		Interloper::WritesInto(&[0xff, 0xfe, 0x00, 0x41, 0x00, 0x0a]),
+		Interloper::RenamesOver(&[0xa4, 0xe9, 0xa5, 0xbb, 0x0a]),
+	] {
+		let (result, b) =
+			worker_apply_with_reservation_changed(selection.clone(), how);
+		assert_worker_reservation_kept(&result, &b, how);
 	}
 }

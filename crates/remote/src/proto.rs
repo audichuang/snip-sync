@@ -29,9 +29,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// export (an empty [`ExportTarget::path`]), and chunked requests;
 /// 6 = typed, bounded destination reads for commit paste previews;
 /// 7 = compact file previews and one-use prepared file payloads;
-/// 8 = prepared commit replays ([`Request::PrepareReplay`]).
-pub const PROTOCOL_MAX: u32 = 8;
+/// 8 = prepared commit replays ([`Request::PrepareReplay`]);
+/// 9 = file pastes into folders that do not exist yet
+/// ([`PasteMapping::allow_new_dirs`], `RestoreSelection::confirmed_placed`).
+pub const PROTOCOL_MAX: u32 = 9;
 pub const PREPARED_IMPORT_VERSION: u32 = 7;
+/// The first protocol where a worker plans a paste into folders that do not
+/// exist yet and makes them once the master has the user's agreement.
+pub const CREATE_DIRS_VERSION: u32 = 9;
 /// The first protocol with a retained commit-replay preview.
 pub const PREPARED_REPLAY_VERSION: u32 = 8;
 /// The first protocol with Git views.
@@ -260,6 +265,11 @@ pub struct PasteMapping {
 	/// The settings' header format ("" is the default).
 	#[serde(default)]
 	pub header_format: String,
+	/// The destination and every prefix folder may not exist yet (the CLI):
+	/// a worker on [`CREATE_DIRS_VERSION`] or newer plans them as folders to
+	/// make. False: they must exist, as before. Never on the wire when false.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub allow_new_dirs: bool,
 }
 
 /// What a master previewed: an import Apply refuses when the plan made
@@ -2542,5 +2552,88 @@ mod prepared_metadata_tests {
 		}
 		assert!(json.len() <= JOINED_MAX);
 		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
+	}
+
+	/// A Windows worker's prepared preview, hydrated on a master of any OS:
+	/// the folders it lists to make are the worker's, as the worker worked
+	/// them out, not what this machine's path rules make of `C:\ws\new`.
+	#[test]
+	fn a_windows_workers_preview_lists_its_new_folders_on_any_master() {
+		let text = "// file: new/sub/a.txt\nA\n// file: new/b.txt\nB\n";
+		let entries = snip_core::format::parse_clipboard(text, "");
+		let metadata: ImportMetadata =
+			serde_json::from_value(serde_json::json!({
+				"roots": ["C:\\ws"],
+				"restore_roots": ["C:\\ws"],
+				"creates": [
+					{
+						"relative_path": "new/sub/a.txt",
+						"absolute_path": "C:\\ws\\new\\sub\\a.txt",
+						"existed": false,
+						"root_path": "C:\\ws",
+						"entry": 0
+					},
+					{
+						"relative_path": "new/b.txt",
+						"absolute_path": "C:\\ws\\new\\b.txt",
+						"existed": false,
+						"root_path": "C:\\ws",
+						"entry": 1
+					}
+				],
+				"deletes": [],
+				"skips": [],
+				"freshness": {
+					"roots": {},
+					"target_files": {},
+					"missing_dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+					"requested_dirs": ["C:\\ws\\new"],
+					"placed": [["C:\\ws\\new"]],
+					"new_dirs": {
+						"dirs": ["C:\\ws\\new", "C:\\ws\\new\\sub"],
+						"needs": [[0, 1], [0]],
+						"routes": [0, 0]
+					}
+				}
+			}))
+			.unwrap();
+		let restore_plan = snip_core::restore::RestorePlan {
+			roots: metadata.restore_roots.clone(),
+			create_operations: metadata
+				.creates
+				.iter()
+				.map(|op| snip_core::restore::CreateOperation {
+					relative_path: op.relative_path.clone(),
+					absolute_path: op.absolute_path.clone(),
+					content: entries[op.entry].content.clone(),
+					existed: op.existed,
+					root_path: op.root_path.clone(),
+				})
+				.collect(),
+			delete_operations: Vec::new(),
+			skipped_operations: Vec::new(),
+		};
+		let prepared = ImportPrepared {
+			metadata,
+			digest: restore_plan_digest(&restore_plan).unwrap(),
+			suggestion: None,
+			token: None,
+		};
+		let planned = prepared.hydrate(text, "").unwrap();
+		let new = std::path::PathBuf::from(r"C:\ws\new");
+		let sub = std::path::PathBuf::from(r"C:\ws\new\sub");
+		assert_eq!(
+			planned.plan.new_dirs(),
+			snip_core::transfer::NewDirs {
+				requested: vec![new.clone()],
+				incidental: vec![sub],
+				placed: vec![0],
+			}
+		);
+		// The placed folder `--create-dirs` agrees to, by its place.
+		assert_eq!(planned.plan.placed_folders(), [vec![new]]);
+		// The worker gets the list back with the preview it checks.
+		let expect = planned.expect();
+		assert!(serde_json::to_string(&expect).unwrap().contains("new_dirs"));
 	}
 }

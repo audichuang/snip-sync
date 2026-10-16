@@ -77,6 +77,7 @@ fn sanitize_scan_error(failure: &Failure, share: &Path) -> (String, Reason) {
 		| Reason::PayloadTooLarge { .. }
 		| Reason::SourceChanged { .. }
 		| Reason::DestinationChanged { .. }
+		| Reason::NewDirsNotConfirmed { .. }
 		| Reason::CrossRepoCommits
 		| Reason::Discontinuous { .. }
 		| Reason::NotEnoughCommits { .. }

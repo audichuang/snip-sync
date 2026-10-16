@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
+use crate::foldernames::{DirKey, NewFolderNames, TargetId};
 use crate::format::{
 	self, BorrowedPayloadOptions, ChangeType, ParsedEntry, PayloadFile,
 };
@@ -188,6 +189,252 @@ impl CanonicalRootId {
 impl std::fmt::Display for CanonicalRootId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0.display())
+	}
+}
+
+/// A paste folder that may not exist yet: its nearest existing ancestor
+/// (canonical) and the names below it still to be made. A folder that
+/// exists has an empty tail and is exactly its `CanonicalRootId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlacedRoot {
+	anchor: CanonicalRootId,
+	tail: Vec<String>,
+}
+
+/// Why a paste folder cannot be used as a destination.
+#[derive(Debug, thiserror::Error)]
+pub enum DestinationError {
+	#[error("'{}' is not a folder", .path.display())]
+	NotADirectory { path: PathBuf },
+	#[error("'{}' is outside the workspace", .path.display())]
+	OutsideBound { path: PathBuf },
+	#[error("'{name}' cannot be a folder name here")]
+	InvalidName { name: String },
+	#[error(transparent)]
+	Io(#[from] io::Error),
+}
+
+impl DestinationError {
+	/// What a front end words: the variant survives into `PasteError::reason()`.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::NotADirectory { path } => Reason::NotRegularFile {
+				path: path.display().to_string(),
+			},
+			Self::OutsideBound { path } => Reason::OutsideRoot {
+				path: path.display().to_string(),
+			},
+			Self::InvalidName { name } => {
+				Reason::UnsafePath { path: name.clone() }
+			}
+			Self::Io(e) => io_reason(e, ""),
+		}
+	}
+}
+
+/// Wraps the error as the payload of an `io::Error` (NotADirectory keeps the
+/// kind of that name, OutsideBound is PermissionDenied, InvalidName is
+/// InvalidInput; `Io(e)` is `e` itself), so `PasteError::Destination` keeps
+/// its shape and `PasteError::reason()` can still downcast it.
+impl From<DestinationError> for io::Error {
+	fn from(err: DestinationError) -> Self {
+		let kind = match &err {
+			DestinationError::NotADirectory { .. } => {
+				io::ErrorKind::NotADirectory
+			}
+			DestinationError::OutsideBound { .. } => {
+				io::ErrorKind::PermissionDenied
+			}
+			DestinationError::InvalidName { .. } => io::ErrorKind::InvalidInput,
+			DestinationError::Io(_) => {
+				let DestinationError::Io(e) = err else {
+					unreachable!()
+				};
+				return e;
+			}
+		};
+		io::Error::new(kind, err)
+	}
+}
+
+impl From<CanonicalRootId> for PlacedRoot {
+	fn from(anchor: CanonicalRootId) -> Self {
+		Self {
+			anchor,
+			tail: Vec::new(),
+		}
+	}
+}
+
+impl PlacedRoot {
+	/// Reads `path` (absolute) and finds the folder it names: the deepest
+	/// ancestor that exists as the anchor, the names below it as the tail.
+	/// Writes nothing. `bound` is a folder the anchor must lie in, symlinks
+	/// resolved; a name below the anchor is made there, so it cannot leave.
+	///
+	/// A name that is not made yet must be a plain, ordinary folder name:
+	/// no `..`, `.git`, character Windows or a path separator refuses,
+	/// trailing dot or space, or Windows reserved name; and nothing is made
+	/// inside a Git directory. A `..` in the part that exists is resolved by
+	/// the OS, as `CanonicalRootId::new` always did.
+	pub fn resolve(
+		bound: Option<&Path>,
+		path: &Path,
+	) -> Result<Self, DestinationError> {
+		if !path.is_absolute() {
+			return Err(DestinationError::InvalidName {
+				name: path.display().to_string(),
+			});
+		}
+		// Windows reads `new\..\x` as `x` without looking at `new`, so a
+		// `..` after a name that does not exist would pass there and be
+		// refused elsewhere: refused on every system.
+		let mut prefix = PathBuf::new();
+		let mut missing = false;
+		for part in path.components() {
+			if missing && part == std::path::Component::ParentDir {
+				return Err(DestinationError::InvalidName {
+					name: "..".to_string(),
+				});
+			}
+			prefix.push(part);
+			if !missing && matches!(part, std::path::Component::Normal(_)) {
+				missing = fs::symlink_metadata(&prefix).is_err_and(|e| {
+					matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					)
+				});
+			}
+		}
+		let mut cur = path;
+		let mut tail: Vec<String> = Vec::new();
+		let anchor = loop {
+			match fs::symlink_metadata(cur) {
+				Ok(meta) if meta.is_dir() => break CanonicalRootId::new(cur)?,
+				Ok(meta) if meta.file_type().is_symlink() => {
+					if fs::metadata(cur).is_ok_and(|m| m.is_dir()) {
+						break CanonicalRootId::new(cur)?;
+					}
+					return Err(DestinationError::NotADirectory {
+						path: cur.to_path_buf(),
+					});
+				}
+				Ok(_) => {
+					return Err(DestinationError::NotADirectory {
+						path: cur.to_path_buf(),
+					})
+				}
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					) =>
+				{
+					match cur.components().next_back() {
+						Some(std::path::Component::Normal(name)) => {
+							let Some(name) = name.to_str() else {
+								return Err(DestinationError::InvalidName {
+									name: name.to_string_lossy().into_owned(),
+								});
+							};
+							tail.push(name.to_string());
+						}
+						Some(std::path::Component::CurDir) => {}
+						Some(other) => {
+							return Err(DestinationError::InvalidName {
+								name: other
+									.as_os_str()
+									.to_string_lossy()
+									.into_owned(),
+							})
+						}
+						None => return Err(DestinationError::Io(e)),
+					}
+					match cur.parent() {
+						Some(parent) => cur = parent,
+						None => return Err(DestinationError::Io(e)),
+					}
+				}
+				Err(e) => return Err(DestinationError::Io(e)),
+			}
+		};
+		tail.reverse();
+		for name in &tail {
+			let plain = sanitize_relative_path(name).as_deref()
+				== Some(name.as_str())
+				&& !name.contains('/')
+				&& !paths::has_git_segment(name)
+				&& !paths::is_unfit_new_folder_name(name);
+			if !plain {
+				return Err(DestinationError::InvalidName {
+					name: name.clone(),
+				});
+			}
+		}
+		if let Some(bound) = bound {
+			let bound_real = dunce::canonicalize(bound)?;
+			if !paths::is_contained(anchor.path(), &bound_real) {
+				return Err(DestinationError::OutsideBound {
+					path: anchor.path().to_path_buf(),
+				});
+			}
+		}
+		let placed = Self { anchor, tail };
+		if !placed.tail.is_empty() && paths::lands_in_git_dir(&placed.path()) {
+			return Err(DestinationError::InvalidName {
+				name: placed.tail[0].clone(),
+			});
+		}
+		Ok(placed)
+	}
+
+	/// The nearest existing ancestor.
+	pub fn anchor(&self) -> &CanonicalRootId {
+		&self.anchor
+	}
+
+	/// The names below the anchor that are not made yet, shallow to deep.
+	pub fn tail(&self) -> &[String] {
+		&self.tail
+	}
+
+	/// The tail joined with `/`; empty when the folder exists.
+	pub fn tail_rel(&self) -> String {
+		self.tail.join("/")
+	}
+
+	/// The folder itself, lexically: the anchor with the tail below it.
+	pub fn path(&self) -> PathBuf {
+		let mut path = self.anchor.path().to_path_buf();
+		path.extend(&self.tail);
+		path
+	}
+
+	/// anchor/t1, anchor/t1/t2, ... (shallow to deep); empty when it exists.
+	/// Built with `PathBuf::push` per name, never by joining strings: the
+	/// keys must compare equal to `missing_dirs`, which come from
+	/// `op.absolute_path.parent()` (Windows separators included).
+	pub fn new_chain(&self) -> Vec<PathBuf> {
+		let mut path = self.anchor.path().to_path_buf();
+		self.tail
+			.iter()
+			.map(|name| {
+				path.push(name);
+				path.clone()
+			})
+			.collect()
+	}
+
+	/// Heap storage owned by this value; the enclosing owner counts the
+	/// inline struct once.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.tail.iter().fold(
+			self.anchor.retained_heap_bytes().saturating_add(
+				self.tail.capacity() * std::mem::size_of::<String>(),
+			),
+			|bytes, name| bytes.saturating_add(name.capacity()),
+		)
 	}
 }
 
@@ -389,15 +636,46 @@ pub enum TransferError {
 		at: String,
 		first_parent: Option<String>,
 	},
+	#[error(
+		"{} folder(s) would be created without consent: {}",
+		.dirs.len(),
+		.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+	)]
+	NewDirsNotConfirmed { dirs: Vec<PathBuf> },
 	#[error(transparent)]
 	Git(#[from] GitError),
 	#[error(transparent)]
 	Commit(#[from] CommitError),
 	#[error(transparent)]
 	Io(#[from] io::Error),
+	/// The Apply was refused after it made empty files or folders, and
+	/// taking some of them back failed: they are still there.
+	#[error(
+		"{cause}; what this paste made could not all be taken back: {}",
+		.left.join(", ")
+	)]
+	NotTakenBack {
+		cause: Box<TransferError>,
+		/// `path: why`, each.
+		left: Vec<String>,
+	},
 }
 
 impl TransferError {
+	/// `cause`, and `left` when taking back what was made failed for some.
+	fn left_behind(cause: Self, left: Vec<NotTakenBack>) -> Self {
+		if left.is_empty() {
+			return cause;
+		}
+		Self::NotTakenBack {
+			cause: Box::new(cause),
+			left: left
+				.iter()
+				.map(|(path, e)| format!("{}: {e}", path.display()))
+				.collect(),
+		}
+	}
+
 	/// Why this failed, as data for a front end to word. The `Display` text
 	/// stays the CLI's. An exhaustive match: a new variant must decide.
 	pub fn reason(&self) -> Reason {
@@ -451,6 +729,9 @@ impl TransferError {
 					change: change.clone(),
 				}
 			}
+			Self::NewDirsNotConfirmed { dirs } => Reason::NewDirsNotConfirmed {
+				count: dirs.len() as u64,
+			},
 			Self::CrossRepoCommitsNotSupported => Reason::CrossRepoCommits,
 			Self::DiscontinuousCommits {
 				base,
@@ -466,6 +747,8 @@ impl TransferError {
 			Self::Git(e) => e.reason(),
 			Self::Commit(e) => e.reason(),
 			Self::Io(e) => io_reason(e, ""),
+			// Why it was refused: what is left is in the text.
+			Self::NotTakenBack { cause, .. } => cause.reason(),
 		}
 	}
 
@@ -670,10 +953,12 @@ pub struct EntryMapping {
 /// Explicit destination mappings for importing clipboard payloads.
 #[derive(Debug, Clone, Default)]
 pub struct ImportMapping {
-	pub primary_destination: Option<CanonicalRootId>,
+	/// A destination folder may not exist yet: it is a [`PlacedRoot`], the
+	/// anchor the engine plans against plus the names still to be made.
+	pub primary_destination: Option<PlacedRoot>,
 	/// Nest every entry that lands in the primary destination under this directory (applies to relative entries only).
 	pub primary_prefix: Option<String>,
-	pub prefix_destinations: HashMap<String, CanonicalRootId>,
+	pub prefix_destinations: HashMap<String, PlacedRoot>,
 	pub entry_destinations: HashMap<String, EntryMapping>,
 	pub blocked_prefixes: HashSet<String>,
 }
@@ -683,17 +968,18 @@ impl ImportMapping {
 		Self::default()
 	}
 
-	pub fn with_primary(root: CanonicalRootId) -> Self {
+	pub fn with_primary(root: impl Into<PlacedRoot>) -> Self {
 		Self {
-			primary_destination: Some(root),
+			primary_destination: Some(root.into()),
 			..Default::default()
 		}
 	}
 
 	pub fn from_restore_base(
 		suggestion: &restore::RestoreBaseSuggestion,
-		primary: CanonicalRootId,
+		primary: impl Into<PlacedRoot>,
 	) -> Self {
+		let primary = primary.into();
 		match &suggestion.base {
 			restore::RestoreBase::Strip { segment } => {
 				let mut mapping = Self::with_primary(primary.clone());
@@ -711,9 +997,9 @@ impl ImportMapping {
 	pub fn map_prefix(
 		&mut self,
 		prefix: impl Into<String>,
-		root: CanonicalRootId,
+		root: impl Into<PlacedRoot>,
 	) -> &mut Self {
-		self.prefix_destinations.insert(prefix.into(), root);
+		self.prefix_destinations.insert(prefix.into(), root.into());
 		self
 	}
 
@@ -771,6 +1057,117 @@ pub struct DestinationFreshnessSnapshot {
 	/// did not show, so it is stale. `None`: not recorded.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub symlinked_dirs: Option<HashMap<PathBuf, PathBuf>>,
+	/// The folders of `missing_dirs` the user named as a destination or an
+	/// import path (a `PlacedRoot`'s tail), as opposed to those a file path
+	/// implies. Apply makes them only with consent, and one that exists by
+	/// then, as anything, is stale. `None`: not recorded (no tail, an older
+	/// peer).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub requested_dirs: Option<HashSet<PathBuf>>,
+	/// Each placed folder with a tail (the primary destination, then each
+	/// prefix by name; one entry for two that are the same anchor and
+	/// tail): every level of its tail, spelled as it was resolved
+	/// (`anchor/t1`, `anchor/t1/t2`, ...), what did not exist when the user
+	/// placed the folder. Its place in this list is what the user agrees
+	/// to (`RestoreSelection::confirmed_placed`). Apply holds the plan to
+	/// these, apart from how planning classified the folders
+	/// (`requested_dirs`): a level that exists is stale; one a kept row is
+	/// routed through is made only with consent; and a level of one not
+	/// agreed to that exists once this Apply made its folders (however the
+	/// filesystem matched the names) refuses the whole paste. `None`: no
+	/// tail, or an older peer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub placed: Option<Vec<Vec<PathBuf>>>,
+	/// The folders of `missing_dirs` each planned create needs, worked out
+	/// where the plan was made ([`PlannedNewDirs`]). A master reads a
+	/// worker's paths only as they are written: it never takes them apart
+	/// by its own path rules (on Unix `\` is part of a name), so what a
+	/// worker on another OS makes comes from here. Recorded only when the
+	/// plan places a folder (`placed`), so a plan without one is what
+	/// it was. `None`: no tail, or an older peer; then the folders are read
+	/// off the paths, right only when both machines share path rules.
+	/// Not compared by `matches_preview`: it follows from the plan the
+	/// digest covers and `missing_dirs`, and a worker's Apply works it out
+	/// again from its own plan.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub new_dirs: Option<PlannedNewDirs>,
+}
+
+/// The folders a plan's creates need made, as the planning machine reads
+/// its own paths: [`DestinationFreshnessSnapshot::new_dirs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedNewDirs {
+	/// Every folder of `missing_dirs` a create needs, shallow to deep (the
+	/// order [`NewDirs`] lists them in), each once.
+	pub dirs: Vec<PathBuf>,
+	/// For each create, by its index in the plan: the positions in `dirs`
+	/// of the folders it needs, ascending. Empty for one that exists.
+	pub needs: Vec<Vec<usize>>,
+	/// For each create, by its index in the plan: the placed folder
+	/// (`DestinationFreshnessSnapshot::placed`) its route goes through,
+	/// as routing chose it, never as its path reads. Empty: not recorded
+	/// (an older peer); then every placed folder counts as needed.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub routes: Vec<Option<usize>>,
+}
+
+impl PlannedNewDirs {
+	/// Read off the paths of `creates` by this machine's path rules: a
+	/// folder that exists has every ancestor existing, so what is missing
+	/// is one run from the file upward.
+	fn of(
+		creates: &[CreateOperation],
+		missing: &HashSet<PathBuf>,
+		routes: Vec<Option<usize>>,
+	) -> Self {
+		let mut per_create: Vec<Vec<&Path>> = Vec::with_capacity(creates.len());
+		let mut all: BTreeSet<(usize, &Path)> = BTreeSet::new();
+		for op in creates {
+			let mut chain = Vec::new();
+			if !op.existed {
+				let mut dir = op.absolute_path.parent();
+				while let Some(d) = dir {
+					if !missing.contains(d) {
+						break;
+					}
+					all.insert((d.components().count(), d));
+					chain.push(d);
+					dir = d.parent();
+				}
+			}
+			per_create.push(chain);
+		}
+		let position: HashMap<&Path, usize> =
+			all.iter().enumerate().map(|(i, (_, d))| (*d, i)).collect();
+		let needs = per_create
+			.into_iter()
+			.map(|chain| {
+				let mut idx: Vec<usize> =
+					chain.into_iter().map(|d| position[d]).collect();
+				idx.sort_unstable();
+				idx
+			})
+			.collect();
+		Self {
+			dirs: all.into_iter().map(|(_, d)| d.to_path_buf()).collect(),
+			needs,
+			routes,
+		}
+	}
+
+	fn heap_bytes(&self) -> usize {
+		let mut bytes = self.dirs.capacity() * std::mem::size_of::<PathBuf>()
+			+ self.needs.capacity() * std::mem::size_of::<Vec<usize>>()
+			+ self.routes.capacity() * std::mem::size_of::<Option<usize>>();
+		for dir in &self.dirs {
+			bytes = bytes.saturating_add(dir.capacity());
+		}
+		for need in &self.needs {
+			bytes = bytes
+				.saturating_add(need.capacity() * std::mem::size_of::<usize>());
+		}
+		bytes
+	}
 }
 
 impl DestinationFreshnessSnapshot {
@@ -826,6 +1223,31 @@ impl DestinationFreshnessSnapshot {
 			for dir in dirs {
 				bytes = bytes.saturating_add(dir.capacity());
 			}
+		}
+		if let Some(dirs) = &self.requested_dirs {
+			bytes = bytes
+				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
+					dirs.capacity(),
+				));
+			for dir in dirs {
+				bytes = bytes.saturating_add(dir.capacity());
+			}
+		}
+		if let Some(placed) = &self.placed {
+			bytes = bytes.saturating_add(
+				placed.capacity() * std::mem::size_of::<Vec<PathBuf>>(),
+			);
+			for levels in placed {
+				bytes = bytes.saturating_add(
+					levels.capacity() * std::mem::size_of::<PathBuf>(),
+				);
+				for dir in levels {
+					bytes = bytes.saturating_add(dir.capacity());
+				}
+			}
+		}
+		if let Some(new_dirs) = &self.new_dirs {
+			bytes = bytes.saturating_add(new_dirs.heap_bytes());
 		}
 		if let Some(dirs) = &self.symlinked_dirs {
 			bytes = bytes
@@ -918,6 +1340,9 @@ impl DestinationFreshnessSnapshot {
 			repos: Some(repos),
 			missing_dirs: Some(missing_dirs),
 			symlinked_dirs: Some(symlinked_dirs),
+			requested_dirs: None,
+			placed: None,
+			new_dirs: None,
 		})
 	}
 
@@ -968,6 +1393,9 @@ impl DestinationFreshnessSnapshot {
 			repos: None,
 			missing_dirs: None,
 			symlinked_dirs: None,
+			requested_dirs: None,
+			placed: None,
+			new_dirs: None,
 		})
 	}
 
@@ -982,7 +1410,11 @@ impl DestinationFreshnessSnapshot {
 	/// that the preview saw and is gone (replaced by a plain folder) is a
 	/// change. A worker checks the old snapshot and then plans again, so a
 	/// shrunken list would let the new plan, checked later against itself
-	/// only, write where the preview did not show.
+	/// only, write where the preview did not show. `placed` must be
+	/// equal when the preview recorded it (the agreement names its
+	/// entries by place): the worker resolves the
+	/// folders again, and a tail that came out different means a level of
+	/// it appeared in between.
 	pub fn matches_preview(&self, preview: &Self) -> bool {
 		self.roots == preview.roots
 			&& self.target_files == preview.target_files
@@ -994,6 +1426,14 @@ impl DestinationFreshnessSnapshot {
 				.symlinked_dirs
 				.as_ref()
 				.is_none_or(|then| self.symlinked_dirs.as_ref() == Some(then))
+			&& preview
+				.requested_dirs
+				.as_ref()
+				.is_none_or(|then| self.requested_dirs.as_ref() == Some(then))
+			&& preview
+				.placed
+				.as_ref()
+				.is_none_or(|then| self.placed.as_ref() == Some(then))
 	}
 
 	/// Every folder a write is rooted in still resolves to the canonical
@@ -1075,12 +1515,36 @@ impl DestinationFreshnessSnapshot {
 			}
 		}
 
-		if let Some(missing) = &self.missing_dirs {
-			let mut missing: Vec<&PathBuf> = missing.iter().collect();
+		if self.missing_dirs.is_some()
+			|| self.requested_dirs.is_some()
+			|| self.placed.is_some()
+		{
+			// A folder the user named (a destination, an import path) is
+			// strict: whatever is there now, it was not there when the
+			// preview put this destination under an anchor, so the paths the
+			// rows show are not the ones a write would reach. Every level of
+			// a placed tail is such a folder, however planning classified it.
+			let mut missing: Vec<&PathBuf> = self
+				.missing_dirs
+				.iter()
+				.flatten()
+				.chain(self.requested_dirs.iter().flatten())
+				.chain(self.placed.iter().flatten().flatten())
+				.collect();
 			missing.sort();
+			missing.dedup();
 			for dir in missing {
+				let requested = self
+					.requested_dirs
+					.as_ref()
+					.is_some_and(|dirs| dirs.contains(dir))
+					|| self
+						.placed
+						.iter()
+						.flatten()
+						.any(|levels| levels.contains(dir));
 				match fs::symlink_metadata(dir) {
-					Ok(meta) if meta.file_type().is_dir() => {}
+					Ok(meta) if meta.file_type().is_dir() && !requested => {}
 					Ok(_) => {
 						return Err(self.created_where_a_folder_was_needed(dir))
 					}
@@ -1493,9 +1957,100 @@ impl TransferImportPlan {
 		&self.restore_plan.skipped_operations
 	}
 
+	/// Every create's folders (what `--dry-run` lists).
+	pub fn new_dirs(&self) -> NewDirs {
+		self.new_dirs_for(&RestoreSelection::default())
+	}
+
+	/// The placed folders with a tail, by the place an agreement names them
+	/// by (`RestoreSelection::confirmed_placed`): each one's levels,
+	/// shallow to deep. Empty when every folder exists.
+	pub fn placed_folders(&self) -> &[Vec<PathBuf>] {
+		self.destination_freshness.placed.as_deref().unwrap_or(&[])
+	}
+
+	/// The planning machine's answer when it sent one: a worker's paths are
+	/// read here only as written.
+	fn planned_new_dirs(&self) -> std::borrow::Cow<'_, PlannedNewDirs> {
+		let freshness = &self.destination_freshness;
+		match &freshness.new_dirs {
+			Some(planned) => std::borrow::Cow::Borrowed(planned),
+			None => std::borrow::Cow::Owned(PlannedNewDirs::of(
+				self.create_operations(),
+				freshness.missing_dirs.as_ref().unwrap_or(&HashSet::new()),
+				Vec::new(),
+			)),
+		}
+	}
+
+	/// Only the folders the creates `selection` keeps need: an unchecked row,
+	/// and an existing file, need none.
+	pub fn new_dirs_for(&self, selection: &RestoreSelection) -> NewDirs {
+		let empty = HashSet::new();
+		let freshness = &self.destination_freshness;
+		let requested = freshness.requested_dirs.as_ref().unwrap_or(&empty);
+		let levels: HashSet<&PathBuf> =
+			self.placed_folders().iter().flatten().collect();
+		let planned = self.planned_new_dirs();
+		let mut kept: BTreeSet<usize> = BTreeSet::new();
+		for (i, op) in self.create_operations().iter().enumerate() {
+			if op.existed || selection.unchecked_creates.contains(&i) {
+				continue;
+			}
+			if let Some(need) = planned.needs.get(i) {
+				kept.extend(need.iter().copied());
+			}
+		}
+		let mut out = NewDirs::default();
+		for dir in kept.into_iter().filter_map(|i| planned.dirs.get(i)) {
+			if requested.contains(dir) || levels.contains(dir) {
+				out.requested.push(dir.clone());
+			} else {
+				out.incidental.push(dir.clone());
+			}
+		}
+		out.placed = self
+			.routed_placed(selection, &planned)
+			.into_iter()
+			.collect();
+		out
+	}
+
+	/// The placed folders a create `selection` keeps is routed through:
+	/// told by the route planning chose, never by how a path reads. A plan
+	/// that does not say (an older peer, or a route out of range) needs
+	/// every one, as soon as it keeps a new file.
+	fn routed_placed(
+		&self,
+		selection: &RestoreSelection,
+		planned: &PlannedNewDirs,
+	) -> BTreeSet<usize> {
+		let count = self.placed_folders().len();
+		let mut routed = BTreeSet::new();
+		if count == 0 {
+			return routed;
+		}
+		for (i, op) in self.create_operations().iter().enumerate() {
+			if op.existed || selection.unchecked_creates.contains(&i) {
+				continue;
+			}
+			match planned.routes.get(i) {
+				Some(None) => {}
+				Some(Some(id)) if *id < count => {
+					routed.insert(*id);
+				}
+				_ => return (0..count).collect(),
+			}
+		}
+		routed
+	}
+
 	/// Applies the planned restore after verifying destination freshness.
 	/// If any destination repo or file changed after preview, returns a stale error
-	/// and writes nothing.
+	/// and writes nothing. Folders the user named that do not exist are made
+	/// only when `selection.confirmed_placed` names every placed folder the
+	/// rows kept are routed through; a file's own intermediate folders are
+	/// made with it.
 	pub fn apply(
 		&self,
 		selection: &RestoreSelection,
@@ -1505,6 +2060,15 @@ impl TransferImportPlan {
 
 	/// [`Self::apply`] observing every committed write as it lands: a
 	/// remote worker's e2e paste-hold pauses after the first.
+	///
+	/// Which two names are one folder or one file is the filesystem's to
+	/// say, here, under the write lock: nothing in this method compares
+	/// names. Before any content is written, the folders the rows need are
+	/// made and every new file is made empty with `create_new`. A new file
+	/// that is already there is someone else's (stale) or one this Apply
+	/// just made under another name (a collision); a placed folder not
+	/// agreed to that exists by then was made through another name of it.
+	/// Either refuses the whole paste and takes back what was made.
 	pub fn apply_observed(
 		&self,
 		selection: &RestoreSelection,
@@ -1515,34 +2079,741 @@ impl TransferImportPlan {
 	) -> Result<RestoreExecutionResult, TransferError> {
 		// Lock before revalidating: a check made before the lock leaves a
 		// gap another paste could write into.
-		let creates =
-			self.create_operations()
-				.iter()
-				.enumerate()
-				.filter(|(i, op)| {
-					!selection.unchecked_creates.contains(i)
-						&& (!op.existed
-							|| (selection.overwrite_existing
-								&& !selection.skip_existing))
-				});
-		let deletes = self
-			.delete_operations()
-			.iter()
-			.enumerate()
-			.filter(|(i, _)| !selection.unchecked_deletes.contains(i));
-		let directories = creates
+		let directories = self
+			.kept_creates(selection)
 			.map(|(_, op)| op.absolute_path.parent().unwrap())
-			.chain(deletes.map(|(_, op)| op.absolute_path.parent().unwrap()));
+			.chain(
+				self.kept_deletes(selection)
+					.map(|op| op.absolute_path.parent().unwrap()),
+			);
 		let _locks =
 			lock_destination_repos(directories, &RunOptions::default())?;
 		self.destination_freshness.revalidate()?;
-		let result = restore::execute_restore_plan_observed(
+
+		// Stale outranks a missing consent: a plan that changed is previewed
+		// again, and the agreement to the old one is not carried over.
+		let placed = self.placed_folders();
+		let routed = self.routed_placed(selection, &self.planned_new_dirs());
+		let unconfirmed: Vec<PathBuf> = routed
+			.iter()
+			.filter(|id| !selection.confirmed_placed.contains(id))
+			.flat_map(|&id| placed[id].iter().cloned())
+			.collect();
+		if !unconfirmed.is_empty() {
+			return Err(TransferError::NewDirsNotConfirmed {
+				dirs: unconfirmed,
+			});
+		}
+
+		// Made after the lock and the checks: its pin budget counts the
+		// descriptors they hold open.
+		let mut made = Made::default();
+		let reserved = match self.reserve(selection, &routed, &mut made) {
+			Ok(reserved) => reserved,
+			Err(e) => {
+				let left = made.take_back();
+				return Err(TransferError::left_behind(e, left));
+			}
+		};
+		let (mut result, unwritten) = restore::execute_restore_plan_reserved(
 			&self.restore_plan,
 			selection,
+			&reserved,
 			after_write,
 		);
+		// An empty file left behind is reported: a later Apply would take
+		// it for an existing file and skip it.
+		for i in unwritten {
+			let op = &self.create_operations()[i];
+			if let Err(e) = made.release_file(&op.absolute_path) {
+				result.fail(
+					&op.relative_path,
+					&format!("left empty, could not be taken back: {e}"),
+					io_reason(&e, &op.relative_path),
+				);
+			}
+		}
+		let wrote = result.created_count
+			+ result.overwritten_count
+			+ result.deleted_count
+			> 0;
+		let (kept, left) = made.finish(wrote);
+		result.created_dirs = kept;
+		for (dir, e) in left {
+			let shown = dir.display().to_string();
+			result.fail(
+				&shown,
+				&format!("folder made could not be taken back: {e}"),
+				io_reason(&e, &shown),
+			);
+		}
 		Ok(result)
 	}
+
+	/// The creates `selection` keeps that write: new files, and existing
+	/// ones when it overwrites.
+	fn kept_creates<'a>(
+		&'a self,
+		selection: &'a RestoreSelection,
+	) -> impl Iterator<Item = (usize, &'a CreateOperation)> + 'a {
+		self.create_operations()
+			.iter()
+			.enumerate()
+			.filter(|(i, op)| {
+				!selection.unchecked_creates.contains(i)
+					&& (!op.existed
+						|| (selection.overwrite_existing
+							&& !selection.skip_existing))
+			})
+	}
+
+	fn kept_deletes<'a>(
+		&'a self,
+		selection: &'a RestoreSelection,
+	) -> impl Iterator<Item = &'a DeleteOperation> + 'a {
+		self.delete_operations()
+			.iter()
+			.enumerate()
+			.filter(|(i, _)| !selection.unchecked_deletes.contains(i))
+			.map(|(_, op)| op)
+	}
+
+	/// Everything an Apply makes before it writes content, under the lock
+	/// and after `revalidate`, recorded in `made` (the caller takes it back
+	/// on an error):
+	///
+	/// 1. the placed folders the kept rows are routed through (`routed`,
+	///    agreed to), level by level;
+	/// 2. each kept new file, empty, with `create_new`, and the folders on
+	///    its way level by level. One already there is a collision when
+	///    it is an object this Apply made or a file it overwrites or
+	///    deletes, and stale otherwise;
+	/// 3. a placed folder not agreed to must not exist by now.
+	///
+	/// Two existing files the rows write or delete must be two objects. A
+	/// new file that cannot be made fails its row, as its write would.
+	fn reserve(
+		&self,
+		selection: &RestoreSelection,
+		routed: &BTreeSet<usize>,
+		made: &mut Made,
+	) -> Result<HashMap<usize, restore::Reservation>, TransferError> {
+		let placed = self.placed_folders();
+		for &id in routed {
+			for dir in &placed[id] {
+				self.make_placed_level(dir, made)?;
+			}
+		}
+
+		// The files that are there: each one is one object, written or
+		// deleted once (two cases of one name, two hard links).
+		let mut existing: HashMap<DirKey, String> = HashMap::new();
+		let rows =
+			self.kept_creates(selection)
+				.filter(|(_, op)| op.existed)
+				.map(|(_, op)| ("create", &op.absolute_path, &op.relative_path))
+				.chain(self.kept_deletes(selection).map(|op| {
+					("delete", &op.absolute_path, &op.relative_path)
+				}));
+		for (what, path, rel) in rows {
+			if fs::metadata(path).is_err() {
+				continue;
+			}
+			let current = format!("{what} {rel}");
+			if let Some(prev) =
+				existing.insert(DirKey::of(path), current.clone())
+			{
+				return Err(TransferError::TargetCollision {
+					path: path.clone(),
+					msg: format!(
+						"previous was '{prev}', current is '{current}'"
+					),
+				});
+			}
+		}
+
+		let mut reserved = HashMap::new();
+		let roots = &self.restore_plan.roots;
+		for (i, op) in self.kept_creates(selection) {
+			if op.existed || restore::create_is_refused(roots, op) {
+				continue;
+			}
+			match self.make_new_file(op, made, &existing) {
+				Ok(made_file) => {
+					reserved.insert(i, restore::Reservation::Made(made_file));
+				}
+				Err(Reserve::Row(e)) => {
+					reserved.insert(i, restore::Reservation::Failed(e));
+				}
+				Err(Reserve::Batch(e)) => return Err(e),
+			}
+		}
+
+		// Whatever name reached it, a placed folder not agreed to that is
+		// there now was made by this Apply's folders (or by someone else
+		// since the lock): not what the user agreed to.
+		for (id, levels) in placed.iter().enumerate() {
+			if selection.confirmed_placed.contains(&id) {
+				continue;
+			}
+			for dir in levels {
+				match fs::symlink_metadata(dir) {
+					Ok(_) if made.is_placed(&DirKey::of(dir)) => {}
+					Ok(_) => {
+						return Err(TransferError::NewDirsNotConfirmed {
+							dirs: levels.clone(),
+						})
+					}
+					Err(e)
+						if matches!(
+							e.kind(),
+							io::ErrorKind::NotFound
+								| io::ErrorKind::NotADirectory
+						) =>
+					{
+						break
+					}
+					Err(e) => return Err(TransferError::Io(e)),
+				}
+			}
+		}
+		Ok(reserved)
+	}
+
+	/// Makes one level of a placed folder. One already there is this
+	/// Apply's own only when it is an object this Apply made (another
+	/// placed folder, another name of it); anything else is stale. What is
+	/// there right after is checked as the object made, never as a
+	/// spelling: HFS+ stores a composed name decomposed, which replaces
+	/// nothing.
+	fn make_placed_level(
+		&self,
+		dir: &Path,
+		made: &mut Made,
+	) -> Result<(), TransferError> {
+		// The planner refuses such a folder first (`PlacedRoot::resolve`,
+		// test P10); this is the guard for one that came to lie in a Git
+		// directory since. A repository that appears under the anchor after
+		// the preview is stopped even earlier, by the lock.
+		if paths::lands_in_git_dir(dir) {
+			return Err(TransferError::UnsafePath(dir.display().to_string()));
+		}
+		new_dir_hook(NewDirStage::BeforeCreate, dir)?;
+		match fs::create_dir(dir) {
+			Ok(()) => {
+				let key = made.dir(dir, true);
+				new_dir_hook(NewDirStage::AfterCreate, dir)?;
+				// Someone put a symlink or another folder where the folder
+				// was just made: the rows would land somewhere the preview
+				// did not show.
+				let same = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+					&& DirKey::of(dir) == key;
+				if !same {
+					return Err(TransferError::StaleDestination {
+						root: dir.parent().unwrap_or(dir).to_path_buf(),
+						reason: format!(
+							"folder '{}' was replaced right after it was made",
+							dir.display()
+						),
+						change: StaleChange::Preview,
+					});
+				}
+				Ok(())
+			}
+			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+				let ours = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+					&& made.has(&DirKey::of(dir));
+				if ours {
+					Ok(())
+				} else {
+					Err(self
+						.destination_freshness
+						.created_where_a_folder_was_needed(dir))
+				}
+			}
+			Err(e) => Err(TransferError::Io(e)),
+		}
+	}
+
+	/// Makes `op`'s file empty with `create_new`, and the folders on its
+	/// way that are missing, level by level. Returns the file as made, for
+	/// its row to write into only while it is still that file untouched.
+	fn make_new_file(
+		&self,
+		op: &CreateOperation,
+		made: &mut Made,
+		existing: &HashMap<DirKey, String>,
+	) -> Result<restore::Reserved, Reserve> {
+		let path = &op.absolute_path;
+		let mut missing: Vec<&Path> = Vec::new();
+		let mut cur = path.parent();
+		while let Some(dir) = cur {
+			match fs::symlink_metadata(dir) {
+				Ok(_) => {
+					if !fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
+						return Err(Reserve::Batch(
+							self.met(op, dir, made, existing),
+						));
+					}
+					break;
+				}
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					) =>
+				{
+					missing.push(dir);
+					cur = dir.parent();
+				}
+				Err(e) => return Err(Reserve::Row(e)),
+			}
+		}
+		for dir in missing.into_iter().rev() {
+			match fs::create_dir(dir) {
+				Ok(()) => {
+					made.dir(dir, false);
+				}
+				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+					// A folder by now (made under another name of it, or
+					// one a path implies that someone made): the file is
+					// still checked on its own below.
+					if !fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
+						return Err(Reserve::Batch(
+							self.met(op, dir, made, existing),
+						));
+					}
+				}
+				Err(e) => return Err(Reserve::Row(e)),
+			}
+		}
+		if let Err(e) = restore::fail_point("reserve", path) {
+			return Err(Reserve::Batch(TransferError::Io(e)));
+		}
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		match options.open(path) {
+			Ok(file) => {
+				// The object made, read from its handle: what is at the
+				// name a moment later may be someone else's.
+				let key =
+					DirKey::of_file(&file).unwrap_or_else(|| DirKey::of(path));
+				// Read by name, as the row will read it.
+				let modified = fs::symlink_metadata(path)
+					.and_then(|info| info.modified())
+					.ok();
+				let reserved = made.reserved(file, key, modified);
+				made.file(path, &reserved, &op.relative_path);
+				Ok(reserved)
+			}
+			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+				Err(Reserve::Batch(self.met(op, path, made, existing)))
+			}
+			// Windows refuses to make a file over a folder (or a file being
+			// deleted) as access denied: something is there all the same.
+			Err(e)
+				if cfg!(windows)
+					&& e.kind() == io::ErrorKind::PermissionDenied
+					&& fs::symlink_metadata(path).is_ok() =>
+			{
+				Err(Reserve::Batch(self.met(op, path, made, existing)))
+			}
+			Err(e) => Err(Reserve::Row(e)),
+		}
+	}
+
+	/// `op` met something at `at` (its file, or a folder on its way): one
+	/// of this Apply's own objects or a file it writes is the same target
+	/// twice; anything else appeared after the preview.
+	fn met(
+		&self,
+		op: &CreateOperation,
+		at: &Path,
+		made: &Made,
+		existing: &HashMap<DirKey, String>,
+	) -> TransferError {
+		let key = DirKey::of(at);
+		let current = format!("create {}", op.relative_path);
+		if let Some(prev) = made.what(&key).or_else(|| existing.get(&key)) {
+			return TransferError::TargetCollision {
+				path: op.absolute_path.clone(),
+				msg: format!("previous was '{prev}', current is '{current}'"),
+			};
+		}
+		if at == op.absolute_path {
+			TransferError::StaleDestination {
+				root: op.root_path.clone(),
+				reason: format!(
+					"target file '{}' was created externally after preview",
+					op.relative_path
+				),
+				change: StaleChange::Created {
+					rel: op.relative_path.clone(),
+				},
+			}
+		} else {
+			created_where_a_folder_was_needed_at(&op.root_path, at)
+		}
+	}
+}
+
+/// How making one new file failed.
+enum Reserve {
+	/// Only this row: it fails, as its write would have.
+	Row(io::Error),
+	/// The whole paste.
+	Batch(TransferError),
+}
+
+/// What an Apply made before writing content, each with the object it is,
+/// so that only what is still that object is taken back.
+///
+/// An object is told by its number ([`DirKey`]), and a number says which
+/// object only while that object lives: Linux filesystems (ext4, tmpfs)
+/// give a freed inode number to the next object made, so a folder removed
+/// and made again at once, by someone else, is the same `DirKey`, and its
+/// timestamps tick too coarsely (about 4 ms) to tell them apart. On Linux
+/// each object made is therefore pinned for the rest of the Apply: a handle
+/// held open keeps its inode, and its number, from being freed, so another
+/// object can never carry it. The pin is `O_PATH` (or the handle a file was
+/// made with) and blocks nothing: the object can still be written, renamed
+/// or removed. macOS and Windows hand a number out again only much later
+/// (APFS object ids grow; an NTFS file index carries a sequence number),
+/// and Windows cannot replace an open file, so nothing is held there.
+///
+/// Pins are descriptors, and the Apply's own rows and take-backs need
+/// descriptors too: how many the process holds is a ceiling read from its
+/// limit and what else is open ([`pin_ceiling`]), shared by every Apply
+/// running in it; past it, or with no room at all, an object is told by
+/// its number alone, as elsewhere. A pinned file is checked through its
+/// pin, with no descriptor of its own.
+struct Made {
+	/// Folders in the order made; `true` for a placed folder's level.
+	dirs: Vec<(PathBuf, DirKey, bool)>,
+	/// Empty files made with `create_new`, as made (with their pins).
+	files: Vec<(PathBuf, restore::Reserved)>,
+	/// Every object made, with what made it.
+	objects: HashMap<DirKey, String>,
+	/// The handles that keep the folders made from being freed (Linux).
+	#[cfg(target_os = "linux")]
+	dir_pins: Vec<fs::File>,
+	/// How many objects the process may hold pinned, as read when this
+	/// Apply began, and how many this Apply pinned.
+	#[cfg(target_os = "linux")]
+	ceiling: usize,
+	#[cfg(target_os = "linux")]
+	pinned: usize,
+}
+
+/// At most this many objects are pinned in the whole process at once: a
+/// quarter of the usual soft limit on open files (1024).
+#[cfg(target_os = "linux")]
+const PIN_CAP: usize = 256;
+
+/// Descriptors kept free for everything else an Apply opens while its pins
+/// are held: one per row at a time (its write handle, or the temporary
+/// file of a replace), one to check an unpinned file, git's pipes, the
+/// `/proc` listing, and whatever else the process does meanwhile. Its
+/// repository locks are open already, and counted as used.
+#[cfg(target_os = "linux")]
+const PIN_RESERVE: usize = 64;
+
+/// The objects pinned by every Apply in this process now: two Applies in
+/// one process (two tabs pasting into two repositories) share its limit.
+#[cfg(target_os = "linux")]
+static PINNED: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+/// How many objects the whole process may hold pinned, read now: half of
+/// what the soft limit leaves past [`PIN_RESERVE`] and the descriptors
+/// open other than pins, within [`PIN_CAP`]. It is a ceiling on the pins
+/// of every Apply together, never an allowance each Apply takes for
+/// itself: two Applies each given the room left would hold twice that.
+/// When what is open cannot be counted, half the limit is taken as open.
+#[cfg(target_os = "linux")]
+fn pin_ceiling() -> usize {
+	use nix::sys::resource::{getrlimit, Resource};
+	use std::sync::atomic::Ordering;
+	let Ok((soft, _)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+		return 0;
+	};
+	let soft = usize::try_from(soft).unwrap_or(usize::MAX);
+	let pinned = PINNED.load(Ordering::Relaxed);
+	let others = fs::read_dir("/proc/self/fd")
+		.map(|fds| fds.count().saturating_sub(pinned))
+		.unwrap_or(soft / 2);
+	let room = soft.saturating_sub(others).saturating_sub(PIN_RESERVE) / 2;
+	room.min(PIN_CAP)
+}
+
+// Derivable only where nothing is pinned.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::derivable_impls))]
+impl Default for Made {
+	fn default() -> Self {
+		Self {
+			dirs: Vec::new(),
+			files: Vec::new(),
+			objects: HashMap::new(),
+			#[cfg(target_os = "linux")]
+			dir_pins: Vec::new(),
+			#[cfg(target_os = "linux")]
+			ceiling: pin_ceiling(),
+			#[cfg(target_os = "linux")]
+			pinned: 0,
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Made {
+	fn drop(&mut self) {
+		use std::sync::atomic::Ordering;
+		PINNED.fetch_sub(self.pinned, Ordering::Relaxed);
+	}
+}
+
+/// Something an Apply made that it meant to take back and could not: the
+/// path, and why. An empty file left this way is still there, and a
+/// later Apply would take it for one that exists.
+pub(crate) type NotTakenBack = (PathBuf, io::Error);
+
+impl Made {
+	/// Records the folder just made at `path` and returns which object it
+	/// is: read by following `path`, as every later check reads it.
+	fn dir(&mut self, path: &Path, placed: bool) -> DirKey {
+		let key = DirKey::of(path);
+		self.pin_dir(path, &key);
+		self.objects
+			.entry(key.clone())
+			.or_insert_with(|| format!("folder {}", path.display()));
+		self.dirs.push((path.to_path_buf(), key.clone(), placed));
+		key
+	}
+
+	/// Takes one pin, if the process holds fewer than the ceiling: counted
+	/// and checked in one step, so Applies racing for the last ones never
+	/// take more than there are.
+	#[cfg(target_os = "linux")]
+	fn take_pin(&mut self) -> bool {
+		use std::sync::atomic::Ordering;
+		let mut now = PINNED.load(Ordering::Acquire);
+		while now < self.ceiling {
+			match PINNED.compare_exchange_weak(
+				now,
+				now + 1,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => {
+					self.pinned += 1;
+					return true;
+				}
+				Err(seen) => now = seen,
+			}
+		}
+		false
+	}
+
+	/// Pins the folder at `path` if it is still `key` (see [`Made`]).
+	#[cfg(target_os = "linux")]
+	fn pin_dir(&mut self, path: &Path, key: &DirKey) {
+		use std::os::unix::fs::OpenOptionsExt;
+		if PINNED.load(std::sync::atomic::Ordering::Relaxed) >= self.ceiling {
+			return;
+		}
+		// The access mode is ignored with `O_PATH`: no permission on the
+		// folder is needed, so a folder umask left unreadable is pinned too.
+		let handle = fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+			.open(path);
+		if let Ok(handle) = handle {
+			if DirKey::of_file(&handle).as_ref() == Some(key) && self.take_pin()
+			{
+				self.dir_pins.push(handle);
+			}
+		}
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn pin_dir(&mut self, _path: &Path, _key: &DirKey) {}
+
+	/// The file just made through `handle`, as `key`, last modified at
+	/// `modified`: its handle kept as its pin on Linux within the ceiling
+	/// (see [`Made`]), closed otherwise. One held per new file past it
+	/// would run out of descriptors on a large paste, and Windows cannot
+	/// replace an open file.
+	fn reserved(
+		&mut self,
+		handle: fs::File,
+		key: DirKey,
+		modified: Option<std::time::SystemTime>,
+	) -> restore::Reserved {
+		#[allow(unused_mut)]
+		let mut reserved = restore::Reserved::new(key, modified);
+		#[cfg(target_os = "linux")]
+		if self.take_pin() {
+			reserved.pin = Some(std::sync::Arc::new(handle));
+			return reserved;
+		}
+		drop(handle);
+		reserved
+	}
+
+	fn file(&mut self, path: &Path, reserved: &restore::Reserved, rel: &str) {
+		self.objects
+			.entry(reserved.key.clone())
+			.or_insert_with(|| format!("create {rel}"));
+		self.files.push((path.to_path_buf(), reserved.clone()));
+	}
+
+	fn has(&self, key: &DirKey) -> bool {
+		self.objects.contains_key(key)
+	}
+
+	fn what(&self, key: &DirKey) -> Option<&String> {
+		self.objects.get(key)
+	}
+
+	/// A level of a placed folder this Apply made (agreed to).
+	fn is_placed(&self, key: &DirKey) -> bool {
+		self.dirs.iter().any(|(_, k, placed)| *placed && k == key)
+	}
+
+	/// Removes the empty file made at `path`, if it is still that file
+	/// untouched (`Reserved::is_untouched`, the test its row wrote by, asked
+	/// without any permission on the file's content, and through its pin
+	/// when it has one). On macOS and other Unix without `O_PATH` the check
+	/// is an `lstat`, so a residual, very small window remains between it
+	/// and the unlink.
+	///
+	/// An error is what kept it from telling or from removing: the file
+	/// may be left there empty, and the caller reports it. One that is
+	/// someone else's by now, or gone, is no error.
+	fn release_file(&self, path: &Path) -> io::Result<()> {
+		let Some((_, reserved)) = self.files.iter().find(|(p, _)| p == path)
+		else {
+			return Ok(());
+		};
+		restore::fail_point("release", path)?;
+		if !reserved.is_untouched(path)? {
+			return Ok(());
+		}
+		match fs::remove_file(path) {
+			Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+			_ => Ok(()),
+		}
+	}
+
+	/// Removes, deepest first, the folders made that are still those
+	/// folders and empty. A folder with something in it, or gone, stays
+	/// as it is; one that could not be told or removed is returned.
+	fn take_back_dirs(&self) -> Vec<NotTakenBack> {
+		let mut left = Vec::new();
+		for (path, key, _) in self.dirs.iter().rev() {
+			match fs::symlink_metadata(path) {
+				Ok(info) if info.is_dir() && DirKey::of(path) == *key => {}
+				Ok(_) => continue,
+				Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+				Err(e) => {
+					left.push((path.clone(), e));
+					continue;
+				}
+			}
+			match fs::remove_dir(path) {
+				Ok(()) => {}
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound
+							| io::ErrorKind::DirectoryNotEmpty
+					) => {}
+				Err(e) => left.push((path.clone(), e)),
+			}
+		}
+		left
+	}
+
+	/// Takes back everything made: no content was written. Returns what
+	/// it could not.
+	fn take_back(&self) -> Vec<NotTakenBack> {
+		let mut left: Vec<NotTakenBack> = self
+			.files
+			.iter()
+			.filter_map(|(path, _)| {
+				self.release_file(path).err().map(|e| (path.clone(), e))
+			})
+			.collect();
+		left.extend(self.take_back_dirs());
+		left
+	}
+
+	/// After the rows ran: a paste that wrote and deleted nothing leaves no
+	/// folder it made behind (one with something in it stays). Returns how
+	/// many placed folders' levels it made are still there, and the
+	/// folders it meant to take back and could not.
+	fn finish(&self, wrote: bool) -> (usize, Vec<NotTakenBack>) {
+		let left = if wrote {
+			Vec::new()
+		} else {
+			self.take_back_dirs()
+		};
+		let kept = self
+			.dirs
+			.iter()
+			.filter(|(path, _, placed)| {
+				*placed && fs::symlink_metadata(path).is_ok()
+			})
+			.count();
+		(kept, left)
+	}
+}
+
+/// The folders an Apply would make, shallow to deep, each once: what a
+/// front end lists. `requested` are the ones the user named (a placed
+/// folder's levels, and what planning took for one of them under another
+/// name), `incidental` the ones a file's path implies. What the user agrees
+/// to is `placed`; the lists only show it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewDirs {
+	pub requested: Vec<PathBuf>,
+	pub incidental: Vec<PathBuf>,
+	/// The placed folders the rows kept are routed through, by their place
+	/// in [`TransferImportPlan::placed_folders`]: what the agreement must
+	/// name (`RestoreSelection::confirmed_placed`).
+	pub placed: Vec<usize>,
+}
+
+/// Where `make_placed_level` is in a folder: a test injects a failure or
+/// an interloper here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewDirStage {
+	BeforeCreate,
+	AfterCreate,
+}
+
+#[cfg(test)]
+type NewDirHook = Box<dyn Fn(NewDirStage, &Path) -> io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+	static NEW_DIR_HOOK: std::cell::RefCell<Option<NewDirHook>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn new_dir_hook(stage: NewDirStage, dir: &Path) -> Result<(), TransferError> {
+	NEW_DIR_HOOK
+		.with(|slot| match slot.borrow().as_ref() {
+			Some(hook) => hook(stage, dir),
+			None => Ok(()),
+		})
+		.map_err(TransferError::Io)
+}
+
+#[cfg(not(test))]
+fn new_dir_hook(_stage: NewDirStage, _dir: &Path) -> Result<(), TransferError> {
+	Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2127,170 +3398,7 @@ fn root_basename(path: &Path) -> String {
 		.to_string()
 }
 
-/// Resolves target identity across symlinks and platform case folding.
-fn canonical_target_identity(path: &Path) -> String {
-	if let Ok(c) = dunce::canonicalize(path) {
-		return paths::path_key(&c.to_string_lossy());
-	}
-	let mut current = path.to_path_buf();
-	let mut trail = Vec::new();
-	while !current.exists() {
-		if let Some(name) = current.file_name() {
-			trail.push(name.to_os_string());
-		}
-		if !current.pop() {
-			break;
-		}
-	}
-	let canonical_ancestor = dunce::canonicalize(&current).unwrap_or(current);
-	let mut full = canonical_ancestor;
-	for segment in trail.into_iter().rev() {
-		full.push(segment);
-	}
-	paths::path_key(&full.to_string_lossy())
-}
-
-pub(crate) fn fs_is_case_insensitive(root: &Path) -> bool {
-	probe_fs_case_insensitive(root)
-		.unwrap_or(cfg!(any(windows, target_os = "macos")))
-}
-
-fn swap_ascii_case(s: &str) -> Option<String> {
-	let mut swapped = String::with_capacity(s.len());
-	let mut has_ascii_alpha = false;
-	for c in s.chars() {
-		if c.is_ascii_alphabetic() {
-			has_ascii_alpha = true;
-			if c.is_ascii_lowercase() {
-				swapped.push(c.to_ascii_uppercase());
-			} else {
-				swapped.push(c.to_ascii_lowercase());
-			}
-		} else {
-			swapped.push(c);
-		}
-	}
-	if has_ascii_alpha {
-		Some(swapped)
-	} else {
-		None
-	}
-}
-
-#[cfg(unix)]
-fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
-	use std::os::unix::fs::MetadataExt;
-	let m1 = fs::symlink_metadata(p1)?;
-	let m2 = fs::symlink_metadata(p2)?;
-	Ok(m1.dev() == m2.dev() && m1.ino() == m2.ino())
-}
-
-#[cfg(not(unix))]
-fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
-	let c1 = dunce::canonicalize(p1)?;
-	let c2 = dunce::canonicalize(p2)?;
-	Ok(c1 == c2)
-}
-
-fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
-	if let Ok(entries) = fs::read_dir(root) {
-		for entry in entries.flatten() {
-			let name = entry.file_name();
-			let name_str = name.to_string_lossy();
-			if let Some(swapped) = swap_ascii_case(&name_str) {
-				let orig_path = root.join(&name);
-				let swapped_path = root.join(&swapped);
-				match fs::symlink_metadata(&swapped_path) {
-					Ok(_) => {
-						if let Ok(same) =
-							is_same_file(&orig_path, &swapped_path)
-						{
-							return Ok(same);
-						}
-					}
-					Err(e) if e.kind() == io::ErrorKind::NotFound => {
-						return Ok(false);
-					}
-					Err(_) => {}
-				}
-			}
-		}
-	}
-
-	let pid = std::process::id();
-	let nanos = SystemTime::now()
-		.duration_since(SystemTime::UNIX_EPOCH)
-		.map(|d| d.as_nanos())
-		.unwrap_or(0);
-	let probe_name = format!(".snip-case-probe-{pid}-{nanos}");
-	let probe_path = root.join(&probe_name);
-	let swapped_name = format!(".SNIP-CASE-PROBE-{pid}-{nanos}");
-	let swapped_path = root.join(&swapped_name);
-
-	let probe_file = fs::OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.open(&probe_path);
-
-	match probe_file {
-		Ok(f) => {
-			drop(f);
-			let is_ci = match fs::symlink_metadata(&swapped_path) {
-				Ok(_) => {
-					is_same_file(&probe_path, &swapped_path).unwrap_or(true)
-				}
-				Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-				Err(_) => cfg!(any(windows, target_os = "macos")),
-			};
-			let _ = fs::remove_file(&probe_path);
-			let _ = fs::remove_file(&swapped_path);
-			Ok(is_ci)
-		}
-		Err(e) => Err(e),
-	}
-}
-
-fn op_is_case_insensitive(
-	op_root: Option<&Path>,
-	op_absolute: &Path,
-	canonical_dest_roots: &[CanonicalRootId],
-	root_case_insensitive: &HashMap<PathBuf, bool>,
-	primary: Option<&CanonicalRootId>,
-) -> bool {
-	if let Some(r) = op_root {
-		if let Some(&ci) = root_case_insensitive.get(r) {
-			return ci;
-		}
-		for cr in canonical_dest_roots {
-			if cr.path() == r
-				|| paths::path_key(&cr.path().to_string_lossy())
-					== paths::path_key(&r.to_string_lossy())
-			{
-				if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-					return ci;
-				}
-			}
-		}
-	}
-	for cr in canonical_dest_roots {
-		if op_absolute.starts_with(cr.path()) {
-			if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-				return ci;
-			}
-		}
-	}
-	if let Some(p) = primary {
-		if let Some(&ci) = root_case_insensitive.get(p.path()) {
-			return ci;
-		}
-	}
-	if let Some(cr) = canonical_dest_roots.first() {
-		if let Some(&ci) = root_case_insensitive.get(cr.path()) {
-			return ci;
-		}
-	}
-	cfg!(any(windows, target_os = "macos"))
-}
+pub(crate) use crate::fscase::fs_is_case_insensitive;
 
 // ---------------------------------------------------------------------------
 // Core Public APIs
@@ -3494,6 +4602,257 @@ pub fn plan_import_with(
 		.map(|(plan, _)| plan)
 }
 
+/// Points in planning where a test changes the disk, deterministically:
+/// what another process could do in between, in this order.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks {
+	use std::sync::Mutex;
+
+	type Hook = Box<dyn Fn() + Send>;
+
+	/// Process-wide: a worker in a test plans on its own thread. A test runs
+	/// in its own process under nextest.
+	static AFTER_TAIL_CHECK: Mutex<Option<Hook>> = Mutex::new(None);
+
+	/// Removes the hook when dropped.
+	pub struct HookGuard;
+
+	impl Drop for HookGuard {
+		fn drop(&mut self) {
+			*AFTER_TAIL_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		}
+	}
+
+	/// Runs `f` each time planning has checked that no level of a placed
+	/// folder's tail exists, before it tells the folders the user named
+	/// from the others.
+	pub fn after_tail_check(f: impl Fn() + Send + 'static) -> HookGuard {
+		*AFTER_TAIL_CHECK.lock().unwrap_or_else(|e| e.into_inner()) =
+			Some(Box::new(f));
+		HookGuard
+	}
+
+	/// Removes the switch below when dropped.
+	pub struct NameKeyGuard;
+
+	impl Drop for NameKeyGuard {
+		fn drop(&mut self) {
+			crate::foldernames::set_distinct_name_keys(false);
+		}
+	}
+
+	/// Until the guard drops, every name is told from every other one,
+	/// even from itself (`foldernames::name_key` gives each call its own
+	/// key): what a filesystem merges that the key does not know. A safety
+	/// check that still holds with this on does not rest on the key.
+	pub fn distinct_name_keys() -> NameKeyGuard {
+		crate::foldernames::set_distinct_name_keys(true);
+		NameKeyGuard
+	}
+
+	pub(super) fn run_after_tail_check() {
+		if let Some(hook) = AFTER_TAIL_CHECK
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
+			hook();
+		}
+	}
+}
+
+/// A folder an absolute entry path may name, with the anchor it is planned
+/// against and the names below that anchor still to be made.
+struct RouteCandidate {
+	path: PathBuf,
+	anchor: CanonicalRootId,
+	tail: String,
+	/// The placed folder (its place in `placed_list`) when it has a tail.
+	placed: Option<usize>,
+}
+
+/// The placed folders with a tail, each once (one anchor and tail named
+/// twice is one folder to agree to): the primary destination, then the
+/// prefixes in the order of their names. Its order is the place an
+/// agreement names a folder by (`DestinationFreshnessSnapshot::placed`).
+fn placed_list(mapping: &ImportMapping) -> Vec<&PlacedRoot> {
+	let mut prefixes: Vec<(&String, &PlacedRoot)> =
+		mapping.prefix_destinations.iter().collect();
+	prefixes.sort_by_key(|(prefix, _)| *prefix);
+	let mut out: Vec<&PlacedRoot> = Vec::new();
+	for placed in mapping
+		.primary_destination
+		.iter()
+		.chain(prefixes.into_iter().map(|(_, placed)| placed))
+	{
+		if !placed.tail().is_empty() && !out.contains(&placed) {
+			out.push(placed);
+		}
+	}
+	out
+}
+
+/// Which placed folder (its place in `placed`) an absolute entry path
+/// names, when that folder is not made yet and the path does not read as
+/// it was placed: the existing folder nearest above the path is the
+/// placed folder's anchor, told by the filesystem's object, and the names
+/// below it start with its tail, by `name_key` where that filesystem folds
+/// case. Returns the place and the path below the tail. A miss only leaves
+/// the path to the rule for an absolute path outside every destination;
+/// the deepest tail wins.
+fn placed_for_absolute(
+	placed: &[&PlacedRoot],
+	normalized: &str,
+) -> Option<(usize, String)> {
+	if placed.is_empty() {
+		return None;
+	}
+	let path = Path::new(normalized);
+	let mut names: Vec<&str> = Vec::new();
+	let mut cur = path;
+	let anchor = loop {
+		match fs::symlink_metadata(cur) {
+			Ok(meta) if meta.is_dir() => break cur,
+			Ok(_) => {
+				if fs::metadata(cur).is_ok_and(|m| m.is_dir()) {
+					break cur;
+				}
+				return None;
+			}
+			Err(_) => {
+				names.push(cur.file_name()?.to_str()?);
+				cur = cur.parent()?;
+			}
+		}
+	};
+	names.reverse();
+	let key = DirKey::of(anchor);
+	let folds = fs_is_case_insensitive(
+		&dunce::canonicalize(anchor).unwrap_or_else(|_| anchor.to_path_buf()),
+	);
+	placed
+		.iter()
+		.enumerate()
+		.filter(|(_, p)| {
+			p.tail().len() < names.len()
+				&& DirKey::of(p.anchor().path()) == key
+				&& p.tail().iter().zip(&names).all(|(t, n)| {
+					crate::foldernames::name_key(t, folds)
+						== crate::foldernames::name_key(n, folds)
+				})
+		})
+		.max_by_key(|(_, p)| p.tail().len())
+		.map(|(id, p)| (id, names[p.tail().len()..].join("/")))
+}
+
+/// The folders an absolute entry path can name. Without a folder still to
+/// be made this is exactly the destination roots, in their order. A root
+/// that is only the anchor of a folder still to be made is not one: an
+/// absolute path under it but outside the destination would otherwise land
+/// in it.
+fn route_candidates(
+	canonical_dest_roots: &[CanonicalRootId],
+	mapping: &ImportMapping,
+	placed_ids: &[&PlacedRoot],
+) -> Vec<RouteCandidate> {
+	let mut placed: Vec<&PlacedRoot> = mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+		.collect();
+	let tail_anchors: HashSet<&CanonicalRootId> = placed
+		.iter()
+		.filter(|p| !p.tail().is_empty())
+		.map(|p| p.anchor())
+		.collect();
+	let mut out: Vec<RouteCandidate> = Vec::new();
+	if tail_anchors.is_empty() {
+		out.extend(canonical_dest_roots.iter().map(|id| RouteCandidate {
+			path: id.path().to_path_buf(),
+			anchor: id.clone(),
+			tail: String::new(),
+			placed: None,
+		}));
+		return out;
+	}
+	let mut add = |path: PathBuf,
+	               anchor: &CanonicalRootId,
+	               tail: String,
+	               placed: Option<usize>| {
+		if !out.iter().any(|c| c.path == path) {
+			out.push(RouteCandidate {
+				path,
+				anchor: anchor.clone(),
+				tail,
+				placed,
+			});
+		}
+	};
+	for id in canonical_dest_roots {
+		if !tail_anchors.contains(id) {
+			add(id.path().to_path_buf(), id, String::new(), None);
+		}
+	}
+	placed.sort_by_key(|p| p.path());
+	for p in placed {
+		let id = placed_ids.iter().position(|q| *q == p);
+		add(p.path(), p.anchor(), p.tail_rel(), id);
+	}
+	for em in mapping.entry_destinations.values() {
+		add(em.root.path().to_path_buf(), &em.root, String::new(), None);
+	}
+	out
+}
+
+/// The folders each destination (the primary one, then the prefixes in the
+/// order of their names) names below its anchor, shallow to deep, under the
+/// spellings in `names`: the first spelling met, the named folders first.
+fn named_folder_chains(
+	mapping: &ImportMapping,
+	names: &mut NewFolderNames,
+) -> Vec<PathBuf> {
+	let mut prefixes: Vec<(&String, &PlacedRoot)> =
+		mapping.prefix_destinations.iter().collect();
+	prefixes.sort_by_key(|(prefix, _)| *prefix);
+	mapping
+		.primary_destination
+		.iter()
+		.chain(prefixes.into_iter().map(|(_, placed)| placed))
+		.flat_map(|placed| {
+			names.name_chain(placed.anchor().path(), placed.tail())
+		})
+		.collect()
+}
+
+/// `rest` below a placed folder's tail (`tail/rest`), or `rest` itself when
+/// the folder exists.
+fn with_tail<'a>(
+	tail: &str,
+	rest: impl Into<std::borrow::Cow<'a, str>>,
+) -> std::borrow::Cow<'a, str> {
+	let rest = rest.into();
+	if tail.is_empty() {
+		rest
+	} else {
+		std::borrow::Cow::Owned(format!("{tail}/{rest}"))
+	}
+}
+
+/// The path an entry that no prefix claims has below the primary
+/// destination (its tail comes in front of it later): the entry's path,
+/// under the restore base's directory when it is relative.
+fn primary_relative<'a>(
+	mapping: &ImportMapping,
+	entry_path: &'a str,
+) -> std::borrow::Cow<'a, str> {
+	match &mapping.primary_prefix {
+		Some(p) if restore::is_relative(entry_path) => {
+			std::borrow::Cow::Owned(format!("{p}/{entry_path}"))
+		}
+		_ => std::borrow::Cow::Borrowed(entry_path),
+	}
+}
+
 /// The same import engine, consuming entries already parsed with
 /// [`format::parse_clipboard`]. Returned ordinals align with create_operations
 /// and name each create's original parsed entry, before path routing or skips.
@@ -3515,18 +4874,21 @@ pub fn plan_import_parsed_with(
 	}
 
 	// Every mapped destination root must belong to the explicit destination_roots
+	// (a placed folder by its anchor: the folder it names may not exist yet).
 	if let Some(ref primary) = mapping.primary_destination {
 		cancelled_err(opts, "plan-import")?;
-		if !canonical_dest_roots.contains(primary) {
+		if !canonical_dest_roots.contains(primary.anchor()) {
 			return Err(TransferError::UnknownRoot(
-				primary.path().to_path_buf(),
+				primary.anchor().path().to_path_buf(),
 			));
 		}
 	}
 	for root in mapping.prefix_destinations.values() {
 		cancelled_err(opts, "plan-import")?;
-		if !canonical_dest_roots.contains(root) {
-			return Err(TransferError::UnknownRoot(root.path().to_path_buf()));
+		if !canonical_dest_roots.contains(root.anchor()) {
+			return Err(TransferError::UnknownRoot(
+				root.anchor().path().to_path_buf(),
+			));
 		}
 	}
 	for entry_mapping in mapping.entry_destinations.values() {
@@ -3538,6 +4900,31 @@ pub fn plan_import_parsed_with(
 		}
 	}
 
+	// A placed folder's tail is what did not exist when it was resolved. One
+	// layer of it that exists now (made by someone else in between) voids
+	// that premise: the anchor is no longer the nearest existing ancestor,
+	// and the folder the user named would be told from an incidental one by
+	// an identity that no longer holds (two spellings of one new folder on
+	// a case-folding filesystem would slip past consent).
+	for placed in mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+	{
+		cancelled_err(opts, "plan-import")?;
+		for dir in placed.new_chain() {
+			if fs::symlink_metadata(&dir).is_ok() {
+				return Err(created_where_a_folder_was_needed_at(
+					placed.anchor().path(),
+					&dir,
+				));
+			}
+		}
+	}
+
+	#[cfg(any(test, feature = "test-support"))]
+	test_hooks::run_after_tail_check();
+
 	let mut root_case_insensitive: HashMap<PathBuf, bool> = HashMap::new();
 	for root in &canonical_dest_roots {
 		cancelled_err(opts, "plan-import")?;
@@ -3546,34 +4933,62 @@ pub fn plan_import_parsed_with(
 			.or_insert_with(|| fs_is_case_insensitive(root.path()));
 	}
 
+	// The folders the user named, each under one spelling. On a filesystem
+	// that folds case `new` and `NEW` are one folder, and every place that
+	// tells folders apart (what is agreed to, what is recorded as named,
+	// what is made) goes by this one: the first spelling met, the named
+	// folders first.
+	let mut folder_names = NewFolderNames::new(root_case_insensitive.clone());
+	let named_paths = named_folder_chains(mapping, &mut folder_names);
+
+	let placed_ids = placed_list(mapping);
+	let placed_id = |p: &PlacedRoot| placed_ids.iter().position(|q| *q == p);
+	let route_candidates =
+		route_candidates(&canonical_dest_roots, mapping, &placed_ids);
 	let dest_root_paths: Vec<&Path> =
-		canonical_dest_roots.iter().map(|id| id.path()).collect();
-	let primary_dest_path =
-		mapping.primary_destination.as_ref().map(|id| id.path());
+		route_candidates.iter().map(|c| c.path.as_path()).collect();
+	let primary_dest_path: Option<PathBuf> =
+		mapping.primary_destination.as_ref().map(PlacedRoot::path);
 
 	let mut planned_entries: Vec<(
 		CanonicalRootId,
 		ParsedEntry,
 		String,
 		usize,
+		Option<usize>,
 	)> = Vec::new();
 	let mut skipped_operations = Vec::new();
 
 	for (entry_index, entry) in entries.into_iter().enumerate() {
 		cancelled_err(opts, "plan-import")?;
-		let (target_root, rel_path) = if let Some(em) =
+		// Where the entry lands: the anchor, the names below it that a folder
+		// still to be made adds, the path the route leaves below them, and,
+		// when the route puts a folder in front of that path (Add), the path
+		// the entry keeps for the file itself. What the entry keeps is
+		// checked on its own before anything is put in front of it, so a path
+		// that names no file cannot become the folder it is under.
+		// `route` is the placed folder (its place in `placed_ids`) the
+		// entry goes through, as routing chooses it here: what its folders
+		// need agreed to, apart from how its path reads.
+		let (target_root, tail, rel_path, own_path, route) = if let Some(em) =
 			mapping.entry_destinations.get(&entry.path)
 		{
 			let rel =
 				em.relative_path.as_deref().unwrap_or(entry.path.as_str());
-			(&em.root, std::borrow::Cow::Borrowed(rel))
+			(
+				&em.root,
+				std::borrow::Cow::Borrowed(""),
+				std::borrow::Cow::Borrowed(rel),
+				None,
+				None,
+			)
 		} else {
 			let normalized = paths::normalize_system_path(&entry.path);
 			if paths::is_absolute_path(&normalized) {
 				if let Some((root_str, rel)) =
 					paths::resolve_absolute_import_candidate(
 						&dest_root_paths,
-						primary_dest_path,
+						primary_dest_path.as_deref(),
 						&entry.path,
 					) {
 					if rel.is_empty() {
@@ -3585,20 +5000,27 @@ pub fn plan_import_parsed_with(
 						});
 						continue;
 					}
-					let matched_root = canonical_dest_roots.iter().find(|id| {
-						paths::path_key(&id.path().to_string_lossy())
+					let matched_root = route_candidates.iter().find(|c| {
+						paths::path_key(&c.path.to_string_lossy())
 							== paths::path_key(&root_str)
 							|| dunce::canonicalize(Path::new(&root_str))
-								.map(|c| {
-									paths::path_key(&c.to_string_lossy())
-										== paths::path_key(
-											&id.path().to_string_lossy(),
-										)
+								.map(|canonical| {
+									paths::path_key(
+										&canonical.to_string_lossy(),
+									) == paths::path_key(
+										&c.path.to_string_lossy(),
+									)
 								})
 								.unwrap_or(false)
 					});
 					match matched_root {
-						Some(root) => (root, std::borrow::Cow::Owned(rel)),
+						Some(c) => (
+							&c.anchor,
+							std::borrow::Cow::Borrowed(c.tail.as_str()),
+							std::borrow::Cow::Owned(rel),
+							None,
+							c.placed,
+						),
 						None => {
 							skipped_operations.push(SkippedOperation {
 								raw_path: entry.path.clone(),
@@ -3609,6 +5031,17 @@ pub fn plan_import_parsed_with(
 							continue;
 						}
 					}
+				} else if let Some((id, rel)) =
+					placed_for_absolute(&placed_ids, &normalized)
+				{
+					let placed = placed_ids[id];
+					(
+						placed.anchor(),
+						std::borrow::Cow::Owned(placed.tail_rel()),
+						std::borrow::Cow::Owned(rel),
+						None,
+						Some(id),
+					)
 				} else if entry.change_types.contains(&ChangeType::Deleted) {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -3618,7 +5051,13 @@ pub fn plan_import_parsed_with(
 					});
 					continue;
 				} else if let Some(ref primary) = mapping.primary_destination {
-					(primary, std::borrow::Cow::Borrowed(entry.path.as_str()))
+					(
+						primary.anchor(),
+						std::borrow::Cow::Owned(primary.tail_rel()),
+						std::borrow::Cow::Borrowed(entry.path.as_str()),
+						None,
+						placed_id(primary),
+					)
 				} else {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -3640,18 +5079,21 @@ pub fn plan_import_parsed_with(
 				}
 				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
 					// Prefix consumed EXACTLY ONCE
-					(dest, std::borrow::Cow::Borrowed(rest))
+					(
+						dest.anchor(),
+						std::borrow::Cow::Owned(dest.tail_rel()),
+						std::borrow::Cow::Borrowed(rest),
+						None,
+						placed_id(dest),
+					)
 				} else if let Some(ref primary) = mapping.primary_destination {
-					let rel = match &mapping.primary_prefix {
-						Some(p) if restore::is_relative(&entry.path) => {
-							std::borrow::Cow::Owned(format!(
-								"{p}/{}",
-								entry.path
-							))
-						}
-						_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
-					};
-					(primary, rel)
+					(
+						primary.anchor(),
+						std::borrow::Cow::Owned(primary.tail_rel()),
+						primary_relative(mapping, &entry.path),
+						Some(entry.path.as_str()),
+						placed_id(primary),
+					)
 				} else {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -3662,13 +5104,13 @@ pub fn plan_import_parsed_with(
 					continue;
 				}
 			} else if let Some(ref primary) = mapping.primary_destination {
-				let rel = match &mapping.primary_prefix {
-					Some(p) if restore::is_relative(&entry.path) => {
-						std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
-					}
-					_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
-				};
-				(primary, rel)
+				(
+					primary.anchor(),
+					std::borrow::Cow::Owned(primary.tail_rel()),
+					primary_relative(mapping, &entry.path),
+					Some(entry.path.as_str()),
+					placed_id(primary),
+				)
 			} else {
 				skipped_operations.push(SkippedOperation {
 					raw_path: entry.path.clone(),
@@ -3692,7 +5134,22 @@ pub fn plan_import_parsed_with(
 			continue;
 		}
 
-		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
+		// What the entry keeps for the file itself, with nothing put in front
+		// of it: a name, no `..`. A folder put in front (Add) or a tail
+		// would otherwise make a path that names no file (`.`) the folder.
+		if sanitize_relative_path(own_path.unwrap_or(&rel_path)).is_none() {
+			skipped_operations.push(SkippedOperation {
+				raw_path: entry.path.clone(),
+				relative_path: None,
+				reason: SkipReason::UnresolvedPath,
+				detail: None,
+			});
+			continue;
+		}
+
+		// The file's own path: non-empty, no `..`, at least one name. Below
+		// a folder to make it is what keeps the file below that folder.
+		let Some(file_path) = sanitize_relative_path(&rel_path) else {
 			skipped_operations.push(SkippedOperation {
 				raw_path: entry.path.clone(),
 				relative_path: None,
@@ -3701,6 +5158,7 @@ pub fn plan_import_parsed_with(
 			});
 			continue;
 		};
+		let sanitized = with_tail(&tail, file_path).into_owned();
 
 		if paths::has_git_segment(&sanitized) {
 			skipped_operations.push(SkippedOperation {
@@ -3721,17 +5179,19 @@ pub fn plan_import_parsed_with(
 			},
 			entry.path,
 			entry_index,
+			route,
 		));
 	}
 
 	let mut combined_creates = Vec::new();
 	let mut create_entry_indices = Vec::new();
+	let mut create_routes: Vec<Option<usize>> = Vec::new();
 	let mut combined_deletes = Vec::new();
 	let mut all_skipped = skipped_operations;
 
 	// Same `plan_restore` as before, one entry at a time so a cancel is
 	// observed before the next file's encoding read.
-	for (root_id, entry, raw_path, entry_index) in planned_entries {
+	for (root_id, entry, raw_path, entry_index, route) in planned_entries {
 		cancelled_err(opts, "plan-import")?;
 		let sub_plan = restore::plan_restore(
 			&[root_id.path()],
@@ -3739,6 +5199,10 @@ pub fn plan_import_parsed_with(
 		);
 		create_entry_indices.extend(std::iter::repeat_n(
 			entry_index,
+			sub_plan.create_operations.len(),
+		));
+		create_routes.extend(std::iter::repeat_n(
+			route,
 			sub_plan.create_operations.len(),
 		));
 		combined_creates.extend(sub_plan.create_operations);
@@ -3751,58 +5215,39 @@ pub fn plan_import_parsed_with(
 		));
 	}
 
-	// Reject if two entries map to the same target file (including symlinks and case aliases)
-	let mut target_identities: HashMap<String, String> = HashMap::new();
+	// Reject two writes to one target file, as early as the preview can
+	// tell. After every step that moves a target (routing, the restore
+	// base, a folder's tail), so it sees the paths Apply writes, and by the
+	// file they are as far as this plan can tell (`TargetId`: symlinks,
+	// case aliases, two spellings of one folder). This is a warning that
+	// errs towards refusing: Apply meets every pair it misses at
+	// `create_new`.
+	let mut targets: HashMap<TargetId, String> = HashMap::new();
 	for op in &combined_creates {
 		cancelled_err(opts, "plan-import")?;
-		let is_ci = op_is_case_insensitive(
-			Some(&op.root_path),
-			&op.absolute_path,
-			&canonical_dest_roots,
-			&root_case_insensitive,
-			mapping.primary_destination.as_ref(),
-		);
-		let mut identity = canonical_target_identity(&op.absolute_path);
-		if is_ci {
-			identity = identity.to_lowercase();
-		}
-		if let Some(prev) = target_identities
-			.insert(identity.clone(), format!("create {}", op.relative_path))
+		let current = format!("create {}", op.relative_path);
+		if let Some(prev) = targets
+			.insert(folder_names.target_id(&op.absolute_path), current.clone())
 		{
 			return Err(TransferError::TargetCollision {
 				path: op.absolute_path.clone(),
-				msg: format!(
-					"previous was '{prev}', current is 'create {}'",
-					op.relative_path
-				),
+				msg: format!("previous was '{prev}', current is '{current}'"),
 			});
 		}
 	}
 	for op in &combined_deletes {
 		cancelled_err(opts, "plan-import")?;
-		let is_ci = op_is_case_insensitive(
-			None,
-			&op.absolute_path,
-			&canonical_dest_roots,
-			&root_case_insensitive,
-			mapping.primary_destination.as_ref(),
-		);
-		let mut identity = canonical_target_identity(&op.absolute_path);
-		if is_ci {
-			identity = identity.to_lowercase();
-		}
-		if let Some(prev) = target_identities
-			.insert(identity.clone(), format!("delete {}", op.relative_path))
+		let current = format!("delete {}", op.relative_path);
+		if let Some(prev) = targets
+			.insert(folder_names.target_id(&op.absolute_path), current.clone())
 		{
 			return Err(TransferError::TargetCollision {
 				path: op.absolute_path.clone(),
-				msg: format!(
-					"previous was '{prev}', current is 'delete {}'",
-					op.relative_path
-				),
+				msg: format!("previous was '{prev}', current is '{current}'"),
 			});
 		}
 	}
+	drop(targets);
 
 	let restore_plan = RestorePlan {
 		roots: destination_roots.to_vec(),
@@ -3812,11 +5257,37 @@ pub fn plan_import_parsed_with(
 	};
 
 	cancelled_err(opts, "plan-import")?;
-	let destination_freshness = DestinationFreshnessSnapshot::capture_with(
+	let mut destination_freshness = DestinationFreshnessSnapshot::capture_with(
 		destination_roots,
 		&restore_plan,
 		opts,
 	)?;
+	// The folders the user named: a tail's names that a create's path needs.
+	// Only when there are some, so a plan without a tail is what it was.
+	if let Some(missing) = &destination_freshness.missing_dirs {
+		let requested = folder_names.requested(missing, &named_paths);
+		if !requested.is_empty() {
+			destination_freshness.requested_dirs = Some(requested);
+		}
+	}
+	// What Apply holds the plan to, whatever the classification above made
+	// of it: the tails as the folders were placed, each by its place, and
+	// the place each create's route goes through.
+	if !placed_ids.is_empty() {
+		destination_freshness.placed =
+			Some(placed_ids.iter().map(|p| p.new_chain()).collect());
+		// Which of the folders to make each create needs, read here, where
+		// the paths are this machine's: a master on another OS cannot.
+		let empty = HashSet::new();
+		destination_freshness.new_dirs = Some(PlannedNewDirs::of(
+			&restore_plan.create_operations,
+			destination_freshness
+				.missing_dirs
+				.as_ref()
+				.unwrap_or(&empty),
+			create_routes,
+		));
+	}
 
 	Ok((
 		TransferImportPlan {
@@ -4484,6 +5955,9 @@ fn capture_replay_freshness(
 		repos: None,
 		missing_dirs: None,
 		symlinked_dirs: None,
+		requested_dirs: None,
+		placed: None,
+		new_dirs: None,
 	})
 }
 
@@ -5847,3 +7321,769 @@ mod freshness_helper_tests {
 		assert_eq!(slash_rel(root, &root.join("a")), "a");
 	}
 }
+
+#[cfg(test)]
+mod new_dir_tests {
+	use super::*;
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	/// Installs the hook for this thread until dropped. A test runs in its
+	/// own process under nextest, and the slot is thread-local besides.
+	struct HookGuard;
+
+	impl Drop for HookGuard {
+		fn drop(&mut self) {
+			NEW_DIR_HOOK.with(|slot| *slot.borrow_mut() = None);
+		}
+	}
+
+	fn hook(
+		f: impl Fn(NewDirStage, &Path) -> io::Result<()> + 'static,
+	) -> HookGuard {
+		NEW_DIR_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+		HookGuard
+	}
+
+	/// A plan pasting `a.txt` into the folder `dest` (which may not exist),
+	/// and the selection that agrees to the folders it would make.
+	fn plan(ws: &Path, dest: &Path) -> (TransferImportPlan, RestoreSelection) {
+		let placed = PlacedRoot::resolve(None, dest).unwrap();
+		let plan = plan_import_with(
+			"// file: a.txt\nA\n",
+			"",
+			&[placed.anchor().path().to_path_buf()],
+			&ImportMapping::with_primary(placed),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let _ = ws;
+		let selection = RestoreSelection {
+			confirmed_placed: plan.new_dirs().placed.into_iter().collect(),
+			..Default::default()
+		};
+		(plan, selection)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let path = entry.unwrap().path();
+				out.push(path.clone());
+				if path.is_dir() && !path.is_symlink() {
+					walk(&path, out);
+				}
+			}
+		}
+		let mut out = Vec::new();
+		walk(dir, &mut out);
+		out.sort();
+		out
+	}
+
+	/// A4: a folder that is there by the time it is made is a change the
+	/// preview did not show, not something to carry on into.
+	#[test]
+	fn a_named_folder_that_exists_when_made_is_stale() {
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let _hook = hook(|stage, dir| {
+			if stage == NewDirStage::BeforeCreate {
+				fs::create_dir(dir)?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), vec![ws.join("new")], "no file written");
+	}
+
+	/// A5 (a): a failure part-way takes back the folders already made.
+	#[test]
+	fn a_failure_while_making_folders_takes_back_the_ones_made() {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		assert_eq!(sel.confirmed_placed, [0].into());
+		assert_eq!(plan.placed_folders()[0].len(), 2);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::BeforeCreate && dir == target {
+				return Err(io::ErrorKind::PermissionDenied.into());
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::Io(e)) => {
+				assert_eq!(e.kind(), io::ErrorKind::PermissionDenied)
+			}
+			other => panic!("expected an io error, got {other:?}"),
+		}
+		assert!(scan(&ws).is_empty(), "{:?}", scan(&ws));
+	}
+
+	/// A5 (b): the last level taken by a file in the meantime is stale, and
+	/// the level made before it is taken back as far as it can be (it holds
+	/// the interloper, which stays).
+	#[test]
+	fn a_file_where_a_folder_was_to_be_made_is_stale_and_the_rest_is_taken_back(
+	) {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::BeforeCreate && dir == target {
+				fs::write(dir, "interloper")?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new/deeper"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert_eq!(fs::read_to_string(&deeper).unwrap(), "interloper");
+		assert_eq!(scan(&ws), vec![ws.join("new"), deeper]);
+	}
+
+	/// A5 (c): something put where the file goes, in a folder this Apply
+	/// just made, is stale; the folder made stays, since it is not empty.
+	#[test]
+	fn a_made_folder_with_something_in_it_stays_when_nothing_was_written() {
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let _hook = hook(|stage, dir| {
+			if stage == NewDirStage::AfterCreate {
+				fs::create_dir(dir.join("a.txt"))?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Created { rel },
+				..
+			}) => assert_eq!(rel, "new/a.txt"),
+			other => panic!("expected a stale Created, got {other:?}"),
+		}
+		assert!(ws.join("new/a.txt").is_dir());
+	}
+
+	/// A5 (d): a failure right after the last level was made takes back every
+	/// level, that one included.
+	#[test]
+	fn a_failure_after_the_last_level_takes_back_every_level() {
+		let (_tmp, ws) = tmp();
+		let deeper = ws.join("new").join("deeper");
+		let (plan, sel) = plan(&ws, &deeper);
+		let target = deeper.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::AfterCreate && dir == target {
+				return Err(io::ErrorKind::PermissionDenied.into());
+			}
+			Ok(())
+		});
+		assert!(matches!(plan.apply(&sel), Err(TransferError::Io(_))));
+		assert!(scan(&ws).is_empty(), "{:?}", scan(&ws));
+	}
+
+	/// A5 (d), the end of an Apply: nothing written leaves no empty folder it
+	/// made; something written keeps them; a folder with content stays, and
+	/// so does one that is another object by then.
+	#[test]
+	fn finishing_takes_back_empty_folders_only_when_nothing_was_written() {
+		let (_tmp, ws) = tmp();
+		let (a, b) = (ws.join("a"), ws.join("a").join("b"));
+		let make = || {
+			fs::create_dir_all(&b).unwrap();
+			let mut made = Made::default();
+			made.dir(&a, true);
+			made.dir(&b, true);
+			made
+		};
+		let made = make();
+		assert_eq!(made.finish(true).0, 2);
+		assert!(b.is_dir());
+		assert_eq!(made.finish(false).0, 0);
+		assert!(!a.exists());
+
+		let made = make();
+		fs::write(b.join("keep.txt"), "x").unwrap();
+		let (kept, left) = made.finish(false);
+		assert_eq!(kept, 2);
+		assert!(
+			left.is_empty(),
+			"a folder with something in it is no failure: {left:?}"
+		);
+		assert!(b.join("keep.txt").exists());
+
+		fs::remove_dir_all(&a).unwrap();
+		let made = make();
+		fs::remove_dir(&b).unwrap();
+		fs::create_dir(&b).unwrap();
+		assert!(made.finish(false).1.is_empty());
+		assert!(b.is_dir(), "another folder in its place is not ours");
+	}
+
+	/// The file made, removed and made again empty at once by someone
+	/// else, is another file even where the filesystem would reuse its
+	/// inode number and its clock has not ticked (Linux): it is neither
+	/// written nor taken back.
+	#[test]
+	fn a_new_file_replaced_by_another_empty_one_is_not_taken_back() {
+		let (_tmp, ws) = tmp();
+		let path = ws.join("new.txt");
+		let file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.unwrap();
+		let key = DirKey::of_file(&file).unwrap();
+		let mut made = Made::default();
+		let modified = fs::symlink_metadata(&path)
+			.and_then(|info| info.modified())
+			.ok();
+		let reserved = made.reserved(file, key, modified);
+		made.file(&path, &reserved, "new.txt");
+		fs::remove_file(&path).unwrap();
+		// Made within the same clock tick: Linux stamps a file with a
+		// coarse clock, so its time can equal the one recorded.
+		let other = fs::File::create(&path).unwrap();
+		other.set_modified(modified.unwrap()).unwrap();
+		drop(other);
+		assert!(!reserved.is_untouched(&path).unwrap());
+		made.release_file(&path).unwrap();
+		assert!(path.exists(), "another file in its place is not ours");
+	}
+
+	/// Restores the process umask when dropped. Safe to change here: each
+	/// test is its own process under nextest.
+	#[cfg(unix)]
+	struct UmaskGuard(nix::sys::stat::Mode);
+
+	#[cfg(unix)]
+	impl UmaskGuard {
+		fn set(mask: u32) -> Self {
+			use nix::sys::stat::{umask, Mode};
+			Self(umask(Mode::from_bits_truncate(mask as _)))
+		}
+	}
+
+	#[cfg(unix)]
+	impl Drop for UmaskGuard {
+		fn drop(&mut self) {
+			nix::sys::stat::umask(self.0);
+		}
+	}
+
+	/// Under umask 0444 the file made is write-only: no permission to read
+	/// it must not make it "not ours", or the row skips it and leaves an
+	/// empty file with nothing written.
+	#[cfg(unix)]
+	#[test]
+	fn a_new_file_that_umask_leaves_unreadable_is_still_written() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_tmp, ws) = tmp();
+		let (plan, sel) = plan(&ws, &ws);
+		let guard = UmaskGuard::set(0o444);
+		let result = plan.apply(&sel);
+		drop(guard);
+		let result = result.unwrap();
+		assert_eq!(result.created_count, 1, "{result:?}");
+		assert_eq!(result.skipped_existing_count, 0, "{result:?}");
+		assert!(result.errors.is_empty(), "{result:?}");
+		let path = ws.join("a.txt");
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+		assert_eq!(fs::read_to_string(&path).unwrap(), "A");
+	}
+
+	/// The same file, after a failed write: taking it back needs no read
+	/// permission either.
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_empty_file_made_is_taken_back() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_tmp, ws) = tmp();
+		let path = ws.join("new.txt");
+		let file = fs::File::create(&path).unwrap();
+		let key = DirKey::of_file(&file).unwrap();
+		drop(file);
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o222)).unwrap();
+		let modified = fs::symlink_metadata(&path)
+			.and_then(|info| info.modified())
+			.ok();
+		let reserved = restore::Reserved::new(key, modified);
+		let mut made = Made::default();
+		made.file(&path, &reserved, "new.txt");
+		made.release_file(&path).unwrap();
+		assert!(!path.exists(), "an empty write-only file made is ours");
+	}
+
+	/// A6: a symlink put where the folder was just made is stale, and nothing
+	/// reaches what it points at.
+	#[cfg(unix)]
+	#[test]
+	fn a_folder_swapped_for_a_symlink_right_after_it_was_made_is_stale() {
+		let (_tmp, ws) = tmp();
+		let elsewhere = ws.join("elsewhere");
+		fs::create_dir(&elsewhere).unwrap();
+		let (plan, sel) = plan(&ws, &ws.join("new"));
+		let target = elsewhere.clone();
+		let _hook = hook(move |stage, dir| {
+			if stage == NewDirStage::AfterCreate {
+				fs::remove_dir(dir)?;
+				std::os::unix::fs::symlink(&target, dir)?;
+			}
+			Ok(())
+		});
+		match plan.apply(&sel) {
+			Err(TransferError::StaleDestination {
+				change: StaleChange::Preview,
+				..
+			}) => {}
+			other => panic!("expected a stale Preview, got {other:?}"),
+		}
+		assert!(scan(&elsewhere).is_empty());
+	}
+}
+
+#[cfg(test)]
+mod case_policy_tests {
+	use super::*;
+	use crate::fscase::{with_probe_override, CaseSensitivity};
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	/// An empty folder on a filesystem that cannot be told and gives the
+	/// names nothing to compare: two targets that differ only in case are
+	/// one target to the plan, as on any folding filesystem.
+	#[test]
+	fn two_targets_that_differ_in_case_collide_when_case_cannot_be_told() {
+		let (_tmp, ws) = tmp();
+		let result =
+			with_probe_override(CaseSensitivity::Unknown, None, || {
+				plan_import(
+					"// file: B.txt\nB\n// file: b.txt\nb\n",
+					"",
+					std::slice::from_ref(&ws),
+					&ImportMapping::with_primary(
+						CanonicalRootId::new(&ws).unwrap(),
+					),
+				)
+			});
+		assert!(
+			matches!(result, Err(TransferError::TargetCollision { .. })),
+			"{result:?}"
+		);
+	}
+
+	/// The same folder spelled two ways, when case cannot be told: both
+	/// spellings are listed as named, and each placed folder is agreed to
+	/// on its own (whether they are one folder is the filesystem's to say
+	/// when Apply makes them).
+	#[test]
+	fn one_new_folder_spelled_two_ways_is_asked_for_when_case_cannot_be_told() {
+		let (_tmp, ws) = tmp();
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed("new"));
+		mapping.map_prefix("q", placed("NEW"));
+		let plan = with_probe_override(CaseSensitivity::Unknown, None, || {
+			plan_import(
+				"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+				"",
+				std::slice::from_ref(&ws),
+				&mapping,
+			)
+			.unwrap()
+		});
+		let new = plan.new_dirs();
+		assert_eq!(new.requested, vec![ws.join("NEW"), ws.join("new")]);
+		assert_eq!(new.incidental, Vec::<PathBuf>::new());
+		assert_eq!(new.placed, vec![1, 2]);
+	}
+
+	/// The same answer decides for the folders an exact name differs
+	/// under: a definite `Sensitive` keeps them apart.
+	#[test]
+	fn a_known_sensitive_filesystem_keeps_the_two_spellings_apart() {
+		let (_tmp, ws) = tmp();
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed("new"));
+		mapping.map_prefix("q", placed("NEW"));
+		let plan =
+			with_probe_override(CaseSensitivity::Sensitive, None, || {
+				plan_import(
+					"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+					"",
+					std::slice::from_ref(&ws),
+					&mapping,
+				)
+				.unwrap()
+			});
+		assert_eq!(plan.new_dirs().requested.len(), 2, "{:?}", plan.new_dirs());
+	}
+
+	/// Two destination roots that are two folders though their paths read
+	/// alike in lower case (`\u{391}` and `\u{3b1}`), each with a new folder
+	/// of the same name. When case cannot be told both fold, and the folder
+	/// the user named under the second root must still ask for consent: it
+	/// was once taken for the first root's, dropped from the agreement and
+	/// made without asking. Linux only: macOS and Windows fold the two names
+	/// into one folder, so the scenario cannot be built there, and a test
+	/// that returned early would pass as a skip.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_named_folder_under_another_root_is_not_the_first_roots_folder() {
+		let (_tmp, ws) = tmp();
+		let (upper, lower) = (ws.join("\u{391}"), ws.join("\u{3b1}"));
+		fs::create_dir(&upper).unwrap();
+		fs::create_dir(&lower)
+			.expect("cannot make two folders that differ in case on Linux");
+		let placed =
+			|root: &Path| PlacedRoot::resolve(None, &root.join("new")).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed(&upper));
+		mapping.map_prefix("q", placed(&lower));
+		let roots = [upper.clone(), lower.clone()];
+		let plan = with_probe_override(CaseSensitivity::Unknown, None, || {
+			plan_import("// file: q/b.txt\nB\n", "", &roots, &mapping).unwrap()
+		});
+		let want = NewDirs {
+			requested: vec![lower.join("new")],
+			incidental: Vec::new(),
+			placed: vec![1],
+		};
+		assert_eq!(plan.new_dirs(), want);
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs, vec![lower.join("new")]);
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert!(!lower.join("new").exists());
+		assert!(!upper.join("new").exists());
+	}
+}
+
+/// The folders the user named are made only with consent, whatever planning
+/// made of them: Apply checks each placed folder's tail itself.
+#[cfg(test)]
+mod placed_consent_tests {
+	use super::*;
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let path = entry.unwrap().path();
+				out.push(path.clone());
+				if path.is_dir() && !path.is_symlink() {
+					walk(&path, out);
+				}
+			}
+		}
+		let mut out = Vec::new();
+		walk(dir, &mut out);
+		out.sort();
+		out
+	}
+
+	/// Primary `new/sub` and prefix `q` at `NEW/SUB`, a payload for `q`
+	/// only, with `new` made by someone else after planning checked the
+	/// tails and before it told the named folders from the others. On a
+	/// filesystem that folds case `NEW/SUB` is then `sub` below an existing
+	/// folder, and planning took it for an incidental one.
+	#[cfg(any(target_os = "macos", windows))]
+	fn plan_raced(ws: &Path) -> TransferImportPlan {
+		let probe = ws.join(".case-probe");
+		fs::write(&probe, "").unwrap();
+		assert!(
+			ws.join(".CASE-PROBE").exists(),
+			"needs a filesystem that folds case"
+		);
+		fs::remove_file(&probe).unwrap();
+		let placed =
+			|rel: &str| PlacedRoot::resolve(None, &ws.join(rel)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("new/sub"));
+		mapping.map_prefix("q", placed("NEW/SUB"));
+		let new = ws.join("new");
+		let _hook = test_hooks::after_tail_check(move || {
+			fs::create_dir_all(&new).unwrap();
+		});
+		plan_import("// file: q/b.txt\nB\n", "", &[ws.to_path_buf()], &mapping)
+			.unwrap()
+	}
+
+	/// The folder made in between is gone again by Apply: every level of
+	/// the tail is missing, as the preview had it, and the folder the user
+	/// named is made only with consent, though planning listed none.
+	#[cfg(any(target_os = "macos", windows))]
+	#[test]
+	fn a_folder_made_while_planning_does_not_take_consent_away() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_raced(&ws);
+		fs::remove_dir(ws.join("new")).unwrap();
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert!(!dirs.is_empty())
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// The folder made in between is still there: a level of the tail
+	/// exists that did not when the folder was placed, so the plan is stale.
+	#[cfg(any(target_os = "macos", windows))]
+	#[test]
+	fn a_folder_made_while_planning_makes_the_plan_stale() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_raced(&ws);
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::StaleDestination { .. }) => {}
+			other => panic!("expected StaleDestination, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), vec![ws.join("new")]);
+	}
+
+	/// A plan whose classification names no folder (what a planning
+	/// mistake would leave) still lists the placed folder's levels and
+	/// makes them only with consent: Apply reads the tail itself.
+	#[test]
+	fn apply_asks_for_a_placed_tail_the_plan_does_not_list() {
+		let (_tmp, ws) = tmp();
+		let placed = PlacedRoot::resolve(None, &ws.join("new/sub")).unwrap();
+		let plan = plan_import(
+			"// file: a.txt\nA\n",
+			"",
+			std::slice::from_ref(&ws),
+			&ImportMapping::with_primary(placed),
+		)
+		.unwrap();
+		let mut freshness = plan.destination_freshness().clone();
+		freshness.requested_dirs = None;
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			plan.restore_plan().clone(),
+			freshness,
+		);
+		assert_eq!(
+			plan.new_dirs().requested,
+			vec![ws.join("new"), ws.join("new/sub")]
+		);
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert!(!dirs.is_empty())
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+
+		// With the tail agreed to, it is made and the file written.
+		let agreed = RestoreSelection {
+			confirmed_placed: [0].into(),
+			..Default::default()
+		};
+		plan.apply(&agreed).unwrap();
+		assert_eq!(fs::read_to_string(ws.join("new/sub/a.txt")).unwrap(), "A");
+	}
+}
+
+/// One name spelled in Unicode's two forms (`é` composed, `e` with a
+/// combining accent) is one folder to macOS, and to the plan on every
+/// filesystem: a folder the user named is not made without consent, and
+/// two writes to it are refused, however the payload spells it.
+#[cfg(test)]
+mod unicode_name_tests {
+	use super::*;
+
+	const COMPOSED: &str = "\u{e9}";
+	const DECOMPOSED: &str = "e\u{301}";
+
+	fn tmp() -> (tempfile::TempDir, PathBuf) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dunce::canonicalize(dir.path()).unwrap();
+		(dir, path)
+	}
+
+	fn scan(dir: &Path) -> Vec<PathBuf> {
+		let mut out: Vec<PathBuf> = fs::read_dir(dir)
+			.unwrap()
+			.map(|e| e.unwrap().path())
+			.collect();
+		out.sort();
+		out
+	}
+
+	/// The primary destination is the new folder `ws/é` (composed); `q`
+	/// is `ws` itself, and the payload reaches the same folder through
+	/// `q/é` decomposed.
+	fn plan_named_through_the_other_form(ws: &Path) -> TransferImportPlan {
+		let mut mapping = ImportMapping::with_primary(
+			PlacedRoot::resolve(None, &ws.join(COMPOSED)).unwrap(),
+		);
+		mapping.map_prefix("q", CanonicalRootId::new(ws).unwrap());
+		plan_import(
+			&format!("// file: q/{DECOMPOSED}/a.txt\nA\n"),
+			"",
+			&[ws.to_path_buf()],
+			&mapping,
+		)
+		.unwrap()
+	}
+
+	/// Planning lists the folder as named, and Apply makes nothing without
+	/// consent: on macOS the filesystem says the two forms are one folder.
+	/// (Where it keeps them apart they are two, and the engine does not
+	/// say otherwise.)
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn the_named_folder_reached_in_the_other_form_needs_consent() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_named_through_the_other_form(&ws);
+		assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs.len(), 1, "{dirs:?}");
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// A plan that lists nothing as named, its create spelled decomposed
+	/// under the composed placed tail (a peer's plan, `from_parts`): Apply
+	/// tells the two forms as one folder itself, and asks.
+	#[test]
+	fn apply_asks_for_the_named_folder_reached_in_the_other_form() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_named_through_the_other_form(&ws);
+		let mut freshness = plan.destination_freshness().clone();
+		freshness.requested_dirs = None;
+		let mut restore_plan = plan.restore_plan().clone();
+		let op = &mut restore_plan.create_operations[0];
+		op.absolute_path = ws.join(DECOMPOSED).join("a.txt");
+		op.relative_path = format!("{DECOMPOSED}/a.txt");
+		op.root_path.clone_from(&ws);
+		freshness.new_dirs = Some(PlannedNewDirs {
+			dirs: vec![ws.join(DECOMPOSED)],
+			needs: vec![vec![0]],
+			routes: Vec::new(),
+		});
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			restore_plan,
+			freshness,
+		);
+		assert!(plan.new_dirs().requested.is_empty());
+		match plan.apply(&RestoreSelection::default()) {
+			Err(TransferError::NewDirsNotConfirmed { dirs }) => {
+				assert_eq!(dirs, vec![ws.join(COMPOSED)]);
+			}
+			other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	fn two_forms_mapping(ws: &Path) -> ImportMapping {
+		let placed =
+			|name: &str| PlacedRoot::resolve(None, &ws.join(name)).unwrap();
+		let mut mapping = ImportMapping::with_primary(placed("other"));
+		mapping.map_prefix("p", placed(COMPOSED));
+		mapping.map_prefix("q", placed(DECOMPOSED));
+		mapping
+	}
+
+	#[cfg(target_os = "macos")]
+	fn agree_to_everything() -> RestoreSelection {
+		RestoreSelection {
+			overwrite_existing: true,
+			confirmed_placed: (0..3).collect(),
+			..Default::default()
+		}
+	}
+
+	/// Two routes to the two forms of one new folder, each writing `a.txt`:
+	/// one file written twice, refused by planning.
+	#[test]
+	fn two_routes_to_the_two_forms_of_one_folder_collide() {
+		let (_tmp, ws) = tmp();
+		let result = plan_import(
+			"// file: p/a.txt\nA\n// file: q/a.txt\nB\n",
+			"",
+			std::slice::from_ref(&ws),
+			&two_forms_mapping(&ws),
+		);
+		assert!(
+			matches!(result, Err(TransferError::TargetCollision { .. })),
+			"{result:?}"
+		);
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+
+	/// The same two writes in a plan that did not come from planning here
+	/// (`from_parts`): Apply refuses them itself, before writing anything,
+	/// where the filesystem says they are one file.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn apply_refuses_two_writes_to_the_two_forms_of_one_file() {
+		let (_tmp, ws) = tmp();
+		let plan = plan_import(
+			"// file: p/a.txt\nA\n// file: q/b.txt\nB\n",
+			"",
+			std::slice::from_ref(&ws),
+			&two_forms_mapping(&ws),
+		)
+		.unwrap();
+		let mut restore_plan = plan.restore_plan().clone();
+		for op in &mut restore_plan.create_operations {
+			let form = if op.content.starts_with('A') {
+				COMPOSED
+			} else {
+				DECOMPOSED
+			};
+			op.absolute_path = ws.join(form).join("a.txt");
+			op.relative_path = "a.txt".to_string();
+			op.root_path = ws.join(form);
+		}
+		let plan = TransferImportPlan::from_parts(
+			plan.roots().to_vec(),
+			restore_plan,
+			plan.destination_freshness().clone(),
+		);
+		match plan.apply(&agree_to_everything()) {
+			Err(TransferError::TargetCollision { .. }) => {}
+			other => panic!("expected TargetCollision, got {other:?}"),
+		}
+		assert_eq!(scan(&ws), Vec::<PathBuf>::new());
+	}
+}
+
+#[cfg(test)]
+mod fs_decides_tests;
+
+#[cfg(test)]
+mod fd_budget_tests;

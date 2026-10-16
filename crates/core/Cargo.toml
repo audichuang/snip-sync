@@ -14,20 +14,30 @@ arboard = "3"
 thiserror = "2"
 tempfile = "3"
 similar = "2.7"
+# Which new names are one folder (foldernames.rs `name_key`): Unicode
+# normalization and full case folding.
+unicode-normalization = "0.1"
+unicase = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# Process groups, exit observation without reaping, non-blocking pipes (gitrun.rs).
-nix = { version = "0.27", default-features = false, features = ["event", "fs", "poll", "process", "signal"] }
+# Process groups, exit observation without reaping, non-blocking pipes (gitrun.rs);
+# `resource` lets a test lower RLIMIT_NOFILE without `unsafe`.
+nix = { version = "0.27", default-features = false, features = ["event", "fs", "poll", "process", "resource", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 # A Job object owns the whole process tree; process-wrap terminates the
 # suspended child if job setup fails (gitrun.rs).
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+# A folder's volume and file index, read and released at once (foldernames.rs).
+winapi-util = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
+# Safe `statfs` and `FS_IOC_GETFLAGS` for the case-folding query (fscase.rs):
+# the workspace forbids `unsafe`, so the raw ioctl is not an option here.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [features]
 # Test samples other crates walk (`reason::test_support`).

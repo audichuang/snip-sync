@@ -3,13 +3,16 @@
 //! Port of ClipCodeVSCode `src/restore.ts` and `src/restoreBase.ts`
 //! (commit 0aa24c8).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::foldernames::{links_of_file, DirKey};
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
@@ -140,6 +143,14 @@ pub struct RestoreSelection {
 	pub skip_existing: bool,
 	pub unchecked_creates: BTreeSet<usize>,
 	pub unchecked_deletes: BTreeSet<usize>,
+	/// The placed folders (a destination or an import path not made yet)
+	/// the user agreed to make, by their place in the plan's list
+	/// (`DestinationFreshnessSnapshot::placed`): the agreement is to a
+	/// destination, never to a spelling of a path. Apply refuses when a row
+	/// it keeps is routed to one that is not here, and when one that is not
+	/// here exists once this Apply made its folders.
+	#[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+	pub confirmed_placed: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +170,15 @@ pub struct RestoreExecutionResult {
 	/// end to word. Empty from a peer that predates it.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub failures: Vec<RestoreFailure>,
+	/// The folders the user named (a destination or an import path) that
+	/// this Apply made and that are still there. Additive on the wire: an
+	/// older worker sends none.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub created_dirs: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+	*n == 0
 }
 
 /// One failed entry: the plan's relative path and why, as a [`Reason`].
@@ -174,7 +194,7 @@ pub struct RestoreFailure {
 impl RestoreExecutionResult {
 	/// Record a failure in both forms, so the CLI's line and the typed
 	/// reason cannot drift apart.
-	fn fail(&mut self, path: &str, text: &str, reason: Reason) {
+	pub(crate) fn fail(&mut self, path: &str, text: &str, reason: Reason) {
 		self.errors.push(format!("{path}: {text}"));
 		self.failures.push(RestoreFailure {
 			path: path.to_string(),
@@ -328,17 +348,288 @@ pub fn execute_restore_plan_observed(
 	selection: &RestoreSelection,
 	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
 ) -> RestoreExecutionResult {
+	execute_restore_plan_reserved(plan, selection, &HashMap::new(), after_write)
+		.0
+}
+
+/// What an Apply did for a new file before any content was written.
+#[derive(Debug)]
+pub(crate) enum Reservation {
+	/// An empty file of this Apply's own is there (`create_new`): the row
+	/// writes into it while it is still that file, untouched.
+	Made(Reserved),
+	/// Making it failed: the row fails with this, and writes nothing.
+	Failed(std::io::Error),
+}
+
+/// The empty file an Apply made for a new file, as it was right after:
+/// which object it is and when it was last modified (its length is 0, and
+/// it has one name).
+#[derive(Debug, Clone)]
+pub(crate) struct Reserved {
+	pub(crate) key: DirKey,
+	pub(crate) modified: Option<SystemTime>,
+	/// The handle the file was made with, kept open on Linux within the
+	/// Apply's budget (`Made` in transfer.rs): while it is open the file's
+	/// number is no other object's, and the file is read through it with
+	/// no descriptor of its own.
+	#[cfg(target_os = "linux")]
+	pub(crate) pin: Option<std::sync::Arc<fs::File>>,
+}
+
+/// What the filesystem says a file is, taken without any right to read or
+/// write its content (see [`Seen::of_path`]) or from an open handle.
+struct Seen {
+	key: DirKey,
+	len: u64,
+	modified: Option<SystemTime>,
+	links: Option<u64>,
+}
+
+impl Seen {
+	/// From the open `file` (opened at `path`), as the writable handle is
+	/// read. `None` when it is not a file or the filesystem cannot say.
+	fn of_file(file: &fs::File, path: &Path) -> Option<Self> {
+		let info = file.metadata().ok()?;
+		info.is_file().then(|| Self {
+			key: DirKey::of_file(file).unwrap_or_else(|| DirKey::of(path)),
+			len: info.len(),
+			modified: info.modified().ok(),
+			links: links_of_file(file),
+		})
+	}
+
+	/// The one identity pre-check, for every caller: what is at `path`
+	/// by name, a file (not a link) and never through a link, asked
+	/// WITHOUT any permission on its content, so a file umask left
+	/// write-only (or any mode) is told like another.
+	///
+	/// - Linux: an `O_PATH | O_NOFOLLOW` handle, fstat-ed. It pins the
+	///   object, so a caller may stat it again just before it acts.
+	/// - Other Unix (no `O_PATH`): `lstat`. Between this answer and the
+	///   caller's next step (a write open, an unlink) the name can still
+	///   be swapped; the write path re-checks on its writable handle
+	///   ([`Reserved::holds`]), but a take-back's `unlink` has a residual,
+	///   very small window here.
+	/// - Windows: a handle with access mode 0 (no read or write right).
+	///
+	/// `None` when there is nothing there or it is not a plain file.
+	fn of_path(path: &Path) -> std::io::Result<Option<Self>> {
+		use std::io::ErrorKind::NotFound;
+		let info = match fs::symlink_metadata(path) {
+			Ok(info) if info.is_file() => info,
+			Ok(_) => return Ok(None),
+			Err(e) if e.kind() == NotFound => return Ok(None),
+			Err(e) => return Err(e),
+		};
+		#[cfg(all(unix, not(target_os = "linux")))]
+		{
+			use std::os::unix::fs::MetadataExt;
+			Ok(Some(Self {
+				key: DirKey::Object(info.dev(), info.ino()),
+				len: info.len(),
+				modified: info.modified().ok(),
+				links: Some(info.nlink()),
+			}))
+		}
+		#[cfg(any(target_os = "linux", windows))]
+		{
+			let _ = info;
+			let mut options = fs::OpenOptions::new();
+			#[cfg(windows)]
+			{
+				use std::os::windows::fs::OpenOptionsExt;
+				options.access_mode(0);
+			}
+			#[cfg(target_os = "linux")]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				// The access mode is ignored with `O_PATH`: no permission
+				// on the content is checked.
+				options
+					.read(true)
+					.custom_flags(libc::O_PATH | libc::O_NOFOLLOW);
+			}
+			match options.open(path) {
+				Ok(file) => Ok(Self::of_file(&file, path)),
+				Err(e) if e.kind() == NotFound => Ok(None),
+				Err(e) => Err(e),
+			}
+		}
+	}
+}
+
+impl Reserved {
+	/// The file made as `key`, last modified at `modified`, not pinned.
+	pub(crate) fn new(key: DirKey, modified: Option<SystemTime>) -> Self {
+		Self {
+			key,
+			modified,
+			#[cfg(target_os = "linux")]
+			pin: None,
+		}
+	}
+
+	/// Whether `seen` is still the file made, untouched: the same object,
+	/// empty, not modified since, and under no other name. The one test
+	/// every step takes it by: its row writes into it, and the Apply takes
+	/// it back, only while this holds. Anything the filesystem cannot say
+	/// counts as touched.
+	fn holds(&self, seen: &Seen) -> bool {
+		seen.key == self.key
+			&& seen.len == 0
+			&& (self.modified.is_none() || seen.modified == self.modified)
+			&& seen.links == Some(1)
+	}
+
+	/// Opens `path` to write without creating or truncating: by name a
+	/// file (not a link), and never through a link. `None` when there is
+	/// nothing there, or when it cannot be opened that way for lack of
+	/// permission: it is not the file made.
+	fn open_writable(path: &Path) -> std::io::Result<Option<fs::File>> {
+		use std::io::ErrorKind::{NotFound, PermissionDenied};
+		let mut options = fs::OpenOptions::new();
+		options.write(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.custom_flags(libc::O_NOFOLLOW);
+		}
+		match options.open(path) {
+			Ok(file) => Ok(Some(file)),
+			Err(e) if matches!(e.kind(), NotFound | PermissionDenied) => {
+				Ok(None)
+			}
+			Err(e) => Err(e),
+		}
+	}
+
+	/// Whether what is at `path` is still the file made, untouched
+	/// ([`Self::holds`]), asked without any permission on its content: the
+	/// Apply takes a file back on this.
+	///
+	/// A pinned file opens nothing: the name is `lstat`-ed, and when it
+	/// names the pinned object (whose number nothing else can carry while
+	/// it is held) the object is read through the pin. Taking back what
+	/// an Apply made must not need a descriptor its pins took.
+	pub(crate) fn is_untouched(&self, path: &Path) -> std::io::Result<bool> {
+		#[cfg(target_os = "linux")]
+		if let Some(pin) = &self.pin {
+			use std::os::unix::fs::MetadataExt;
+			let named = match fs::symlink_metadata(path) {
+				Ok(info) => info,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					return Ok(false)
+				}
+				Err(e) => return Err(e),
+			};
+			if !named.is_file()
+				|| DirKey::Object(named.dev(), named.ino()) != self.key
+			{
+				return Ok(false);
+			}
+			return Ok(
+				Seen::of_file(pin, path).is_some_and(|seen| self.holds(&seen))
+			);
+		}
+		Ok(Seen::of_path(path)?.is_some_and(|seen| self.holds(&seen)))
+	}
+
+	/// The file made, opened to write, when what is at `path` is still
+	/// that file untouched: asked first without any permission, so a file
+	/// replaced by one that cannot be written is simply not ours; then
+	/// through the writable handle itself, which is the check that lets a
+	/// write through, in case it was swapped between the two. `None` when
+	/// it is not.
+	pub(crate) fn open_untouched(
+		&self,
+		path: &Path,
+	) -> std::io::Result<Option<fs::File>> {
+		if !self.is_untouched(path)? {
+			return Ok(None);
+		}
+		let Some(file) = Self::open_writable(path)? else {
+			return Ok(None);
+		};
+		Ok(Seen::of_file(&file, path)
+			.is_some_and(|seen| self.holds(&seen))
+			.then_some(file))
+	}
+}
+
+/// A step of an Apply a test makes fail: `"write"` (a reserved row's
+/// write), `"release"` (taking an empty file back) or `"reserve"` (making
+/// a new file), with the path it is at.
+#[cfg(test)]
+pub(crate) type FailPoint = Box<dyn Fn(&str, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+	pub(crate) static FAIL_POINT: std::cell::RefCell<Option<FailPoint>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_point(step: &str, path: &Path) -> std::io::Result<()> {
+	FAIL_POINT.with(|slot| match slot.borrow().as_ref() {
+		Some(f) => f(step, path),
+		None => Ok(()),
+	})
+}
+
+#[cfg(not(test))]
+pub(crate) fn fail_point(_step: &str, _path: &Path) -> std::io::Result<()> {
+	Ok(())
+}
+
+/// Whether the shared write path refuses `op` before writing anything.
+pub(crate) fn create_is_refused(
+	roots: &[PathBuf],
+	op: &CreateOperation,
+) -> bool {
+	escapes_all_roots(roots, &op.absolute_path)
+		|| has_git_segment(&op.relative_path)
+		|| lands_in_git_dir(&op.absolute_path)
+}
+
+/// [`execute_restore_plan_observed`] with the new files `reserved` made
+/// already, by create index. Returns, besides the result, the indices
+/// of the files made that no content reached and that nobody else
+/// touched either: the ones the Apply may take back. A file found
+/// touched is someone else's from then on, and is never among them.
+pub(crate) fn execute_restore_plan_reserved(
+	plan: &RestorePlan,
+	selection: &RestoreSelection,
+	reserved: &HashMap<usize, Reservation>,
+	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
+) -> (RestoreExecutionResult, Vec<usize>) {
 	let mut result = RestoreExecutionResult {
 		planned_skipped_count: plan.skipped_operations.len(),
 		..Default::default()
 	};
+	let mut unwritten = Vec::new();
 
 	for (i, op) in plan.create_operations.iter().enumerate() {
 		if selection.unchecked_creates.contains(&i) {
 			continue;
 		}
-		// The plan's FULL root set, not only the op's own root.
-		match run_create(&plan.roots, selection, op) {
+		let run = match reserved.get(&i) {
+			Some(Reservation::Failed(e)) => Err(CreateFailure {
+				text: e.to_string(),
+				reason: io_reason(e, &op.relative_path),
+			}),
+			Some(Reservation::Made(reserved)) => {
+				let (run, ours) =
+					run_reserved_create(&plan.roots, selection, op, reserved);
+				if ours {
+					unwritten.push(i);
+				}
+				run
+			}
+			// The plan's FULL root set, not only the op's own root.
+			None => run_create(&plan.roots, selection, op),
+		};
+		match run {
 			Ok(
 				outcome @ (CreateOutcome::Created | CreateOutcome::Overwritten),
 			) => {
@@ -385,7 +676,7 @@ pub fn execute_restore_plan_observed(
 		}
 	}
 
-	result
+	(result, unwritten)
 }
 
 /// What one create operation ended in. A skipped row wrote nothing.
@@ -401,15 +692,73 @@ struct CreateFailure {
 	reason: Reason,
 }
 
+/// A new file whose empty file this Apply made. While that file is still
+/// there untouched ([`Reserved::holds`]: the same object, empty, not
+/// modified since, with no other name), the content is written into it
+/// through its own handle, as a file that was not there would be: nothing
+/// is renamed over the name. Anything else at the name (written into,
+/// emptied again, given another name, replaced, removed) is someone
+/// else's by now, and the row runs as any row onto an existing file does
+/// ([`run_create`]): kept unless overwriting is allowed, then replaced by
+/// a rename that leaves any other name alone, and never when it is not
+/// UTF-8.
+///
+/// Also returns whether the file is still the one made and empty, for
+/// the Apply to take back when the row wrote nothing: `false` once it was
+/// found touched, whatever the row did next.
+///
+/// What is left is the moment between the check of the handle and the
+/// write: a writer that puts content into the file then has it
+/// overwritten. Nothing in a filesystem's plain file API closes it.
+fn run_reserved_create(
+	roots: &[PathBuf],
+	selection: &RestoreSelection,
+	op: &CreateOperation,
+	reserved: &Reserved,
+) -> (Result<CreateOutcome, CreateFailure>, bool) {
+	let failure = |e: std::io::Error| CreateFailure {
+		text: e.to_string(),
+		reason: io_reason(&e, &op.relative_path),
+	};
+	if create_is_refused(roots, op) {
+		let refused = CreateFailure {
+			text: "unsafe path".into(),
+			reason: Reason::UnsafePath {
+				path: op.relative_path.clone(),
+			},
+		};
+		return (Err(refused), true);
+	}
+	if let Err(e) = fail_point("write", &op.absolute_path) {
+		return (Err(failure(e)), true);
+	}
+	let mut file = match reserved.open_untouched(&op.absolute_path) {
+		Ok(Some(file)) => file,
+		Ok(None) => return (run_create(roots, selection, op), false),
+		// Not known to be touched: taking it back checks again.
+		Err(e) => return (Err(failure(e)), true),
+	};
+	let written = file
+		.write_all(op.content.as_bytes())
+		.and_then(|()| file.sync_all());
+	if let Err(e) = written {
+		// Back to empty and to the time it was made, so the file can be
+		// taken back as made.
+		let _ = file.set_len(0);
+		if let Some(modified) = reserved.modified {
+			let _ = file.set_modified(modified);
+		}
+		return (Err(failure(e)), true);
+	}
+	(Ok(CreateOutcome::Created), false)
+}
+
 fn run_create(
 	roots: &[PathBuf],
 	selection: &RestoreSelection,
 	op: &CreateOperation,
 ) -> Result<CreateOutcome, CreateFailure> {
-	if escapes_all_roots(roots, &op.absolute_path)
-		|| has_git_segment(&op.relative_path)
-		|| lands_in_git_dir(&op.absolute_path)
-	{
+	if create_is_refused(roots, op) {
 		return Err(CreateFailure {
 			text: "unsafe path".into(),
 			reason: Reason::UnsafePath {
@@ -735,6 +1084,136 @@ mod tests {
 	use crate::format::{build_payload, parse_clipboard, BuildPayloadOptions};
 
 	const HEADER: &str = "// file: $FILE_PATH";
+
+	/// An empty file made as an Apply makes one, and what it records.
+	fn made_file(root: &Path) -> (PathBuf, Reserved) {
+		let path = root.join("new.txt");
+		let file = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.unwrap();
+		let key = DirKey::of_file(&file).unwrap();
+		drop(file);
+		let modified = fs::symlink_metadata(&path).unwrap().modified().ok();
+		(path, Reserved::new(key, modified))
+	}
+
+	fn untouched(path: &Path, reserved: &Reserved) -> bool {
+		reserved.open_untouched(path).unwrap().is_some()
+	}
+
+	#[test]
+	fn a_made_file_is_untouched_until_someone_changes_it() {
+		let (_dir, root) = tmp();
+		let (path, reserved) = made_file(&root);
+		assert!(untouched(&path, &reserved));
+
+		// Emptied again: same object, still empty, a new time.
+		let earlier = SystemTime::UNIX_EPOCH
+			+ std::time::Duration::from_secs(1_000_000_000);
+		fs::File::options()
+			.write(true)
+			.open(&path)
+			.unwrap()
+			.set_modified(earlier)
+			.unwrap();
+		assert!(!untouched(&path, &reserved), "a new time is a change");
+	}
+
+	/// Runs on every OS: `fs::hard_link` makes a hard link on Windows too.
+	#[test]
+	fn a_made_file_given_another_name_is_touched() {
+		let (_dir, root) = tmp();
+		let (path, reserved) = made_file(&root);
+		let alias = root.join("alias.txt");
+		fs::hard_link(&path, &alias).unwrap();
+		assert!(!untouched(&path, &reserved), "two names");
+		fs::remove_file(&alias).unwrap();
+		assert!(untouched(&path, &reserved), "one name again");
+	}
+
+	/// What a row does after a failed write: back to empty and to the time
+	/// it was made, so the Apply can still take the file back.
+	#[test]
+	fn a_made_file_reset_after_a_failed_write_is_untouched_again() {
+		let (_dir, root) = tmp();
+		let (path, reserved) = made_file(&root);
+		let mut file = reserved.open_untouched(&path).unwrap().unwrap();
+		file.write_all(b"partial").unwrap();
+		drop(file);
+		assert!(!untouched(&path, &reserved));
+		let file = fs::File::options().write(true).open(&path).unwrap();
+		file.set_len(0).unwrap();
+		file.set_modified(reserved.modified.unwrap()).unwrap();
+		drop(file);
+		assert!(untouched(&path, &reserved));
+	}
+
+	/// The made file swapped, from outside, for a non-empty readable file
+	/// that cannot be written: not ours any more, so the row follows the
+	/// existing-file rules instead of failing on the permission.
+	#[cfg(unix)]
+	fn run_over_a_swapped_read_only_file(
+		selection: &RestoreSelection,
+	) -> (
+		RestoreExecutionResult,
+		Vec<usize>,
+		PathBuf,
+		tempfile::TempDir,
+	) {
+		use std::os::unix::fs::PermissionsExt;
+		let (dir, root) = tmp();
+		let (path, reserved) = made_file(&root);
+		fs::remove_file(&path).unwrap();
+		fs::write(&path, "external").unwrap();
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+		let plan = plan_restore(&[&root], &[entry("new.txt", "ours")]);
+		let map = HashMap::from([(0, Reservation::Made(reserved))]);
+		let (result, unwritten) = execute_restore_plan_reserved(
+			&plan,
+			selection,
+			&map,
+			&mut |_, _| {},
+		);
+		(result, unwritten, path, dir)
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_skipped_by_default() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&RestoreSelection::default());
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.created_count + result.overwritten_count, 0);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "external");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_skipped_when_skipping_existing() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&RestoreSelection {
+				skip_existing: true,
+				..Default::default()
+			});
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.created_count + result.overwritten_count, 0);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "external");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_swapped_read_only_file_is_replaced_when_overwriting() {
+		let (result, unwritten, path, _dir) =
+			run_over_a_swapped_read_only_file(&overwrite());
+		assert!(result.errors.is_empty(), "{:?}", result.errors);
+		assert_eq!(result.overwritten_count, 1);
+		assert!(unwritten.is_empty());
+		assert_eq!(read(path), "ours");
+	}
 
 	fn entry(path: &str, content: &str) -> RestoreEntry {
 		RestoreEntry {

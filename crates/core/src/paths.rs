@@ -761,6 +761,26 @@ fn collapse_slashes(s: &str) -> String {
 	out
 }
 
+/// A folder name a paste may not make, on every platform: one that ends in a
+/// dot or a space, or one Windows reserves (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9`, `LPT1`-`LPT9`, with or without an extension). Refused
+/// everywhere, as `sanitize_relative_path` refuses `:` everywhere, so one
+/// command gives one answer on every machine. Only names to be made are
+/// checked; a folder that exists keeps whatever name it has.
+pub(crate) fn is_unfit_new_folder_name(name: &str) -> bool {
+	if name.ends_with(['.', ' ']) {
+		return true;
+	}
+	let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+	let upper = stem.to_ascii_uppercase();
+	matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+		|| ["COM", "LPT"].iter().any(|p| {
+			upper
+				.strip_prefix(p)
+				.is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+		})
+}
+
 /// True when `value` is already the exact relative path a payload header
 /// carries, so an export item named by it passes validation unchanged.
 pub fn is_exportable_relative_path(value: &str) -> bool {
@@ -962,7 +982,7 @@ pub fn escapes_all_roots<P: AsRef<Path>>(
 }
 
 /// Component-wise containment on native paths, never on strings.
-fn is_contained(real_target: &Path, real_root: &Path) -> bool {
+pub(crate) fn is_contained(real_target: &Path, real_root: &Path) -> bool {
 	#[cfg(windows)]
 	{
 		// Windows paths compare case-insensitively (as node's path.relative).

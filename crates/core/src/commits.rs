@@ -3831,6 +3831,22 @@ mod tests {
 		assert_eq!(result.created.len(), 3);
 	}
 
+	/// The replay layout asks the same detector as the paste planner, and
+	/// a filesystem that cannot be told folds case for it too.
+	#[test]
+	fn the_replay_layout_folds_case_when_case_cannot_be_told() {
+		use crate::fscase::{with_probe_override, CaseSensitivity};
+		let dir = tempfile::tempdir().unwrap();
+		let fold = |query| {
+			with_probe_override(query, None, || {
+				PlannedLayout::fold_case_for(dir.path())
+			})
+		};
+		assert!(fold(CaseSensitivity::Unknown));
+		assert!(fold(CaseSensitivity::Insensitive));
+		assert!(!fold(CaseSensitivity::Sensitive));
+	}
+
 	// Issue #76: on a case-insensitive filesystem, a path spelled with
 	// another case is the same entry as the one an earlier commit touched.
 	// A case-sensitive one keeps them apart; both must match Apply.
