@@ -749,10 +749,28 @@ pub struct TargetFileFreshness {
 }
 
 /// Destination freshness snapshot captured during import preview.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationFreshnessSnapshot {
 	pub roots: HashMap<CanonicalRootId, RepoFreshness>,
 	pub target_files: HashMap<PathBuf, TargetFileFreshness>,
+	/// Every repository an Apply of any planned operation would lock (the
+	/// nearest `.git` above each target's nearest existing folder), keyed by
+	/// that folder. `None`: not recorded (commit replay, or an older master
+	/// that dropped the field).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub repos: Option<HashMap<CanonicalRootId, RepoFreshness>>,
+	/// Folders on a planned create's path that did not exist at preview.
+	/// Apply accepts them still missing or now a real folder; a file or a
+	/// symlink there is stale.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub missing_dirs: Option<HashSet<PathBuf>>,
+	/// Folders on a planned target's path that were symlinks to a folder at
+	/// preview (below the target's root), each with the canonical folder it
+	/// pointed at then. A folder that is a symlink now but was not one then,
+	/// or that points elsewhere, would carry the write somewhere the preview
+	/// did not show, so it is stale. `None`: not recorded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub symlinked_dirs: Option<HashMap<PathBuf, PathBuf>>,
 }
 
 impl DestinationFreshnessSnapshot {
@@ -783,6 +801,42 @@ impl DestinationFreshnessSnapshot {
 				.saturating_add(path.capacity())
 				.saturating_add(state.root.0.capacity())
 				.saturating_add(state.relative_path.capacity());
+		}
+		if let Some(repos) = &self.repos {
+			bytes = bytes.saturating_add(fresh_capture_table_bytes::<
+				CanonicalRootId,
+				RepoFreshness,
+			>(repos.capacity()));
+			for (root, state) in repos {
+				bytes = bytes
+					.saturating_add(root.0.capacity())
+					.saturating_add(
+						state.head_commit.as_ref().map_or(0, String::capacity),
+					)
+					.saturating_add(
+						state.head_ref.as_ref().map_or(0, String::capacity),
+					);
+			}
+		}
+		if let Some(dirs) = &self.missing_dirs {
+			bytes = bytes
+				.saturating_add(fresh_capture_table_bytes::<PathBuf, ()>(
+					dirs.capacity(),
+				));
+			for dir in dirs {
+				bytes = bytes.saturating_add(dir.capacity());
+			}
+		}
+		if let Some(dirs) = &self.symlinked_dirs {
+			bytes = bytes
+				.saturating_add(fresh_capture_table_bytes::<PathBuf, PathBuf>(
+					dirs.capacity(),
+				));
+			for (dir, target) in dirs {
+				bytes = bytes
+					.saturating_add(dir.capacity())
+					.saturating_add(target.capacity());
+			}
 		}
 		bytes
 	}
@@ -853,10 +907,17 @@ impl DestinationFreshnessSnapshot {
 			);
 		}
 
+		let (missing_dirs, symlinked_dirs) =
+			capture_folder_chain(plan, &roots, &target_files, opts)?;
+		let repos = capture_destination_repos(&roots, &target_files, opts)?;
+
 		cancelled_err(opts, "import-freshness")?;
 		Ok(Self {
 			roots,
 			target_files,
+			repos: Some(repos),
+			missing_dirs: Some(missing_dirs),
+			symlinked_dirs: Some(symlinked_dirs),
 		})
 	}
 
@@ -904,7 +965,32 @@ impl DestinationFreshnessSnapshot {
 		Ok(Self {
 			roots,
 			target_files,
+			repos: None,
+			missing_dirs: None,
+			symlinked_dirs: None,
 		})
+	}
+
+	/// Whether this snapshot, captured again on the worker, still describes the
+	/// `preview` a master showed. A field the preview lacks is not compared: an
+	/// older master drops fields it does not know, and the worker's own Apply
+	/// still re-checks its fresh capture under the lock. `missing_dirs` is not
+	/// compared: a planned folder that now exists as a folder is fine, and
+	/// `revalidate` has already checked the preview's list against the disk.
+	/// `symlinked_dirs` may only shrink: a symlink that is here now but was
+	/// not in the preview, or that points elsewhere, is a change.
+	pub fn matches_preview(&self, preview: &Self) -> bool {
+		self.roots == preview.roots
+			&& self.target_files == preview.target_files
+			&& preview
+				.repos
+				.as_ref()
+				.is_none_or(|r| self.repos.as_ref() == Some(r))
+			&& preview.symlinked_dirs.as_ref().is_none_or(|then| {
+				self.symlinked_dirs.as_ref().is_some_and(|now| {
+					now.iter().all(|(dir, to)| then.get(dir) == Some(to))
+				})
+			})
 	}
 
 	pub fn revalidate(&self) -> Result<(), TransferError> {
@@ -915,6 +1001,156 @@ impl DestinationFreshnessSnapshot {
 				prev_repo,
 				&opts,
 			)?;
+		}
+
+		// The repositories an Apply locks. The key sets are compared before
+		// any of them is handed to git: a master's snapshot never decides
+		// which folder git runs in.
+		if let Some(prev) = &self.repos {
+			let expected = destination_repo_set(
+				self.target_files.keys().filter_map(|p| p.parent()),
+				&opts,
+			)?;
+			let recorded: BTreeSet<&Path> =
+				prev.keys().map(CanonicalRootId::path).collect();
+			let wanted: BTreeSet<&Path> =
+				expected.iter().map(PathBuf::as_path).collect();
+			if let Some(differs) = recorded.symmetric_difference(&wanted).next()
+			{
+				return Err(TransferError::StaleDestination {
+					root: differs.to_path_buf(),
+					reason: "destination repositories changed after preview"
+						.into(),
+					change: StaleChange::Repository,
+				});
+			}
+			for (root, prev_repo) in prev {
+				if !self.roots.contains_key(root) {
+					revalidate_destination_repo_freshness(
+						root.path(),
+						prev_repo,
+						&opts,
+					)?;
+				}
+			}
+		}
+
+		if let Some(missing) = &self.missing_dirs {
+			let mut missing: Vec<&PathBuf> = missing.iter().collect();
+			missing.sort();
+			for dir in missing {
+				match fs::symlink_metadata(dir) {
+					Ok(meta) if meta.file_type().is_dir() => {}
+					Ok(_) => {
+						return Err(self.created_where_a_folder_was_needed(dir))
+					}
+					Err(e)
+						if matches!(
+							e.kind(),
+							io::ErrorKind::NotFound
+								| io::ErrorKind::NotADirectory
+						) => {}
+					Err(e) => return Err(TransferError::Io(e)),
+				}
+			}
+		}
+
+		// A created path needs a folder at its nearest existing ancestor.
+		// And no folder on the way down to any planned target (one to create,
+		// to overwrite or to delete) may be a symlink the preview did not see
+		// or one that points elsewhere now: the write would land where the
+		// preview did not show. This also guards a snapshot that carries no
+		// `missing_dirs`.
+		let mut checked = HashSet::new();
+		let mut chain_ok: HashSet<(PathBuf, PathBuf)> = HashSet::new();
+		for (path, target) in &self.target_files {
+			let Some(parent) = path.parent() else {
+				continue;
+			};
+			if !checked.insert((parent, target.existed, target.root.path())) {
+				continue;
+			}
+			if !target.existed {
+				let root = target.root.path();
+				let mut found = false;
+				for ancestor in
+					parent.ancestors().take_while(|a| a.starts_with(root))
+				{
+					match fs::symlink_metadata(ancestor) {
+						Ok(meta) => {
+							let folder = meta.file_type().is_dir()
+								|| (meta.file_type().is_symlink()
+									&& fs::metadata(ancestor)
+										.is_ok_and(|m| m.is_dir()));
+							if !folder {
+								return Err(
+									created_where_a_folder_was_needed_at(
+										root, ancestor,
+									),
+								);
+							}
+							found = true;
+							break;
+						}
+						Err(e)
+							if matches!(
+								e.kind(),
+								io::ErrorKind::NotFound
+									| io::ErrorKind::NotADirectory
+							) => {}
+						Err(e) => return Err(TransferError::Io(e)),
+					}
+				}
+				if !found {
+					return Err(TransferError::Io(
+						io::ErrorKind::NotFound.into(),
+					));
+				}
+			}
+			let Some(linked) = &self.symlinked_dirs else {
+				continue;
+			};
+			let boundary = chain_boundary(path, target, &self.roots);
+			for dir in parent
+				.ancestors()
+				.take_while(|a| *a != boundary && a.starts_with(&boundary))
+			{
+				// Verified up to this very boundary: the rest of the way
+				// is verified too. Another boundary may reach further.
+				if chain_ok.contains(&(dir.to_path_buf(), boundary.clone())) {
+					break;
+				}
+				let now = match fs::symlink_metadata(dir) {
+					Ok(meta) if meta.file_type().is_symlink() => {
+						Some(dunce::canonicalize(dir).ok())
+					}
+					Ok(_) => None,
+					Err(e)
+						if matches!(
+							e.kind(),
+							io::ErrorKind::NotFound
+								| io::ErrorKind::NotADirectory
+						) =>
+					{
+						None
+					}
+					Err(e) => return Err(TransferError::Io(e)),
+				};
+				// Same symlink, same place it pointed at: fine. A symlink
+				// that is new, or points elsewhere, or one that is gone, is
+				// not what the preview showed.
+				let same = match (&now, linked.get(dir)) {
+					(Some(now), Some(then)) => now.as_ref() == Some(then),
+					(None, None) => true,
+					_ => false,
+				};
+				if !same {
+					return Err(created_where_a_folder_was_needed_at(
+						&boundary, dir,
+					));
+				}
+				chain_ok.insert((dir.to_path_buf(), boundary.clone()));
+			}
 		}
 
 		for (path, target) in &self.target_files {
@@ -966,6 +1202,187 @@ impl DestinationFreshnessSnapshot {
 
 		Ok(())
 	}
+
+	/// The stale error for a folder `dir`, planned as missing at preview,
+	/// that is now a file or a symlink.
+	fn created_where_a_folder_was_needed(&self, dir: &Path) -> TransferError {
+		let root = self
+			.target_files
+			.iter()
+			.filter(|(path, _)| path.starts_with(dir))
+			.min_by_key(|(path, _)| *path)
+			.map(|(_, target)| target.root.path().to_path_buf())
+			.or_else(|| dir.parent().map(Path::to_path_buf))
+			.unwrap_or_else(|| dir.to_path_buf());
+		created_where_a_folder_was_needed_at(&root, dir)
+	}
+}
+
+/// `dir` (a folder the paste needs, below `root`) is a file or a symlink now.
+fn created_where_a_folder_was_needed_at(
+	root: &Path,
+	dir: &Path,
+) -> TransferError {
+	let rel = slash_rel(root, dir);
+	TransferError::StaleDestination {
+		root: root.to_path_buf(),
+		reason: format!(
+			"'{rel}' was created externally after preview where the paste needs a folder"
+		),
+		change: StaleChange::Created { rel },
+	}
+}
+
+/// `path` relative to `root`, always with `/`.
+fn slash_rel(root: &Path, path: &Path) -> String {
+	let rel = path.strip_prefix(root).unwrap_or(path);
+	rel.components()
+		.map(|c| c.as_os_str().to_string_lossy())
+		.collect::<Vec<_>>()
+		.join("/")
+}
+
+/// The OS's own "not a directory" error: its text is the OS's words, never
+/// ours, wherever a front end shows the detail.
+fn not_a_directory() -> io::Error {
+	#[cfg(unix)]
+	{
+		io::Error::from_raw_os_error(20) // ENOTDIR on Linux, macOS and the BSDs
+	}
+	#[cfg(windows)]
+	{
+		io::Error::from_raw_os_error(267) // ERROR_DIRECTORY
+	}
+}
+
+/// Where the folder chain above a planned target stops being looked at.
+///
+/// It is read off the target's lexical path, never off the canonical folder a
+/// delete records as its root: that folder is where the file really is, and a
+/// delete reached through a symlink would have the chain end at the symlink's
+/// destination, with the symlink itself left outside it. So the candidates
+/// are the recorded root (when the path sits below it) and the deepest
+/// destination root above the target's folder, and the shallower of the two
+/// wins. A target that sits directly in a root (or whose folder is its own
+/// recorded root, as a delete's is) goes up to the nearest destination root
+/// above it, so the folder itself is looked at.
+fn chain_boundary(
+	path: &Path,
+	target: &TargetFileFreshness,
+	roots: &HashMap<CanonicalRootId, RepoFreshness>,
+) -> PathBuf {
+	let root = target.root.path();
+	let Some(parent) = path.parent() else {
+		return root.to_path_buf();
+	};
+	let above = roots
+		.keys()
+		.map(CanonicalRootId::path)
+		.filter(|r| *r != parent && parent.starts_with(r))
+		.max_by_key(|r| r.components().count());
+	let recorded = parent.starts_with(root).then_some(root);
+	[recorded, above]
+		.into_iter()
+		.flatten()
+		.min_by_key(|r| r.components().count())
+		.unwrap_or(root)
+		.to_path_buf()
+}
+
+/// The folders on every planned target's path, below its root. For a create
+/// of a new file: those that do not exist yet, and those that are symlinks to
+/// a folder (with the canonical folder each points at). For a file that
+/// exists (an overwrite or a delete): its symlinks only. A file or a symlink
+/// that is not a folder where a folder is needed is refused here, the same on
+/// every platform.
+fn capture_folder_chain(
+	plan: &RestorePlan,
+	roots: &HashMap<CanonicalRootId, RepoFreshness>,
+	target_files: &HashMap<PathBuf, TargetFileFreshness>,
+	opts: &RunOptions,
+) -> Result<(HashSet<PathBuf>, HashMap<PathBuf, PathBuf>), TransferError> {
+	let mut missing = HashSet::new();
+	let mut linked = HashMap::new();
+	let mut seen = HashSet::new();
+	let targets = plan
+		.create_operations
+		.iter()
+		.map(|op| (&op.absolute_path, op.existed))
+		.chain(
+			plan.delete_operations
+				.iter()
+				.map(|op| (&op.absolute_path, true)),
+		);
+	for (path, existed) in targets {
+		cancelled_err(opts, "import-freshness")?;
+		let Some(target) = target_files.get(path) else {
+			continue;
+		};
+		let boundary = chain_boundary(path, target, roots);
+		let mut dir = path.parent();
+		while let Some(d) = dir {
+			// The root itself is not looked at: whether it is fit is checked
+			// elsewhere.
+			if d == boundary
+				|| !d.starts_with(&boundary)
+				|| !seen.insert((d.to_path_buf(), boundary.clone()))
+			{
+				break;
+			}
+			match fs::symlink_metadata(d) {
+				Ok(meta) if meta.file_type().is_dir() => {}
+				Ok(meta)
+					if meta.file_type().is_symlink()
+						&& fs::metadata(d).is_ok_and(|m| m.is_dir()) =>
+				{
+					linked.insert(
+						d.to_path_buf(),
+						dunce::canonicalize(d).map_err(TransferError::Io)?,
+					);
+				}
+				// A file that exists is checked against its own record.
+				Ok(_) if existed => {}
+				Ok(_) => return Err(TransferError::Io(not_a_directory())),
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					) =>
+				{
+					if !existed {
+						missing.insert(d.to_path_buf());
+					}
+				}
+				Err(e) => return Err(TransferError::Io(e)),
+			}
+			dir = d.parent();
+		}
+	}
+	Ok((missing, linked))
+}
+
+/// The repositories an Apply of the snapshot's targets locks, with the state
+/// each is in. A repository that is also a recorded root is not read twice.
+fn capture_destination_repos(
+	roots: &HashMap<CanonicalRootId, RepoFreshness>,
+	target_files: &HashMap<PathBuf, TargetFileFreshness>,
+	opts: &RunOptions,
+) -> Result<HashMap<CanonicalRootId, RepoFreshness>, TransferError> {
+	let candidates = destination_repo_set(
+		target_files.keys().filter_map(|p| p.parent()),
+		opts,
+	)?;
+	let mut repos = HashMap::new();
+	for candidate in candidates {
+		cancelled_err(opts, "import-freshness")?;
+		let id = CanonicalRootId(candidate);
+		let state = match roots.get(&id) {
+			Some(state) => state.clone(),
+			None => capture_repo_freshness(id.path(), opts)?,
+		};
+		repos.insert(id, state);
+	}
+	Ok(repos)
 }
 
 /// An immutable import plan containing the exact file restore operations and freshness token.
@@ -1087,15 +1504,14 @@ impl TransferImportPlan {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Lock every repository containing a destination directory, all or none.
-/// Discover candidate roots through the filesystem first, caching ancestor
-/// lookups; Git processes scale with repositories, not existing directories.
-/// Resolve aliases before discovering roots and deduplicate canonical git
-/// dirs before locking, including worktrees/submodules with a `.git` file.
-fn lock_destination_repos<'a>(
+/// The folders whose repositories an Apply writing into `directories`
+/// locks: each directory's nearest existing folder, then its nearest `.git`
+/// ancestor. The write lock and the freshness snapshot both use this, so the
+/// snapshot always covers what the lock takes.
+fn destination_repo_set<'a>(
 	directories: impl IntoIterator<Item = &'a Path>,
 	opts: &RunOptions,
-) -> Result<Vec<HeavyGuard>, TransferError> {
+) -> Result<BTreeSet<PathBuf>, TransferError> {
 	let mut existing_cache = HashMap::new();
 	let mut repo_cache = HashMap::new();
 	let mut candidates = BTreeSet::new();
@@ -1109,6 +1525,19 @@ fn lock_destination_repos<'a>(
 			candidates.insert(root);
 		}
 	}
+	Ok(candidates)
+}
+
+/// Lock every repository containing a destination directory, all or none.
+/// Discover candidate roots through the filesystem first, caching ancestor
+/// lookups; Git processes scale with repositories, not existing directories.
+/// Resolve aliases before discovering roots and deduplicate canonical git
+/// dirs before locking, including worktrees/submodules with a `.git` file.
+fn lock_destination_repos<'a>(
+	directories: impl IntoIterator<Item = &'a Path>,
+	opts: &RunOptions,
+) -> Result<Vec<HeavyGuard>, TransferError> {
+	let candidates = destination_repo_set(directories, opts)?;
 	let mut repos = Vec::with_capacity(candidates.len());
 	for root in candidates {
 		let git = match Git::open_with(&root, opts) {
@@ -4007,6 +4436,9 @@ fn capture_replay_freshness(
 	Ok(DestinationFreshnessSnapshot {
 		roots,
 		target_files,
+		repos: None,
+		missing_dirs: None,
+		symlinked_dirs: None,
 	})
 }
 
@@ -5349,5 +5781,24 @@ mod parsed_import_tests {
 			Err(TransferError::UnknownRoot(_))
 		));
 		assert!(!root.join("a").exists());
+	}
+}
+
+#[cfg(test)]
+mod freshness_helper_tests {
+	use super::*;
+
+	#[test]
+	fn not_a_directory_is_the_os_error_kind() {
+		let e = not_a_directory();
+		assert_eq!(e.kind(), io::ErrorKind::NotADirectory, "{e}");
+		assert!(e.raw_os_error().is_some());
+	}
+
+	#[test]
+	fn slash_rel_uses_forward_slashes_below_the_root() {
+		let root = Path::new("root");
+		assert_eq!(slash_rel(root, &root.join("a").join("b")), "a/b");
+		assert_eq!(slash_rel(root, &root.join("a")), "a");
 	}
 }

@@ -7521,3 +7521,730 @@ fn import_refuses_deleted_git_file_and_leaves_it_intact() {
 	assert_eq!(fs::read(&git_config).unwrap(), original_config);
 	assert_eq!(fs::read(&git_head).unwrap(), original_head);
 }
+
+// ---------------------------------------------------------------------------
+// 27. Freshness covers the repositories the write lock takes and the folders
+//     on a target's path (#237)
+// ---------------------------------------------------------------------------
+
+/// Runs `git` in `dir` with an empty global config and a fixed identity.
+fn git_at(dir: &Path, cfg: &Path, args: &[&str]) {
+	let out = Command::new("git")
+		.args(["-c", "user.name=Test User", "-c", "user.email=t@t"])
+		.args(["-c", "commit.gpgsign=false"])
+		.args(args)
+		.current_dir(dir)
+		.env("GIT_CONFIG_GLOBAL", cfg)
+		.env("LC_ALL", "C")
+		.output()
+		.unwrap();
+	assert!(
+		out.status.success(),
+		"git {args:?} in {dir:?} failed: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+}
+
+/// `git init` in an existing folder, with one commit.
+fn git_init_at(dir: &Path, cfg: &Path) {
+	git_at(dir, cfg, &["init", "-q", "-b", "main"]);
+	fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+	git_at(dir, cfg, &["add", "-A"]);
+	git_at(dir, cfg, &["commit", "-q", "-m", "seed"]);
+}
+
+impl TestRepo {
+	/// The folder holding this repository: a canonical folder that is not a
+	/// repository itself.
+	fn workspace(&self) -> PathBuf {
+		let parent = self.repo_path.parent().unwrap();
+		dunce::canonicalize(parent).unwrap()
+	}
+
+	/// A repository nested at `rel`, with one commit.
+	fn nested(&self, rel: &str) -> PathBuf {
+		let dir = self.repo_path.join(rel);
+		fs::create_dir_all(&dir).unwrap();
+		git_init_at(&dir, &self.cfg);
+		dir
+	}
+}
+
+fn assert_not_a_repo(ws: &Path) {
+	assert!(
+		matches!(Git::open(ws), Err(gitsrc::GitError::NotARepository(_))),
+		"{ws:?} lies inside a git repository; these tests need a non-repo workspace root",
+	);
+}
+
+fn stale_change(err: TransferError) -> StaleChange {
+	match err {
+		TransferError::StaleDestination { change, .. } => change,
+		other => panic!("expected StaleDestination, got {other:?}"),
+	}
+}
+
+fn plan_one(
+	root: &Path,
+	text: &str,
+) -> snip_core::transfer::TransferImportPlan {
+	let id = CanonicalRootId::new(root).unwrap();
+	plan_import(
+		text,
+		"// file: $FILE_PATH",
+		&[root.to_path_buf()],
+		&ImportMapping::with_primary(id),
+	)
+	.unwrap()
+}
+
+#[test]
+fn test_freshness_covers_a_repo_under_a_non_repo_destination() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let ws = a.workspace();
+	assert_not_a_repo(&ws);
+
+	let plan = plan_one(&ws, "// file: repoA/x.txt\nx\n");
+	a.write("other.txt", "other\n");
+	a.git(&["add", "other.txt"]);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(stale_change(err), StaleChange::Repository);
+	assert!(!a.exists("x.txt"));
+}
+
+#[test]
+fn test_freshness_covers_the_inner_repo_of_a_nested_pair() {
+	let o = TestRepo::new("outer");
+	o.write("seed.txt", "seed\n");
+	o.commit("seed");
+	let inner = o.nested("inner");
+
+	let plan = plan_one(o.path(), "// file: inner/x.txt\nx\n");
+	fs::write(inner.join("more.txt"), "more\n").unwrap();
+	git_at(&inner, &o.cfg, &["add", "-A"]);
+	git_at(&inner, &o.cfg, &["commit", "-q", "-m", "more"]);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(stale_change(err), StaleChange::Repository);
+	assert!(!inner.join("x.txt").exists());
+}
+
+#[test]
+fn test_a_repo_initialised_above_a_target_after_preview_is_stale() {
+	let host = TestRepo::new("host");
+	let ws = host.workspace();
+	assert_not_a_repo(&ws);
+	let plain = ws.join("plain");
+	fs::create_dir_all(&plain).unwrap();
+
+	let plan = plan_one(&ws, "// file: plain/x.txt\nx\n");
+	git_init_at(&plain, &host.cfg);
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match err {
+		TransferError::StaleDestination { reason, change, .. } => {
+			assert_eq!(change, StaleChange::Repository);
+			assert!(reason.contains("repositories changed"), "{reason}");
+		}
+		other => panic!("expected StaleDestination, got {other:?}"),
+	}
+	assert!(!plain.join("x.txt").exists());
+}
+
+#[test]
+fn test_a_file_where_a_new_folder_was_planned_is_stale_and_nothing_is_written()
+{
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: new/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::write(dst.path().join("new"), "x").unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "new".into() }
+	);
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[test]
+fn test_an_existing_folder_replaced_by_a_file_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	fs::write(dst.path().join("old"), "x").unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[test]
+fn test_a_planned_folder_that_appears_as_a_folder_or_a_parent_that_vanishes_still_applies(
+) {
+	// (a) a folder planned as new is created by someone else first.
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	let plan = plan_one(dst.path(), "// file: new/a.txt\na\n");
+	fs::create_dir(dst.path().join("new")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("new/a.txt"), "a");
+
+	// (b) an existing folder vanishes: the write recreates it.
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+	let plan = plan_one(dst.path(), "// file: old/b.txt\nb\n");
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("old/b.txt"), "b");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_where_a_new_folder_was_planned_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("other")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: new/a.txt\na\n");
+	std::os::unix::fs::symlink("other", dst.path().join("new")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "new".into() }
+	);
+	assert!(!dst.exists("other/a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_existing_folder_replaced_by_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("old")).unwrap();
+	fs::create_dir(dst.path().join("other")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_dir(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert!(!dst.exists("other/a.txt"));
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_folder_that_was_already_a_symlink_at_preview_still_applies() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real")).unwrap();
+	std::os::unix::fs::symlink("real", dst.path().join("link")).unwrap();
+
+	// The symlink is the nearest existing folder.
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/new/a.txt"), "a");
+
+	// The symlink lies higher on the chain than the nearest existing folder.
+	let plan = plan_one(dst.path(), "// file: link/new/deep/b.txt\nb\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/new/deep/b.txt"), "b");
+
+	// An existing folder below the symlink is removed after the preview: the
+	// symlink above it was already one, so the write still goes through it.
+	fs::create_dir(dst.path().join("real/sub")).unwrap();
+	let plan = plan_one(dst.path(), "// file: link/sub/c.txt\nc\n");
+	fs::remove_dir(dst.path().join("real/sub")).unwrap();
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("real/sub/c.txt"), "c");
+}
+
+#[test]
+fn test_a_file_on_the_folder_path_is_refused_at_preview_on_every_platform() {
+	let dst = TestRepo::new("dst");
+	dst.write("a.txt", "a file\n");
+	dst.commit("seed");
+	let id = CanonicalRootId::new(dst.path()).unwrap();
+	let not_a_dir = |what: &str, res: Result<_, TransferError>| match res {
+		Err(TransferError::Io(e)) => {
+			assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}")
+		}
+		Err(other) => panic!("expected Io(NotADirectory), got {other:?}"),
+		Ok(_) => panic!("{what}: a file where a folder is needed was planned"),
+	};
+	not_a_dir(
+		"regular file",
+		plan_import(
+			"// file: a.txt/b.txt\nb\n",
+			"// file: $FILE_PATH",
+			&[dst.path().to_path_buf()],
+			&ImportMapping::with_primary(id.clone()),
+		),
+	);
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::symlink("missing", dst.path().join("link")).unwrap();
+		not_a_dir(
+			"dangling symlink",
+			plan_import(
+				"// file: link/b.txt\nb\n",
+				"// file: $FILE_PATH",
+				&[dst.path().to_path_buf()],
+				&ImportMapping::with_primary(id),
+			),
+		);
+	}
+}
+
+#[test]
+fn test_freshness_repo_set_is_not_doubled_for_a_repo_root_destination() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let plan = plan_one(a.path(), "// file: x.txt\nx\n");
+	let snap = plan.destination_freshness();
+	let repos = snap.repos.as_ref().expect("a file paste records its repos");
+	let got: std::collections::HashSet<_> = repos.keys().collect();
+	let want: std::collections::HashSet<_> = snap.roots.keys().collect();
+	assert_eq!(got, want);
+	assert!(snap.missing_dirs.as_ref().unwrap().is_empty());
+}
+
+#[test]
+fn test_a_snapshot_without_the_new_fields_still_revalidates_and_matches() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let ws = a.workspace();
+	assert_not_a_repo(&ws);
+
+	let plan = plan_one(&ws, "// file: repoA/new/x.txt\nx\n");
+	let new = plan.destination_freshness().clone();
+	let repo_id = a.canonical_id();
+	assert!(new.repos.as_ref().unwrap().contains_key(&repo_id));
+	assert_eq!(
+		new.missing_dirs.as_ref().unwrap().len(),
+		1,
+		"{:?}",
+		new.missing_dirs
+	);
+
+	// What an older master sends back: the fields it did not know are gone.
+	let mut json = serde_json::to_value(&new).unwrap();
+	let object = json.as_object_mut().unwrap();
+	object.remove("repos");
+	object.remove("missing_dirs");
+	object.remove("symlinked_dirs");
+	let old: DestinationFreshnessSnapshot =
+		serde_json::from_value(json).unwrap();
+	assert_eq!(
+		(&old.repos, &old.missing_dirs, &old.symlinked_dirs),
+		(&None, &None, &None)
+	);
+	old.revalidate().unwrap();
+	assert!(new.matches_preview(&old));
+
+	// A repo the preview recorded must be the one captured again.
+	let mut changed = new.clone();
+	changed
+		.repos
+		.as_mut()
+		.unwrap()
+		.get_mut(&repo_id)
+		.unwrap()
+		.head_commit = Some("0".repeat(40));
+	assert!(!changed.matches_preview(&new));
+	assert!(new.matches_preview(&new));
+
+	// A folder planned as new that exists by Apply time does not make the
+	// capture differ.
+	let mut grown = new.clone();
+	grown.missing_dirs.as_mut().unwrap().clear();
+	assert!(grown.matches_preview(&new));
+
+	let back: DestinationFreshnessSnapshot =
+		serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+	assert_eq!(back, new);
+}
+
+#[cfg(unix)]
+fn overwrite() -> RestoreSelection {
+	RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	}
+}
+
+/// `dir/name` with `body`, its modified time copied from `like`, so a
+/// freshness record (size, mtime, hash) cannot tell the two files apart.
+#[cfg(unix)]
+fn write_like(dir: &Path, name: &str, body: &str, like: &Path) {
+	fs::create_dir_all(dir).unwrap();
+	let path = dir.join(name);
+	fs::write(&path, body).unwrap();
+	let mtime = fs::metadata(like).unwrap().modified().unwrap();
+	fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_modified(mtime)
+		.unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_repointed_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	fs::create_dir(dst.path().join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: link/new/a.txt\na\n// file: keep.txt\nkeep\n",
+	);
+	fs::remove_file(dst.path().join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", dst.path().join("link")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert!(!dst.exists("real2/new/a.txt"));
+	assert!(!dst.exists("real1/new/a.txt"));
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_replaced_by_a_folder_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	fs::remove_file(dst.path().join("link")).unwrap();
+	fs::create_dir(dst.path().join("link")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert!(!dst.exists("link/new/a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_overwrite_whose_folder_became_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("old/a.txt", "same\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: old/a.txt\nnew\n// file: keep.txt\nkeep\n",
+	);
+	// A look-alike behind a symlink: same bytes, same size, same mtime.
+	let original = dst.path().join("old/a.txt");
+	write_like(&dst.path().join("other"), "a.txt", "same\n", &original);
+	fs::remove_dir_all(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&overwrite()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert_eq!(dst.read("other/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_whose_folder_became_a_symlink_after_preview_is_stale() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("old/a.txt", "same\n");
+	dst.commit("seed");
+
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] old/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	let original = dst.path().join("old/a.txt");
+	write_like(&dst.path().join("other"), "a.txt", "same\n", &original);
+	fs::remove_dir_all(dst.path().join("old")).unwrap();
+	std::os::unix::fs::symlink("other", dst.path().join("old")).unwrap();
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "old".into() }
+	);
+	assert_eq!(dst.read("other/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+/// `dst/real1/<rel>` with a look-alike under `dst/real2/<rel>` (same bytes,
+/// same size, same mtime), and `dst/link` pointing at `real1`.
+#[cfg(unix)]
+fn delete_through_a_symlink_fixture(rel: &str) -> TestRepo {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write(&format!("real1/{rel}"), "same\n");
+	dst.commit("seed");
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+	dst
+}
+
+/// Points `dst/link` at `real2`, which holds a look-alike of `real1/<rel>`.
+#[cfg(unix)]
+fn repoint_link_to_a_look_alike(dst: &TestRepo, rel: &str) {
+	let original = dst.path().join("real1").join(rel);
+	let (dir, name) = match rel.rsplit_once('/') {
+		Some((d, n)) => (dst.path().join("real2").join(d), n),
+		None => (dst.path().join("real2"), rel),
+	};
+	write_like(&dir, name, "same\n", &original);
+	fs::remove_file(dst.path().join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", dst.path().join("link")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_through_a_symlink_repointed_after_preview_is_stale() {
+	let dst = delete_through_a_symlink_fixture("a.txt");
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] link/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	repoint_link_to_a_look_alike(&dst, "a.txt");
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert_eq!(dst.read("real2/a.txt"), "same\n");
+	assert_eq!(dst.read("real1/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_nested_delete_through_a_symlink_repointed_after_preview_is_stale() {
+	let dst = delete_through_a_symlink_fixture("sub/a.txt");
+	let plan = plan_one(
+		dst.path(),
+		"// file: [DELETED] link/sub/a.txt\n// file: keep.txt\nkeep\n",
+	);
+	repoint_link_to_a_look_alike(&dst, "sub/a.txt");
+
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created { rel: "link".into() }
+	);
+	assert_eq!(dst.read("real2/sub/a.txt"), "same\n");
+	assert!(!dst.exists("keep.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_planned_through_a_symlink_records_the_symlink() {
+	let dst = delete_through_a_symlink_fixture("sub/a.txt");
+	let plan = plan_one(dst.path(), "// file: [DELETED] link/sub/a.txt\n");
+	let linked = plan
+		.destination_freshness()
+		.symlinked_dirs
+		.as_ref()
+		.expect("recorded");
+	assert_eq!(
+		linked.get(&dunce::canonicalize(dst.path()).unwrap().join("link")),
+		Some(&dunce::canonicalize(dst.path().join("real1")).unwrap()),
+		"{linked:?}"
+	);
+	assert_eq!(linked.len(), 1, "{linked:?}");
+}
+
+/// Targets under a nested destination root may carry different boundaries (a
+/// planner can hand a path inside the inner root to the outer one). A folder
+/// verified up to the inner boundary must not stand in for the folders
+/// between the inner and the outer one.
+#[cfg(unix)]
+#[test]
+fn test_a_folder_verified_to_a_deeper_boundary_does_not_hide_the_folders_above()
+{
+	let tmp = tempfile::tempdir().unwrap();
+	let outer = dunce::canonicalize(tmp.path()).unwrap().join("outer");
+	let inner = outer.join("inner");
+	for i in 0..40 {
+		fs::create_dir_all(inner.join(format!("x/d{i}"))).unwrap();
+	}
+	let outer_id = CanonicalRootId::new(&outer).unwrap();
+	let inner_id = CanonicalRootId::new(&inner).unwrap();
+
+	// Many targets bounded by the inner root, each verifying `inner/x`, and
+	// one in `inner/x` bounded by the outer root: unless the map yields that
+	// one first, it meets `inner/x` already verified.
+	let mut targets: Vec<(PathBuf, String)> = (0..40)
+		.map(|i| (inner.join(format!("x/d{i}/a.txt")), format!("x/d{i}/a.txt")))
+		.collect();
+	let far = inner.join("x/far.txt");
+	targets.push((far.clone(), "inner/x/far.txt".into()));
+	let mut snapshot = DestinationFreshnessSnapshot::capture_paths(
+		&[outer.clone(), inner.clone()],
+		&targets,
+	)
+	.unwrap();
+	snapshot.symlinked_dirs = Some(Default::default());
+	for (path, target) in snapshot.target_files.iter_mut() {
+		target.root = if *path == far {
+			outer_id.clone()
+		} else {
+			inner_id.clone()
+		};
+	}
+	snapshot.revalidate().unwrap();
+
+	// `outer/inner` becomes a symlink after the preview.
+	fs::rename(&inner, outer.join("inner_real")).unwrap();
+	std::os::unix::fs::symlink("inner_real", &inner).unwrap();
+	let err = snapshot.revalidate().unwrap_err();
+	assert_eq!(
+		stale_change(err),
+		StaleChange::Created {
+			rel: "inner".into()
+		}
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_delete_through_a_folder_that_was_a_symlink_at_preview_still_applies()
+{
+	let dst = delete_through_a_symlink_fixture("a.txt");
+	let plan = plan_one(dst.path(), "// file: [DELETED] link/a.txt\n");
+	let res = plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.deleted_count, 1);
+	assert!(!dst.exists("real1/a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_an_overwrite_through_a_folder_that_was_a_symlink_at_preview_still_applies(
+) {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.write("real/a.txt", "old\n");
+	dst.commit("seed");
+	std::os::unix::fs::symlink("real", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/a.txt\nnew\n");
+	let res = plan.apply(&overwrite()).unwrap();
+	assert_eq!(res.overwritten_count, 1);
+	assert_eq!(dst.read("real/a.txt"), "new");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_matches_preview_compares_the_symlinks_the_preview_recorded() {
+	let dst = TestRepo::new("dst");
+	dst.write("seed.txt", "seed\n");
+	dst.commit("seed");
+	fs::create_dir(dst.path().join("real1")).unwrap();
+	fs::create_dir(dst.path().join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", dst.path().join("link")).unwrap();
+
+	let plan = plan_one(dst.path(), "// file: link/new/a.txt\na\n");
+	let preview = plan.destination_freshness().clone();
+	let linked = preview.symlinked_dirs.as_ref().expect("recorded");
+	assert_eq!(linked.len(), 1);
+	let (dir, target) = linked.iter().next().unwrap();
+	assert!(dir.ends_with("link"), "{dir:?}");
+	assert_eq!(
+		target,
+		&dunce::canonicalize(dst.path().join("real1")).unwrap()
+	);
+	assert!(preview.matches_preview(&preview));
+
+	// A symlink the preview did not see.
+	let mut extra = preview.clone();
+	extra
+		.symlinked_dirs
+		.as_mut()
+		.unwrap()
+		.insert(dst.path().join("sneaky"), dst.path().join("real2"));
+	assert!(!extra.matches_preview(&preview));
+
+	// A symlink that points somewhere else now.
+	let mut moved = preview.clone();
+	let key = moved
+		.symlinked_dirs
+		.as_ref()
+		.unwrap()
+		.keys()
+		.next()
+		.unwrap()
+		.clone();
+	moved
+		.symlinked_dirs
+		.as_mut()
+		.unwrap()
+		.insert(key, dunce::canonicalize(dst.path().join("real2")).unwrap());
+	assert!(!moved.matches_preview(&preview));
+
+	// Fewer symlinks than the preview saw is fine; so is a preview from an
+	// older master that recorded none.
+	let mut fewer = preview.clone();
+	fewer.symlinked_dirs.as_mut().unwrap().clear();
+	assert!(fewer.matches_preview(&preview));
+	let mut old_preview = preview.clone();
+	old_preview.symlinked_dirs = None;
+	assert!(extra.matches_preview(&old_preview));
+}

@@ -1562,3 +1562,371 @@ fn a_lost_replay_check_answer_through_a_paste_target_is_a_plain_failure() {
 		"{err:?}"
 	);
 }
+
+#[test]
+fn a_paste_target_refuses_a_changed_repo_under_a_non_repo_destination_on_both_sides(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local_real = tmp.path().join("local_real");
+	for dir in [&ws, &local_real] {
+		fs::create_dir_all(dir).unwrap();
+		init_repo(&dir.join("repoA"));
+	}
+	// The two destinations must not lie in a repository themselves, or the
+	// repository set this test is about changes with the temp directory.
+	for dir in [&ws, &local_real] {
+		assert!(
+			matches!(
+				snip_core::gitsrc::Git::open(dir),
+				Err(snip_core::gitsrc::GitError::NotARepository(_))
+			),
+			"{dir:?} lies inside a git repository; this test needs a non-repo destination",
+		);
+	}
+	let local_dest = spelled(tmp.path(), &local_real, "local");
+	let text = entry("repoA/x.txt", "x");
+	let route = PasteRoute::default();
+	let opts = RunOptions::default();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let local = PasteTarget::Local { dest: local_dest };
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let lp = local.plan_files(&text, &route, &opts, None).unwrap();
+	let rp = remote.plan_files(&text, &route, &opts, None).unwrap();
+	// A repository below the destination moves after the preview: the write
+	// lock takes it, so the preview has to have seen it.
+	for dir in [&ws, &local_real] {
+		let repo = dir.join("repoA");
+		fs::write(repo.join("other.txt"), "other\n").unwrap();
+		git(&repo, &["add", "other.txt"]);
+	}
+	let sel = unchecked(&[]);
+	let mut reasons = Vec::new();
+	for (name, target, plan) in
+		[("local", &local, &lp), ("remote", &remote, &rp)]
+	{
+		let err = target
+			.apply_files(&text, &route, plan, &sel)
+			.err()
+			.unwrap_or_else(|| {
+				panic!("the {name} target wrote into a changed repository")
+			});
+		assert!(err.is_stale(), "{name}: {err:?}");
+		assert!(
+			matches!(
+				err.reason(),
+				snip_remote::Reason::DestinationChanged {
+					change: snip_remote::StaleChange::Repository
+				}
+			),
+			"{name}: {:?}",
+			err.reason()
+		);
+		reasons.push(err.reason());
+	}
+	assert_eq!(reasons[0], reasons[1], "both sides name the same change");
+	for dir in [&ws, &local_real] {
+		assert!(!dir.join("repoA/x.txt").exists());
+	}
+}
+
+#[test]
+fn a_file_where_a_new_folder_was_planned_is_stale_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = [entry("new/a.txt", "a"), entry("keep.txt", "keep")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	fs::write(ws.join("new"), "someone's file").unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker wrote around a file that took a folder's place");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert_eq!(
+		err.reason(),
+		snip_remote::Reason::DestinationChanged {
+			change: snip_remote::StaleChange::Created { rel: "new".into() }
+		}
+	);
+	assert!(!ws.join("keep.txt").exists());
+}
+
+#[test]
+fn a_folder_created_after_a_remote_preview_still_applies() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("new/a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	fs::create_dir(ws.join("new")).unwrap();
+	client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.unwrap();
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
+}
+
+#[test]
+fn a_forged_repo_key_is_refused_as_stale_before_git_runs_there() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let mut expect = planned.expect();
+	// A folder that does not exist: git cannot be opened in it, so a worker
+	// that ran git on it first would answer Io, not Stale.
+	expect.freshness.repos.get_or_insert_default().insert(
+		serde_json::from_value(serde_json::json!(ws.join("nowhere"))).unwrap(),
+		snip_core::transfer::RepoFreshness {
+			head_commit: None,
+			head_ref: None,
+			index_hash: None,
+		},
+	);
+	let code = refused(client.import_apply(
+		&id,
+		"",
+		&text,
+		&mapping,
+		&unchecked(&[]),
+		&expect,
+		None,
+	));
+	assert_eq!(code, ErrorCode::Stale);
+	assert!(!ws.join("a.txt").exists());
+}
+
+#[test]
+fn a_snapshot_naming_a_folder_outside_the_workspace_is_a_bad_request() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let elsewhere = tmp.path().join("elsewhere");
+
+	let mut missing = planned.expect();
+	missing
+		.freshness
+		.missing_dirs
+		.get_or_insert_default()
+		.insert(elsewhere.clone());
+	let mut linked = planned.expect();
+	linked
+		.freshness
+		.symlinked_dirs
+		.get_or_insert_default()
+		.insert(elsewhere.clone(), ws.clone());
+	for (what, expect) in
+		[("missing_dirs", missing), ("symlinked_dirs", linked)]
+	{
+		let code = refused(client.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&expect,
+			None,
+		));
+		assert_eq!(code, ErrorCode::BadRequest, "{what}");
+		assert!(!ws.join("a.txt").exists(), "{what}");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_repointed_after_a_remote_preview_is_stale_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("real1")).unwrap();
+	fs::create_dir_all(ws.join("real2")).unwrap();
+	std::os::unix::fs::symlink("real1", ws.join("link")).unwrap();
+	let text = [entry("link/a.txt", "a"), entry("keep.txt", "keep")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert_eq!(
+		planned
+			.expect()
+			.freshness
+			.symlinked_dirs
+			.as_ref()
+			.map(|m| m.len()),
+		Some(1)
+	);
+	fs::remove_file(ws.join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", ws.join("link")).unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker wrote through a symlink that points elsewhere");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert!(!ws.join("real2/a.txt").exists());
+	assert!(!ws.join("real1/a.txt").exists());
+	assert!(!ws.join("keep.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_delete_through_a_symlink_repointed_after_a_remote_preview_is_stale_on_a_worker(
+) {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(ws.join("real1")).unwrap();
+	fs::create_dir_all(ws.join("real2")).unwrap();
+	fs::write(ws.join("real1/a.txt"), "same\n").unwrap();
+	std::os::unix::fs::symlink("real1", ws.join("link")).unwrap();
+	let text = format!(
+		"// File: [DELETED] link/a.txt\n{}",
+		entry("keep.txt", "keep")
+	);
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert_eq!(
+		planned
+			.expect()
+			.freshness
+			.symlinked_dirs
+			.as_ref()
+			.map(|m| m.len()),
+		Some(1),
+		"a delete planned through a symlink records it"
+	);
+	// A look-alike behind the symlink's new target: same bytes, same mtime.
+	fs::write(ws.join("real2/a.txt"), "same\n").unwrap();
+	let mtime = fs::metadata(ws.join("real1/a.txt"))
+		.unwrap()
+		.modified()
+		.unwrap();
+	fs::File::options()
+		.write(true)
+		.open(ws.join("real2/a.txt"))
+		.unwrap()
+		.set_modified(mtime)
+		.unwrap();
+	fs::remove_file(ws.join("link")).unwrap();
+	std::os::unix::fs::symlink("real2", ws.join("link")).unwrap();
+	let err = client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.expect_err("a worker deleted through a symlink that points elsewhere");
+	assert!(
+		matches!(
+			&err,
+			RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			}
+		),
+		"{err:?}"
+	);
+	assert!(ws.join("real2/a.txt").exists());
+	assert!(ws.join("real1/a.txt").exists());
+	assert!(!ws.join("keep.txt").exists());
+}
+
+#[test]
+fn an_older_masters_snapshot_without_the_new_fields_still_applies() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	// The workspace is itself a repository, so the worker's own capture has
+	// a non-empty `repos` to differ from the snapshot's absent one.
+	init_repo(&ws);
+	let text = entry("new/a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert!(planned.expect().freshness.repos.is_some());
+	let mut json = serde_json::to_value(planned.expect()).unwrap();
+	let freshness = json["freshness"].as_object_mut().unwrap();
+	freshness.remove("repos");
+	freshness.remove("missing_dirs");
+	freshness.remove("symlinked_dirs");
+	let expect: snip_remote::proto::ImportExpect =
+		serde_json::from_value(json).unwrap();
+	assert!(expect.freshness.repos.is_none());
+	assert!(expect.freshness.missing_dirs.is_none());
+	assert!(expect.freshness.symlinked_dirs.is_none());
+	client
+		.import_apply(&id, "", &text, &mapping, &unchecked(&[]), &expect, None)
+		.unwrap();
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
+}
