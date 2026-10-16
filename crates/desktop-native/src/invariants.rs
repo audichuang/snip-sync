@@ -57,8 +57,10 @@ pub(crate) enum Invariant {
 	L4,
 	/// No files, no per-file state. Guard: #230 PR-0.
 	L5,
-	/// No selection, no commit view, no Log preview. Guard: #202 (the repo
-	/// filter's hand-made reset left a preview behind).
+	/// No selection, no commit view, no Log preview; a rev tree outlives the
+	/// selection and keeps its own file selected and read as the Log's.
+	/// Guard: #202 (the repo filter's hand-made reset left a preview
+	/// behind); evidence for the rev tree premise: `fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind`.
 	L6,
 	/// A list that failed to reload keeps no selection it hid. Quiescent.
 	/// Guard: #230 PR-0 (failed reload clears the selection).
@@ -428,10 +430,18 @@ pub(crate) fn eval(
 			if selected {
 				return None;
 			}
-			if !view.is_reset() {
+			// A rev tree outlives the selection and keeps its own file
+			// selected here; nothing else of the view may be left.
+			let reset = if m.rev_tree.is_some() {
+				view.is_reset_but_for_tree_file()
+			} else {
+				view.is_reset()
+			};
+			if !reset {
 				return Some("no selection, but a commit view is left".into());
 			}
-			if m.preview_pending_from_log {
+			// A rev tree's file is read as the Log's too (`open_rev_file`).
+			if m.preview_pending_from_log && m.rev_tree.is_none() {
 				return Some(
 					"no selection, but the preview is marked from the Log"
 						.into(),

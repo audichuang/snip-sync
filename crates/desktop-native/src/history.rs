@@ -148,6 +148,36 @@ impl CommitView {
 	}
 }
 
+impl CommitView {
+	/// [`Self::is_reset`], except for the file selection of a rev tree: a
+	/// tree opened from a commit outlives the selection (the editor tab
+	/// closes, its own button leaves it) and a file of it is selected here
+	/// with no commit selected. Destructures every field without `..`, like
+	/// `is_reset`.
+	pub fn is_reset_but_for_tree_file(&self) -> bool {
+		let Self {
+			commit_files,
+			commit_file_origin,
+			commit_file_gitlinks,
+			commit_files_truncated,
+			commit_files_first_parent_same,
+			selected_commit_file: _,
+			commit_file_sel: _,
+			commit_details,
+			selection_details,
+			log_commit_root,
+		} = self;
+		commit_files.is_empty()
+			&& commit_file_origin.is_empty()
+			&& commit_file_gitlinks.is_empty()
+			&& !commit_files_truncated
+			&& commit_files_first_parent_same.is_none()
+			&& commit_details.is_none()
+			&& selection_details.is_empty()
+			&& log_commit_root.is_none()
+	}
+}
+
 /// How a history read changes the loaded window of pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageLoad {
