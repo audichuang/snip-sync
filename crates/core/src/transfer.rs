@@ -6688,20 +6688,17 @@ mod case_policy_tests {
 	/// of the same name. When case cannot be told both fold, and the folder
 	/// the user named under the second root must still ask for consent: it
 	/// was once taken for the first root's, dropped from the agreement and
-	/// made without asking.
+	/// made without asking. Linux only: macOS and Windows fold the two names
+	/// into one folder, so the scenario cannot be built there, and a test
+	/// that returned early would pass as a skip.
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_named_folder_under_another_root_is_not_the_first_roots_folder() {
 		let (_tmp, ws) = tmp();
 		let (upper, lower) = (ws.join("\u{391}"), ws.join("\u{3b1}"));
 		fs::create_dir(&upper).unwrap();
-		if fs::create_dir(&lower).is_err() {
-			// One folder on a filesystem that folds case (macOS, Windows):
-			// the scenario cannot be built there. Linux must build it.
-			if cfg!(target_os = "linux") {
-				panic!("cannot make two folders that differ in case on Linux");
-			}
-			return;
-		}
+		fs::create_dir(&lower)
+			.expect("cannot make two folders that differ in case on Linux");
 		let placed =
 			|root: &Path| PlacedRoot::resolve(None, &root.join("new")).unwrap();
 		let mut mapping = ImportMapping::with_primary(placed(&upper));

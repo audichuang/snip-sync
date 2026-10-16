@@ -8458,6 +8458,13 @@ fn plan_placed(
 	mapping: &ImportMapping,
 ) -> snip_core::transfer::TransferImportPlan {
 	let before = scan_tree(ws);
+	let plan = plan_import(text, "", &roots_of(mapping), mapping).unwrap();
+	assert_eq!(scan_tree(ws), before, "planning must not write");
+	plan
+}
+
+/// The destination roots a mapping points at, each once.
+fn roots_of(mapping: &ImportMapping) -> Vec<PathBuf> {
 	let mut roots: Vec<PathBuf> = Vec::new();
 	for placed in mapping
 		.primary_destination
@@ -8469,9 +8476,7 @@ fn plan_placed(
 			roots.push(anchor);
 		}
 	}
-	let plan = plan_import(text, "", &roots, mapping).unwrap();
-	assert_eq!(scan_tree(ws), before, "planning must not write");
-	plan
+	roots
 }
 
 fn create_paths(
@@ -8779,6 +8784,81 @@ fn test_a_named_folder_reached_through_another_spelling_of_its_anchor_is_asked_f
 		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
 	}
 	assert!(!root.join("Sub/new").exists());
+}
+
+/// A1c: the anchor the two spellings lead to cannot be read (a drop box,
+/// `-wx`). It is still one object, so the folder named under it still asks:
+/// told by a canonical path it was two folders, and the named one was made
+/// as an incidental one, without consent.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_an_unreadable_anchor_reached_through_another_spelling_is_asked_for() {
+	use std::os::unix::fs::PermissionsExt;
+
+	struct Restore(PathBuf);
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			let _ =
+				fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+		}
+	}
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let _restore = Restore(root.join("Sub"));
+	fs::set_permissions(root.join("Sub"), fs::Permissions::from_mode(0o311))
+		.unwrap();
+	// Not `plan_placed`: its tree scan cannot read the folder either.
+	let plan = plan_import(
+		"// file: q/Sub/new/b.txt\nB\n",
+		"",
+		&roots_of(&mapping),
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan.new_dirs().incidental, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	assert!(
+		matches!(err, TransferError::NewDirsNotConfirmed { .. }),
+		"{err:?}"
+	);
+	assert!(!root.join("Sub/new").exists());
+}
+
+/// A1d: the plan identifies every existing folder a payload goes through, and
+/// that costs no file descriptor. A terminal's default limit is 256, and a
+/// plan with a named folder and 400 existing ones under another root used to
+/// fail to start git.
+#[cfg(unix)]
+#[test]
+fn test_planning_with_many_existing_folders_needs_no_descriptor_for_each() {
+	use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+	// One test per process under nextest, so the limit stays here.
+	let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+	setrlimit(Resource::RLIMIT_NOFILE, 256.min(hard).min(soft), hard).unwrap();
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	let mut text = String::new();
+	for i in 0..400 {
+		fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+		text.push_str(&format!("// file: q/d{i}/x/f.txt\nF\n"));
+	}
+	text.push_str("// file: b.txt\nB\n");
+	let mut mapping = ImportMapping::with_primary(placed(&root.join("new")));
+	mapping.map_prefix("q", placed(&root));
+	let plan = plan_placed(&ws, &text, &mapping);
+	let dirs = plan.new_dirs();
+	assert_eq!(dirs.requested, vec![root.join("new")]);
+	assert_eq!(dirs.incidental.len(), 400);
 }
 
 /// A2: with the agreement the folder is made and the file written.

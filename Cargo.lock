@@ -5303,13 +5303,13 @@ dependencies = [
  "process-wrap",
  "regex",
  "rustix 1.1.5",
- "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "similar",
  "tempfile",
  "thiserror 2.0.20",
+ "winapi-util",
  "windows 0.62.2",
 ]
 

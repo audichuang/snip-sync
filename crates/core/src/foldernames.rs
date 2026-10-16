@@ -5,10 +5,11 @@
 //! That folder is the filesystem's own, so it is told by the object the
 //! filesystem has (its device and inode, on Windows its file index; see
 //! [`DirKey`]), never by how its path is spelled, and never folded: a
-//! canonical path keeps the spelling the caller used for every segment that
-//! is not a symlink, so `R/Sub` and `R/sub` are one folder on a filesystem
-//! that folds case (and `/private/x` and `/System/Volumes/Data/private/x`
-//! are one on macOS), yet two canonical paths. Only the names below the
+//! folder has many spellings (`R/Sub` and `R/sub` on a filesystem that folds
+//! case, `/private/x` and `/System/Volumes/Data/private/x` on macOS, two
+//! mount points of one bind mount), and a path-based key would miss some of
+//! them. The object is read with a stat, which needs no right to read the
+//! folder and holds nothing open. Only the names below the
 //! anchor, which the filesystem has not seen yet, fold case, and only when
 //! the anchor's filesystem does. Two folders under two existing folders are
 //! two folders however alike the paths read: `Α/new` and `α/new` are one
@@ -25,7 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::fscase::fs_is_case_insensitive;
 use crate::restore;
@@ -33,24 +33,43 @@ use crate::restore;
 /// Which existing folder: the filesystem's object, not a spelling of it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DirKey {
-	/// The folder's own device and inode (Windows: volume and file index).
-	Object(Arc<same_file::Handle>),
-	/// Only when the folder cannot be opened: its canonical path.
+	/// The folder's own device and inode (Windows: volume serial number
+	/// and file index), read once. Nothing is held open: one key per
+	/// distinct anchor must not cost a file descriptor.
+	Object(u64, u64),
+	/// Only when the folder cannot be statted at all: its canonical path.
 	Path(PathBuf),
 }
 
 impl DirKey {
-	/// What the filesystem says `path` is. A folder that exists but cannot
-	/// be opened is told by its canonical path, which is all there is.
+	/// What the filesystem says `path` is. A stat needs the right to search
+	/// the folders above it, not to read the folder itself, so a drop box
+	/// (`-wx`) is told by its object like any other.
 	pub(crate) fn of(path: &Path) -> Self {
-		match same_file::Handle::from_path(path) {
-			Ok(handle) => Self::Object(Arc::new(handle)),
-			Err(_) => Self::Path(
+		match object_of(path) {
+			Some((volume, index)) => Self::Object(volume, index),
+			None => Self::Path(
 				dunce::canonicalize(path)
 					.unwrap_or_else(|_| path.to_path_buf()),
 			),
 		}
 	}
+}
+
+#[cfg(unix)]
+fn object_of(path: &Path) -> Option<(u64, u64)> {
+	use std::os::unix::fs::MetadataExt;
+	let md = fs::metadata(path).ok()?;
+	Some((md.dev(), md.ino()))
+}
+
+/// Opened with no access rights, as `same_file` does, and released as soon
+/// as the index is read.
+#[cfg(windows)]
+fn object_of(path: &Path) -> Option<(u64, u64)> {
+	let handle = winapi_util::Handle::from_path_any(path).ok()?;
+	let info = winapi_util::file::information(&handle).ok()?;
+	Some((info.volume_serial_number(), info.file_index()))
 }
 
 /// A folder to be made, by the exact identity of the folder it is made in
@@ -427,6 +446,61 @@ mod tests {
 		assert_eq!(
 			DirKey::of(&tmp.path().join("missing")),
 			DirKey::Path(tmp.path().join("missing"))
+		);
+	}
+
+	/// A folder that cannot be read (a drop box, `-wx`) is still told by its
+	/// object: a stat needs only the right to search the folders above it.
+	/// Told by a path instead, two spellings of it would be two folders.
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_folder_is_told_by_its_object() {
+		use std::os::unix::fs::PermissionsExt;
+
+		struct Restore(PathBuf);
+		impl Drop for Restore {
+			fn drop(&mut self) {
+				let _ = fs::set_permissions(
+					&self.0,
+					fs::Permissions::from_mode(0o755),
+				);
+			}
+		}
+
+		let tmp = tempfile::tempdir().unwrap();
+		let a = tmp.path().join("a");
+		fs::create_dir(&a).unwrap();
+		let _restore = Restore(a.clone());
+		fs::set_permissions(&a, fs::Permissions::from_mode(0o311)).unwrap();
+		let key = DirKey::of(&a);
+		assert!(matches!(key, DirKey::Object(..)), "{key:?}");
+		assert_eq!(key, DirKey::of(&tmp.path().join("./a")));
+		assert_ne!(key, DirKey::of(&tmp.path().join("missing")));
+	}
+
+	/// A key holds no file descriptor: the plan keeps one per distinct
+	/// existing folder, and a terminal's default limit is 256.
+	#[cfg(unix)]
+	#[test]
+	fn keys_for_many_folders_do_not_run_out_of_descriptors() {
+		use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+		let tmp = tempfile::tempdir().unwrap();
+		let dirs: Vec<PathBuf> = (0..300)
+			.map(|i| {
+				let d = tmp.path().join(format!("d{i}"));
+				fs::create_dir(&d).unwrap();
+				d
+			})
+			.collect();
+		// One test per process under nextest, so the limit stays here.
+		let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+		let low = 128.min(hard);
+		setrlimit(Resource::RLIMIT_NOFILE, low.min(soft), hard).unwrap();
+		let keys: Vec<DirKey> = dirs.iter().map(|d| DirKey::of(d)).collect();
+		assert!(
+			keys.iter().all(|k| matches!(k, DirKey::Object(..))),
+			"{keys:?}"
 		);
 	}
 }
