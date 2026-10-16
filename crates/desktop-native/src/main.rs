@@ -22901,6 +22901,22 @@ mod tests {
 			});
 		}
 
+		/// Opens the Project tool window with the rail button, as a user does.
+		fn open_project_tool(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let open = model.read_with(cx, |m, _| {
+				m.active_tab == WorkbenchTab::FileExplorer
+			});
+			if !open {
+				click_probed(model, cx, "rail-project");
+			}
+			settle_until(cx, "the Project tree", |cx| {
+				model.read_with(cx, |m, _| m.file_tree.is_some())
+			});
+		}
+
 		/// Two file reads in flight, the last one refused by the budget: the
 		/// second read must not capture the emptied selection the first one
 		/// left behind. The snapshot belongs to the diff still shown, not to
@@ -22913,6 +22929,7 @@ mod tests {
 			let alpha = repo(ws.path(), "alpha", &[]);
 			let beta = repo(ws.path(), "beta", &[]);
 			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			fs::write(alpha.join("small.txt"), "small\n").unwrap();
 			git(&alpha, &["add", "."]);
 			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
 			fs::write(beta.join("b.txt"), "beta content\n").unwrap();
@@ -22948,17 +22965,11 @@ mod tests {
 			});
 			let delay = std::time::Duration::from_secs(60);
 			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
-			// Two reads, the second superseding the first before it lands.
-			for _ in 0..2 {
-				let root = alpha.clone();
-				model.update(cx, |m, cx| {
-					m.select_file_in(
-						Some(root),
-						"big.txt",
-						snip_core::transfer::SourceKind::File,
-						cx,
-					);
-				});
+			open_project_tool(&model, cx);
+			// Two reads by the user's gesture (Project tree rows), the second
+			// superseding the first before it lands.
+			for name in ["small.txt", "big.txt"] {
+				click_probed(&model, cx, &format!("tree-row:{name}"));
 			}
 			settle(cx);
 			// Nearly all of the retained budget is held, so the 128 KiB file
@@ -23027,18 +23038,11 @@ mod tests {
 						&& commit_preview_shown(m)
 				})
 			});
+			open_project_tool(&model, cx);
 			let read = |model: &Entity<WorkbenchModel>,
 			            cx: &mut VisualTestContext,
 			            name: &str| {
-				let (root, name) = (alpha.clone(), name.to_string());
-				model.update(cx, |m, cx| {
-					m.select_file_in(
-						Some(root),
-						&name,
-						snip_core::transfer::SourceKind::File,
-						cx,
-					);
-				});
+				click_probed(model, cx, &format!("tree-row:{name}"));
 			};
 			let delay = std::time::Duration::from_secs(60);
 			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
