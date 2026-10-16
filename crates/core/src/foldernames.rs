@@ -85,6 +85,21 @@ fn object_of_file(file: &fs::File) -> Option<(u64, u64)> {
 	Some((info.volume_serial_number(), info.file_index()))
 }
 
+/// How many names the open `file` has; `None` when the filesystem cannot
+/// say. Read from the handle, as [`DirKey::of_file`] is.
+#[cfg(unix)]
+pub(crate) fn links_of_file(file: &fs::File) -> Option<u64> {
+	use std::os::unix::fs::MetadataExt;
+	file.metadata().ok().map(|md| md.nlink())
+}
+
+#[cfg(windows)]
+pub(crate) fn links_of_file(file: &fs::File) -> Option<u64> {
+	let handle = winapi_util::HandleRef::from_file(file);
+	let info = winapi_util::file::information(&handle).ok()?;
+	Some(info.number_of_links())
+}
+
 #[cfg(unix)]
 fn object_of(path: &Path) -> Option<(u64, u64)> {
 	use std::os::unix::fs::MetadataExt;

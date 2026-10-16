@@ -2334,8 +2334,9 @@ impl TransferImportPlan {
 				let modified = fs::symlink_metadata(path)
 					.and_then(|info| info.modified())
 					.ok();
-				made.file(path, key.clone(), &op.relative_path);
-				Ok(restore::Reserved { key, modified })
+				let reserved = restore::Reserved { key, modified };
+				made.file(path, &reserved, &op.relative_path);
+				Ok(reserved)
 			}
 			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 				Err(Reserve::Batch(self.met(op, path, made, existing)))
@@ -2393,8 +2394,8 @@ enum Reserve {
 struct Made {
 	/// Folders in the order made; `true` for a placed folder's level.
 	dirs: Vec<(PathBuf, DirKey, bool)>,
-	/// Empty files made with `create_new`.
-	files: Vec<(PathBuf, DirKey)>,
+	/// Empty files made with `create_new`, as made.
+	files: Vec<(PathBuf, restore::Reserved)>,
 	/// Every object made, with what made it.
 	objects: HashMap<DirKey, String>,
 }
@@ -2407,11 +2408,11 @@ impl Made {
 		self.dirs.push((path.to_path_buf(), key, placed));
 	}
 
-	fn file(&mut self, path: &Path, key: DirKey, rel: &str) {
+	fn file(&mut self, path: &Path, reserved: &restore::Reserved, rel: &str) {
 		self.objects
-			.entry(key.clone())
+			.entry(reserved.key.clone())
 			.or_insert_with(|| format!("create {rel}"));
-		self.files.push((path.to_path_buf(), key));
+		self.files.push((path.to_path_buf(), reserved.clone()));
 	}
 
 	fn has(&self, key: &DirKey) -> bool {
@@ -2427,14 +2428,19 @@ impl Made {
 		self.dirs.iter().any(|(_, k, placed)| *placed && k == key)
 	}
 
-	/// Removes the empty file made at `path`, if it is still that file.
+	/// Removes the empty file made at `path`, if it is still that file
+	/// untouched (`Reserved::open_untouched`, the test its row wrote by).
 	fn release_file(&self, path: &Path) {
-		let Some((_, key)) = self.files.iter().find(|(p, _)| p == path) else {
+		let Some((_, reserved)) = self.files.iter().find(|(p, _)| p == path)
+		else {
 			return;
 		};
-		let empty = fs::symlink_metadata(path)
-			.is_ok_and(|m| m.is_file() && m.len() == 0);
-		if empty && DirKey::of(path) == *key {
+		// The handle is closed before the name is removed: on Windows the
+		// name of an open file lingers, and its folder is not empty yet.
+		let untouched = reserved
+			.open_untouched(path)
+			.is_ok_and(|file| file.is_some());
+		if untouched {
 			let _ = fs::remove_file(path);
 		}
 	}
