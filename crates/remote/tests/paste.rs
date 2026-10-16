@@ -2134,3 +2134,50 @@ fn an_ancestor_or_prefix_folder_replaced_after_a_remote_preview_is_stale_on_a_wo
 		assert!(!ws.join("primary/y.txt").exists(), "{what}");
 	}
 }
+
+/// #241 guard (R3/R4): a worker that was not asked for folders that may not
+/// exist (the app's paste, or an older protocol) still refuses a missing
+/// destination (`NotFound`: the folder does not resolve), and makes nothing.
+#[test]
+fn a_worker_refuses_a_missing_folder_it_was_not_asked_to_make() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "x");
+	let before: Vec<_> = fs::read_dir(&ws).unwrap().collect();
+	assert!(before.is_empty());
+	for max_protocol in [None, Some(8)] {
+		let w = worker(max_protocol);
+		let (client, id) = open(&w, &ws);
+		let planned = client.import_plan(
+			&id,
+			"not/yet",
+			&text,
+			&PasteMapping::default(),
+			None,
+		);
+		assert_eq!(refused(planned), ErrorCode::NotFound);
+		let remote = PasteTarget::Remote {
+			client: Arc::new(client),
+			workspace: id,
+			dest: "not/yet".into(),
+		};
+		match remote.plan_files(
+			&text,
+			&PasteRoute::default(),
+			&RunOptions::default(),
+			None,
+		) {
+			Err(PasteError::Remote(RemoteError::Refused {
+				code: ErrorCode::NotFound,
+				..
+			})) => {}
+			other => panic!("expected a NotFound refusal, got {other:?}"),
+		}
+		assert!(
+			fs::read_dir(&ws).unwrap().next().is_none(),
+			"the worker made a folder it was not asked to"
+		);
+	}
+}

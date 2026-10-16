@@ -3087,36 +3087,138 @@ fn paste_refuses_git_path_segment() {
 	);
 }
 
+/// #241 L1 + L2: a `--repo` that does not exist is a folder to make, not an
+/// error. `--dry-run` lists it (stdout keeps its format), plans without
+/// writing, and `--apply` refuses to make it without `--create-dirs`.
 #[test]
-fn paste_into_missing_repo_exits_one_naming_the_path() {
+fn paste_into_missing_repo_needs_create_dirs() {
 	let tmp = tempfile::tempdir().unwrap();
 	let nope = tmp.path().join("nope");
 	let nope_s = nope.to_str().unwrap();
 	let payload = "// file: a/b.txt\nhi\n";
 
-	let apply = snip(
-		&["--repo", nope_s, "paste", "--apply", "--stdin"],
-		Some(payload.as_bytes()),
-	);
-	assert_eq!(code(&apply), 1);
-	let apply_err = text(&apply.stderr);
-	assert!(apply_err.contains("nope"), "stderr was: {apply_err}");
-	let want = format!(
-		"--repo {} does not exist or cannot be resolved: ",
-		nope.display()
-	);
-	assert!(apply_err.contains(&want), "stderr was: {apply_err}");
-	assert!(!nope.exists());
-
 	let dry = snip(
 		&["--repo", nope_s, "paste", "--dry-run", "--stdin"],
 		Some(payload.as_bytes()),
 	);
-	assert_eq!(code(&dry), 1);
+	assert_eq!(code(&dry), 0, "stderr was: {}", text(&dry.stderr));
 	let dry_err = text(&dry.stderr);
-	assert!(dry_err.contains("nope"), "stderr was: {dry_err}");
-	assert!(dry_err.contains(&want), "stderr was: {dry_err}");
-	assert!(!nope.exists());
+	let folder_line = dry_err
+		.lines()
+		.find(|l| l.starts_with("would create folder: "))
+		.unwrap_or_else(|| panic!("no 'would create folder:' in: {dry_err}"));
+	assert!(
+		folder_line.ends_with("nope/"),
+		"folder line was: {folder_line}"
+	);
+	assert!(
+		text(&dry.stdout).contains("create\tnope/a/b.txt"),
+		"stdout was: {}",
+		text(&dry.stdout)
+	);
+	assert!(!nope.exists(), "a dry run must not make the folder");
+
+	let apply = snip(
+		&["--repo", nope_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 1, "stderr was: {}", text(&apply.stderr));
+	let apply_err = text(&apply.stderr);
+	assert!(apply_err.contains("nope"), "stderr was: {apply_err}");
+	assert!(
+		apply_err.contains("--create-dirs"),
+		"stderr was: {apply_err}"
+	);
+	assert!(!nope.exists(), "a refused apply must not make the folder");
+}
+
+/// #241 L3: with `--create-dirs` the folder is made and pasted into.
+#[test]
+fn paste_create_dirs_makes_the_missing_repo() {
+	let tmp = tempfile::tempdir().unwrap();
+	let nope = tmp.path().join("nope");
+	let apply = snip(
+		&[
+			"--repo",
+			nope.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--create-dirs",
+			"--stdin",
+		],
+		Some(b"// file: a/b.txt\nhi\n"),
+	);
+	assert_eq!(code(&apply), 0, "stderr was: {}", text(&apply.stderr));
+	assert_eq!(fs::read_to_string(nope.join("a/b.txt")).unwrap(), "hi\n");
+	assert!(
+		text(&apply.stdout).contains("Created folders 1"),
+		"stdout was: {}",
+		text(&apply.stdout)
+	);
+}
+
+/// #241 L4: `--map PREFIX=PATH` sends the entries under `PREFIX/` to a folder
+/// (`.` is `--repo` itself); a folder that is not there needs `--create-dirs`.
+#[test]
+fn paste_map_sends_a_prefix_to_a_folder() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let repo_s = repo.to_str().unwrap();
+	let payload = "// file: sub/a.txt\nA\n// file: top.txt\nT\n";
+
+	let flat = snip(
+		&[
+			"--repo", repo_s, "paste", "--apply", "--map", "sub=.", "--stdin",
+		],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&flat), 0, "stderr was: {}", text(&flat.stderr));
+	assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "A\n");
+	assert_eq!(fs::read_to_string(repo.join("top.txt")).unwrap(), "T\n");
+	assert!(!repo.join("sub").exists());
+
+	let nested = snip(
+		&[
+			"--repo",
+			repo_s,
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--map",
+			"sub=lib/x",
+			"--create-dirs",
+			"--stdin",
+		],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&nested), 0, "stderr was: {}", text(&nested.stderr));
+	assert_eq!(fs::read_to_string(repo.join("lib/x/a.txt")).unwrap(), "A\n");
+}
+
+/// #241 L7: a `--repo` that is a regular file is no folder, and the error
+/// names it.
+#[test]
+fn paste_into_a_file_repo_names_the_path() {
+	let tmp = tempfile::tempdir().unwrap();
+	let file = tmp.path().join("plain.txt");
+	fs::write(&file, "x").unwrap();
+	let out = snip(
+		&[
+			"--repo",
+			file.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(b"// file: a.txt\nhi\n"),
+	);
+	assert_eq!(code(&out), 1, "stderr was: {}", text(&out.stderr));
+	assert!(
+		text(&out.stderr).contains("plain.txt"),
+		"stderr was: {}",
+		text(&out.stderr)
+	);
 }
 
 /// `snip paste --dry-run | head -1` closes the read end while the plan is
