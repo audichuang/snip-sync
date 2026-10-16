@@ -756,7 +756,7 @@ pub(crate) fn text_width(window: &Window, s: &str, size: f32) -> f32 {
 }
 
 /// [`log_date_in`] in the viewer's time zone, now.
-pub(super) fn log_date(iso: &str, loc: Locale) -> String {
+pub(crate) fn log_date(iso: &str, loc: Locale) -> String {
 	log_date_in(iso, loc, chrono::Utc::now(), &chrono::Local)
 }
 
@@ -1666,7 +1666,13 @@ impl WorkbenchModel {
 										cx,
 									))
 									.when_some(repo, |d, r| {
-										d.child(yielding_suffix(r))
+										let selector =
+											format!("menu-repo:{name}");
+										d.child(
+											yielding_suffix(r).debug_selector(
+												move || selector,
+											),
+										)
 									})
 									.into_any_element(),
 							);
@@ -2789,5 +2795,50 @@ mod repo_label_tests {
 		assert_eq!(label_icon_kind(&label(true, false)), Icon::Head);
 		assert_eq!(label_icon_kind(&label(false, true)), Icon::Tag);
 		assert_eq!(label_icon_kind(&label(false, false)), Icon::Branch);
+	}
+}
+
+#[cfg(test)]
+mod row_fit_tests {
+	use super::*;
+
+	/// The policy over every shape of a log row (#228). While the list's
+	/// columns and each row's widths come from two functions and a flex
+	/// layout, this is checked on the first of them: `list_cols`. A date is
+	/// whole (`date_need` wide) or the column is absent, and it is absent
+	/// only on a list narrower than 250px.
+	#[test]
+	fn log_row_policy_holds_for_every_shape() {
+		let mut bad = Vec::new();
+		for list_w in (300..=1400).step_by(10) {
+			let list_w = list_w as f32;
+			for hash in [false, true] {
+				for labels_w in [0., 60., 176., 337.] {
+					for gutter in [24., 40., 72., 392.] {
+						for date_need in [110., 124.8] {
+							let c = list_cols(
+								list_w, gutter, labels_w, date_need, hash,
+							);
+							if c.date < date_need - 0.5 {
+								bad.push(format!(
+									"list {list_w} hash={hash} labels={labels_w} gutter={gutter} need={date_need}: date {}",
+									c.date
+								));
+							}
+						}
+					}
+				}
+			}
+		}
+		// The 433px list a 900 window leaves, hash off, labels, 110px dates:
+		// the date is squeezed to 97px, a time cut off.
+		let c = list_cols(433., 392., 176., 110., false);
+		assert!(
+			bad.is_empty(),
+			"{} shapes cut the date (433px, labels, need 110: date {}):\n{}",
+			bad.len(),
+			c.date,
+			bad.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
+		);
 	}
 }

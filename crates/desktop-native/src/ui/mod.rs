@@ -87,9 +87,9 @@ pub(crate) use changes::{
 	change_rows, commit_file_rows, natural_cmp, ChangeItemRow, ChangeLayout,
 	UNREADABLE,
 };
-#[cfg(test)]
-pub(crate) use log::text_width;
 use log::*;
+#[cfg(test)]
+pub(crate) use log::{log_date, text_width};
 pub use log::{LogFilterLayout, LogMenu};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────

@@ -473,6 +473,7 @@ impl WorkbenchModel {
 							.child(
 								div()
 									.id("log-list")
+									.debug_selector(|| "log-list".into())
 									.relative()
 									.key_context("GitLog")
 									.track_focus(&self.log_focus)
@@ -718,6 +719,7 @@ impl WorkbenchModel {
 		let date = log_date(&c.author_date, loc);
 		div()
 			.id(SharedString::from(row_id.clone()))
+			.debug_selector(|| format!("log-row:{ix}"))
 			.relative()
 			.w_full()
 			.flex()
@@ -836,6 +838,9 @@ impl WorkbenchModel {
 					.when(collapsed, |d| {
 						d.child(
 							div()
+								.debug_selector(|| {
+									format!("log-collapsed:{ix}")
+								})
 								.flex_shrink_0()
 								.text_size(px(SMALL_TEXT))
 								.text_color(rgb(pal().text_muted))
@@ -847,6 +852,7 @@ impl WorkbenchModel {
 					.when(!labels.is_empty(), |d| {
 						d.child(
 							div()
+								.debug_selector(|| format!("log-labels:{ix}"))
 								.flex_shrink_0()
 								.flex()
 								.flex_row()
@@ -862,6 +868,7 @@ impl WorkbenchModel {
 			.child(
 				div()
 					.id(SharedString::from(format!("author:{key}")))
+					.debug_selector(|| format!("log-author:{ix}"))
 					.flex_shrink_0()
 					.w(px(cols.author))
 					.tip(format!("{} <{}>", c.author_name, c.author_email))
@@ -874,6 +881,7 @@ impl WorkbenchModel {
 			.child(
 				div()
 					.id(SharedString::from(format!("date:{key}")))
+					.debug_selector(|| format!("log-date:{ix}"))
 					.flex_shrink_0()
 					.w(px(cols.date))
 					.tip(short_date(&c.author_date))
@@ -883,6 +891,7 @@ impl WorkbenchModel {
 				d.child(
 					div()
 						.id(SharedString::from(format!("sha:{key}")))
+						.debug_selector(|| format!("log-sha:{ix}"))
 						.flex_shrink_0()
 						.w(px(hash_w))
 						.font_family(CODE_FONT)
