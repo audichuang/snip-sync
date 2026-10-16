@@ -274,6 +274,7 @@ mod menu;
 mod multi_log;
 pub mod open_tabs;
 pub mod paste;
+mod paste_dest;
 mod reader;
 mod reason;
 mod recent;
@@ -1064,6 +1065,9 @@ pub struct WorkbenchModel {
 		std::rc::Rc<std::cell::Cell<Option<Bounds<gpui::Pixels>>>>,
 	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
+	/// The paste panel's typed destination folder. Open or closed is the
+	/// paste session's (`paste.dest_edit()`); the text lives here.
+	pub paste_dest_input: Entity<TextInput>,
 	/// Remembered workspaces, newest first.
 	pub recent_workspaces: Vec<PathBuf>,
 	pub lifecycle: lifecycle::Lifecycle,
@@ -1381,6 +1385,19 @@ impl WorkbenchModel {
 			},
 		)
 		.detach();
+		let paste_dest_input = cx.new(|cx| {
+			TextInput::new(i18n::t("paste_dest_placeholder", loc), 58, cx)
+		});
+		cx.subscribe(
+			&paste_dest_input,
+			|this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.submit_paste_dest(cx),
+				InputEvent::Dismiss => this.dismiss_paste_dest(cx),
+				InputEvent::Changed => this.paste_dest_changed(cx),
+				_ => {}
+			},
+		)
+		.detach();
 		let remote_path_input = cx.new(|cx| {
 			TextInput::new(i18n::t("remote_path_placeholder", loc), 71, cx)
 		});
@@ -1579,6 +1596,7 @@ impl WorkbenchModel {
 			workspace_menu_button: Default::default(),
 			workspace_picker: false,
 			workspace_path_input,
+			paste_dest_input,
 			recent_workspaces: recent::load(),
 			lifecycle: lifecycle::Lifecycle::new(1),
 			watch_running: false,
@@ -2222,6 +2240,7 @@ impl WorkbenchModel {
 			(self.log_since_input.clone(), "log_date_from"),
 			(self.log_until_input.clone(), "log_date_to"),
 			(self.branch_filter_input.clone(), "log_branch_placeholder"),
+			(self.paste_dest_input.clone(), "paste_dest_placeholder"),
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
 		}
@@ -2781,6 +2800,7 @@ impl WorkbenchModel {
 			self.selector_input.clone(),
 			self.add_repo_input.clone(),
 			self.workspace_path_input.clone(),
+			self.paste_dest_input.clone(),
 			self.log_path_input.clone(),
 			self.log_branch_menu_input.clone(),
 			self.log_since_input.clone(),
@@ -5129,8 +5149,8 @@ impl WorkbenchModel {
 			self.refresh_paste_candidates(cx);
 		}
 		match landed {
-			Some(paste::preview::Landed::Shown { remap }) => {
-				self.show_landed_plan(remap);
+			Some(paste::preview::Landed::Shown { remap, retargeted }) => {
+				self.show_landed_plan(remap, retargeted);
 				let selected_idx =
 					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
 				self.load_paste_diff(selected_idx, cx);
@@ -5186,7 +5206,11 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+	fn show_landed_plan(
+		&mut self,
+		remap: Option<(String, bool)>,
+		retargeted: bool,
+	) {
 		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
 		let items_count = plan.items.len();
@@ -5211,14 +5235,33 @@ impl WorkbenchModel {
 					);
 				}
 			}
-			app_log!(
-				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
-				items_count,
-				plan.shown(&plan.destination),
-				plan.mapping_ready()
-			);
+			if retargeted {
+				app_log!(
+					"[APP:PASTE_RETARGETED: items={} dest={} executable={} error={}]",
+					items_count,
+					plan.shown(&plan.destination),
+					plan.executable(),
+					plan.error.as_ref().map_or("-", |e| e.key)
+				);
+			} else {
+				app_log!(
+					"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
+					items_count,
+					plan.shown(&plan.destination),
+					plan.mapping_ready()
+				);
+			}
 		}
-		self.set_status("status_paste_preview", [items_count.to_string()]);
+		// A folder the engine refused is said at once, in its own words; a
+		// mapping still to choose is not a refusal.
+		let refusal = plan.error.clone().filter(|_| {
+			retargeted && plan.mapping_ready() && !plan.executable()
+		});
+		match refusal {
+			Some(err) => self.set_status_msg(err),
+			None => self
+				.set_status("status_paste_preview", [items_count.to_string()]),
+		}
 		if self.paste.collapse_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
@@ -5233,6 +5276,17 @@ impl WorkbenchModel {
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.trigger_paste_preview_into(None, cx);
+	}
+
+	/// Opens the paste preview from the clipboard: into `folder`, or, when
+	/// none is named, the default destination (`--restore-dir`, else the
+	/// pinned repo, else the workspace folder).
+	pub fn trigger_paste_preview_into(
+		&mut self,
+		folder: Option<paste::dest::DestFolder>,
+		cx: &mut Context<Self>,
+	) {
 		self.user_action();
 		if self.refuse_while_applying("preview", cx) {
 			return;
@@ -5272,9 +5326,15 @@ impl WorkbenchModel {
 			return;
 		}
 
-		let target_dest = self.current_restore_destination();
+		let folder = folder.unwrap_or_else(|| {
+			self.dest_folder(self.current_restore_destination())
+		});
+		let target_dest = folder.path.clone();
 		let known_roots = self.repos.roots();
 		self.pending_focus = Some(self.paste_focus.clone());
+		// After the early returns above (a failed read leaves no folder
+		// behind) and after `clear`, which resets it.
+		self.paste.set_folder(folder);
 		self.queue_paste(
 			paste::PasteRequest::Clipboard {
 				text,
@@ -22955,7 +23015,10 @@ mod tests {
 			}
 
 			fn file(path: &Path) -> Option<String> {
-				fs::read_to_string(path).ok()
+				// The payload's closing line break is not part of the file.
+				fs::read_to_string(path)
+					.ok()
+					.map(|text| text.trim_end().to_string())
 			}
 
 			/// The report of #236: in a workspace of several repos there was
@@ -22972,10 +23035,15 @@ mod tests {
 				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
 				assert_ne!(first, ws);
 				assert_eq!(plan_destination(&model, cx), first);
+				assert_eq!(folder(&model, cx).0, first);
 
 				click_probed(&model, cx, "paste-dest-crumb:0");
 				landed(&model, cx);
 				assert_eq!(plan_destination(&model, cx), ws);
+				assert_eq!(
+					folder(&model, cx),
+					(ws.clone(), Some(String::new()))
+				);
 				assert!(executable(&model, cx));
 				assert!(
 					paste_focused(&model, cx),
@@ -23014,10 +23082,7 @@ mod tests {
 				click_probed(&model, cx, "paste-map-keep:notes");
 				landed(&model, cx);
 				apply_with_enter(&model, cx);
-				assert_eq!(
-					file(&ws.join("notes/x.txt")).as_deref(),
-					Some("N\n")
-				);
+				assert_eq!(file(&ws.join("notes/x.txt")).as_deref(), Some("N"));
 			}
 
 			/// Right-click a folder, pick "paste into this folder": the next
@@ -23046,7 +23111,7 @@ mod tests {
 					apply_with_enter(&model, cx);
 					assert_eq!(
 						file(&ws.join("docs/x.txt")).as_deref(),
-						Some("X\n")
+						Some("X")
 					);
 					fs::remove_file(ws.join("docs/x.txt")).unwrap();
 				}
@@ -23101,10 +23166,7 @@ mod tests {
 				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
 				assert!(!ws.join("docs/x.txt").exists());
 				apply_with_enter(&model, cx);
-				assert_eq!(
-					file(&ws.join("docs/x.txt")).as_deref(),
-					Some("X\n")
-				);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
 			}
 
 			/// With a preview already open the menu moves it, and the
@@ -23131,10 +23193,225 @@ mod tests {
 						.any(|i| i.path == "x.txt")
 				}));
 				apply_with_enter(&model, cx);
-				assert_eq!(
-					file(&ws.join("docs/x.txt")).as_deref(),
-					Some("X\n")
-				);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+			}
+
+			/// The target of the item `paste-into` in `entries`, if it is
+			/// there and enabled.
+			fn paste_into_act(
+				entries: Vec<crate::menu::MenuEntry>,
+			) -> Option<PathBuf> {
+				entries.into_iter().find_map(|e| match e {
+					crate::menu::MenuEntry::Item {
+						id: "paste-into",
+						act: Some(crate::menu::MenuAct::PasteInto(path)),
+						..
+					} => Some(path),
+					_ => None,
+				})
+			}
+
+			fn has_paste_into(entries: &[crate::menu::MenuEntry]) -> bool {
+				entries.iter().any(|e| {
+					matches!(
+						e,
+						crate::menu::MenuEntry::Item {
+							id: "paste-into",
+							..
+						}
+					)
+				})
+			}
+
+			/// Folder rows and repo rows offer "paste into this folder", with
+			/// the folder as the target; file rows do not.
+			#[gpui::test]
+			fn project_menus_offer_paste_into_for_folders_only(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, ws) = multi_repo_ws();
+				fs::write(ws.join("top.txt"), "T").unwrap();
+				for repo in ["repoA", "repoB"] {
+					fs::create_dir(ws.join(repo).join("dir")).unwrap();
+					fs::write(ws.join(repo).join("dir/b.txt"), "B").unwrap();
+				}
+				let (model, cx) = open_ready(cx, &ws);
+				open_repo_tree(&model, cx, 0);
+				model.read_with(cx, |m, _| {
+					// A workspace folder row and its file.
+					let tree = m.ws_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let row = |rel: &str| {
+						rows.iter().find(|r| r.rel_path == rel).cloned()
+					};
+					let docs = row("docs").expect("docs row");
+					assert_eq!(
+						paste_into_act(m.work_row_menu(&docs, true)),
+						Some(m.ws_root().unwrap().join("docs"))
+					);
+					let top = row("top.txt").expect("top.txt row");
+					assert!(!top.is_dir);
+					assert!(!has_paste_into(&m.work_row_menu(&top, true)));
+					// A folder inside the open repo.
+					let tree = m.file_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let find = |rel: &str| {
+						rows.iter().find(|r| r.rel_path == rel).unwrap().clone()
+					};
+					let dir = find("dir");
+					assert!(dir.is_dir);
+					assert_eq!(
+						paste_into_act(m.work_row_menu(&dir, false)),
+						Some(m.repo_root().unwrap().join("dir"))
+					);
+					let base = find("base.txt");
+					assert!(!has_paste_into(&m.work_row_menu(&base, false)));
+					// Every repo row, first in its menu.
+					for i in 0..m.repos.len() {
+						let entries = m.repo_row_menu(i);
+						assert!(matches!(
+							entries.first(),
+							Some(crate::menu::MenuEntry::Item {
+								id: "paste-into",
+								..
+							})
+						));
+						assert_eq!(
+							paste_into_act(entries),
+							Some(m.repos[i].root.clone())
+						);
+					}
+				});
+			}
+
+			/// In a remote workspace the target is a tree path under the
+			/// session root, which is what the worker is asked about.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn remote_project_menus_paste_into_a_tree_path_under_the_session_root(
+				cx: &mut TestAppContext,
+			) {
+				let _serial = remote_lock();
+				let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+				model.read_with(cx, |m, _| {
+					let root = m.remote.session.as_ref().unwrap().root.clone();
+					let tree = m.ws_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let notes = rows
+						.iter()
+						.find(|r| r.rel_path == "notes")
+						.expect("notes row");
+					assert_eq!(
+						paste_into_act(m.work_row_menu(notes, true)),
+						Some(root.join("notes"))
+					);
+					let repo = paste_into_act(m.repo_row_menu(0))
+						.expect("the repo row offers it");
+					assert!(
+						repo.starts_with(&root) && repo != root,
+						"{repo:?}"
+					);
+				});
+			}
+
+			/// At the narrowest window the bar wraps instead of overlapping:
+			/// its controls and Apply and Cancel stay apart and inside the
+			/// panel.
+			#[gpui::test]
+			fn paste_dest_bar_fits_at_900w(cx: &mut TestAppContext) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_sized(cx, ws.clone(), None, 900., 700.);
+				settle_until(cx, "the workspace scan", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.is_loading && m.repos.len() == 2
+					})
+				});
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				// Probes switch on with the first read and draw next frame.
+				let _ = probed_point(&model, cx, "btn-apply");
+				settle(cx);
+				let ids = [
+					"paste-dest-crumb:0",
+					"paste-dest-crumb:1",
+					"paste-dest-root",
+					"paste-dest-edit",
+					"paste-dest-browse",
+					"btn-apply",
+					"btn-cancel",
+				];
+				let bounds = |cx: &mut VisualTestContext, id: &str| {
+					model
+						.read_with(cx, |m, _| {
+							m.probes.as_ref().unwrap().bounds(id)
+						})
+						.unwrap_or_else(|| panic!("{id} is not drawn"))
+				};
+				let panel = bounds(cx, "paste-panel");
+				let inside = |b: [i32; 4]| {
+					b[0] >= panel[0]
+						&& b[1] >= panel[1]
+						&& b[0] + b[2] <= panel[0] + panel[2]
+						&& b[1] + b[3] <= panel[1] + panel[3]
+				};
+				let all: Vec<(&str, [i32; 4])> =
+					ids.iter().map(|id| (*id, bounds(cx, id))).collect();
+				for (id, b) in &all {
+					assert!(
+						inside(*b),
+						"{id} {b:?} leaves the panel {panel:?}"
+					);
+				}
+				for (i, (a_id, a)) in all.iter().enumerate() {
+					for (b_id, b) in &all[i + 1..] {
+						let apart = a[0] + a[2] <= b[0]
+							|| b[0] + b[2] <= a[0]
+							|| a[1] + a[3] <= b[1]
+							|| b[1] + b[3] <= a[1];
+						assert!(apart, "{a_id} {a:?} overlaps {b_id} {b:?}");
+					}
+				}
+			}
+
+			/// The Project selection offers its folder as a place to paste:
+			/// a file names its folder, and nothing is offered for several
+			/// rows (one cannot be guessed).
+			#[gpui::test]
+			fn the_left_chip_names_the_folder_of_the_single_selected_row(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				click_probed(&model, cx, "ws-tree-row:docs");
+				settle_until(cx, "docs to open", |cx| {
+					model.read_with(cx, |m, _| {
+						m.probes.as_ref().is_some_and(|p| {
+							p.bounds("ws-tree-row:docs/readme.txt").is_some()
+						})
+					})
+				});
+				click_probed(&model, cx, "ws-tree-row:docs/readme.txt");
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				assert!(probed(&model, cx, "paste-dest-left"));
+				click_probed(&model, cx, "paste-dest-left");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some("docs"));
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+
+				// Two rows selected: no chip.
+				model.update(cx, |m, cx| {
+					m.select_tree_rows_alone(
+						true,
+						&["docs".into(), "my dir".into()],
+						cx,
+					)
+				});
+				settle(cx);
+				preview(&model, cx, "// FILE: y.txt\nY\n");
+				assert!(!probed(&model, cx, "paste-dest-left"));
 			}
 
 			/// Opens the destination editor over a fresh preview.
@@ -23167,10 +23444,7 @@ mod tests {
 				// The first Enter chose the folder; the second applies.
 				assert!(!ws.join("docs/x.txt").exists());
 				apply_with_enter(&model, cx);
-				assert_eq!(
-					file(&ws.join("docs/x.txt")).as_deref(),
-					Some("X\n")
-				);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
 
 				// Escape drops what was typed and keeps the folder.
 				open_editor(&model, cx);
@@ -23244,7 +23518,7 @@ mod tests {
 				settle(cx);
 				assert!(!editor_open(&model, cx));
 				apply_with_enter(&model, cx);
-				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X\n"));
+				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X"));
 			}
 
 			/// A space typed in the field is text, not the preview's row
@@ -23307,6 +23581,7 @@ mod tests {
 				});
 				assert_ne!(first, root);
 				assert_eq!(plan_destination(&model, cx), first);
+				assert_eq!(folder(&model, cx).0, first);
 
 				click_probed(&model, cx, "paste-dest-root");
 				for _ in 0..300 {
@@ -23323,7 +23598,7 @@ mod tests {
 				);
 				assert!(executable(&model, cx));
 				remote_paste_apply(&model, cx);
-				assert_eq!(file(&shared.join("x.txt")).as_deref(), Some("X\n"));
+				assert_eq!(file(&shared.join("x.txt")).as_deref(), Some("X"));
 				assert!(!shared.join("repoA/x.txt").exists());
 				assert!(!shared.join("repoB/x.txt").exists());
 
@@ -23350,7 +23625,7 @@ mod tests {
 						.map(|e| e.render(crate::i18n::Locale::ZhTw))
 				});
 				let said = said.expect("the worker's refusal is shown");
-				assert!(said.contains("無法使用貼上目的地"), "{said}");
+				assert!(said.contains("找不到"), "{said}");
 				assert!(!said.contains("No such file"), "{said}");
 				assert!(model.read_with(cx, |m, _| m.paste.is_open()));
 				cx.simulate_keystrokes("enter");
@@ -23359,33 +23634,55 @@ mod tests {
 				assert!(!shared.join("y.txt").exists());
 			}
 
-			// Red-light stand-ins: the destination editor does not exist yet.
 			fn editor_open(
-				_model: &Entity<WorkbenchModel>,
-				_cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
 			) -> bool {
-				unimplemented!("destination editor (#238)")
+				model.read_with(cx, |m, _| m.paste.dest_edit().is_some())
 			}
 
 			fn editor_focused(
-				_model: &Entity<WorkbenchModel>,
-				_cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
 			) -> bool {
-				unimplemented!("destination editor (#238)")
+				cx.update(|w, cx| {
+					model
+						.read(cx)
+						.paste_dest_input
+						.read(cx)
+						.handle()
+						.is_focused(w)
+				})
 			}
 
 			fn editor_text(
-				_model: &Entity<WorkbenchModel>,
-				_cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
 			) -> String {
-				unimplemented!("destination editor (#238)")
+				model.read_with(cx, |m, cx| {
+					m.paste_dest_input.read(cx).text().to_string()
+				})
 			}
 
 			fn editor_error(
-				_model: &Entity<WorkbenchModel>,
-				_cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
 			) -> Option<crate::i18n::Msg> {
-				unimplemented!("destination editor (#238)")
+				model.read_with(cx, |m, _| {
+					m.paste.dest_edit().and_then(|e| e.error.clone())
+				})
+			}
+
+			/// The folder the session holds, and where it lies in the
+			/// workspace.
+			fn folder(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> (PathBuf, Option<String>) {
+				model.read_with(cx, |m, _| {
+					let f = m.paste.folder().expect("a destination folder");
+					(f.path.clone(), f.rel.clone())
+				})
 			}
 		}
 	}

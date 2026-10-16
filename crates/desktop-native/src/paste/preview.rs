@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use snip_core::gitrun::CancelToken;
 
+use super::dest::{DestEdit, DestFolder};
 use super::*;
 use crate::i18n::Msg;
 use crate::reader::Preview;
@@ -28,6 +29,12 @@ pub struct PastePreview {
 	log_before: Option<bool>,
 	/// Test-only delay before a confirmed write (E2E only).
 	apply_delay: Option<std::time::Duration>,
+	/// The destination folder as the user picked it. Survives a loading,
+	/// refused or retargeting plan; reset by `clear`.
+	folder: Option<DestFolder>,
+	/// The typed destination field, while it is open. Kept here so that
+	/// everything that ends or restarts the session closes it too.
+	dest_edit: Option<DestEdit>,
 }
 
 #[derive(Debug)]
@@ -46,6 +53,9 @@ pub enum Landed {
 	/// Invariant: whenever `Landed::Shown` is produced, `self.plan` is guaranteed to be `Some`.
 	Shown {
 		remap: Option<(String, bool)>,
+		/// The plan answers a destination change, not a first preview or a
+		/// mapping choice.
+		retargeted: bool,
 	},
 	Refused {
 		err: Msg,
@@ -122,7 +132,46 @@ impl PastePreview {
 			scroll: gpui::UniformListScrollHandle::new(),
 			log_before: None,
 			apply_delay,
+			folder: None,
+			dest_edit: None,
 		}
+	}
+
+	/// The destination folder the user picked for this preview.
+	pub fn folder(&self) -> Option<&DestFolder> {
+		self.folder.as_ref()
+	}
+
+	/// Records the destination folder. Set after `clear`, which resets it.
+	pub fn set_folder(&mut self, folder: DestFolder) {
+		self.folder = Some(folder);
+	}
+
+	/// The typed destination field, when it is open.
+	pub fn dest_edit(&self) -> Option<&DestEdit> {
+		self.dest_edit.as_ref()
+	}
+
+	/// Opens the field, or keeps an open one as it is.
+	pub fn open_dest_edit(&mut self) {
+		self.dest_edit.get_or_insert_with(DestEdit::default);
+	}
+
+	pub fn close_dest_edit(&mut self) {
+		self.dest_edit = None;
+	}
+
+	/// Why the typed path was refused. Does nothing once the field is closed.
+	pub fn set_dest_edit_error(&mut self, error: Option<Msg>) {
+		if let Some(edit) = &mut self.dest_edit {
+			edit.error = error;
+		}
+	}
+
+	/// The session holds no plan any more (dropped by the budget).
+	fn forget_destination(&mut self) {
+		self.folder = None;
+		self.dest_edit = None;
 	}
 
 	pub fn plan(&self) -> Option<&PastePreviewPlan> {
@@ -199,6 +248,7 @@ impl PastePreview {
 	pub fn clear(&mut self, ordinary: Option<&Preview>) {
 		self.plan = None;
 		self.detail = None;
+		self.forget_destination();
 		release(&mut lock_pending(&self.pending), ordinary, None, None);
 	}
 
@@ -251,6 +301,7 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Landed {
 		let remap = outcome.remap;
+		let retargeted = outcome.retargeted;
 		let built = outcome.result.and_then(|plan| {
 			let detail = plan.detail_preview();
 			pending.admit_ui(ordinary, Some(&plan), detail.as_ref())?;
@@ -261,7 +312,7 @@ impl PastePreview {
 				self.plan = Some(plan);
 				self.detail = detail;
 				self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				Landed::Shown { remap }
+				Landed::Shown { remap, retargeted }
 			}
 			Err(err) => {
 				if pending
@@ -274,6 +325,7 @@ impl PastePreview {
 				{
 					self.plan = None;
 					self.detail = None;
+					self.forget_destination();
 					release(pending, ordinary, None, None);
 				}
 				Landed::Refused {
@@ -406,10 +458,42 @@ impl PastePreview {
 		}
 		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
 			self.plan = None;
+			self.forget_destination();
 			release(&mut pending, ordinary, None, None);
 			return Remapped::Dropped(err);
 		}
 		Remapped::Ready(PasteRequest::Remap { prefix, keep })
+	}
+
+	/// Moves the open preview to `dest`: the same payload planned again
+	/// there. The shell is disarmed first, so neither Apply nor a second
+	/// gesture can act on what was planned for the old folder.
+	pub fn retarget(
+		&mut self,
+		dest: PathBuf,
+		roots: Vec<PathBuf>,
+		generation: u64,
+		ordinary: Option<&Preview>,
+	) -> Remapped {
+		self.invalidate_job();
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		let Some(plan) = self.plan.as_mut() else {
+			return Remapped::NoPlan;
+		};
+		plan.disarm_for(dest.clone());
+		self.detail = None;
+		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
+			self.plan = None;
+			self.forget_destination();
+			release(&mut pending, ordinary, None, None);
+			return Remapped::Dropped(err);
+		}
+		Remapped::Ready(PasteRequest::Retarget {
+			dest,
+			roots,
+			generation,
+		})
 	}
 
 	pub fn toggle_overwrite(&mut self, idx: usize) -> Option<bool> {
@@ -584,6 +668,129 @@ mod tests {
 			false,
 			Language::Plain,
 		)
+	}
+
+	/// One commit adding `a.txt`, for the replay tests of a retarget.
+	fn commit_text() -> String {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "add a".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "a.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("A\n".into()),
+					not_copied: None,
+				}],
+			}],
+		})
+	}
+
+	/// Runs the retarget job `request` asks for, as the model does.
+	fn run_retarget(session: &mut PastePreview, request: PasteRequest) {
+		session.enqueue(request).unwrap();
+		let (work, cancel) = session.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		session.bind_job(1, cancel);
+	}
+
+	/// Between the gesture and the new plan nothing planned for the old
+	/// folder can be applied, a replayed commit included (#238).
+	#[test]
+	fn retarget_disarms_the_shell_before_the_job_runs() {
+		let dir = tempfile::tempdir().unwrap();
+		let other = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		for text in ["// FILE: a.txt\nA\n".to_string(), commit_text()] {
+			let mut session = landed(&text, dir.path(), None);
+			assert!(session.plan().unwrap().executable());
+			let Remapped::Ready(request) =
+				session.retarget(other.path().into(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			let plan = session.plan().unwrap();
+			assert_eq!(plan.destination, other.path());
+			assert!(!plan.executable());
+			assert!(plan.items.is_empty());
+			assert!(plan.commit_preview.is_none());
+			assert_eq!(
+				session.begin_apply().err(),
+				Some(ApplyRefused::NotExecutable)
+			);
+			session.enqueue(request).unwrap();
+			assert_eq!(
+				session.begin_apply().err(),
+				Some(ApplyRefused::Loading)
+			);
+		}
+	}
+
+	/// A folder the engine cannot use lands as a shell with the engine's own
+	/// words, not as a refused job; only the memory budget refuses (#238).
+	#[test]
+	fn retarget_to_a_missing_folder_lands_a_shell_with_the_engine_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let plain = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		let missing = dir.path().join("missing");
+		for (text, to) in [
+			("// FILE: a.txt\nA\n".to_string(), missing.clone()),
+			// A replay has no repository in a plain folder.
+			(commit_text(), plain.path().to_path_buf()),
+		] {
+			let mut session = landed(&text, dir.path(), None);
+			let Remapped::Ready(request) =
+				session.retarget(to.clone(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			run_retarget(&mut session, request);
+			let Polled::Settled {
+				landed: Some(Landed::Shown { retargeted, .. }),
+				..
+			} = session.poll(false, None)
+			else {
+				panic!("the shell lands");
+			};
+			assert!(retargeted);
+			let plan = session.plan().unwrap();
+			assert_eq!(plan.destination, to);
+			assert!(!plan.executable());
+			assert!(plan.error.is_some(), "the refusal is the plan's error");
+		}
+		let missing_key = {
+			let mut session = landed("// FILE: a.txt\nA\n", dir.path(), None);
+			let Remapped::Ready(request) =
+				session.retarget(missing.clone(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			run_retarget(&mut session, request);
+			session.poll(false, None);
+			session.plan().unwrap().error.as_ref().unwrap().key
+		};
+		assert_eq!(missing_key, "paste_err_destination");
+
+		// The budget still refuses.
+		let mut shell = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: a.txt\nA\n",
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		shell.disarm_for(dir.path().into());
+		let err = shell
+			.retarget_with(dir.path(), &[], 2, &RunOptions::default(), 5)
+			.expect_err("over the budget");
+		assert_eq!(err.key, "preview_memory_limit");
 	}
 
 	#[test]

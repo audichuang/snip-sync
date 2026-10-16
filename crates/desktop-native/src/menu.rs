@@ -182,6 +182,9 @@ pub enum MenuAct {
 		path: String,
 	},
 	CopyText(String),
+	/// Paste into this folder (a tree path: a local path, or a path under
+	/// the remote session root).
+	PasteInto(PathBuf),
 	CommitDiff(String),
 	CopyCommits(String),
 	/// The node's files as one snip-sync payload.
@@ -271,18 +274,42 @@ impl WorkbenchModel {
 			.map(|slot| slot.root.clone())
 	}
 
+	/// "Paste into this folder": enabled for a folder inside the workspace.
+	/// What the destination bar names is judged by the same words, so the
+	/// menu never offers a folder the bar would refuse to show.
+	fn paste_into_entry(&self, folder: Option<PathBuf>) -> MenuEntry {
+		let remote = self.remote.session.is_some();
+		let inside = folder.filter(|path| {
+			crate::paste::dest::folder_rel(&self.workspace_root, path, remote)
+				.is_some()
+		});
+		item(
+			"paste-into",
+			"menu_paste_into",
+			None,
+			inside.map(MenuAct::PasteInto),
+		)
+	}
+
 	pub(crate) fn repo_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
 		let root = self.repos.get(idx).map(|r| r.root.clone());
+		let paste_into = self.paste_into_entry(root.clone());
 		if self.remote.session.is_some() {
 			let path = root.as_deref().and_then(|r| self.remote_worker_path(r));
-			return vec![item(
-				"copy-path",
-				"menu_copy_path",
-				None,
-				path.map(MenuAct::CopyText),
-			)];
+			return vec![
+				paste_into,
+				MenuEntry::Sep,
+				item(
+					"copy-path",
+					"menu_copy_path",
+					None,
+					path.map(MenuAct::CopyText),
+				),
+			];
 		}
 		vec![
+			paste_into,
+			MenuEntry::Sep,
 			item(
 				"copy-path",
 				"menu_copy_path",
@@ -338,17 +365,22 @@ impl WorkbenchModel {
 		} else {
 			Vec::new()
 		};
-		let mut v = vec![copy_entry(targets), MenuEntry::Sep];
+		let root = if ws { self.ws_root() } else { self.repo_root() };
+		let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+		let mut v = vec![copy_entry(targets)];
+		if row.is_dir {
+			v.push(
+				self.paste_into_entry(
+					abs.clone().filter(|_| row.is_valid_utf8),
+				),
+			);
+		}
+		v.push(MenuEntry::Sep);
 		if self.remote.session.is_some() {
-			let root = if ws { self.ws_root() } else { self.repo_root() };
-			let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
 			let worker_path =
 				abs.as_deref().and_then(|p| self.remote_worker_path(p));
 			v.extend(copy_entries(worker_path, &row.rel_path));
 		} else if ws {
-			let abs = self
-				.ws_root()
-				.map(|r| r.join(row.rel_path.trim_end_matches('/')));
 			v.extend(copy_entries(
 				abs.as_ref().map(|p| p.display().to_string()),
 				&row.rel_path,
@@ -791,6 +823,9 @@ impl WorkbenchModel {
 				}
 			}
 			MenuAct::CopyText(text) => self.copy_text(&text),
+			// After the menu closed and handed focus to the tree: the panel
+			// the paste opens must keep it (the next Enter applies).
+			MenuAct::PasteInto(path) => self.paste_into_folder(path, cx),
 			MenuAct::CommitDiff(sha) => {
 				if self.selected_commit.as_deref() != Some(sha.as_str()) {
 					self.select_commit(&sha, cx);
