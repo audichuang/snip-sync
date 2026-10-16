@@ -51,3 +51,13 @@ _Avoid_: 錯誤字串、error message（當成資料讀取時）
 **錯誤碼**（ErrorCode）:
 線上拒絕的封閉分類，拼法固定。新的意義加在 `Reason`，不加在 `ErrorCode`。
 _Avoid_: 用錯誤碼表達細節
+
+## 驗證
+
+**不變式**（Invariant）:
+桌面模型裡兩個檢視對同一件事必須一致的條件，登記在 `crates/desktop-native/src/invariants.rs`，由同一個 `eval` 判定。任何時刻都成立的叫 A，等載入全部結束才成立的叫 Q。有 probes 的視窗每畫一幀就印一行 `[APP:INVARIANT_BROKEN]`，隨機動作 lane 在每個手勢後檢查它。已知違反由某個 issue 負責的，登記為 `Pending(issue)`，不靠動作序列豁免。
+_Avoid_: 斷言、檢查（泛指時）
+
+**故障規則**（FaultRule）:
+測試給 worker 的一條指令：哪一種請求（可以限定工作區）、略過幾個、作用幾次、做什麼（拒絕、斷線、截半回覆、節流、先沉默……）。只有測試能啟動，`snip serve --stdio` 沒有任何入口。heartbeat 永遠不受影響，故障只作用在答覆。
+_Avoid_: mock、stub

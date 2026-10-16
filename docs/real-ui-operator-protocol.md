@@ -226,6 +226,7 @@ ID 可以含任何字元：空白、`=`、`:`、`]`，甚至欄位自己的名�
 
 - `[APP:CTRL_COVERED: by=<B 的編碼> id=<A>]`：A 的可見中心被後畫的 B 蓋住，點 A 的中心會點到 B。A 是 `id=` 之後的全部文字；B 是另一個自由文字 ID，所以寫成 `by=` 欄位時把 `%`、空白、`]`、換行編成 `%25`、`%20`、`%5D`、`%0A`／`%0D`（其餘照原樣），日誌裡 `by=` 到第一個空白之間就是 B，讀的人把這幾個 `%XX` 還原。不要點；這一格判 `ui-defect`，證據欄寫 `covered A by B`。若已經點了而觸發 B 的動作，判 `fail`。
 - `[APP:CTRL_DUPLICATE: id=<ID>]`：同一幀有兩個控制項用同一個 ID。涉及這個 ID 的格子判 `fail`，證據欄寫 `identity-fail`。
+- `[APP:INVARIANT_BROKEN: detail=<說明的編碼> id=<標籤>]`：App 內部登記的某個不變式（`crates/desktop-native/src/invariants.rs`，標籤如 `L4`、`O(O4)`）在剛畫完的這一幀不成立。`detail=` 的編碼同 `by=`（`%`、空白、`]`、換行編成 `%25`、`%20`、`%5D`、`%0A`／`%0D`），`id=` 是最後一個欄位。同一個違反持續時只印一次，消失後再出現會再印。這一格照實記下行文，判 `ui-defect`，證據欄寫 `invariant <標籤>`；harness 目前不自動判失敗。
 
 macOS 輔助使用在這個 App 上只到視窗。沒有 `CTRL_BOUNDS` 的點擊，不能記 `pass`。
 
