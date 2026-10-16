@@ -977,8 +977,12 @@ impl DestinationFreshnessSnapshot {
 	/// still re-checks its fresh capture under the lock. `missing_dirs` is not
 	/// compared: a planned folder that now exists as a folder is fine, and
 	/// `revalidate` has already checked the preview's list against the disk.
-	/// `symlinked_dirs` may only shrink: a symlink that is here now but was
-	/// not in the preview, or that points elsewhere, is a change.
+	/// `symlinked_dirs` must be equal when the preview recorded it: a symlink
+	/// that is here now but was not in the preview, that points elsewhere, or
+	/// that the preview saw and is gone (replaced by a plain folder) is a
+	/// change. A worker checks the old snapshot and then plans again, so a
+	/// shrunken list would let the new plan, checked later against itself
+	/// only, write where the preview did not show.
 	pub fn matches_preview(&self, preview: &Self) -> bool {
 		self.roots == preview.roots
 			&& self.target_files == preview.target_files
@@ -986,11 +990,47 @@ impl DestinationFreshnessSnapshot {
 				.repos
 				.as_ref()
 				.is_none_or(|r| self.repos.as_ref() == Some(r))
-			&& preview.symlinked_dirs.as_ref().is_none_or(|then| {
-				self.symlinked_dirs.as_ref().is_some_and(|now| {
-					now.iter().all(|(dir, to)| then.get(dir) == Some(to))
-				})
-			})
+			&& preview
+				.symlinked_dirs
+				.as_ref()
+				.is_none_or(|then| self.symlinked_dirs.as_ref() == Some(then))
+	}
+
+	/// Every folder a write is rooted in still resolves to the canonical
+	/// path it had at preview: the destination root and each of its
+	/// ancestors, a nested or prefix root, and the folder a delete was
+	/// planned in. The folder chain below a root is compared separately;
+	/// this is the part above it, which that chain never looks at. A root
+	/// that was moved aside and replaced by a symlink keeps its path and
+	/// its Git state, yet carries every write elsewhere.
+	///
+	/// A folder that cannot be resolved at all is not judged here: the
+	/// checks of its repository and targets name what is gone.
+	fn revalidate_root_identities(&self) -> Result<(), TransferError> {
+		let mut seen = HashSet::new();
+		let ids = self
+			.roots
+			.keys()
+			.chain(self.target_files.values().map(|t| &t.root));
+		for id in ids {
+			if !seen.insert(id.path()) {
+				continue;
+			}
+			if let Ok(now) = dunce::canonicalize(id.path()) {
+				if now != id.path() {
+					return Err(TransferError::StaleDestination {
+						root: id.path().to_path_buf(),
+						reason: format!(
+							"destination folder '{}' now resolves to '{}'",
+							id.path().display(),
+							now.display()
+						),
+						change: StaleChange::Preview,
+					});
+				}
+			}
+		}
+		Ok(())
 	}
 
 	pub fn revalidate(&self) -> Result<(), TransferError> {
@@ -1152,6 +1192,11 @@ impl DestinationFreshnessSnapshot {
 				chain_ok.insert((dir.to_path_buf(), boundary.clone()));
 			}
 		}
+
+		// After the chain, which names a folder that became a symlink the
+		// way the user sees it (created externally); what is left is a root
+		// that is no longer where the preview had it.
+		self.revalidate_root_identities()?;
 
 		for (path, target) in &self.target_files {
 			let current_exists = path.exists();
