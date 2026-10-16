@@ -15710,6 +15710,123 @@ mod tests {
 			assert_eq!(paste_cursor(&model, cx), PasteCursor::Dir(app));
 		}
 
+		/// Two commits that both touch `src/`: a fold of the folder under one
+		/// commit must not touch the other's.
+		fn shared_folder_commits_payload() -> String {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let added = |path: &str| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some(format!("{path}\n")),
+				not_copied: None,
+			};
+			let record = |message: &str, author: &str, files| CommitRecord {
+				message: message.into(),
+				author_name: author.into(),
+				author_email: format!("{author}@example.invalid"),
+				author_date: "2026-09-25T12:34:56+00:00".into(),
+				files,
+			};
+			snip_core::commits::to_clipboard_text(&CommitsPayload {
+				commits: vec![
+					record(
+						"first",
+						"ann",
+						vec![
+							added("src/a.txt"),
+							added("src/b.txt"),
+							added("top.txt"),
+						],
+					),
+					record("second", "bob", vec![added("src/c.txt")]),
+				],
+			})
+		}
+
+		/// #239: a commit replay shows the same nested folders as a file
+		/// paste, and each commit folds its own folders.
+		#[gpui::test]
+		fn commit_folders_fold_per_commit_and_header_folds_still_work(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(dest));
+			paste(&model, cx, &shared_folder_commits_payload());
+			let (a, b, top, c) = (
+				paste_ix(&model, cx, "src/a.txt"),
+				paste_ix(&model, cx, "src/b.txt"),
+				paste_ix(&model, cx, "top.txt"),
+				paste_ix(&model, cx, "src/c.txt"),
+			);
+			let row = |ix: usize, path: &str| {
+				crate::paste::RowControl::Row.id(ix, path)
+			};
+			let drawn = |cx: &mut VisualTestContext, id: &str| {
+				cx.debug_bounds(Box::leak(id.to_string().into_boxed_str()))
+					.is_some()
+			};
+
+			// Both commits draw their own `src` folder, rows nested in it.
+			cx.run_until_parked();
+			for id in ["paste-dir:0:src", "paste-dir:1:src"] {
+				assert!(drawn(cx, id), "{id} is drawn");
+			}
+			assert!(drawn(cx, &row(a, "src/a.txt")));
+
+			// Folding commit #1's `src` leaves commit #2's `src` open.
+			click(cx, "paste-dir-toggle:0:src");
+			assert!(!drawn(cx, &row(a, "src/a.txt")));
+			assert!(!drawn(cx, &row(b, "src/b.txt")));
+			assert!(drawn(cx, &row(top, "top.txt")), "outside the folder");
+			assert!(drawn(cx, &row(c, "src/c.txt")), "the other commit");
+			click(cx, "paste-dir-toggle:1:src");
+			assert!(!drawn(cx, &row(c, "src/c.txt")));
+			click(cx, "paste-dir-toggle:0:src");
+			assert!(drawn(cx, &row(a, "src/a.txt")));
+			assert!(!drawn(cx, &row(c, "src/c.txt")), "#2 is still folded");
+			click(cx, "paste-dir-toggle:1:src");
+
+			// A folder's include box is locked: a replay is all or nothing.
+			click(cx, "paste-dir-include:0:src");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items.iter().all(|i| i.selected));
+				assert!(plan.error.is_none());
+			});
+
+			// Folding the folder that holds the selected row moves the
+			// selection to a row that is still shown.
+			click_dyn(cx, row(a, "src/a.txt"));
+			click(cx, "paste-dir-toggle:0:src");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, top);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.clone()).as_deref(),
+					Some("top.txt")
+				);
+			});
+			click(cx, "paste-dir-toggle:0:src");
+
+			// Folding the header hides its folders too, and its own state
+			// survives the round trip.
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			cx.run_until_parked();
+			assert!(!drawn(cx, "paste-dir:0:src"));
+			assert!(drawn(cx, "paste-dir:1:src"));
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			cx.run_until_parked();
+			assert!(drawn(cx, "paste-dir:0:src"));
+			assert!(drawn(cx, &row(a, "src/a.txt")));
+		}
+
 		/// The branch name keeps its width before the repo count gives way
 		/// (#194): the `×N` suffix shrinks to nothing first.
 		#[gpui::test]
