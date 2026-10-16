@@ -16,7 +16,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// What the filesystem says about case.
+/// What the filesystem says about case. Only Linux can answer `Sensitive`:
+/// Windows asks nothing, and macOS cannot tell a case sensitive volume.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaseSensitivity {
 	/// Known to fold case.
@@ -78,24 +80,107 @@ fn decide(
 	query: CaseSensitivity,
 	names: impl FnOnce() -> Option<bool>,
 ) -> bool {
-	let _ = query;
-	names().unwrap_or(false)
+	match query {
+		CaseSensitivity::Insensitive => true,
+		CaseSensitivity::Sensitive => false,
+		CaseSensitivity::Unknown => names().unwrap_or(true),
+	}
 }
 
+/// What the filesystem under `root` says, by a query that writes nothing.
+///
+/// Windows folds case unless a folder was switched to case sensitive, which
+/// is not asked: a folder that does is treated as folding, the safe side.
+#[cfg(windows)]
+fn query_filesystem(_root: &Path) -> CaseSensitivity {
+	CaseSensitivity::Insensitive
+}
+
+/// Linux: the `statfs` magic, and for the filesystems that fold case in a
+/// folder that carries `FS_CASEFOLD_FL` (ext4, f2fs, tmpfs) that folder's
+/// flags.
+#[cfg(target_os = "linux")]
+fn query_filesystem(root: &Path) -> CaseSensitivity {
+	let Ok(stat) = rustix::fs::statfs(root) else {
+		return CaseSensitivity::Unknown;
+	};
+	#[allow(clippy::unnecessary_cast)]
+	let magic = stat.f_type as u64;
+	match classify_f_type(magic) {
+		MagicClass::Insensitive => CaseSensitivity::Insensitive,
+		MagicClass::Sensitive => CaseSensitivity::Sensitive,
+		MagicClass::Unknown => CaseSensitivity::Unknown,
+		MagicClass::CasefoldCapable => casefold_flag(root),
+	}
+}
+
+/// `FS_CASEFOLD_FL` of the folder `root`.
+#[cfg(target_os = "linux")]
+fn casefold_flag(root: &Path) -> CaseSensitivity {
+	use rustix::io::Errno;
+	const FS_CASEFOLD_FL: u32 = 0x4000_0000;
+	let Ok(dir) = fs::File::open(root) else {
+		return CaseSensitivity::Unknown;
+	};
+	match rustix::fs::ioctl_getflags(&dir) {
+		Ok(flags) if flags.bits() & FS_CASEFOLD_FL != 0 => {
+			CaseSensitivity::Insensitive
+		}
+		Ok(_) => CaseSensitivity::Sensitive,
+		// A filesystem that has no such flag has no folding folder either.
+		Err(Errno::NOTTY | Errno::INVAL | Errno::OPNOTSUPP | Errno::NOSYS) => {
+			CaseSensitivity::Sensitive
+		}
+		Err(_) => CaseSensitivity::Unknown,
+	}
+}
+
+/// macOS: `pathconf(_PC_CASE_SENSITIVE)` would say, but it is unsafe to
+/// call and the workspace forbids that; the type name settles the volumes
+/// that always fold case, and APFS and HFS+ (which come both ways) are left
+/// to the names.
+#[cfg(target_os = "macos")]
+fn query_filesystem(root: &Path) -> CaseSensitivity {
+	match nix::sys::statfs::statfs(root) {
+		Ok(stat) => classify_macos_fstype(stat.filesystem_type_name()),
+		Err(_) => CaseSensitivity::Unknown,
+	}
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn query_filesystem(_root: &Path) -> CaseSensitivity {
 	CaseSensitivity::Unknown
 }
 
-/// How a Linux `statfs` magic reads.
+/// How a Linux `statfs` magic reads. `f_type` is a signed word on some
+/// targets, so a magic with the top bit set arrives sign-extended: only its
+/// low 32 bits are the magic.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn classify_f_type(_raw: u64) -> MagicClass {
-	MagicClass::Unknown
+pub(crate) fn classify_f_type(raw: u64) -> MagicClass {
+	match raw & 0xFFFF_FFFF {
+		// vfat, exfat, ntfs3, ntfs, cifs, smb2, sdcardfs
+		0x4d44 | 0x2011_BAB0 | 0x7366_746e | 0x5346_544e | 0xFF53_4D42
+		| 0xFE53_4D42 | 0x5dca_2df5 => MagicClass::Insensitive,
+		// ext2/3/4, f2fs, tmpfs
+		0xEF53 | 0xF2F5_2010 | 0x0102_1994 => MagicClass::CasefoldCapable,
+		// xfs, btrfs, zfs, ramfs, squashfs, erofs, jfs, reiserfs, bcachefs
+		0x5846_5342 | 0x9123_683E | 0x2FC1_2FC1 | 0x8584_58f6 | 0x7371_7368
+		| 0xE0F5_E1E2 | 0x3153_464a | 0x5265_4973 | 0xca45_1a4e => {
+			MagicClass::Sensitive
+		}
+		// fuse and fuseblk, overlayfs, nfs, 9p, virtiofs, hfs, hfsplus and
+		// the rest: what is underneath is not known from the type.
+		_ => MagicClass::Unknown,
+	}
 }
 
 /// How a macOS `f_fstypename` reads.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn classify_macos_fstype(_name: &str) -> CaseSensitivity {
-	CaseSensitivity::Unknown
+pub(crate) fn classify_macos_fstype(name: &str) -> CaseSensitivity {
+	match name {
+		"msdos" | "exfat" | "ntfs" => CaseSensitivity::Insensitive,
+		_ => CaseSensitivity::Unknown,
+	}
 }
 
 fn probe_names(root: &Path) -> Option<bool> {

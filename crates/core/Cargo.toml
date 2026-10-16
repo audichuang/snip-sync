@@ -28,6 +28,9 @@ windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
+# Safe `statfs` and `FS_IOC_GETFLAGS` for the case-folding query (fscase.rs):
+# the workspace forbids `unsafe`, so the raw ioctl is not an option here.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [features]
 # Test samples other crates walk (`reason::test_support`).

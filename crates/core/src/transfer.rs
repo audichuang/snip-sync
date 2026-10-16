@@ -2640,7 +2640,8 @@ fn op_is_case_insensitive(
 			return ci;
 		}
 	}
-	cfg!(any(windows, target_os = "macos"))
+	// No root was asked: the safe side, as for a filesystem that cannot be told.
+	true
 }
 
 // ---------------------------------------------------------------------------
@@ -4002,7 +4003,7 @@ fn named_folder_chains(
 			let folds = root_case_insensitive
 				.get(placed.anchor().path())
 				.copied()
-				.unwrap_or(false);
+				.unwrap_or(true);
 			if !folds {
 				return placed.new_chain();
 			}

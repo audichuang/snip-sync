@@ -5,7 +5,7 @@
 ## 決定
 
 1. **尾段在路由裡一致套用，不放進 `primary_prefix`；接上尾段之前先驗證路由後的檔案路徑。** 錨點才是 `plan_import_parsed_with` 的 root（`destination_roots`、`op.root_path`），`op.relative_path` 是 `尾段/相對路徑`。命中某個 prefix 的 entry 直接拿 `rest`、絕對路徑 entry 也不會加上 `primary_prefix`，所以尾段若放進 `primary_prefix` 就只套得到其中一種路由。留給檔案本身的路徑要先通過 `sanitize_relative_path`（非空、有檔名）才接尾段，否則 `.` 或 `p/` 會變成目的資料夾本身。
-2. **規劃只讀不寫。** `PlacedRoot::resolve` 只查 `symlink_metadata`；沒有東西在規劃時被建立，包含 `--dry-run`。大小寫偵測也只讀（用現有項目或資料夾自己的名稱比對，不建探測檔），測試以錨點目錄的 mtime 驗證。
+2. **規劃只讀不寫。** `PlacedRoot::resolve` 只查 `symlink_metadata`；沒有東西在規劃時被建立，包含 `--dry-run`。大小寫偵測也只讀（向檔案系統查詢能力，查不出來才用現有項目或資料夾自己的名稱比對，不建探測檔；仍無法確定就當不分大小寫），測試以錨點目錄的 mtime 驗證。
 3. **「指定新資料夾」只在 Apply 經同意後、在寫入鎖之下逐層建立。** 指定新資料夾是使用者指名的目的資料夾或導入路徑的尾段（`requested_dirs`，`missing_dirs` 的子集）；檔案路徑裡的中間資料夾（順帶新資料夾）照舊由寫檔時建立、不需同意。`RestoreSelection::confirmed_new_dirs` 必須涵蓋目前勾選且是新增的列實際需要的指定新資料夾，否則 `NewDirsNotConfirmed`；失敗或一個檔都沒寫成時，把這次建立的資料夾由深到淺刪回（有內容的留著）。worker 只建自己重新規劃算出的資料夾，master 送來的同意只用來放行。
 4. **freshness 涵蓋寫入鎖鎖住的 repo（#237），指定新資料夾在預覽後出現就算過期。** 錨點一變，落點路徑就變了，所以不像順帶新資料夾那樣容許它後來變成一般資料夾；`revalidate` 對 `requested_dirs` 裡任何現在存在的東西回 `StaleChange::Created`。建立之後再確認它仍是自己 canonical 的位置，擋住 revalidate 和 mkdir 之間被換成 symlink。
 
