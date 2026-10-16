@@ -874,10 +874,18 @@ pub(super) fn fit_log_row(
 	fit_row(avail, &all_parts(present), &claims)
 }
 
-/// The width the date cell needs for the longest date string of `loc`
-/// (a double-digit month and day, the latest time, and the today and
-/// yesterday forms), measured with `measure`.
+/// The width the date cell needs for the widest date of `loc`, measured with
+/// `measure`. The UI font's digits are proportional (1 is far narrower than
+/// 4), so a fixed date would only be the widest for the digits it happens to
+/// have: every digit position of the longest forms (a double-digit month and
+/// day, the latest time, and the today and yesterday forms) takes the widest
+/// digit `measure` knows, which no date can exceed.
 pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
+	let widest = ('0'..='9')
+		.max_by(|a, b| {
+			measure(&a.to_string()).total_cmp(&measure(&b.to_string()))
+		})
+		.unwrap_or('0');
 	let time = "23:59";
 	[
 		log_date_in(
@@ -892,7 +900,13 @@ pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
 		tf("log_yesterday", loc, &[&time]),
 	]
 	.iter()
-	.map(|s| measure(s))
+	.map(|s| {
+		let wide: String = s
+			.chars()
+			.map(|c| if c.is_ascii_digit() { widest } else { c })
+			.collect();
+		measure(&wide)
+	})
 	.fold(0., f32::max)
 }
 
@@ -3428,5 +3442,43 @@ mod row_fit_tests {
 		let m = |s: &str| s.chars().count() as f32 * 7.;
 		let d = date_need_w(Locale::ZhTw, &m);
 		assert_eq!(d, "2026/12/28 23:59".chars().count() as f32 * 7.);
+	}
+
+	/// With proportional digits ('4' is the widest, '1' the narrowest) the
+	/// need is the longest form written in the widest digit, not the width
+	/// of "2026/12/28 23:59", and no date of the locale is wider.
+	#[test]
+	fn the_date_need_uses_the_widest_digit_in_every_position() {
+		let m = |s: &str| {
+			s.chars()
+				.map(|c| match c {
+					'4' => 9.,
+					'1' => 3.,
+					c if c.is_ascii_digit() => 7.,
+					_ => 5.,
+				})
+				.sum::<f32>()
+		};
+		assert_eq!(date_need_w(Locale::ZhTw, &m), m("4444/44/44 44:44"));
+		assert_eq!(date_need_w(Locale::En, &m), m("44/44/44, 44:44"));
+		for loc in [Locale::ZhTw, Locale::En] {
+			let need = date_need_w(loc, &m);
+			for iso in [
+				"2024-10-24T04:44:00Z",
+				"2020-10-20T20:00:00Z",
+				"2026-12-28T23:59:00Z",
+				"2026-11-11T11:11:00Z",
+			] {
+				let s = log_date_in(
+					iso,
+					loc,
+					chrono::DateTime::parse_from_rfc3339("2027-06-01T00:00:00Z")
+						.unwrap()
+						.with_timezone(&chrono::Utc),
+					&chrono::Utc,
+				);
+				assert!(m(&s) <= need, "{loc:?} {s:?}");
+			}
+		}
 	}
 }
