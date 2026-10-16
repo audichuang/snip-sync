@@ -747,7 +747,12 @@ mod tests {
 				message: "x".into(),
 				reason: None,
 			},
-			RemoteError::Connect("x".into()),
+			RemoteError::Start {
+				kind: crate::ConnectFailureKind::Other,
+				reason: None,
+				detail: snip_core::reason::Datum::for_test("x"),
+				message: "x".into(),
+			},
 			RemoteError::WorkerTooOld {
 				worker: "w".into(),
 				have: 1,

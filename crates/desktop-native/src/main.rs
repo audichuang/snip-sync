@@ -101,9 +101,46 @@ pub(crate) fn run_isolated(exact_test_path: &str) -> bool {
 /// `ws_tab=<id>` ([`tabs::tag_line`]).
 macro_rules! app_log {
 	($($arg:tt)*) => {{
-		println!("{}", $crate::tabs::tag_line(format!($($arg)*)));
+		let line = $crate::tabs::tag_line(format!($($arg)*));
+		#[cfg(test)]
+		$crate::test_log::push(&line);
+		println!("{line}");
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 	}};
+}
+
+/// The lines `app_log!` printed on this thread, for a test of what a driver
+/// would read. A `#[gpui::test]` runs its foreground work on the test's own
+/// thread, and each test is a process of its own under nextest, so one
+/// test's lines never mix with another's.
+#[cfg(test)]
+pub(crate) mod test_log {
+	use std::cell::RefCell;
+	use std::collections::VecDeque;
+
+	/// The oldest lines are dropped past this many, so a long test cannot
+	/// grow the buffer without bound.
+	const KEEP: usize = 10_000;
+
+	thread_local! {
+		static LINES: RefCell<VecDeque<String>> =
+			const { RefCell::new(VecDeque::new()) };
+	}
+
+	pub(crate) fn push(line: &str) {
+		LINES.with(|lines| {
+			let mut lines = lines.borrow_mut();
+			if lines.len() >= KEEP {
+				lines.pop_front();
+			}
+			lines.push_back(line.to_string());
+		});
+	}
+
+	/// The lines so far; the buffer is empty afterwards.
+	pub(crate) fn take() -> Vec<String> {
+		LINES.with(|lines| lines.borrow_mut().drain(..).collect())
+	}
 }
 
 /// A commit copy's failure: the engine's own text (what the CLI prints, for
@@ -125,6 +162,7 @@ fn export_commits_local(
 ) -> Result<(String, usize, Msg), CopyCommitsFailure> {
 	let opts = interactive_read_opts(cancel);
 	let git = Git::open_with(repo_root, &opts)
+		// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
 		.map_err(|e| (e.to_string(), crate::remote::git_error_msg(e)))?;
 	let exported = plan_commit_export_exact_with(
 		&git,
@@ -133,6 +171,7 @@ fn export_commits_local(
 		&opts,
 		snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 	)
+	// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
 	.map_err(|e| (e.to_string(), crate::reason::reason_msg(&e.reason())))?;
 	let out = exported.outcome();
 	let status = commit_copied_status(&out);
@@ -1864,32 +1903,27 @@ impl WorkbenchModel {
 			let this = cx.weak_entity();
 			let bg = cx.background_executor().clone();
 			let cancel_bg = cancel.clone();
-			self.spawn_owned(
-				cx,
-				lifecycle::JobKind::CancellableRead,
-				Some(cancel.clone()),
-				async move {
-					let read_root = root.clone();
-					let result = bg
-						.spawn(async move {
-							read_change_list(
-								&host,
-								&read_root,
-								known.as_ref(),
-								cancel_bg,
-							)
-						})
-						.await;
-					let _ = this.update(&mut async_app, |model, cx| {
-						model.changes_queue.finish();
-						if model.changes_generation == generation {
-							model.land_queued_changes(&root, result);
-						}
-						model.pump_changes(cx);
-						cx.notify();
-					});
-				},
-			);
+			self.spawn_owned(cx, Some(cancel.clone()), async move {
+				let read_root = root.clone();
+				let result = bg
+					.spawn(async move {
+						read_change_list(
+							&host,
+							&read_root,
+							known.as_ref(),
+							cancel_bg,
+						)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					model.changes_queue.finish();
+					if model.changes_generation == generation {
+						model.land_queued_changes(&root, result);
+					}
+					model.pump_changes(cx);
+					cx.notify();
+				});
+			});
 		}
 	}
 
@@ -2272,14 +2306,39 @@ impl WorkbenchModel {
 		.detach();
 	}
 
+	/// Runs `fut` as this tab's read. Pass the token the work polls: the
+	/// lifecycle cancels it on a close or a quit. A job whose work polls no
+	/// token passes `None` and is drained instead. The kind follows from
+	/// the token, so a job cannot be recorded as cancellable without one;
+	/// what the types cannot catch is a future that polls a token the
+	/// caller never passed here.
 	pub(crate) fn spawn_owned(
 		&mut self,
 		cx: &mut Context<Self>,
-		kind: lifecycle::JobKind,
 		cancel: Option<CancelToken>,
 		fut: impl std::future::Future<Output = ()> + 'static,
 	) -> u64 {
-		let (id, flag) = self.lifecycle.register(kind, cancel);
+		let registered = self.lifecycle.register_read(cancel);
+		self.spawn_registered(cx, registered, fut)
+	}
+
+	/// Runs a confirmed paste or replay: never cancelled, and a close or
+	/// quit is refused while it runs.
+	pub(crate) fn spawn_mutating(
+		&mut self,
+		cx: &mut Context<Self>,
+		fut: impl std::future::Future<Output = ()> + 'static,
+	) -> u64 {
+		let registered = self.lifecycle.register_mutating();
+		self.spawn_registered(cx, registered, fut)
+	}
+
+	fn spawn_registered(
+		&mut self,
+		cx: &mut Context<Self>,
+		(id, flag): (u64, lifecycle::FinishFlag),
+		fut: impl std::future::Future<Output = ()> + 'static,
+	) -> u64 {
 		let fut = tabs::tagged(self.ws_tab, fut);
 		let task = cx.foreground_executor().spawn(async move {
 			fut.await;
@@ -3076,24 +3135,19 @@ impl WorkbenchModel {
 		let cancel_job = cancel.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel_job),
-			async move {
-				let bg = async_app.background_executor().clone();
-				let cancel_bg = cancel.clone();
-				let outcome = bg
-					.spawn(async move { resolve_added_repo(path, &cancel_bg) })
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if cancel.is_cancelled() {
-						return;
-					}
-					model.install_added_repo(outcome, cx);
-				});
-			},
-		);
+		self.spawn_owned(cx, Some(cancel_job), async move {
+			let bg = async_app.background_executor().clone();
+			let cancel_bg = cancel.clone();
+			let outcome = bg
+				.spawn(async move { resolve_added_repo(path, &cancel_bg) })
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if cancel.is_cancelled() {
+					return;
+				}
+				model.install_added_repo(outcome, cx);
+			});
+		});
 	}
 
 	fn launch_fresh_discovery(
@@ -3113,46 +3167,40 @@ impl WorkbenchModel {
 		let cancel_job = cancel.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel_job),
-			async move {
-				let bg = async_app.background_executor().clone();
-				let open_root = root.clone();
-				let opened = bg
-					.spawn(async move { Discovery::new(&open_root, 8, 256) })
-					.await;
-				let disc = match opened {
-					Ok(disc) => disc,
-					Err(err) => {
-						let _ = this.update(&mut async_app, |model, cx| {
-							if model.discovery_generation != generation {
-								return;
-							}
-							model.discovery = None;
-							model.discovery_status =
-								Some(ScanStatus::Incomplete);
-							model.push_discovery_error((
-								root.clone(),
-								Failure::io(&err, &root.display().to_string()),
-							));
-							model.finish_discovery(cx);
-						});
-						return;
-					}
-				};
-				drive_discovery(
-					this,
-					&mut async_app,
-					disc,
-					generation,
-					cancel,
-					wipe,
-				)
+		self.spawn_owned(cx, Some(cancel_job), async move {
+			let bg = async_app.background_executor().clone();
+			let open_root = root.clone();
+			let opened = bg
+				.spawn(async move { Discovery::new(&open_root, 8, 256) })
 				.await;
-			},
-		);
+			let disc = match opened {
+				Ok(disc) => disc,
+				Err(err) => {
+					let _ = this.update(&mut async_app, |model, cx| {
+						if model.discovery_generation != generation {
+							return;
+						}
+						model.discovery = None;
+						model.discovery_status = Some(ScanStatus::Incomplete);
+						model.push_discovery_error((
+							root.clone(),
+							Failure::io(&err, &root.display().to_string()),
+						));
+						model.finish_discovery(cx);
+					});
+					return;
+				}
+			};
+			drive_discovery(
+				this,
+				&mut async_app,
+				disc,
+				generation,
+				cancel,
+				wipe,
+			)
+			.await;
+		});
 	}
 
 	fn launch_discovery_cursor(
@@ -3172,22 +3220,17 @@ impl WorkbenchModel {
 		let cancel_job = cancel.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel_job),
-			async move {
-				drive_discovery(
-					this,
-					&mut async_app,
-					disc,
-					generation,
-					cancel,
-					wipe,
-				)
-				.await;
-			},
-		);
+		self.spawn_owned(cx, Some(cancel_job), async move {
+			drive_discovery(
+				this,
+				&mut async_app,
+				disc,
+				generation,
+				cancel,
+				wipe,
+			)
+			.await;
+		});
 	}
 
 	/// Replaces the list with the manual repos plus the open one, so the
@@ -3598,79 +3641,71 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let mut pending = Some(io);
-				while let Some(io) = pending.take() {
-					if cancel.is_cancelled() {
-						break;
-					}
-					let cancel_bg = cancel.clone();
-					let hold_bg = hold.clone();
-					let remote_bg = remote.clone();
-					let result = bg
-						.spawn(async move {
-							let result = match remote_bg {
-								Some((client, ws, session_root)) => {
-									remote::tree_io(
-										&client,
-										&ws,
-										&session_root,
-										io,
-										Some(&cancel_bg),
-									)
-								}
-								None => {
-									crate::tree::execute_tree_io(io, &cancel_bg)
-								}
-							};
-							hold_tree_read(hold_bg.as_deref());
-							result
-						})
-						.await;
-					pending = this
-						.update(&mut async_app, |model, cx| {
-							// A close or reopen bumps the lifecycle generation;
-							// a repo switch bumps the worker id.
-							if model.lifecycle.generation() != ws_gen
-								|| model.tree_worker != worker
-							{
-								if e2e_on() {
-									app_log!(
-										"[APP:TREE_IO_DISCARDED: stale rel={}]",
-										result
-											.key
-											.utf8_rel()
-											.unwrap_or_default()
-									);
-								}
-								return None;
-							}
-							model.apply_tree_result(result);
-							let next = model.next_tree_io();
-							if next.is_none() {
-								model.tree_worker_alive = false;
-								model.tree_cancel = None;
-							}
-							cx.notify();
-							next
-						})
-						.ok()
-						.flatten();
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let mut pending = Some(io);
+			while let Some(io) = pending.take() {
+				if cancel.is_cancelled() {
+					break;
 				}
-				// Not gated on the generation: after a failed drain the
-				// workspace stays open and must be able to read again.
-				let _ = this.update(&mut async_app, |model, _| {
-					if model.tree_worker == worker {
-						model.tree_worker_alive = false;
-						model.tree_cancel = None;
-					}
-				});
-			},
-		);
+				let cancel_bg = cancel.clone();
+				let hold_bg = hold.clone();
+				let remote_bg = remote.clone();
+				let result = bg
+					.spawn(async move {
+						let result = match remote_bg {
+							Some((client, ws, session_root)) => {
+								remote::tree_io(
+									&client,
+									&ws,
+									&session_root,
+									io,
+									Some(&cancel_bg),
+								)
+							}
+							None => {
+								crate::tree::execute_tree_io(io, &cancel_bg)
+							}
+						};
+						hold_tree_read(hold_bg.as_deref());
+						result
+					})
+					.await;
+				pending = this
+					.update(&mut async_app, |model, cx| {
+						// A close or reopen bumps the lifecycle generation;
+						// a repo switch bumps the worker id.
+						if model.lifecycle.generation() != ws_gen
+							|| model.tree_worker != worker
+						{
+							if e2e_on() {
+								app_log!(
+									"[APP:TREE_IO_DISCARDED: stale rel={}]",
+									result.key.utf8_rel().unwrap_or_default()
+								);
+							}
+							return None;
+						}
+						model.apply_tree_result(result);
+						let next = model.next_tree_io();
+						if next.is_none() {
+							model.tree_worker_alive = false;
+							model.tree_cancel = None;
+						}
+						cx.notify();
+						next
+					})
+					.ok()
+					.flatten();
+			}
+			// Not gated on the generation: after a failed drain the
+			// workspace stays open and must be able to read again.
+			let _ = this.update(&mut async_app, |model, _| {
+				if model.tree_worker == worker {
+					model.tree_worker_alive = false;
+					model.tree_cancel = None;
+				}
+			});
+		});
 	}
 
 	fn apply_tree_result(&mut self, result: crate::tree::TreeIoResult) {
@@ -4111,172 +4146,162 @@ impl WorkbenchModel {
 		let repo_root_for_update = repo_root.clone();
 		let known = self.repos[idx].identity.clone();
 		let host = self.git_host();
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let working_res = bg
-					.spawn(async move {
-						read_change_list(
-							&host,
-							&repo_root,
-							known.as_ref(),
-							cancel_bg,
-						)
-					})
-					.await;
+		self.spawn_owned(cx, Some(cancel), async move {
+			let working_res = bg
+				.spawn(async move {
+					read_change_list(
+						&host,
+						&repo_root,
+						known.as_ref(),
+						cancel_bg,
+					)
+				})
+				.await;
 
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.generation != task_generation {
-						return;
-					}
-					match working_res {
-						Ok((summary, changes, total)) => {
-							model.update_open_summary(summary);
-							let slot = model.ensure_change_slot(
-								&repo_root_for_update,
-								&repo_name,
-							);
-							model.install_slot_changes(
-								slot,
-								Ok((changes, total)),
-							);
-							let slot = slot_range(&model.files, slot);
-							model.changes_loaded = true;
-							app_log!(
-								"[APP:REPO_LOADED: {} files={}]",
-								repo_name,
-								slot.len()
-							);
-							model.set_status(
-								"status_repo_loaded",
-								[repo_name.clone(), slot.len().to_string()],
-							);
-							if anchor_commit.is_some() {
-								// The history reload re-selects the commit.
-							} else if let Some(ref anchor) = anchor_file {
-								let kept = anchor_source.as_ref().filter(|s| {
-									**s == SourceKind::File
-										|| model.files[slot.clone()].iter().any(
-											|f| {
-												&f.path == anchor
-													&& &f.source == *s
-											},
-										)
-								});
-								if let Some(source) = kept {
-									if *source == SourceKind::File {
-										let root = model
-											.selected_file_root
-											.clone()
-											.or_else(|| {
-												model
-													.remote
-													.session
-													.as_ref()
-													.map(|s| s.root.clone())
-											})
-											.or_else(|| model.repo_root());
-										model.select_file_in(
-											root,
-											anchor,
-											source.clone(),
-											cx,
-										);
-									} else {
-										model.select_file_with_source(
-											anchor,
-											source.clone(),
-											cx,
-										);
-									}
-								} else if model.files[slot.clone()]
-									.iter()
-									.any(|f| &f.path == anchor)
-								{
-									model.selected_file_root = None;
-									model.select_file(anchor, cx);
-								} else if let Some(first) =
-									model.files[slot.clone()].first()
-								{
-									model.selected_file_root = None;
-									let first_path = first.path.clone();
-									model.select_file(&first_path, cx);
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.generation != task_generation {
+					return;
+				}
+				match working_res {
+					Ok((summary, changes, total)) => {
+						model.update_open_summary(summary);
+						let slot = model.ensure_change_slot(
+							&repo_root_for_update,
+							&repo_name,
+						);
+						model.install_slot_changes(slot, Ok((changes, total)));
+						let slot = slot_range(&model.files, slot);
+						model.changes_loaded = true;
+						app_log!(
+							"[APP:REPO_LOADED: {} files={}]",
+							repo_name,
+							slot.len()
+						);
+						model.set_status(
+							"status_repo_loaded",
+							[repo_name.clone(), slot.len().to_string()],
+						);
+						if anchor_commit.is_some() {
+							// The history reload re-selects the commit.
+						} else if let Some(ref anchor) = anchor_file {
+							let kept = anchor_source.as_ref().filter(|s| {
+								**s == SourceKind::File
+									|| model.files[slot.clone()].iter().any(
+										|f| {
+											&f.path == anchor && &f.source == *s
+										},
+									)
+							});
+							if let Some(source) = kept {
+								if *source == SourceKind::File {
+									let root = model
+										.selected_file_root
+										.clone()
+										.or_else(|| {
+											model
+												.remote
+												.session
+												.as_ref()
+												.map(|s| s.root.clone())
+										})
+										.or_else(|| model.repo_root());
+									model.select_file_in(
+										root,
+										anchor,
+										source.clone(),
+										cx,
+									);
 								} else {
-									model.selected_file = None;
-									model.selected_file_source = None;
-									model.selected_file_root = None;
-									model.clear_preview();
-									if model.mode == "preview" {
-										ready_marker("PREVIEW");
-									}
+									model.select_file_with_source(
+										anchor,
+										source.clone(),
+										cx,
+									);
 								}
+							} else if model.files[slot.clone()]
+								.iter()
+								.any(|f| &f.path == anchor)
+							{
+								model.selected_file_root = None;
+								model.select_file(anchor, cx);
 							} else if let Some(first) =
 								model.files[slot.clone()].first()
 							{
 								model.selected_file_root = None;
 								let first_path = first.path.clone();
 								model.select_file(&first_path, cx);
-							} else if model.mode == "preview" {
-								ready_marker("PREVIEW");
+							} else {
+								model.selected_file = None;
+								model.selected_file_source = None;
+								model.selected_file_root = None;
+								model.clear_preview();
+								if model.mode == "preview" {
+									ready_marker("PREVIEW");
+								}
 							}
-							model.sync_list_row();
+						} else if let Some(first) =
+							model.files[slot.clone()].first()
+						{
+							model.selected_file_root = None;
+							let first_path = first.path.clone();
+							model.select_file(&first_path, cx);
+						} else if model.mode == "preview" {
+							ready_marker("PREVIEW");
 						}
-						Err(err) => {
-							app_log!("[APP:REPO_ERROR: {}]", repo_name);
-							let slot = model.ensure_change_slot(
-								&repo_root_for_update,
-								&repo_name,
+						model.sync_list_row();
+					}
+					Err(err) => {
+						app_log!("[APP:REPO_ERROR: {}]", repo_name);
+						let slot = model.ensure_change_slot(
+							&repo_root_for_update,
+							&repo_name,
+						);
+						model.install_slot_changes(slot, Err(err.clone()));
+						model.set_status_msg(Msg::with_msg_arg(
+							"error_repo_changes",
+							[repo_name.clone(), String::new()],
+							1,
+							err.clone(),
+						));
+						if let (true, Some(anchor)) = (
+							anchor_source.as_ref() == Some(&SourceKind::File),
+							anchor_file.as_ref(),
+						) {
+							let root = model
+								.selected_file_root
+								.clone()
+								.or_else(|| {
+									model
+										.remote
+										.session
+										.as_ref()
+										.map(|s| s.root.clone())
+								})
+								.or_else(|| model.repo_root());
+							model.select_file_in(
+								root,
+								anchor,
+								SourceKind::File,
+								cx,
 							);
-							model.install_slot_changes(slot, Err(err.clone()));
-							model.set_status_msg(Msg::with_msg_arg(
+						} else {
+							model.show_preview_error(Msg::with_msg_arg(
 								"error_repo_changes",
 								[repo_name.clone(), String::new()],
 								1,
-								err.clone(),
+								err,
 							));
-							if let (true, Some(anchor)) = (
-								anchor_source.as_ref()
-									== Some(&SourceKind::File),
-								anchor_file.as_ref(),
-							) {
-								let root = model
-									.selected_file_root
-									.clone()
-									.or_else(|| {
-										model
-											.remote
-											.session
-											.as_ref()
-											.map(|s| s.root.clone())
-									})
-									.or_else(|| model.repo_root());
-								model.select_file_in(
-									root,
-									anchor,
-									SourceKind::File,
-									cx,
-								);
-							} else {
-								model.show_preview_error(Msg::with_msg_arg(
-									"error_repo_changes",
-									[repo_name.clone(), String::new()],
-									1,
-									err,
-								));
-							}
 						}
 					}
-					if reload_log {
-						model.load_history(cx);
-					} else {
-						model.log_kept_on_repo_switch();
-					}
-					cx.notify();
-				});
-			},
-		);
+				}
+				if reload_log {
+					model.load_history(cx);
+				} else {
+					model.log_kept_on_repo_switch();
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// Selects a file of the open repo, using its known source identity if
@@ -4358,14 +4383,12 @@ impl WorkbenchModel {
 		self.preview_error_root = None;
 
 		let cancel = arm_cancel(&mut self.preview_cancel);
-		let kind = if fs_only {
-			lifecycle::JobKind::UncancellableRead
-		} else {
-			lifecycle::JobKind::CancellableRead
-		};
-		let job_cancel = (!fs_only).then(|| cancel.clone());
-		let delay = self.e2e_read_delay;
 		let remote = self.remote_target();
+		// A local working-file read polls no token (`browser::file_preview`);
+		// every other read does, the remote one included (#191).
+		let cancellable = remote.is_some() || !fs_only;
+		let job_cancel = cancellable.then(|| cancel.clone());
+		let delay = self.e2e_read_delay;
 		let host = self.git_host();
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
@@ -4376,7 +4399,7 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let hold = bg.clone();
 
-		self.spawn_owned(cx, kind, job_cancel, async move {
+		self.spawn_owned(cx, job_cancel, async move {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
@@ -4635,7 +4658,6 @@ impl WorkbenchModel {
 
 		self.spawn_owned(
 			cx,
-			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
 					let result: Result<(String, usize, Msg), Msg> = bg
@@ -4727,7 +4749,7 @@ impl WorkbenchModel {
 		match result {
 			Ok((text, copied_count, msg)) => {
 				if let Err(e) = clip::write_text(&text) {
-					self.set_status("status_clipboard_failed", [e.to_string()]);
+					self.set_status_msg(crate::reason::clipboard_failed(&e));
 				} else {
 					app_log!("[APP:COPY_DONE: copied={copied_count}]");
 					self.set_status_msg(msg);
@@ -4800,48 +4822,43 @@ impl WorkbenchModel {
 		let ws_gen = self.lifecycle.generation();
 		#[cfg(test)]
 		let copy_hold = self.e2e_copy_hold;
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(job_token),
-			async move {
-				let result: Result<(String, usize, Msg), Msg> = bg
-					.spawn(async move {
-						let out = session
-							.client
-							.export_files(
-								&session.workspace.id,
-								items,
-								&native_export_settings(),
-								NATIVE_FILE_COUNT_LIMIT,
-								Some(&run_token),
+		self.spawn_owned(cx, Some(job_token), async move {
+			let result: Result<(String, usize, Msg), Msg> = bg
+				.spawn(async move {
+					let out = session
+						.client
+						.export_files(
+							&session.workspace.id,
+							items,
+							&native_export_settings(),
+							NATIVE_FILE_COUNT_LIMIT,
+							Some(&run_token),
+						)
+						.map_err(|e| {
+							Msg::with_msg_arg(
+								"error_payload",
+								[String::new()],
+								0,
+								crate::remote::describe_msg(e),
 							)
-							.map_err(|e| {
-								Msg::with_msg_arg(
-									"error_payload",
-									[String::new()],
-									0,
-									crate::remote::describe_msg(e),
-								)
-							})?;
-						if out.copied == 0 {
-							return Err(remote_copy_nothing_status(&out));
-						}
-						let msg = copied_status(repo_name, &out);
-						Ok((out.payload, out.copied, msg))
-					})
-					.await;
-				#[cfg(test)]
-				if let Some(hold) = copy_hold {
-					bg.timer(hold).await;
-				}
-				if let Err(err) = this.update(&mut async_app, |model, cx| {
-					model.finish_copy(ws_gen, &cancel, result, cx)
-				}) {
-					app_log!("[APP:COPY_IDLE_FAILED: {err}]");
-				}
-			},
-		);
+						})?;
+					if out.copied == 0 {
+						return Err(remote_copy_nothing_status(&out));
+					}
+					let msg = copied_status(repo_name, &out);
+					Ok((out.payload, out.copied, msg))
+				})
+				.await;
+			#[cfg(test)]
+			if let Some(hold) = copy_hold {
+				bg.timer(hold).await;
+			}
+			if let Err(err) = this.update(&mut async_app, |model, cx| {
+				model.finish_copy(ws_gen, &cancel, result, cx)
+			}) {
+				app_log!("[APP:COPY_IDLE_FAILED: {err}]");
+			}
+		});
 	}
 
 	/// Exports the selected commit or first-parent commit range to the clipboard.
@@ -4906,84 +4923,75 @@ impl WorkbenchModel {
 		#[cfg(test)]
 		let copy_hold = self.e2e_copy_hold;
 
-		self.spawn_owned(
-			cx,
-			lifecycle::JobKind::CancellableRead,
-			Some(job_token),
-			async move {
-				// The error carries the engine's own text for the e2e log
-				// line (a machine contract, never the UI's wording) and the
-				// message the UI words.
-				let result: Result<(String, usize, Msg), CopyCommitsFailure> =
-					bg.spawn(async move {
-						if let Some((session, repo)) = remote {
-							let out = session
-								.client
-								.export_commits(
-									&session.workspace.id,
-									&repo,
-									&tip_sha,
-									selected,
-									Some(&run_token),
-								)
-								.map_err(|e| {
-									(
-										e.to_string(),
-										crate::remote::describe_msg(e),
-									)
-								})?;
-							let status = commit_copied_status(&out);
-							return Ok((out.text, out.commit_count, status));
-						}
-						export_commits_local(
-							&repo_root, &tip_sha, &selected, run_token,
-						)
-					})
-					.await;
-				#[cfg(test)]
-				if let Some(hold) = copy_hold {
-					bg.timer(hold).await;
-				}
+		self.spawn_owned(cx, Some(job_token), async move {
+			// The error carries the engine's own text for the e2e log
+			// line (a machine contract, never the UI's wording) and the
+			// message the UI words.
+			let result: Result<(String, usize, Msg), CopyCommitsFailure> = bg
+				.spawn(async move {
+					if let Some((session, repo)) = remote {
+						let out = session
+							.client
+							.export_commits(
+								&session.workspace.id,
+								&repo,
+								&tip_sha,
+								selected,
+								Some(&run_token),
+							)
+							.map_err(|e| {
+								// ALLOWED-ERR-TEXT: COPY_COMMITS_ERR prints the engine's Display (an e2e contract)
+								(e.to_string(), crate::remote::describe_msg(e))
+							})?;
+						let status = commit_copied_status(&out);
+						return Ok((out.text, out.commit_count, status));
+					}
+					export_commits_local(
+						&repo_root, &tip_sha, &selected, run_token,
+					)
+				})
+				.await;
+			#[cfg(test)]
+			if let Some(hold) = copy_hold {
+				bg.timer(hold).await;
+			}
 
-				let _ = this.update(&mut async_app, |model, cx| {
-					if !model.accept_copy_result(ws_gen, &cancel) {
-						cx.notify();
-						return;
-					}
-					match result {
-						Ok((text, n_commits, status)) => {
-							if let Err(e) = clip::write_text(&text) {
-								model.set_status(
-									"status_clipboard_failed",
-									[e.to_string()],
-								);
-							} else {
-								app_log!(
-									"[APP:COPY_COMMITS_DONE: commits={n_commits}]"
-								);
-								model.status = status;
-							}
-						}
-						Err((log, err)) => {
-							app_log!("{}", copy_commits_err_line(&log));
-							model.set_status_msg(Msg::with_msg_arg(
-								"error_payload",
-								[String::new()],
-								0,
-								err,
-							));
-						}
-					}
-					let ok = matches!(
-						model.status.key,
-						"status_commits_copied"
-							| "status_commits_copied_skipped"
-					);
-					model.show_toast(ok, model.status.clone(), cx);
+			let _ = this.update(&mut async_app, |model, cx| {
+				if !model.accept_copy_result(ws_gen, &cancel) {
 					cx.notify();
-				});
-			},
-		);
+					return;
+				}
+				match result {
+					Ok((text, n_commits, status)) => {
+						if let Err(e) = clip::write_text(&text) {
+							model.set_status_msg(
+								crate::reason::clipboard_failed(&e),
+							);
+						} else {
+							app_log!(
+								"[APP:COPY_COMMITS_DONE: commits={n_commits}]"
+							);
+							model.status = status;
+						}
+					}
+					Err((log, err)) => {
+						app_log!("{}", copy_commits_err_line(&log));
+						model.set_status_msg(Msg::with_msg_arg(
+							"error_payload",
+							[String::new()],
+							0,
+							err,
+						));
+					}
+				}
+				let ok = matches!(
+					model.status.key,
+					"status_commits_copied" | "status_commits_copied_skipped"
+				);
+				model.show_toast(ok, model.status.clone(), cx);
+				cx.notify();
+			});
+		});
 	}
 
 	/// True while a confirmed plan is being written. The write is not
@@ -5067,7 +5075,7 @@ impl WorkbenchModel {
 					[String::new()],
 					0,
 					crate::reason::reason_msg(&Reason::Internal {
-						detail: String::new(),
+						detail: snip_core::reason::Datum::default(),
 						condition: None,
 					}),
 				));
@@ -5082,17 +5090,13 @@ impl WorkbenchModel {
 			Ok(Some((work, cancel))) => {
 				let bg = cx.background_executor().clone();
 				let token = cancel.clone();
-				let id = self.spawn_owned(
-					cx,
-					lifecycle::JobKind::CancellableRead,
-					Some(cancel.clone()),
-					async move {
+				let id =
+					self.spawn_owned(cx, Some(cancel.clone()), async move {
 						bg.spawn(async move {
 							work.run(&interactive_read_opts(token));
 						})
 						.await;
-					},
-				);
+					});
 				self.paste.bind_job(id, cancel);
 			}
 			Ok(None) => {}
@@ -5175,10 +5179,7 @@ impl WorkbenchModel {
 			Err(e) => {
 				app_log!("[APP:PASTE_ERR: clipboard]");
 				self.restore_log_after_paste();
-				self.set_status(
-					"status_clipboard_read_failed",
-					[e.to_string()],
-				);
+				self.set_status_msg(crate::reason::clipboard_read_failed(&e));
 				self.pending_focus = Some(self.focus_handle.clone());
 				cx.notify();
 				return;
@@ -5426,11 +5427,6 @@ impl WorkbenchModel {
 		let dest_path = item.dest_path.clone();
 		let remote = plan.remote.clone();
 		let cancellable = remote.is_some() || commit_request.is_some();
-		let kind = if cancellable {
-			lifecycle::JobKind::CancellableRead
-		} else {
-			lifecycle::JobKind::UncancellableRead
-		};
 		let job_cancel = cancellable.then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
 		#[cfg(test)]
@@ -5440,7 +5436,7 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 
-		self.spawn_owned(cx, kind, job_cancel, async move {
+		self.spawn_owned(cx, job_cancel, async move {
 			let for_bg_path = item_path.clone();
 			let outcome = bg
 				.spawn(async move {
@@ -5695,10 +5691,8 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 
-		self.spawn_owned(
+		self.spawn_mutating(
 			cx,
-			lifecycle::JobKind::Mutating,
-			None,
 			async move {
 				let exec_res = bg
 					.spawn(async move {
@@ -5751,10 +5745,13 @@ impl WorkbenchModel {
 						Err(err) => {
 							app_log!(
 								"[APP:PASTE_STALE_DETECTED: {}]",
-								crate::reason::apply_log_token(&err)
+								err.token.as_str()
 							);
-							model.status = err.clone();
-							model.paste.apply_failed(err, model.preview.as_ref());
+							model.status = err.msg.clone();
+							model.paste.apply_failed(
+								err.msg,
+								model.preview.as_ref(),
+							);
 						}
 					}
 					cx.notify();
@@ -5867,7 +5864,7 @@ impl WorkbenchModel {
 					);
 				}
 				Err(e) => {
-					self.set_status("status_clipboard_failed", [e.to_string()])
+					self.set_status_msg(crate::reason::clipboard_failed(&e))
 				}
 			}
 			cx.notify();
@@ -6029,7 +6026,7 @@ pub(crate) fn test_failure(text: &str) -> Failure {
 	Failure::new(
 		text,
 		Reason::Io {
-			detail: text.into(),
+			detail: snip_core::reason::Datum::for_test(text),
 		},
 	)
 }
@@ -12653,6 +12650,82 @@ mod tests {
 			model.read_with(cx, |m, _| m.status.render(m.locale))
 		}
 
+		/// [`copying_non_contiguous_commits_logs_the_engines_text`] in a
+		/// remote workspace: the worker's export refuses, and the log line
+		/// still carries the engine's text, not the interface's.
+		#[gpui::test]
+		fn copying_non_contiguous_remote_commits_logs_the_engines_text(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			for n in ["one", "two", "three"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				crate::paste::tests::git_run(&alpha, &["add", "."]);
+				crate::paste::tests::git_run(
+					&alpha,
+					&["commit", "-qm", &format!("alpha {n}")],
+				);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the remote log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 3)
+			});
+			let ix_of = |cx: &mut VisualTestContext, subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newest = ix_of(cx, "alpha three");
+			let oldest = ix_of(cx, "alpha one");
+			let id = |ix: usize| -> &'static str {
+				Box::leak(format!("log-subject:{ix}").into_boxed_str())
+			};
+			let row = cx.debug_bounds(id(newest)).expect("the newest row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			let row = cx.debug_bounds(id(oldest)).expect("the oldest row");
+			cx.simulate_click(row.center(), gpui::Modifiers::secondary_key());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "two commits are selected");
+			});
+			let _ = crate::test_log::take();
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let lines = crate::test_log::take();
+			assert!(
+				lines
+					.iter()
+					.any(|l| l.starts_with("[APP:COPY_COMMITS_ERR: ")
+						&& l.contains("not contiguous")),
+				"{lines:#?}"
+			);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "error_payload");
+				let zh = m.status.render(crate::i18n::Locale::ZhTw);
+				assert!(zh.contains("產生 payload 失敗"), "{zh}");
+				assert!(!zh.contains("not contiguous"), "{zh}");
+			});
+		}
+
 		/// Copying the selected commit (Cmd+C in the Git Log) when the worker
 		/// cannot restart (#206).
 		#[cfg(unix)]
@@ -13170,6 +13243,60 @@ mod tests {
 			});
 			assert!(err.contains("預覽"), "{err}");
 			assert_no_snip_in_zh(&err);
+		}
+
+		/// A remote file's preview read polls the tab's token, so the
+		/// lifecycle must record it as a read a close cancels, not one it
+		/// has to drain (#191). Only a local working-file read polls none.
+		#[gpui::test]
+		fn a_remote_file_preview_is_a_cancellable_job(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("notes")).unwrap();
+			fs::write(shared.join("notes/n.txt"), "N\n").unwrap();
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the Project tree to load", |cx| {
+				model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+				})
+			});
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/n.txt").is_some()
+					})
+				})
+			});
+			// The read finishes at once; the held timer keeps the job live.
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(hold));
+			click_probed(&model, cx, "ws-tree-row:notes/n.txt");
+			let (kinds, with_token) = model.read_with(cx, |m, _| {
+				(
+					m.lifecycle.live_kinds(),
+					m.lifecycle.live_jobs_with_cancel(),
+				)
+			});
+			assert!(
+				!kinds.contains(&crate::lifecycle::JobKind::UncancellableRead),
+				"a remote preview read polls a token, yet it is recorded as one the lifecycle must drain: {kinds:?}"
+			);
+			assert!(with_token >= 1, "a close cancels no live job: {kinds:?}");
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the preview to end", |cx| {
+				model.read_with(cx, |m, _| !m.preview_loading)
+			});
 		}
 
 		/// A scan failure shown in 繁中 follows a switch to English: the
@@ -18632,6 +18759,73 @@ mod tests {
 			});
 		}
 
+		/// Copying commits that are not one chain, by the user's gestures
+		/// (click, Cmd-click, Cmd+C): the e2e drivers read the engine's own
+		/// text on `COPY_COMMITS_ERR`, while the status words it in the
+		/// interface language. A regression this stops: the call site printing
+		/// the translated text, dropping the line, or a focus path that never
+		/// starts the copy.
+		#[gpui::test]
+		fn copying_non_contiguous_commits_logs_the_engines_text(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			for n in ["one", "two"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {n}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 3)
+			});
+			let ix_of = |cx: &mut VisualTestContext, subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newest = ix_of(cx, "alpha two");
+			let oldest = ix_of(cx, "base");
+			let id = |ix: usize| -> &'static str {
+				Box::leak(format!("log-subject:{ix}").into_boxed_str())
+			};
+			click(cx, id(newest));
+			let bounds = cx.debug_bounds(id(oldest)).expect("the oldest row");
+			cx.simulate_click(
+				bounds.center(),
+				gpui::Modifiers::secondary_key(),
+			);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "two commits are selected");
+			});
+			let _ = crate::test_log::take();
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let lines = crate::test_log::take();
+			assert!(
+				lines.iter().any(|l| l.starts_with(
+					"[APP:COPY_COMMITS_ERR: commits are not contiguous:"
+				)),
+				"{lines:#?}"
+			);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "error_payload");
+				let zh = m.status.render(crate::i18n::Locale::ZhTw);
+				assert!(zh.contains("產生 payload 失敗"), "{zh}");
+				assert!(!zh.contains("not contiguous"), "{zh}");
+			});
+		}
+
 		/// A Shift-range selection previews a Compare; a repository filter
 		/// change drops it with the selection and the compare state (#202).
 		#[gpui::test]
@@ -19019,11 +19213,26 @@ mod tests {
 				let flag = release.clone();
 				m.update(cx, |m, cx| {
 					let bg = cx.background_executor().clone();
-					m.spawn_owned(cx, kind, None, async move {
+					let hold = async move {
 						while !flag.get() {
 							bg.timer(Duration::from_millis(20)).await;
 						}
-					});
+					};
+					match kind {
+						JobKind::Mutating => {
+							m.spawn_mutating(cx, hold);
+						}
+						JobKind::UncancellableRead => {
+							m.spawn_owned(cx, None, hold);
+						}
+						JobKind::CancellableRead => {
+							m.spawn_owned(
+								cx,
+								Some(snip_core::gitrun::CancelToken::new()),
+								hold,
+							);
+						}
+					}
 					// What a confirmed paste does: the tab bar shows it.
 					cx.notify();
 				});
@@ -20726,6 +20935,30 @@ mod tests {
 					.repos
 					.len()
 					== 1));
+			}
+
+			/// A worker that closes the stream mid-scan is worded by the
+			/// interface language, not by the layer's English sentence (#233).
+			#[gpui::test]
+			fn a_worker_that_closes_the_scan_says_so_in_the_interface_language(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				for model in &models {
+					model.read_with(cx, |m, _| {
+						let msg =
+							m.remote.scan_error.as_ref().expect("scan error");
+						let zh = msg.render(crate::i18n::Locale::ZhTw);
+						let en = msg.render(crate::i18n::Locale::En);
+						assert!(zh.contains("結束了連線"), "{zh}");
+						assert!(!zh.contains("closed the connection"), "{zh}");
+						// The layer's own sentence, not the dictionary's.
+						assert!(!en.contains("the worker closed"), "{en}");
+					});
+				}
 			}
 
 			#[gpui::test]

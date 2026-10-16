@@ -767,9 +767,7 @@ impl WorkbenchModel {
 				self.set_status("status_text_copied", [text.to_string()]);
 				app_log!("[APP:TEXT_COPIED: bytes={}]", text.len());
 			}
-			Err(e) => {
-				self.set_status("status_clipboard_failed", [e.to_string()])
-			}
+			Err(e) => self.set_status_msg(crate::reason::clipboard_failed(&e)),
 		}
 	}
 

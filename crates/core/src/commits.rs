@@ -16,7 +16,7 @@ use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, Overflow, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
-use crate::reason::{io_reason, PayloadErrorKind, Reason};
+use crate::reason::{io_reason, Datum, PayloadErrorKind, Reason};
 
 /// Replay replaces a symlink at the target instead of writing through it,
 /// so only the folder it lands in decides whether it is inside Git.
@@ -2460,7 +2460,7 @@ fn replay_commit(
 			error: format!("{}: {}", plan.files[i].path, conflict.describe()),
 			// Never shown: a layout conflict is worded by its own key.
 			reason: Box::new(Reason::Internal {
-				detail: String::new(),
+				detail: Datum::default(),
 				condition: None,
 			}),
 			layout_conflict: Some(conflict),
