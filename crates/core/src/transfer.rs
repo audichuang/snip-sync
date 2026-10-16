@@ -895,10 +895,12 @@ pub struct EntryMapping {
 /// Explicit destination mappings for importing clipboard payloads.
 #[derive(Debug, Clone, Default)]
 pub struct ImportMapping {
-	pub primary_destination: Option<CanonicalRootId>,
+	/// A destination folder may not exist yet: it is a [`PlacedRoot`], the
+	/// anchor the engine plans against plus the names still to be made.
+	pub primary_destination: Option<PlacedRoot>,
 	/// Nest every entry that lands in the primary destination under this directory (applies to relative entries only).
 	pub primary_prefix: Option<String>,
-	pub prefix_destinations: HashMap<String, CanonicalRootId>,
+	pub prefix_destinations: HashMap<String, PlacedRoot>,
 	pub entry_destinations: HashMap<String, EntryMapping>,
 	pub blocked_prefixes: HashSet<String>,
 }
@@ -908,17 +910,18 @@ impl ImportMapping {
 		Self::default()
 	}
 
-	pub fn with_primary(root: CanonicalRootId) -> Self {
+	pub fn with_primary(root: impl Into<PlacedRoot>) -> Self {
 		Self {
-			primary_destination: Some(root),
+			primary_destination: Some(root.into()),
 			..Default::default()
 		}
 	}
 
 	pub fn from_restore_base(
 		suggestion: &restore::RestoreBaseSuggestion,
-		primary: CanonicalRootId,
+		primary: impl Into<PlacedRoot>,
 	) -> Self {
+		let primary = primary.into();
 		match &suggestion.base {
 			restore::RestoreBase::Strip { segment } => {
 				let mut mapping = Self::with_primary(primary.clone());
@@ -936,9 +939,9 @@ impl ImportMapping {
 	pub fn map_prefix(
 		&mut self,
 		prefix: impl Into<String>,
-		root: CanonicalRootId,
+		root: impl Into<PlacedRoot>,
 	) -> &mut Self {
-		self.prefix_destinations.insert(prefix.into(), root);
+		self.prefix_destinations.insert(prefix.into(), root.into());
 		self
 	}
 
@@ -3719,6 +3722,97 @@ pub fn plan_import_with(
 		.map(|(plan, _)| plan)
 }
 
+/// A folder an absolute entry path may name, with the anchor it is planned
+/// against and the names below that anchor still to be made.
+struct RouteCandidate {
+	path: PathBuf,
+	anchor: CanonicalRootId,
+	tail: String,
+}
+
+/// The folders an absolute entry path can name. Without a folder still to
+/// be made this is exactly the destination roots, in their order. A root
+/// that is only the anchor of a folder still to be made is not one: an
+/// absolute path under it but outside the destination would otherwise land
+/// in it.
+fn route_candidates(
+	canonical_dest_roots: &[CanonicalRootId],
+	mapping: &ImportMapping,
+) -> Vec<RouteCandidate> {
+	let mut placed: Vec<&PlacedRoot> = mapping
+		.primary_destination
+		.iter()
+		.chain(mapping.prefix_destinations.values())
+		.collect();
+	let tail_anchors: HashSet<&CanonicalRootId> = placed
+		.iter()
+		.filter(|p| !p.tail().is_empty())
+		.map(|p| p.anchor())
+		.collect();
+	let mut out: Vec<RouteCandidate> = Vec::new();
+	if tail_anchors.is_empty() {
+		out.extend(canonical_dest_roots.iter().map(|id| RouteCandidate {
+			path: id.path().to_path_buf(),
+			anchor: id.clone(),
+			tail: String::new(),
+		}));
+		return out;
+	}
+	let mut add = |path: PathBuf, anchor: &CanonicalRootId, tail: String| {
+		if !out.iter().any(|c| c.path == path) {
+			out.push(RouteCandidate {
+				path,
+				anchor: anchor.clone(),
+				tail,
+			});
+		}
+	};
+	for id in canonical_dest_roots {
+		if !tail_anchors.contains(id) {
+			add(id.path().to_path_buf(), id, String::new());
+		}
+	}
+	placed.sort_by_key(|p| p.path());
+	for p in placed {
+		add(p.path(), p.anchor(), p.tail_rel());
+	}
+	for em in mapping.entry_destinations.values() {
+		add(em.root.path().to_path_buf(), &em.root, String::new());
+	}
+	out
+}
+
+/// `rest` below a placed folder's tail (`tail/rest`), or `rest` itself when
+/// the folder exists.
+fn with_tail<'a>(
+	tail: &str,
+	rest: impl Into<std::borrow::Cow<'a, str>>,
+) -> std::borrow::Cow<'a, str> {
+	let rest = rest.into();
+	if tail.is_empty() {
+		rest
+	} else {
+		std::borrow::Cow::Owned(format!("{tail}/{rest}"))
+	}
+}
+
+/// Where an entry that no prefix claims lands under the primary destination:
+/// its path, under the restore base's directory when it is relative, below
+/// the destination's tail.
+fn primary_relative<'a>(
+	primary: &PlacedRoot,
+	mapping: &ImportMapping,
+	entry_path: &'a str,
+) -> std::borrow::Cow<'a, str> {
+	let rel = match &mapping.primary_prefix {
+		Some(p) if restore::is_relative(entry_path) => {
+			std::borrow::Cow::Owned(format!("{p}/{entry_path}"))
+		}
+		_ => std::borrow::Cow::Borrowed(entry_path),
+	};
+	with_tail(&primary.tail_rel(), rel)
+}
+
 /// The same import engine, consuming entries already parsed with
 /// [`format::parse_clipboard`]. Returned ordinals align with create_operations
 /// and name each create's original parsed entry, before path routing or skips.
@@ -3740,18 +3834,21 @@ pub fn plan_import_parsed_with(
 	}
 
 	// Every mapped destination root must belong to the explicit destination_roots
+	// (a placed folder by its anchor: the folder it names may not exist yet).
 	if let Some(ref primary) = mapping.primary_destination {
 		cancelled_err(opts, "plan-import")?;
-		if !canonical_dest_roots.contains(primary) {
+		if !canonical_dest_roots.contains(primary.anchor()) {
 			return Err(TransferError::UnknownRoot(
-				primary.path().to_path_buf(),
+				primary.anchor().path().to_path_buf(),
 			));
 		}
 	}
 	for root in mapping.prefix_destinations.values() {
 		cancelled_err(opts, "plan-import")?;
-		if !canonical_dest_roots.contains(root) {
-			return Err(TransferError::UnknownRoot(root.path().to_path_buf()));
+		if !canonical_dest_roots.contains(root.anchor()) {
+			return Err(TransferError::UnknownRoot(
+				root.anchor().path().to_path_buf(),
+			));
 		}
 	}
 	for entry_mapping in mapping.entry_destinations.values() {
@@ -3771,10 +3868,11 @@ pub fn plan_import_parsed_with(
 			.or_insert_with(|| fs_is_case_insensitive(root.path()));
 	}
 
+	let route_candidates = route_candidates(&canonical_dest_roots, mapping);
 	let dest_root_paths: Vec<&Path> =
-		canonical_dest_roots.iter().map(|id| id.path()).collect();
-	let primary_dest_path =
-		mapping.primary_destination.as_ref().map(|id| id.path());
+		route_candidates.iter().map(|c| c.path.as_path()).collect();
+	let primary_dest_path: Option<PathBuf> =
+		mapping.primary_destination.as_ref().map(PlacedRoot::path);
 
 	let mut planned_entries: Vec<(
 		CanonicalRootId,
@@ -3798,7 +3896,7 @@ pub fn plan_import_parsed_with(
 				if let Some((root_str, rel)) =
 					paths::resolve_absolute_import_candidate(
 						&dest_root_paths,
-						primary_dest_path,
+						primary_dest_path.as_deref(),
 						&entry.path,
 					) {
 					if rel.is_empty() {
@@ -3810,20 +3908,21 @@ pub fn plan_import_parsed_with(
 						});
 						continue;
 					}
-					let matched_root = canonical_dest_roots.iter().find(|id| {
-						paths::path_key(&id.path().to_string_lossy())
+					let matched_root = route_candidates.iter().find(|c| {
+						paths::path_key(&c.path.to_string_lossy())
 							== paths::path_key(&root_str)
 							|| dunce::canonicalize(Path::new(&root_str))
-								.map(|c| {
-									paths::path_key(&c.to_string_lossy())
-										== paths::path_key(
-											&id.path().to_string_lossy(),
-										)
+								.map(|canonical| {
+									paths::path_key(
+										&canonical.to_string_lossy(),
+									) == paths::path_key(
+										&c.path.to_string_lossy(),
+									)
 								})
 								.unwrap_or(false)
 					});
 					match matched_root {
-						Some(root) => (root, std::borrow::Cow::Owned(rel)),
+						Some(c) => (&c.anchor, with_tail(&c.tail, rel)),
 						None => {
 							skipped_operations.push(SkippedOperation {
 								raw_path: entry.path.clone(),
@@ -3843,7 +3942,10 @@ pub fn plan_import_parsed_with(
 					});
 					continue;
 				} else if let Some(ref primary) = mapping.primary_destination {
-					(primary, std::borrow::Cow::Borrowed(entry.path.as_str()))
+					(
+						primary.anchor(),
+						with_tail(&primary.tail_rel(), entry.path.as_str()),
+					)
 				} else {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -3865,18 +3967,12 @@ pub fn plan_import_parsed_with(
 				}
 				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
 					// Prefix consumed EXACTLY ONCE
-					(dest, std::borrow::Cow::Borrowed(rest))
+					(dest.anchor(), with_tail(&dest.tail_rel(), rest))
 				} else if let Some(ref primary) = mapping.primary_destination {
-					let rel = match &mapping.primary_prefix {
-						Some(p) if restore::is_relative(&entry.path) => {
-							std::borrow::Cow::Owned(format!(
-								"{p}/{}",
-								entry.path
-							))
-						}
-						_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
-					};
-					(primary, rel)
+					(
+						primary.anchor(),
+						primary_relative(primary, mapping, &entry.path),
+					)
 				} else {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -3887,13 +3983,10 @@ pub fn plan_import_parsed_with(
 					continue;
 				}
 			} else if let Some(ref primary) = mapping.primary_destination {
-				let rel = match &mapping.primary_prefix {
-					Some(p) if restore::is_relative(&entry.path) => {
-						std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
-					}
-					_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
-				};
-				(primary, rel)
+				(
+					primary.anchor(),
+					primary_relative(primary, mapping, &entry.path),
+				)
 			} else {
 				skipped_operations.push(SkippedOperation {
 					raw_path: entry.path.clone(),
@@ -3985,7 +4078,7 @@ pub fn plan_import_parsed_with(
 			&op.absolute_path,
 			&canonical_dest_roots,
 			&root_case_insensitive,
-			mapping.primary_destination.as_ref(),
+			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
 		);
 		let mut identity = canonical_target_identity(&op.absolute_path);
 		if is_ci {
@@ -4010,7 +4103,7 @@ pub fn plan_import_parsed_with(
 			&op.absolute_path,
 			&canonical_dest_roots,
 			&root_case_insensitive,
-			mapping.primary_destination.as_ref(),
+			mapping.primary_destination.as_ref().map(PlacedRoot::anchor),
 		);
 		let mut identity = canonical_target_identity(&op.absolute_path);
 		if is_ci {

@@ -49,7 +49,8 @@ use snip_core::transfer::{
 	plan_import, plan_import_with, selection_from_paths,
 	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
-	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
+	PlacedRoot, SourceFreshnessSnapshot, SourceKind, TransferError,
+	CLIPBOARD_PAYLOAD_MAX,
 };
 
 struct TestRepo {
@@ -8423,4 +8424,171 @@ fn test_a_nested_root_replaced_is_stale_whichever_one_it_is() {
 		assert!(!ext.join("sub/x.txt").exists(), "{replaced}");
 		assert!(!ext.join("y.txt").exists(), "{replaced}");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 38. A destination folder or import path that does not exist yet (#241)
+// ---------------------------------------------------------------------------
+
+fn placed(path: &Path) -> PlacedRoot {
+	PlacedRoot::resolve(None, path).unwrap()
+}
+
+/// Every path below `dir`, sorted.
+fn scan_tree(dir: &Path) -> Vec<PathBuf> {
+	fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+		for entry in fs::read_dir(dir).unwrap() {
+			let path = entry.unwrap().path();
+			out.push(path.clone());
+			if path.is_dir() {
+				walk(&path, out);
+			}
+		}
+	}
+	let mut out = Vec::new();
+	walk(dir, &mut out);
+	out.sort();
+	out
+}
+
+/// Plans `text` against `mapping` (its anchors as the roots) and checks that
+/// planning wrote nothing below `ws`.
+fn plan_placed(
+	ws: &Path,
+	text: &str,
+	mapping: &ImportMapping,
+) -> snip_core::transfer::TransferImportPlan {
+	let before = scan_tree(ws);
+	let plan = plan_import(text, "", &[ws.to_path_buf()], mapping).unwrap();
+	assert_eq!(scan_tree(ws), before, "planning must not write");
+	plan
+}
+
+fn create_paths(
+	plan: &snip_core::transfer::TransferImportPlan,
+) -> Vec<(PathBuf, String)> {
+	let mut out: Vec<_> = plan
+		.create_operations()
+		.iter()
+		.map(|op| (op.absolute_path.clone(), op.relative_path.clone()))
+		.collect();
+	out.sort();
+	out
+}
+
+/// T1: a destination that is a folder to make keeps its tail in every route:
+/// the prefix that points at it, and a path no prefix claims.
+#[test]
+fn test_placed_destination_tail_is_kept_by_prefix_and_primary_routes() {
+	let (_tmp, ws) = canonical_tmp();
+	let dest = placed(&ws.join("new"));
+	assert_eq!(dest.tail(), ["new"]);
+	let mut mapping = ImportMapping::with_primary(dest.clone());
+	mapping.map_prefix("p", dest);
+	let plan = plan_placed(
+		&ws,
+		"// file: p/rest.txt\nr\n// file: q/x.txt\nx\n",
+		&mapping,
+	);
+	assert_eq!(
+		create_paths(&plan),
+		vec![
+			(ws.join("new/q/x.txt"), "new/q/x.txt".to_string()),
+			(ws.join("new/rest.txt"), "new/rest.txt".to_string()),
+		]
+	);
+}
+
+fn base(base: RestoreBase) -> RestoreBaseSuggestion {
+	RestoreBaseSuggestion {
+		base,
+		label: String::new(),
+		matched: 1,
+		total: 1,
+	}
+}
+
+/// T2 and T3: the restore base works on a folder to make as on one that exists.
+#[test]
+fn test_placed_destination_follows_the_restore_base() {
+	let (_tmp, ws) = canonical_tmp();
+	let strip = ImportMapping::from_restore_base(
+		&base(RestoreBase::Strip {
+			segment: "sub".into(),
+		}),
+		placed(&ws.join("new")),
+	);
+	let plan = plan_placed(&ws, "// file: sub/a.ts\nA\n", &strip);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("new/a.ts"), "new/a.ts".to_string())]
+	);
+
+	let add = ImportMapping::from_restore_base(
+		&base(RestoreBase::Add {
+			prefix: "src".into(),
+		}),
+		placed(&ws.join("new")),
+	);
+	let plan = plan_placed(&ws, "// file: a.ts\nA\n", &add);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("new/src/a.ts"), "new/src/a.ts".to_string())]
+	);
+}
+
+/// T4: an absolute entry path matches the folder to make and the folders
+/// that exist, not the anchor the folder to make hangs from.
+#[cfg(unix)]
+#[test]
+fn test_placed_destination_is_not_an_absolute_path_root_through_its_anchor() {
+	let (_tmp, ws) = canonical_tmp();
+	let other = ws.join("other.txt");
+	let inside = ws.join("new/a.txt");
+	let mapping = ImportMapping::with_primary(placed(&ws.join("new")));
+	let text = format!(
+		"// file: {}\nO\n// file: {}\nI\n// file: [DELETED] {}\n",
+		other.display(),
+		inside.display(),
+		other.display()
+	);
+	let plan = plan_placed(&ws, &text, &mapping);
+	assert_eq!(plan.create_operations().len(), 2, "{plan:?}");
+	let rels: Vec<String> = plan
+		.create_operations()
+		.iter()
+		.map(|op| op.relative_path.clone())
+		.collect();
+	assert!(rels.contains(&"new/a.txt".to_string()), "{rels:?}");
+	let other_rel = format!("new/{}", other.display()).replace("//", "/");
+	assert!(
+		rels.iter().any(|r| *r == other_rel),
+		"{rels:?} lacks {other_rel}"
+	);
+	assert!(
+		!plan
+			.create_operations()
+			.iter()
+			.any(|op| op.absolute_path == other),
+		"an absolute path under the anchor, outside the folder, must not land in the anchor"
+	);
+	assert!(plan
+		.skipped_operations()
+		.iter()
+		.any(|s| s.reason == SkipReason::UnresolvedPath));
+	assert!(plan.delete_operations().is_empty());
+}
+
+/// T5: a first name of the tail that is the anchor's own name is not read
+/// as the root's label and stripped.
+#[test]
+fn test_placed_destination_tail_named_like_its_anchor_is_kept() {
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir_all(ws.join("src")).unwrap();
+	let mapping = ImportMapping::with_primary(placed(&ws.join("src/src")));
+	let plan = plan_placed(&ws.join("src"), "// file: a.ts\nA\n", &mapping);
+	assert_eq!(
+		create_paths(&plan),
+		vec![(ws.join("src/src/a.ts"), "src/a.ts".to_string())]
+	);
 }
