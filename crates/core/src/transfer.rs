@@ -4026,6 +4026,8 @@ fn route_candidates(
 #[derive(Default)]
 struct NewFolderNames {
 	spelled: HashMap<String, PathBuf>,
+	/// Keys of the folders the user named (a placed folder's tail).
+	named: HashSet<String>,
 }
 
 impl NewFolderNames {
@@ -4035,8 +4037,16 @@ impl NewFolderNames {
 		self.spelled.entry(key).or_insert(folder).clone()
 	}
 
+	/// `folder`, a folder the user named, as it is spelled for good.
+	fn spell_named(&mut self, folder: PathBuf) -> PathBuf {
+		self.named.insert(folder.to_string_lossy().to_lowercase());
+		self.spell(folder)
+	}
+
 	/// Moves `op` into the spellings of the folders it needs made: the
-	/// folders on its path below the first one that does not exist.
+	/// folders on its path below the first one that does not exist. Only
+	/// when one of them is a folder the user named: a plan that names none
+	/// keeps the payload's spellings, as ClipCode does.
 	fn unify(&mut self, op: &mut restore::CreateOperation) {
 		let Some(parent) = op.absolute_path.parent() else {
 			return;
@@ -4050,16 +4060,29 @@ impl NewFolderNames {
 		) else {
 			return;
 		};
-		let mut cur = op.root_path.clone();
-		let mut exists = true;
+		let mut base = op.root_path.clone();
+		let mut missing = Vec::new();
 		for name in below.components() {
-			let next = cur.join(name);
-			if exists && fs::symlink_metadata(&next).is_ok() {
-				cur = next;
-				continue;
+			if missing.is_empty() {
+				let next = base.join(name);
+				if fs::symlink_metadata(&next).is_ok() {
+					base = next;
+					continue;
+				}
 			}
-			exists = false;
-			cur = self.spell(next);
+			missing.push(name);
+		}
+		let mut chain = base.clone();
+		let names_one = missing.iter().any(|name| {
+			chain.push(name);
+			self.named.contains(&chain.to_string_lossy().to_lowercase())
+		});
+		if !names_one {
+			return;
+		}
+		let mut cur = base;
+		for name in missing {
+			cur = self.spell(cur.join(name));
 		}
 		let absolute = cur.join(file);
 		let Ok(rel) = absolute.strip_prefix(&op.root_path) else {
@@ -4102,7 +4125,7 @@ fn named_folder_chains(
 				.tail()
 				.iter()
 				.map(|name| {
-					cur = names.spell(cur.join(name));
+					cur = names.spell_named(cur.join(name));
 					cur.clone()
 				})
 				.collect()
