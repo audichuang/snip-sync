@@ -39,6 +39,7 @@ use crate::reader::{Preview, PreviewSource};
 use crate::reason::reason_msg;
 use crate::syntax::Language;
 
+pub mod dest;
 pub mod preview;
 
 /// Shared retained preview tier: UI, one active paste input, one latest
@@ -111,6 +112,13 @@ pub enum PasteRequest {
 		remote: Option<RemotePaste>,
 	},
 	Remap(Remap),
+	/// The previewed payload planned into another destination folder
+	/// (#238). The payload is the shell's own, shared, never re-read.
+	Retarget {
+		dest: PathBuf,
+		roots: Vec<PathBuf>,
+		generation: u64,
+	},
 }
 
 /// What a deferred re-plan changes, for its log line once it lands.
@@ -136,20 +144,29 @@ impl PasteRequest {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard {
 				text, dest, roots, ..
-			} => roots.iter().fold(
-				text.capacity()
-					.saturating_add(dest.capacity())
-					.saturating_add(roots.capacity() * size_of::<PathBuf>()),
-				|n, p| n.saturating_add(p.capacity()),
-			),
+			} => text.capacity().saturating_add(paths_bytes(dest, roots)),
 			Self::Remap(remap) => remap.heap_bytes(),
+			Self::Retarget { dest, roots, .. } => paths_bytes(dest, roots),
 		})
 	}
+}
+
+/// Heap bytes of a destination and the repo roots sent with it: what each
+/// allocated, not what it uses.
+#[allow(clippy::ptr_arg)]
+fn paths_bytes(dest: &PathBuf, roots: &Vec<PathBuf>) -> usize {
+	roots.iter().fold(
+		dest.capacity()
+			.saturating_add(roots.capacity() * size_of::<PathBuf>()),
+		|n, p| n.saturating_add(p.capacity()),
+	)
 }
 
 pub struct PasteOutcome {
 	pub result: Result<PastePreviewPlan, Msg>,
 	pub remap: Option<Remap>,
+	/// The plan is the answer to a `Retarget`: the destination moved.
+	pub retargeted: bool,
 }
 
 impl PasteOutcome {
@@ -358,9 +375,25 @@ impl PastePending {
 					remap,
 				}
 			}
+			PasteRequest::Retarget {
+				dest,
+				roots,
+				generation,
+			} => {
+				let Some(plan) = plan else { return Ok(None) };
+				PasteInput::Retarget {
+					plan: plan.clone(),
+					dest,
+					roots,
+					generation,
+				}
+			}
 		};
+		// A remap and a retarget plan from the shell's own payload: the
+		// budget counts that one allocation once.
 		let raw = match &input {
-			PasteInput::Remap { plan, .. } => {
+			PasteInput::Remap { plan, .. }
+			| PasteInput::Retarget { plan, .. } => {
 				Some(Arc::downgrade(&plan.raw_payload))
 			}
 			_ => None,
@@ -399,6 +432,12 @@ enum PasteInput {
 		plan: PastePreviewPlan,
 		remap: Remap,
 	},
+	Retarget {
+		plan: PastePreviewPlan,
+		dest: PathBuf,
+		roots: Vec<PathBuf>,
+		generation: u64,
+	},
 }
 impl PasteInput {
 	fn bytes(&self) -> usize {
@@ -407,6 +446,11 @@ impl PasteInput {
 			Self::Remap { plan, remap } => {
 				plan.retained_bytes().saturating_add(remap.heap_bytes())
 			}
+			Self::Retarget {
+				plan, dest, roots, ..
+			} => plan
+				.retained_bytes()
+				.saturating_add(paths_bytes(dest, roots)),
 		})
 	}
 }
@@ -439,14 +483,32 @@ impl PasteWorker {
 					remote,
 				),
 				remap: None,
+				retargeted: false,
 			},
 			PasteInput::Remap { mut plan, remap } => {
 				let result = plan.rebuild_file_plan_with(opts).map(|()| plan);
 				PasteOutcome {
 					result,
 					remap: Some(remap),
+					retargeted: false,
 				}
 			}
+			PasteInput::Retarget {
+				plan,
+				dest,
+				roots,
+				generation,
+			} => PasteOutcome {
+				result: plan.retarget_with(
+					&dest,
+					&roots,
+					generation,
+					opts,
+					MAX_RETAINED_PREVIEW_BYTES,
+				),
+				remap: None,
+				retargeted: true,
+			},
 			_ => unreachable!(
 				"deferred remap must capture its shell before spawn"
 			),
@@ -470,6 +532,7 @@ impl PasteWorker {
 			state.ready = Some(PasteOutcome {
 				result: Err(preview_budget_error()),
 				remap: None,
+				retargeted: false,
 			});
 		}
 	}
@@ -1464,7 +1527,7 @@ fn slashed(path: &Path) -> String {
 
 /// A destination that could not be opened or captured, named by path so the
 /// status says which directory was refused (the OS error alone does not).
-fn destination_error(dest: &Path, err: &std::io::Error) -> Msg {
+pub(crate) fn destination_error(dest: &Path, err: &std::io::Error) -> Msg {
 	Msg::with_msg_arg(
 		"paste_err_destination",
 		[dest.display().to_string(), String::new()],
@@ -1742,6 +1805,12 @@ impl Drop for DetailReadCharge {
 }
 
 impl PastePreviewPlan {
+	/// A handle that stays equal to itself for as long as this payload is
+	/// the one previewed (a retarget keeps it, a new paste does not).
+	pub fn payload_token(&self) -> std::sync::Weak<str> {
+		Arc::downgrade(&self.raw_payload)
+	}
+
 	pub(crate) fn commit_diff_request(
 		&self,
 		idx: usize,
@@ -2120,10 +2189,88 @@ impl PastePreviewPlan {
 		// arboard has already allocated the OS clipboard String. Refuse before
 		// parsing it or retaining any extra copy; never truncate a payload.
 		check_budget(raw_text.len(), limit)?;
+		Self::build_shared(
+			raw_text.into(),
+			dest,
+			known_roots,
+			generation,
+			opts,
+			limit,
+			remote,
+		)
+	}
+
+	/// [`Self::build_at`] over a payload that is already allocated, which
+	/// the plan then shares: a retarget plans the same text again without a
+	/// second copy of it.
+	fn build_shared(
+		raw: Arc<str>,
+		dest: &Path,
+		known_roots: &[PathBuf],
+		generation: u64,
+		opts: &RunOptions,
+		limit: usize,
+		remote: Option<RemotePaste>,
+	) -> Result<Self, Msg> {
+		let (plan, failed) = Self::plan_shared(
+			raw,
+			dest,
+			known_roots,
+			generation,
+			opts,
+			limit,
+			remote,
+		)?;
+		// A refusal that carries the engine's suggestion lands as the panel
+		// it was opened on, like a retarget's (`retarget_with`): not
+		// executable, with the error, and [Adjust paths] recovers it. One
+		// without a suggestion leaves nothing to keep.
+		if plan.restore_hint().is_some() {
+			return Ok(plan);
+		}
+		if let Some(err) = failed {
+			return Err(err);
+		}
+		// A replay has no file plan: its preview is the plan.
+		if !plan.whole_commit
+			&& plan.prefix_choices.is_empty()
+			&& plan.import_plan.is_none()
+		{
+			return Err(plan
+				.error
+				.unwrap_or_else(|| Msg::new("paste_err_nothing", [])));
+		}
+		Ok(plan)
+	}
+
+	/// [`Self::build_shared`] without judging what the engine answered: the
+	/// plan comes back whatever it said, a refusal as the plan's `error`
+	/// beside the restore-base suggestion the engine made while refusing it
+	/// (what [Adjust paths] recovers). The second value is the error of a
+	/// plan that could not be built at all (the destination did not resolve,
+	/// the worker was unreachable). Only what leaves no plan to keep (the
+	/// memory budget, a payload that is none, a replay) is an `Err`.
+	fn plan_shared(
+		raw: Arc<str>,
+		dest: &Path,
+		known_roots: &[PathBuf],
+		generation: u64,
+		opts: &RunOptions,
+		limit: usize,
+		remote: Option<RemotePaste>,
+	) -> Result<(Self, Option<Msg>), Msg> {
+		check_budget(raw.len(), limit)?;
+		let raw_text: &str = &raw;
 		if commits::is_commit_payload(raw_text) {
 			return Self::build_commit(
-				raw_text, dest, generation, opts, limit, remote,
-			);
+				raw.clone(),
+				dest,
+				generation,
+				opts,
+				limit,
+				remote,
+			)
+			.map(|plan| (plan, None));
 		}
 		if format::parse_clipboard(raw_text, "").is_empty() {
 			return Err(Msg::new("paste_err_not_payload", []));
@@ -2168,7 +2315,7 @@ impl PastePreviewPlan {
 			is_applying: false,
 			generation_snapshot: generation,
 			error: None,
-			raw_payload: raw_text.into(),
+			raw_payload: raw.clone(),
 			remote,
 		};
 		let base = plan.retained_bytes();
@@ -2190,23 +2337,23 @@ impl PastePreviewPlan {
 				limit,
 			)?;
 		}
-		plan.rebuild_with_limit(opts, limit)?;
-		if plan.prefix_choices.is_empty() && plan.import_plan.is_none() {
-			return Err(plan
-				.error
-				.unwrap_or_else(|| Msg::new("paste_err_nothing", [])));
+		match plan.rebuild_with_limit(opts, limit) {
+			Ok(()) => Ok((plan, None)),
+			Err(err) if err.key == preview_budget_error().key => Err(err),
+			// `rebuild_with_limit` left the error on the plan.
+			Err(err) => Ok((plan, Some(err))),
 		}
-		Ok(plan)
 	}
 
 	fn build_commit(
-		raw_text: &str,
+		raw: Arc<str>,
 		dest: &Path,
 		generation: u64,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
 	) -> Result<Self, Msg> {
+		let raw_text: &str = &raw;
 		let payload = commits::parse_commit_payload(raw_text).map_err(|e| {
 			Msg::with_msg_arg(
 				"paste_err_plan",
@@ -2252,7 +2399,7 @@ impl PastePreviewPlan {
 			is_applying: false,
 			generation_snapshot: generation,
 			error: None,
-			raw_payload: raw_text.into(),
+			raw_payload: raw.clone(),
 			remote,
 		};
 		let base = plan.retained_bytes();
@@ -2480,6 +2627,69 @@ impl PastePreviewPlan {
 		self.selected_item_idx = 0;
 		self.import_plan = None;
 		self.plan = empty_plan();
+	}
+
+	/// Turns this plan into the empty shell of a retarget to `dest`: the
+	/// destination moves and nothing planned for the old one can be applied
+	/// while the new plan is built. Unlike [`Self::clear_file_plan`] it also
+	/// drops a whole-commit replay (which has no mapping to rebuild from),
+	/// and the prefix choices, which are the new destination's to ask again.
+	/// The tree's folds and folder cursor name rows under the old folder's
+	/// roots, and the restore-base hint is what the old folder's engine
+	/// suggested: both start over with the new folder, as on a new paste,
+	/// and [Adjust paths] is off again until the user asks.
+	pub(crate) fn disarm_for(&mut self, dest: PathBuf) {
+		self.destination = dest;
+		self.items = Vec::new();
+		self.selected_item_idx = 0;
+		self.import_plan = None;
+		self.plan = empty_plan();
+		self.commit_preview = None;
+		self.commit_prepared = Default::default();
+		self.collapsed_commits.clear();
+		self.collapsed_dirs.clear();
+		self.cursor_dir = None;
+		self.fold_seeded = false;
+		self.restore_base = None;
+		self.adjust_paths = false;
+		self.prefix_choices = Vec::new();
+		self.error = None;
+	}
+
+	/// This disarmed shell's payload planned into `dest`. A destination the
+	/// engine cannot use (it does not exist, the worker refused it, a commit
+	/// replay has no repo there) or a plan it refuses is not a failure of
+	/// the job: the shell lands with the engine's own words, and with the
+	/// restore-base suggestion it made, so the panel stays on the folder the
+	/// user picked and can recover it. Only the memory budget refuses the
+	/// landing.
+	pub(crate) fn retarget_with(
+		mut self,
+		dest: &Path,
+		known_roots: &[PathBuf],
+		generation: u64,
+		opts: &RunOptions,
+		limit: usize,
+	) -> Result<Self, Msg> {
+		let planned = Self::plan_shared(
+			self.raw_payload.clone(),
+			dest,
+			known_roots,
+			generation,
+			opts,
+			limit,
+			self.remote.clone(),
+		);
+		match planned {
+			// A refused plan is the shell the panel stays on: it keeps the
+			// engine's words and the suggestion that recovers it.
+			Ok((plan, _)) => Ok(plan),
+			Err(err) if err.key == preview_budget_error().key => Err(err),
+			Err(err) => {
+				self.error = Some(err);
+				Ok(self)
+			}
+		}
 	}
 
 	/// Plans the writes for the current mapping. Read-only; `opts` carries
@@ -4029,6 +4239,62 @@ pub(crate) mod tests {
 		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
 	}
 
+	/// A retarget starts the tree and the restore-base hint over: the shell
+	/// shown while the new folder is planned keeps no fold, folder cursor,
+	/// hint or [Adjust paths] of the old one, and the new plan is not
+	/// adjusted unasked (#238 over #239 / #240).
+	#[test]
+	fn retarget_starts_the_tree_and_the_hint_over() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(tmp.path()).unwrap();
+		let dest = root.join("sub");
+		let other = root.join("other");
+		fs::create_dir(&dest).unwrap();
+		fs::create_dir(&other).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/d/b.ts\ny\n",
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.set_adjust_paths(true).unwrap();
+		assert!(plan.restore_hint().is_some());
+		let (root_key, path, _) = plan
+			.all_dirs()
+			.into_iter()
+			.find(|(_, path, _)| !path.is_empty())
+			.expect("a folder row");
+		let key = DirKey {
+			commit: None,
+			root: root_key,
+			path,
+		};
+		plan.collapsed_dirs.insert(key.clone());
+		plan.cursor_dir = Some(key);
+
+		plan.disarm_for(other.clone());
+		assert!(plan.restore_hint().is_none(), "the old folder's hint");
+		assert!(!plan.adjust_paths);
+		assert!(plan.collapsed_dirs.is_empty());
+		assert!(plan.cursor_dir.is_none());
+		assert_eq!(plan.cursor(), PasteCursor::Item(0));
+
+		let plan = plan
+			.retarget_with(
+				&other,
+				&[],
+				2,
+				&RunOptions::default(),
+				MAX_RETAINED_PREVIEW_BYTES,
+			)
+			.unwrap();
+		assert_eq!(plan.destination, other);
+		assert!(!plan.adjust_paths, "nothing adjusted unasked");
+		assert_eq!(item_paths(&plan), ["sub/a.ts", "sub/d/b.ts"]);
+		assert!(plan.cursor_dir.is_none());
+	}
+
 	#[test]
 	fn adjusting_paths_replans_with_the_suggestion_and_as_is_undoes_it() {
 		let tmp = tempfile::tempdir().unwrap();
@@ -5143,6 +5409,56 @@ pub(crate) mod tests {
 		assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
 	}
 
+	/// A retarget plans the shown plan's own payload: the budget counts that
+	/// one allocation once, and the result is the same allocation (#238).
+	#[test]
+	fn retarget_shares_the_payload_with_the_shown_plan() {
+		let dir = tempfile::tempdir().unwrap();
+		let other = tempfile::tempdir().unwrap();
+		let raw = "// FILE: a.txt\nbody";
+		let mut shell = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		shell.disarm_for(other.path().into());
+		let pool = Arc::new(Mutex::new(PastePending::default()));
+		lock_pending(&pool)
+			.admit_ui(None, Some(&shell), None)
+			.unwrap();
+		let retarget = || PasteRequest::Retarget {
+			dest: other.path().into(),
+			roots: Vec::new(),
+			generation: 2,
+		};
+		// Nothing to plan from: no job.
+		lock_pending(&pool).enqueue(retarget()).unwrap();
+		assert!(PastePending::start(&pool, None, CancelToken::new())
+			.unwrap()
+			.is_none());
+		lock_pending(&pool).enqueue(retarget()).unwrap();
+		let work = PastePending::start(&pool, Some(&shell), CancelToken::new())
+			.unwrap()
+			.unwrap();
+		{
+			let state = lock_pending(&pool);
+			assert_eq!(
+				state.shared_raw(state.ui_raw.as_ref()),
+				raw.len() + ARC_ALLOWANCE,
+				"the payload is charged once while the job holds it"
+			);
+		}
+		work.run(&RunOptions::default());
+		let outcome = lock_pending(&pool).ready.take().unwrap();
+		assert!(outcome.retargeted);
+		let plan = outcome.result.unwrap();
+		assert!(Arc::ptr_eq(&plan.raw_payload, &shell.raw_payload));
+		assert_eq!(plan.destination, other.path());
+		assert!(plan.executable());
+	}
+
 	#[test]
 	fn pending_overflow_drops_older_intent_and_raw_share_requires_identical_arc(
 	) {
@@ -5296,6 +5612,7 @@ pub(crate) mod tests {
 			state.ready = Some(PasteOutcome {
 				result: Ok(plan),
 				remap: None,
+				retargeted: false,
 			});
 			let duplicate = state
 				.ready

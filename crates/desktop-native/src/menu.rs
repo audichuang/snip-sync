@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 
 use crate::i18n::{t, Msg};
 use crate::icons::{icon, Icon};
+use crate::overlay::{
+	origin_pane, CloseWhy, LayerState, OverlayKind, ReturnFocus,
+};
 use crate::theme::*;
 use crate::tree::FlattenedTreeRow;
 use crate::ui::probe;
@@ -24,7 +27,8 @@ use crate::WorkbenchModel;
 
 /// Chrome state that belongs to no single panel.
 pub struct Chrome {
-	pub menu: Option<ContextMenu>,
+	/// The keyboard handle of an open context menu (the menu itself is a
+	/// layer: `WorkbenchModel::overlays`).
 	pub menu_focus: FocusHandle,
 	/// Speed search text typed into the Project / Changes list.
 	pub speed: String,
@@ -47,7 +51,6 @@ pub struct Chrome {
 impl Chrome {
 	pub fn new(cx: &mut Context<WorkbenchModel>) -> Self {
 		Self {
-			menu: None,
 			menu_focus: cx.focus_handle(),
 			speed: String::new(),
 			collapsed_groups: Vec::new(),
@@ -182,8 +185,11 @@ pub enum MenuAct {
 		path: String,
 	},
 	CopyText(String),
+	/// Paste into this folder (a tree path: a local path, or a path under
+	/// the remote session root).
+	PasteInto(PathBuf),
 	CommitDiff(String),
-	CopyCommits(String),
+	CopyCommits,
 	/// The node's files as one snip-sync payload.
 	CopyNode(Vec<CopyTarget>),
 	CommitFileDiff(String),
@@ -271,18 +277,46 @@ impl WorkbenchModel {
 			.map(|slot| slot.root.clone())
 	}
 
+	/// "Paste into this folder": enabled for a folder inside the workspace.
+	/// What the destination bar names is judged by the same words, so the
+	/// menu never offers a folder the bar would refuse to show.
+	fn paste_into_entry(&self, folder: Option<PathBuf>) -> MenuEntry {
+		let remote = self.remote.session.is_some();
+		let inside = folder.filter(|path| {
+			crate::paste::dest::WsRel::of_folder(
+				&self.workspace_root,
+				path,
+				remote,
+			)
+			.is_some()
+		});
+		item(
+			"paste-into",
+			"menu_paste_into",
+			None,
+			inside.map(MenuAct::PasteInto),
+		)
+	}
+
 	pub(crate) fn repo_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
 		let root = self.repos.get(idx).map(|r| r.root.clone());
+		let paste_into = self.paste_into_entry(root.clone());
 		if self.remote.session.is_some() {
 			let path = root.as_deref().and_then(|r| self.remote_worker_path(r));
-			return vec![item(
-				"copy-path",
-				"menu_copy_path",
-				None,
-				path.map(MenuAct::CopyText),
-			)];
+			return vec![
+				paste_into,
+				MenuEntry::Sep,
+				item(
+					"copy-path",
+					"menu_copy_path",
+					None,
+					path.map(MenuAct::CopyText),
+				),
+			];
 		}
 		vec![
+			paste_into,
+			MenuEntry::Sep,
 			item(
 				"copy-path",
 				"menu_copy_path",
@@ -338,17 +372,22 @@ impl WorkbenchModel {
 		} else {
 			Vec::new()
 		};
-		let mut v = vec![copy_entry(targets), MenuEntry::Sep];
+		let root = if ws { self.ws_root() } else { self.repo_root() };
+		let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+		let mut v = vec![copy_entry(targets)];
+		if row.is_dir {
+			v.push(
+				self.paste_into_entry(
+					abs.clone().filter(|_| row.is_valid_utf8),
+				),
+			);
+		}
+		v.push(MenuEntry::Sep);
 		if self.remote.session.is_some() {
-			let root = if ws { self.ws_root() } else { self.repo_root() };
-			let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
 			let worker_path =
 				abs.as_deref().and_then(|p| self.remote_worker_path(p));
 			v.extend(copy_entries(worker_path, &row.rel_path));
 		} else if ws {
-			let abs = self
-				.ws_root()
-				.map(|r| r.join(row.rel_path.trim_end_matches('/')));
 			v.extend(copy_entries(
 				abs.as_ref().map(|p| p.display().to_string()),
 				&row.rel_path,
@@ -517,7 +556,7 @@ impl WorkbenchModel {
 				"copy-commits",
 				"btn_copy_commits",
 				None,
-				Some(MenuAct::CopyCommits(sha.to_string())),
+				Some(MenuAct::CopyCommits),
 			),
 			MenuEntry::Sep,
 			item(
@@ -556,23 +595,27 @@ impl WorkbenchModel {
 		} else {
 			path.to_string()
 		};
-		let multi = self.commit_file_sel.len() > 1
-			&& self.commit_file_sel.contains(&key);
+		let multi = self.commit_view.commit_file_sel.len() > 1
+			&& self.commit_view.commit_file_sel.contains(&key);
 		let copy: Vec<CopyTarget> = if multi {
-			let targets: Vec<&str> =
-				self.commit_file_sel.iter().map(String::as_str).collect();
+			let targets: Vec<&str> = self
+				.commit_view
+				.commit_file_sel
+				.iter()
+				.map(String::as_str)
+				.collect();
 			commit_copy_selection(
-				&self.commit_files,
-				&self.commit_file_gitlinks,
-				self.commit_files_truncated,
+				&self.commit_view.commit_files,
+				&self.commit_view.commit_file_gitlinks,
+				self.commit_view.commit_files_truncated,
 				self.log_details_by_dir,
 				&targets,
 			)
 		} else {
 			commit_copy_paths(
-				&self.commit_files,
-				&self.commit_file_gitlinks,
-				self.commit_files_truncated,
+				&self.commit_view.commit_files,
+				&self.commit_view.commit_file_gitlinks,
+				self.commit_view.commit_files_truncated,
 				path,
 				is_dir,
 			)
@@ -597,7 +640,10 @@ impl WorkbenchModel {
 			(!copy.is_empty()).then_some(MenuAct::CopyNode(copy)),
 		)];
 		let rev = self.commit_file_rev(path).or_else(|| {
-			self.log_commit_root.clone().map(|r| (r, String::new()))
+			self.commit_view
+				.log_commit_root
+				.clone()
+				.map(|r| (r, String::new()))
 		});
 		if !is_dir {
 			v.push(item(
@@ -628,6 +674,11 @@ impl WorkbenchModel {
 	) {
 		let in_selection = self.log_is_selected(sha);
 		if !in_selection {
+			// A tab that drains ignores the select, and its menu would then
+			// act on the old selection, not on this row.
+			if !self.accepting_work() {
+				return;
+			}
 			self.select_commit(sha, cx);
 		}
 		let entries = self.log_row_menu(sha);
@@ -645,11 +696,6 @@ impl WorkbenchModel {
 		if entries.is_empty() {
 			return;
 		}
-		self.close_popover(cx);
-		// A popup closed by this same press queued focus for the root; the
-		// menu must keep it.
-		self.pending_focus = None;
-		self.hide_workspace_menu();
 		let ids: Vec<&str> = entries
 			.iter()
 			.filter_map(|e| match e {
@@ -658,42 +704,31 @@ impl WorkbenchModel {
 			})
 			.collect();
 		app_log!("[APP:MENU_OPEN: {:?} items={}]", origin, ids.join(","));
-		self.chrome.menu = Some(ContextMenu {
+		let menu = ContextMenu {
 			origin,
 			pos,
 			entries,
 			cursor: None,
-		});
-		window.focus(&self.chrome.menu_focus);
-		// Opened from a mouse press: keep the list below from taking focus.
-		window.prevent_default();
-		cx.notify();
-	}
-
-	pub(crate) fn close_menu(
-		&mut self,
-		window: &mut Window,
-		cx: &mut Context<Self>,
-	) {
-		let Some(m) = self.chrome.menu.take() else {
-			return;
 		};
-		if self.chrome.menu_focus.is_focused(window) {
-			window.focus(match m.origin {
-				MenuOrigin::Left => &self.tree_focus,
-				MenuOrigin::Log => &self.log_focus,
-				MenuOrigin::Editor => &self.reader_focus,
-			});
-		}
-		app_log!("[APP:MENU_CLOSED]");
-		cx.notify();
+		let ret = ReturnFocus::To(origin_pane(self, origin));
+		// Opening a menu closes the layer that was open (it is the
+		// replaced layer's keyboard target the menu inherits when the focus
+		// was in it), takes the keyboard and keeps the list below from
+		// taking it with the press that opened the menu.
+		self.open_layer(
+			OverlayKind::ContextMenu,
+			ret,
+			None,
+			LayerState::ContextMenu(menu),
+			Some(window),
+			cx,
+		);
 	}
 
 	/// Enabled items, in order, for keyboard movement.
 	fn menu_enabled(&self) -> Vec<usize> {
-		self.chrome
-			.menu
-			.as_ref()
+		self.overlays
+			.context_menu()
 			.map(|m| {
 				m.entries
 					.iter()
@@ -709,7 +744,7 @@ impl WorkbenchModel {
 
 	pub(crate) fn menu_step(&mut self, down: bool, cx: &mut Context<Self>) {
 		let enabled = self.menu_enabled();
-		let Some(m) = self.chrome.menu.as_mut() else {
+		let Some(m) = self.overlays.context_menu_mut() else {
 			return;
 		};
 		if enabled.is_empty() {
@@ -731,7 +766,7 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		let cursor = self.chrome.menu.as_ref().and_then(|m| m.cursor);
+		let cursor = self.overlays.context_menu().and_then(|m| m.cursor);
 		if let Some(ix) = cursor {
 			self.menu_pick(ix, window, cx);
 		}
@@ -743,20 +778,18 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		let picked =
-			self.chrome
-				.menu
-				.as_ref()
-				.and_then(|m| match m.entries.get(ix) {
-					Some(MenuEntry::Item {
-						id, act: Some(act), ..
-					}) => Some((*id, act.clone())),
-					_ => None,
-				});
+		let picked = self.overlays.context_menu().and_then(|m| {
+			match m.entries.get(ix) {
+				Some(MenuEntry::Item {
+					id, act: Some(act), ..
+				}) => Some((*id, act.clone())),
+				_ => None,
+			}
+		});
 		let Some((id, act)) = picked else {
 			return;
 		};
-		self.close_menu(window, cx);
+		self.close_overlay(OverlayKind::ContextMenu, CloseWhy::Picked, cx);
 		app_log!("[APP:MENU_ACTION: {id}]");
 		self.run_menu_act(act, window, cx);
 	}
@@ -791,13 +824,16 @@ impl WorkbenchModel {
 				}
 			}
 			MenuAct::CopyText(text) => self.copy_text(&text),
+			// After the menu closed and handed focus to the tree: the panel
+			// the paste opens must keep it (the next Enter applies).
+			MenuAct::PasteInto(path) => self.paste_into_folder(path, cx),
 			MenuAct::CommitDiff(sha) => {
 				if self.selected_commit.as_deref() != Some(sha.as_str()) {
 					self.select_commit(&sha, cx);
 				}
 				window.focus(&self.reader_focus);
 			}
-			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
+			MenuAct::CopyCommits => self.copy_commits_to_clipboard(cx),
 			MenuAct::CopyNode(targets) => self.copy_targets(targets, cx),
 			MenuAct::CommitFileDiff(path) => {
 				self.select_commit_file(&path, cx);
@@ -1080,22 +1116,6 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
-	/// Esc in a tool window: first ends speed search, then goes to the editor.
-	pub(crate) fn escape_to_editor(
-		&mut self,
-		window: &mut Window,
-		cx: &mut Context<Self>,
-	) {
-		if !self.chrome.speed.is_empty() {
-			self.chrome.speed.clear();
-			app_log!("[APP:SPEED_SEARCH: off]");
-		} else {
-			window.focus(&self.reader_focus);
-			app_log!("[APP:FOCUS: editor]");
-		}
-		cx.notify();
-	}
-
 	fn log_select_row(&mut self, sha: &str, cx: &mut Context<Self>) {
 		if let Some(ix) =
 			self.display_commits().iter().position(|c| c.sha == sha)
@@ -1127,7 +1147,7 @@ impl WorkbenchModel {
 		&self,
 		cx: &mut Context<Self>,
 	) -> Option<AnyElement> {
-		let m = self.chrome.menu.as_ref()?;
+		let m = self.overlays.context_menu()?;
 		let loc = self.locale;
 		let log = &self.probes;
 		let width = menu_width(&m.entries, loc);
@@ -1172,7 +1192,7 @@ impl WorkbenchModel {
 								.on_mouse_move(cx.listener(
 									move |this, _: &MouseMoveEvent, _, cx| {
 										if let Some(m) =
-											this.chrome.menu.as_mut()
+											this.overlays.context_menu_mut()
 										{
 											if m.cursor != Some(ix) {
 												m.cursor = Some(ix);
@@ -1227,10 +1247,9 @@ impl WorkbenchModel {
 				}
 			})
 			.collect();
-		let panel = div()
-			.id("context-menu")
+		let panel = self
+			.overlay_panel(OverlayKind::ContextMenu, cx)
 			.relative()
-			.occlude()
 			.track_focus(&self.chrome.menu_focus)
 			.key_context("ContextMenu")
 			.on_action(cx.listener(|this, _: &crate::MenuUp, _, cx| {
@@ -1242,12 +1261,6 @@ impl WorkbenchModel {
 			.on_action(cx.listener(|this, _: &crate::MenuConfirm, w, cx| {
 				this.menu_confirm(w, cx)
 			}))
-			.on_action(cx.listener(|this, _: &crate::MenuCancel, w, cx| {
-				this.close_menu(w, cx)
-			}))
-			.on_mouse_down_out(
-				cx.listener(|this, _, w, cx| this.close_menu(w, cx)),
-			)
 			// A right click inside the menu must not reach the row below.
 			.on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
 			// An anchored popup gets no intrinsic text width from the

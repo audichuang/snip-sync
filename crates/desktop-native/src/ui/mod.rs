@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use gpui::{
 	anchored, canvas, deferred, div, prelude::*, px, rgb, transparent_black,
-	uniform_list, AnyElement, AnyView, App, Context, Div, ElementId,
-	FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+	uniform_list, AnyElement, App, Context, Div, ElementId, FontWeight,
+	MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
 	ScrollWheelEvent, SharedString, Stateful, Window,
 };
 use snip_core::format::ChangeType;
@@ -24,6 +24,7 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf, Locale};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
+use crate::overlay::{CloseWhy, OverlayKind, ReturnFocus, TriggerId};
 use crate::paste::{
 	split_dir, PasteItem, PasteNode, PastePreviewPlan, RowAction, SkipCause,
 };
@@ -60,26 +61,27 @@ pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
 
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
-	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
-	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
-	LogOpen, LogSearchFocus, LogUp, NavCollapse, NavDown, NavExpand, NavToggle,
-	NavUp, OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview,
-	Popover, Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown,
-	ReaderPageUp, ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind,
-	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
-	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
-	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
+	ApplyPaste, CloseWorkspace, CopySelection, FindInFile, FindNext, FindPrev,
+	FocusNext, FocusPrev, GotoLine, HistoryNextPage, HistoryPrevPage, LogCopy,
+	LogDown, LogExtendDown, LogExtendUp, LogHead, LogOpen, LogSearchFocus,
+	LogUp, NavCollapse, NavDown, NavExpand, NavToggle, NavUp, OpenRefSelector,
+	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderCopy,
+	ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll, ReaderUp,
+	Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges, ShowProject,
+	Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse, TreeDown,
+	TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
 mod changes;
 mod editor;
+mod fit;
 mod header;
 mod left;
 mod log;
 mod log_view;
 mod paste;
+pub(crate) mod probe_line;
 mod remote;
 
 use changes::*;
@@ -88,9 +90,11 @@ pub(crate) use changes::{
 	UNREADABLE,
 };
 #[cfg(test)]
-pub(crate) use log::text_width;
+pub(crate) use fit::{rule_holds, FitRole, TextFit};
 use log::*;
-pub use log::{LogFilterLayout, LogMenu};
+#[cfg(test)]
+pub(crate) use log::{log_date, text_width};
+pub use log::{LogFilterLayout, LogFit, LogMenu};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -236,6 +240,12 @@ pub struct ProbeFrame {
 	seen: HashMap<String, [i32; 4]>,
 	seen_order: Vec<(String, [i32; 4])>,
 	probed_this_frame: HashSet<String>,
+	/// `TEXT_FIT` of the last two frames, like `shown` and `seen`.
+	fits_shown: HashMap<String, fit::TextFit>,
+	fits_seen: HashMap<String, fit::TextFit>,
+	/// The line each id last printed, so a line is printed when it changes;
+	/// dropped with the id when it is gone.
+	fits_logged: HashMap<String, String>,
 }
 
 impl ProbeFrame {
@@ -248,7 +258,7 @@ impl ProbeFrame {
 		if !self.probed_this_frame.insert(id.to_string())
 			&& !id.starts_with("change-row:")
 		{
-			app_log!("[APP:CTRL_DUPLICATE: id={}]", id);
+			app_log!("{}", probe_line::duplicate(id));
 		}
 		if let Some(v) = v {
 			self.seen_order.push((id.to_string(), v));
@@ -258,6 +268,49 @@ impl ProbeFrame {
 		} else {
 			false
 		}
+	}
+
+	/// What the last frames saw of the text `id`, if they drew it.
+	pub(crate) fn known_fit(&self, id: &str) -> Option<fit::TextFit> {
+		self.fits_seen
+			.get(id)
+			.or_else(|| self.fits_shown.get(id))
+			.cloned()
+	}
+
+	/// Records a text drawn this frame (`TEXT_FIT`). Prints its line when it
+	/// differs from the last one printed for the id, and a DRIFT line when
+	/// the box differs from the width the solver gave it.
+	pub(crate) fn record_fit(&mut self, id: &str, fit: fit::TextFit) {
+		let line = fit.line(id);
+		if self.fits_logged.get(id) != Some(&line) {
+			app_log!("{}", line);
+			if fit.drifts() {
+				app_log!("{}", fit.drift_line(id));
+			}
+			if fit.style_drifts() {
+				app_log!("{}", fit.style_drift_line(id));
+			}
+			self.fits_logged.insert(id.to_string(), line);
+		}
+		self.fits_seen.insert(id.to_string(), fit);
+	}
+
+	/// Closes the frame's `TEXT_FIT`s; returns the ids drawn last frame but
+	/// not this one.
+	pub(crate) fn end_text_fits(&mut self) -> Vec<String> {
+		let mut gone: Vec<String> = self
+			.fits_shown
+			.keys()
+			.filter(|k| !self.fits_seen.contains_key(*k))
+			.cloned()
+			.collect();
+		gone.sort();
+		for id in &gone {
+			self.fits_logged.remove(id);
+		}
+		self.fits_shown = std::mem::take(&mut self.fits_seen);
+		gone
 	}
 
 	/// Test only: records a control drawn this frame; true when new or moved.
@@ -319,7 +372,11 @@ impl ProbeFrame {
 
 	#[cfg(test)]
 	fn tracked(&self) -> usize {
-		self.shown.len() + self.seen.len()
+		self.shown.len()
+			+ self.seen.len()
+			+ self.fits_shown.len()
+			+ self.fits_seen.len()
+			+ self.fits_logged.len()
 	}
 }
 
@@ -361,6 +418,47 @@ impl Probes {
 		self.0.borrow_mut().end_frame_with_audit(viewport_w)
 	}
 
+	/// Test only: what the probe saw of the text `id` (a `text-fit:...` id).
+	#[cfg(test)]
+	pub(crate) fn text_fit(&self, id: &str) -> Option<fit::TextFit> {
+		self.0.borrow().known_fit(id)
+	}
+
+	/// Test only: every text drawn in the latest frame, by id.
+	#[cfg(test)]
+	pub(crate) fn text_fits(&self) -> Vec<(String, fit::TextFit)> {
+		let f = self.0.borrow();
+		let latest = if f.fits_seen.is_empty() {
+			&f.fits_shown
+		} else {
+			&f.fits_seen
+		};
+		let mut all: Vec<_> =
+			latest.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+		all.sort_by(|a, b| a.0.cmp(&b.0));
+		all
+	}
+
+	/// Test only: the ids whose box differs from the width the solver gave.
+	#[cfg(test)]
+	pub(crate) fn text_fit_drift(&self) -> Vec<String> {
+		self.text_fits()
+			.into_iter()
+			.filter(|(_, f)| f.drifts() || f.style_drifts())
+			.map(|(id, _)| id)
+			.collect()
+	}
+
+	/// Test only: the ids of the latest frame an ancestor clips.
+	#[cfg(test)]
+	pub(crate) fn text_fit_clipped(&self) -> Vec<String> {
+		self.text_fits()
+			.into_iter()
+			.filter(|(_, f)| f.clipped)
+			.map(|(id, _)| id)
+			.collect()
+	}
+
 	pub fn from_env() -> Option<Self> {
 		crate::e2e_on().then(|| Self(Rc::default()))
 	}
@@ -400,14 +498,7 @@ pub fn probe(
 				};
 				if frame.borrow_mut().probe(&id, v) {
 					if let Some(v) = v {
-						app_log!(
-							"[APP:CTRL_BOUNDS: id={} x={} y={} w={} h={}]",
-							id,
-							v[0],
-							v[1],
-							v[2],
-							v[3]
-						);
+						app_log!("{}", probe_line::bounds(&id, v));
 					}
 				}
 			},
@@ -435,10 +526,13 @@ pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 							window.viewport_size().width,
 						));
 					for id in gone {
-						app_log!("[APP:CTRL_GONE: id={}]", id);
+						app_log!("{}", probe_line::gone(&id));
+					}
+					for id in frame.borrow_mut().end_text_fits() {
+						app_log!("{}", probe_line::text_fit_gone(&id));
 					}
 					for (id, by) in covered {
-						app_log!("[APP:CTRL_COVERED: id={} by={}]", id, by);
+						app_log!("{}", probe_line::covered(&id, &by));
 					}
 				},
 				|_, _, _, _| {},
@@ -449,6 +543,77 @@ pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 		.with_priority(usize::MAX)
 		.into_any_element(),
 	)
+}
+
+/// Asks for another frame when this one was laid out with a width that is
+/// not the one the window measured, at most three times for each new width
+/// (`budget` counts them; the caller resets it when the width changes).
+/// `Window::refresh` does nothing while a frame is drawing, so the call waits
+/// for the end of the frame.
+pub(crate) fn refresh_if_stale(
+	stale: bool,
+	budget: &Rc<std::cell::Cell<u8>>,
+	window: &mut Window,
+	cx: &mut App,
+) {
+	if !stale {
+		budget.set(0);
+		return;
+	}
+	let used = budget.get();
+	if used >= 3 {
+		return;
+	}
+	budget.set(used + 1);
+	let handle = window.window_handle();
+	cx.defer(move |cx| {
+		let _ = handle.update(cx, |_, w, _| w.refresh());
+	});
+}
+
+/// A width a frame was laid out with, against the width it was drawn at: the
+/// layout reads last frame's measurement, so a window that was resized draws
+/// one frame with the old width. When the two differ the canvas asks for
+/// another frame ([`refresh_if_stale`]).
+#[derive(Clone, Default)]
+pub(crate) struct StaleWidth {
+	used: Rc<std::cell::Cell<f32>>,
+	measured: Rc<std::cell::Cell<f32>>,
+	budget: Rc<std::cell::Cell<u8>>,
+}
+
+impl StaleWidth {
+	/// The width this frame is laid out with.
+	pub(crate) fn used(&self, w: f32) {
+		self.used.set(w);
+	}
+
+	/// A canvas the size of its (relative) parent, to measure it with.
+	pub(crate) fn canvas(&self) -> impl IntoElement {
+		let (used, measured, budget) = (
+			self.used.clone(),
+			self.measured.clone(),
+			self.budget.clone(),
+		);
+		canvas(
+			move |b, window, cx| {
+				let w = f32::from(b.size.width);
+				// A new width is new input: allow fresh refreshes.
+				if (measured.replace(w) - w).abs() > 0.5 {
+					budget.set(0);
+				}
+				refresh_if_stale(
+					(w - used.get()).abs() > 0.5,
+					&budget,
+					window,
+					cx,
+				);
+			},
+			|_, _, _, _| {},
+		)
+		.absolute()
+		.size_full()
+	}
 }
 
 // ───────────────────────── small building blocks ─────────────────────────
@@ -482,9 +647,16 @@ struct Tip(Rc<dyn Fn(&App) -> SharedString>);
 impl Render for Tip {
 	fn render(
 		&mut self,
-		_: &mut Window,
+		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		// A floating layer is open in this window: a tooltip would land on
+		// it or on the controls under it. Asked here, on every frame the
+		// tooltip is shown, so one that is already up goes when a layer
+		// opens, and no control has to remember to ask.
+		if crate::overlay::tooltips_suppressed(window, cx) {
+			return div();
+		}
 		let text = (self.0)(cx);
 		if text.is_empty() {
 			// The thing it described is gone: no empty box.
@@ -509,22 +681,29 @@ impl Render for Tip {
 	}
 }
 
-pub(crate) fn tip(
-	text: impl Into<SharedString>,
-) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-	let text = text.into();
-	live_tip(move |_| text.clone())
+/// The one way to give an element a tooltip (`clippy.toml` refuses
+/// `.tooltip(`): every tooltip then asks the window's tooltip gate as it is
+/// drawn.
+pub(crate) trait TipExt: StatefulInteractiveElement + Sized {
+	/// A tooltip of fixed text.
+	fn tip(self, text: impl Into<SharedString>) -> Self {
+		let text = text.into();
+		self.live_tip(move |_| text.clone())
+	}
+
+	/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
+	/// shown tooltip's view while the mouse stays, so text fixed when it
+	/// opened goes stale when, say, a tab switch changes the language under
+	/// it.
+	fn live_tip(self, text: impl Fn(&App) -> SharedString + 'static) -> Self {
+		let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
+		#[allow(clippy::disallowed_methods)] // the one place
+		let this = self.tooltip(move |_, cx| cx.new(|_| Tip(text.clone())).into());
+		this
+	}
 }
 
-/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
-/// shown tooltip's view while the mouse stays, so text fixed when it opened
-/// goes stale when, say, a tab switch changes the language under it.
-pub(crate) fn live_tip(
-	text: impl Fn(&App) -> SharedString + 'static,
-) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-	let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
-	move |_, cx| cx.new(|_| Tip(text.clone())).into()
-}
+impl<T: StatefulInteractiveElement> TipExt for T {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Btn {
@@ -693,7 +872,7 @@ fn icon_button(
 		.rounded(px(4.))
 		.border_1()
 		.border_color(transparent_black())
-		.tooltip(tip(tooltip))
+		.tip(tooltip)
 		.when(enabled, |d| {
 			d.cursor_pointer()
 				.tab_index(tab)
@@ -1570,6 +1749,14 @@ impl Render for WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		// A closed layer's keyboard target first; a focus asked for in the
+		// same turn wins over it.
+		self.apply_pending_return(window, cx);
+		// The window's tooltip rule for this frame: tooltips ask it as they
+		// are drawn, after this tab (and the tab bar above it) rendered.
+		self.publish_gate(window, cx);
+		// Triggers are written again as this frame draws them.
+		self.overlays.clear_trigger_slots();
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}
@@ -1591,13 +1778,11 @@ impl Render for WorkbenchModel {
 					cx.notify();
 				}));
 		}
-		// One rule: while a popover is open, a bare Escape closes it first,
-		// whatever has the focus (a pane list, the reader, a text field, the
-		// find bar, the paste panel, a context menu). Each of those binds its
-		// own Escape action in a deeper key context, and actions run before
-		// any key-down listener, so only a keystroke interceptor, which runs
-		// ahead of both, can take the key for the root. It deliberately
-		// takes Escape ahead of an IME composition while a popover is open.
+		// One rule for a bare Escape (`WorkbenchModel::on_escape`): whatever
+		// has the focus, the open floating layer closes first. No pane or
+		// field binds Escape itself: actions run before any key-down
+		// listener, so only a keystroke interceptor, which runs ahead of
+		// both, can take the key for the root. An IME composition keeps it.
 		if self.escape_guard.is_none() {
 			let me = cx.weak_entity();
 			let win = window.window_handle().window_id();
@@ -1609,10 +1794,10 @@ impl Render for WorkbenchModel {
 					{
 						return;
 					}
-					let closed = me
-						.update(cx, |this, cx| this.close_open_popovers(cx))
+					let taken = me
+						.update(cx, |this, cx| this.on_escape(window, cx))
 						.unwrap_or(false);
-					if closed {
+					if taken {
 						cx.stop_propagation();
 					}
 				}));
@@ -1636,7 +1821,7 @@ impl Render for WorkbenchModel {
 			app_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);
 		}
 		// A context menu keeps its list looking focused while it is open.
-		let menu_origin = self.chrome.menu.as_ref().map(|m| m.origin);
+		let menu_origin = self.overlays.context_menu().map(|m| m.origin);
 		self.left_active = self.tree_focus.is_focused(window)
 			|| menu_origin == Some(crate::menu::MenuOrigin::Left);
 		self.log_active = self.log_focus.is_focused(window)
@@ -1684,9 +1869,6 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &ApplyPaste, _, cx| {
 				this.apply_paste_restore(cx)
-			}))
-			.on_action(cx.listener(|this, _: &CancelPaste, _, cx| {
-				this.cancel_paste_preview(cx)
 			}))
 			.on_action(
 				cx.listener(|this, _: &Refresh, _, cx| this.reload_repos(cx)),
@@ -1757,9 +1939,6 @@ impl Render for WorkbenchModel {
 			})
 			.on_action(cx.listener(|this, _: &crate::HideToolWindow, w, cx| {
 				this.hide_active_tool(w, cx)
-			}))
-			.on_action(cx.listener(|this, _: &crate::FocusEditor, w, cx| {
-				this.escape_to_editor(w, cx)
 			}))
 			.on_action(cx.listener(|this, _: &crate::LogParent, _, cx| {
 				this.log_go(true, cx)
@@ -1905,7 +2084,6 @@ impl Render for WorkbenchModel {
 									.child(center),
 							)
 							.when(self.bottom_visible, |d| {
-								self.measure_log_chips(window);
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(
 										self.render_log(bottom_h, window, cx),
@@ -2059,6 +2237,69 @@ mod tests {
 			f.end_frame();
 			assert!(f.tracked() <= 3, "bookkeeping grew to {}", f.tracked());
 		}
+	}
+
+	fn a_fit() -> fit::TextFit {
+		fit::TextFit {
+			role: fit::FitRole::Subject,
+			style: fit::FitRole::Subject.style(),
+			style_drift: None,
+			text: "x".into(),
+			key_graphemes: 0,
+			natural: 10.,
+			floor: 5.,
+			fit: Some(10.),
+			x: 0.,
+			drawn: 10.,
+			visible: 10.,
+			clipped: false,
+			cut: false,
+			shown: 1,
+			total: 1,
+		}
+	}
+
+	#[test]
+	fn text_fit_bookkeeping_is_bounded_by_one_frame() {
+		let mut f = ProbeFrame::default();
+		for frame in 0..1000 {
+			for row in 0..3 {
+				f.record_fit(
+					&format!("text-fit:row:{frame}/{row}:subject"),
+					a_fit(),
+				);
+			}
+			let gone = f.end_text_fits();
+			let want: Vec<String> = if frame == 0 {
+				vec![]
+			} else {
+				(0..3)
+					.map(|row| {
+						format!("text-fit:row:{}/{row}:subject", frame - 1)
+					})
+					.collect()
+			};
+			assert_eq!(gone, want);
+			assert!(f.tracked() <= 6, "bookkeeping grew to {}", f.tracked());
+		}
+	}
+
+	#[test]
+	fn a_text_fit_prints_only_when_it_changes() {
+		let mut f = ProbeFrame::default();
+		let id = "text-fit:row:a:subject";
+		f.record_fit(id, a_fit());
+		let line = f.fits_logged.get(id).cloned().unwrap();
+		assert!(line.contains("rule=readable6") && line.contains("fit=10"));
+		f.end_text_fits();
+		// The same text again: the line stays the one printed.
+		f.record_fit(id, a_fit());
+		assert_eq!(f.fits_logged.get(id), Some(&line));
+		let mut cut = a_fit();
+		cut.drawn = 7.;
+		assert!(cut.drifts());
+		f.record_fit(id, cut);
+		assert_ne!(f.fits_logged.get(id), Some(&line));
 	}
 
 	#[test]

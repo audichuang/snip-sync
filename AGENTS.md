@@ -14,6 +14,10 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - The CLI and the desktop app are front ends over the same `snip-core` `transfer` functions and `snip_remote` stores (`docs/spec.md` §5.2 lists them). A copy, paste or pairing fix goes there, never into one surface: while the CLI ran its own engine, every safety fix reached only the GUI.
 - `copy::collect_copy_files` and `gitsrc::collect_payload` survive only as byte-parity test oracles. Product code must not call them, and a bug fix does not go there.
 
+## Desktop layers
+
+- Menus, selectors, the find bar and the add-repo field are layers owned by `overlay::OverlayStack` (`docs/adr/0004-overlay-layers-have-one-owner.md`). Escape, exclusion, focus return, tab switches and tooltips are decided there: a pane does not bind Escape, add a flag for its own popup, or call `.tooltip(` or `on_mouse_down_out` (`clippy.toml` refuses the last two; use `TipExt::tip` and `overlay_panel`).
+
 ## Branches and releases
 
 - `main` holds released code only. Every change gets a `feature/<name>` or `fix/<name>` branch cut from `develop`, with its PR targeting `develop`, and is squash-merged.

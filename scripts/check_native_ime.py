@@ -48,10 +48,12 @@ REQUIRED_TOOLS = (
     "xclip",
     "git",
 )
-BOUNDS_RE = re.compile(
-    r"\[APP:CTRL_BOUNDS: id=(?P<id>.+?) x=(?P<x>-?\d+) y=(?P<y>-?\d+) "
-    r"w=(?P<w>\d+) h=(?P<h>\d+)\]"
-)
+# The id of a CTRL_* line can hold any character; `id=` is the last field of the line and the id runs
+# to its closing `]`, read by the same patterns as every other harness (see bench_native_memory.py).
+try:
+    from bench_native_memory import BOUNDS_RE, CTRL_GONE_RE, bounds_id
+except ImportError:  # imported as scripts.check_native_ime
+    from scripts.bench_native_memory import BOUNDS_RE, CTRL_GONE_RE, bounds_id
 
 
 class ImeCheckError(Exception):
@@ -89,9 +91,9 @@ def parse_bounds(lines: list[str]) -> dict[str, tuple[int, int, int, int]]:
                 int(match["h"]),
             )
             continue
-        gone = re.search(r"\[APP:CTRL_GONE: id=(.+?)\]", line)
+        gone = CTRL_GONE_RE.search(line)
         if gone:
-            out.pop(gone[1], None)
+            out.pop(gone["id"], None)
     return out
 
 
@@ -689,7 +691,7 @@ class Session:
         self.wait_line(lambda line: "[APP:WINDOW_READY]" in line, timeout=40)
         self.wait_line(lambda line: "[APP:REPO_LOADED:" in line, timeout=30)
         self.wait_line(lambda line: "[APP:GRAPH_LOADED:" in line, timeout=20)
-        self.wait_line(lambda line: "id=log-search-input " in line, timeout=15)
+        self.wait_line(lambda line: bounds_id(line) == "log-search-input", timeout=15)
 
     def x(self, *args: str, timeout: float = 25, check: bool = True) -> subprocess.CompletedProcess:
         display = self.env.get("DISPLAY")

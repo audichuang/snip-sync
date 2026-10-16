@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use snip_core::gitrun::CancelToken;
 
+use super::dest::DestFolder;
 use super::*;
 use crate::i18n::Msg;
 use crate::reader::Preview;
@@ -28,6 +29,14 @@ pub struct PastePreview {
 	log_before: Option<bool>,
 	/// Test-only delay before a confirmed write (E2E only).
 	apply_delay: Option<std::time::Duration>,
+	/// The destination folder as the user picked it. Survives a loading,
+	/// refused or retargeting plan; reset by `clear`.
+	folder: Option<DestFolder>,
+	/// Why the last destination gesture of the bar (breadcrumb, chip, menu,
+	/// dialog) named a folder the workspace cannot take. The open plan was
+	/// left as it was; the bar says why until the destination moves or the
+	/// user types.
+	dest_refusal: Option<Msg>,
 }
 
 #[derive(Debug)]
@@ -46,6 +55,9 @@ pub enum Landed {
 	/// Invariant: whenever `Landed::Shown` is produced, `self.plan` is guaranteed to be `Some`.
 	Shown {
 		remap: Option<Remap>,
+		/// The plan answers a destination change, not a first preview or a
+		/// mapping choice.
+		retargeted: bool,
 	},
 	Refused {
 		err: Msg,
@@ -126,7 +138,41 @@ impl PastePreview {
 			scroll: gpui::UniformListScrollHandle::new(),
 			log_before: None,
 			apply_delay,
+			folder: None,
+			dest_refusal: None,
 		}
+	}
+
+	/// The destination folder the user picked for this preview.
+	pub fn folder(&self) -> Option<&DestFolder> {
+		self.folder.as_ref()
+	}
+
+	/// Records the destination folder. Set after `clear`, which resets it.
+	pub fn set_folder(&mut self, folder: DestFolder) {
+		self.folder = Some(folder);
+		self.dest_refusal = None;
+	}
+
+	/// The refusal the destination bar still shows.
+	pub fn dest_refusal(&self) -> Option<&Msg> {
+		self.dest_refusal.as_ref()
+	}
+
+	pub fn set_dest_refusal(&mut self, refusal: Option<Msg>) {
+		self.dest_refusal = refusal;
+	}
+
+	/// Names the open plan's payload, so an answer that arrives later (the
+	/// OS folder dialog) can tell whether it is still the same paste.
+	pub fn payload_token(&self) -> Option<std::sync::Weak<str>> {
+		self.plan.as_ref().map(|p| p.payload_token())
+	}
+
+	/// The session holds no plan any more (dropped by the budget).
+	fn forget_destination(&mut self) {
+		self.folder = None;
+		self.dest_refusal = None;
 	}
 
 	pub fn plan(&self) -> Option<&PastePreviewPlan> {
@@ -137,6 +183,13 @@ impl PastePreview {
 	#[cfg(test)]
 	pub fn plan_mut(&mut self) -> Option<&mut PastePreviewPlan> {
 		self.plan.as_mut()
+	}
+
+	/// A test holds retained bytes the way a running apply does, so a
+	/// refusal needs neither a worker nor a clock to race.
+	#[cfg(test)]
+	pub fn hold_retained_for_test(&self, bytes: usize) {
+		lock_pending(&self.pending).apply_active = bytes;
 	}
 
 	pub fn detail(&self) -> Option<&Preview> {
@@ -203,6 +256,7 @@ impl PastePreview {
 	pub fn clear(&mut self, ordinary: Option<&Preview>) {
 		self.plan = None;
 		self.detail = None;
+		self.forget_destination();
 		release(&mut lock_pending(&self.pending), ordinary, None, None);
 	}
 
@@ -255,6 +309,7 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Landed {
 		let remap = outcome.remap;
+		let retargeted = outcome.retargeted;
 		let built = outcome.result.and_then(|mut plan| {
 			// Folds and the folder cursor survive a remap only where the
 			// folder is still there.
@@ -268,7 +323,7 @@ impl PastePreview {
 				self.plan = Some(plan);
 				self.detail = detail;
 				self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				Landed::Shown { remap }
+				Landed::Shown { remap, retargeted }
 			}
 			Err(err) => {
 				if pending
@@ -281,6 +336,7 @@ impl PastePreview {
 				{
 					self.plan = None;
 					self.detail = None;
+					self.forget_destination();
 					release(pending, ordinary, None, None);
 				}
 				Landed::Refused {
@@ -429,6 +485,7 @@ impl PastePreview {
 		};
 		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
 			self.plan = None;
+			self.forget_destination();
 			release(&mut pending, ordinary, None, None);
 			return Remapped::Dropped(err);
 		}
@@ -446,6 +503,37 @@ impl PastePreview {
 		self.replan(ordinary, |plan| {
 			plan.choose_adjust_paths(on)?;
 			Ok(Remap::AdjustPaths(on))
+		})
+	}
+
+	/// Moves the open preview to `dest`: the same payload planned again
+	/// there. The shell is disarmed first, so neither Apply nor a second
+	/// gesture can act on what was planned for the old folder.
+	pub fn retarget(
+		&mut self,
+		dest: PathBuf,
+		roots: Vec<PathBuf>,
+		generation: u64,
+		ordinary: Option<&Preview>,
+	) -> Remapped {
+		self.invalidate_job();
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		let Some(plan) = self.plan.as_mut() else {
+			return Remapped::NoPlan;
+		};
+		plan.disarm_for(dest.clone());
+		self.detail = None;
+		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
+			self.plan = None;
+			self.forget_destination();
+			release(&mut pending, ordinary, None, None);
+			return Remapped::Dropped(err);
+		}
+		Remapped::Ready(PasteRequest::Retarget {
+			dest,
+			roots,
+			generation,
 		})
 	}
 
@@ -730,6 +818,227 @@ mod tests {
 			false,
 			Language::Plain,
 		)
+	}
+
+	/// One commit adding `a.txt`, for the replay tests of a retarget.
+	fn commit_text() -> String {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "add a".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "a.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("A\n".into()),
+					not_copied: None,
+				}],
+			}],
+		})
+	}
+
+	/// Runs the retarget job `request` asks for, as the model does.
+	fn run_retarget(session: &mut PastePreview, request: PasteRequest) {
+		session.enqueue(request).unwrap();
+		let (work, cancel) = session.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		session.bind_job(1, cancel);
+	}
+
+	/// Between the gesture and the new plan nothing planned for the old
+	/// folder can be applied, a replayed commit included (#238).
+	#[test]
+	fn retarget_disarms_the_shell_before_the_job_runs() {
+		let dir = tempfile::tempdir().unwrap();
+		let other = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		for text in ["// FILE: a.txt\nA\n".to_string(), commit_text()] {
+			let mut session = landed(&text, dir.path(), None);
+			assert!(session.plan().unwrap().executable());
+			let Remapped::Ready(request) =
+				session.retarget(other.path().into(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			let plan = session.plan().unwrap();
+			assert_eq!(plan.destination, other.path());
+			assert!(!plan.executable());
+			assert!(plan.items.is_empty());
+			assert!(plan.commit_preview.is_none());
+			assert_eq!(
+				session.begin_apply().err(),
+				Some(ApplyRefused::NotExecutable)
+			);
+			session.enqueue(request).unwrap();
+			assert_eq!(
+				session.begin_apply().err(),
+				Some(ApplyRefused::Loading)
+			);
+		}
+	}
+
+	/// A folder the engine cannot use lands as a shell with the engine's own
+	/// words, not as a refused job; only the memory budget refuses (#238).
+	#[test]
+	fn retarget_to_a_missing_folder_lands_a_shell_with_the_engine_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let plain = tempfile::tempdir().unwrap();
+		git_init(dir.path());
+		let missing = dir.path().join("missing");
+		for (text, to) in [
+			("// FILE: a.txt\nA\n".to_string(), missing.clone()),
+			// A replay has no repository in a plain folder.
+			(commit_text(), plain.path().to_path_buf()),
+		] {
+			let mut session = landed(&text, dir.path(), None);
+			let Remapped::Ready(request) =
+				session.retarget(to.clone(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			run_retarget(&mut session, request);
+			let Polled::Settled {
+				landed: Some(Landed::Shown { retargeted, .. }),
+				..
+			} = session.poll(false, None)
+			else {
+				panic!("the shell lands");
+			};
+			assert!(retargeted);
+			let plan = session.plan().unwrap();
+			assert_eq!(plan.destination, to);
+			assert!(!plan.executable());
+			assert!(plan.error.is_some(), "the refusal is the plan's error");
+		}
+		let missing_key = {
+			let mut session = landed("// FILE: a.txt\nA\n", dir.path(), None);
+			let Remapped::Ready(request) =
+				session.retarget(missing.clone(), Vec::new(), 2, None)
+			else {
+				panic!("a plan is open");
+			};
+			run_retarget(&mut session, request);
+			session.poll(false, None);
+			session.plan().unwrap().error.as_ref().unwrap().key
+		};
+		assert_eq!(missing_key, "paste_err_destination");
+
+		// The budget still refuses.
+		let mut shell = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: a.txt\nA\n",
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		shell.disarm_for(dir.path().into());
+		let err = shell
+			.retarget_with(dir.path(), &[], 2, &RunOptions::default(), 5)
+			.expect_err("over the budget");
+		assert_eq!(err.key, "preview_memory_limit");
+	}
+
+	/// The engine suggests dropping `sub/` for a folder named `sub`, then
+	/// refuses the plan as it stands (a regular file `sub` is where the
+	/// directory `sub/` would go). The refusal lands with the suggestion:
+	/// [Adjust paths] is what recovers, and it plans (#240).
+	#[test]
+	fn a_retarget_the_engine_refuses_keeps_the_restore_base_hint() {
+		let ws = tempfile::tempdir().unwrap();
+		let first = ws.path().join("first");
+		let sub = ws.path().join("sub");
+		for dir in [&first, &sub] {
+			std::fs::create_dir(dir).unwrap();
+			git_init(dir);
+		}
+		std::fs::write(sub.join("sub"), "a file named like the folder")
+			.unwrap();
+		let payload = "// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+		let mut session = landed(payload, &first, None);
+		assert!(session.plan().unwrap().executable());
+		let Remapped::Ready(request) =
+			session.retarget(sub.clone(), Vec::new(), 2, None)
+		else {
+			panic!("a plan is open");
+		};
+		run_retarget(&mut session, request);
+		let Polled::Settled {
+			landed: Some(Landed::Shown { retargeted, .. }),
+			..
+		} = session.poll(false, None)
+		else {
+			panic!("the refusal lands as a shell");
+		};
+		assert!(retargeted);
+		let plan = session.plan().unwrap();
+		assert_eq!(plan.destination, sub);
+		assert!(!plan.executable());
+		assert!(plan.error.is_some(), "the engine's refusal");
+		assert!(
+			plan.restore_hint().is_some(),
+			"the suggestion that recovers was thrown away with the plan"
+		);
+		let Remapped::Ready(request) = session.adjust_paths(true, None) else {
+			panic!("the hint is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		assert!(matches!(
+			session.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+		let plan = session.plan().unwrap();
+		assert!(plan.executable(), "{:?}", plan.error);
+		assert_eq!(
+			plan.items
+				.iter()
+				.map(|i| i.path.as_str())
+				.collect::<Vec<_>>(),
+			["a.ts"]
+		);
+	}
+
+	/// The other way round: the adjusted plan is the one the engine refuses
+	/// (a directory `a.ts` stands where the file goes). The refusal keeps the
+	/// suggestion, so [Use as-is] still undoes the adjustment (#240).
+	#[test]
+	fn an_adjustment_the_engine_refuses_keeps_the_restore_base_hint() {
+		let ws = tempfile::tempdir().unwrap();
+		let sub = ws.path().join("sub");
+		std::fs::create_dir(&sub).unwrap();
+		git_init(&sub);
+		std::fs::create_dir(sub.join("a.ts")).unwrap();
+		std::fs::write(sub.join("a.ts").join("kept"), "x").unwrap();
+		let payload = "// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+		let mut session = landed(payload, &sub, None);
+		assert!(session.plan().unwrap().restore_hint().is_some());
+		let Remapped::Ready(request) = session.adjust_paths(true, None) else {
+			panic!("the hint is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		session.poll(false, None);
+		let plan = session.plan().unwrap();
+		assert!(plan.adjust_paths);
+		assert!(!plan.executable(), "the adjusted plan is refused");
+		assert!(plan.error.is_some());
+		assert!(
+			plan.restore_hint().is_some(),
+			"the refusal threw the hint away: no [Use as-is]"
+		);
+		let Remapped::Ready(request) = session.adjust_paths(false, None) else {
+			panic!("[Use as-is] is there to be taken");
+		};
+		run_retarget(&mut session, request);
+		session.poll(false, None);
+		let plan = session.plan().unwrap();
+		assert!(plan.executable(), "{:?}", plan.error);
 	}
 
 	#[test]
@@ -1649,7 +1958,8 @@ mod tests {
 			s.poll(false, None),
 			Polled::Settled {
 				landed: Some(Landed::Shown {
-					remap: Some(Remap::AdjustPaths(true))
+					remap: Some(Remap::AdjustPaths(true)),
+					retargeted: false,
 				}),
 				..
 			}

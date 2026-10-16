@@ -27,7 +27,7 @@ use crate::i18n::{t, Locale, Msg};
 use crate::icons::{icon_tinted, Icon};
 use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
-use crate::ui::{clip_text, live_tip, probe, probe_frame_end, Probes};
+use crate::ui::{clip_text, probe, probe_frame_end, Probes, TipExt};
 use crate::{
 	lifecycle, CloseWorkspace, NextWorkspaceTab, OpenWorkspace,
 	PrevWorkspaceTab, Quit, WorkbenchModel, WorkspaceTab1, WorkspaceTab2,
@@ -74,8 +74,11 @@ pub(crate) fn with_log_tab<R>(tab: Option<u32>, f: impl FnOnce() -> R) -> R {
 	out
 }
 
-/// A `[APP:…]` line printed by a background tab carries ` ws_tab=<id>`
-/// inside its brackets; lines of the shown tab and of the root are left
+/// A `[APP:…]` line printed by a background tab carries `ws_tab=<id>` as
+/// the first field after `KIND: ` (`[APP:KIND: ws_tab=<id> <fields>]`, and
+/// `[APP:KIND: ws_tab=<id>]` for a line without fields). One rule for every
+/// line: what a line ends in (a folder named `... ws_tab=2`, a free-text id)
+/// never passes for the tag. Lines of the shown tab and of the root are left
 /// byte for byte as a one-tab script expects them.
 pub(crate) fn tag_line(line: String) -> String {
 	let Some(tab) = LOG_TAB.with(Cell::get) else {
@@ -88,14 +91,27 @@ pub(crate) fn tag_line(line: String) -> String {
 }
 
 fn tag_with(line: String, tab: u32) -> String {
-	if !line.starts_with("[APP:") || !line.ends_with(']') {
+	let Some(rest) = line.strip_prefix("[APP:") else {
+		return line;
+	};
+	if !line.ends_with(']') {
 		return line;
 	}
-	let body = &line[..line.len() - 1];
-	if body.contains(": ") {
-		format!("{body} ws_tab={tab}]")
-	} else {
-		format!("{body}: ws_tab={tab}]")
+	let kind_len = rest
+		.find(|c: char| {
+			!(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+		})
+		.unwrap_or(rest.len());
+	if kind_len == 0 {
+		return line;
+	}
+	let (kind, after) = rest.split_at(kind_len);
+	match after {
+		"]" => format!("[APP:{kind}: ws_tab={tab}]"),
+		_ => match after.strip_prefix(": ") {
+			Some(fields) => format!("[APP:{kind}: ws_tab={tab} {fields}"),
+			None => line,
+		},
 	}
 }
 
@@ -404,7 +420,7 @@ impl TabsRoot {
 						if let Some(ix) = root.find(&identity, cx) {
 							ix
 						} else {
-							root.add_tab(Some(path), false, window, cx)
+							root.add_tab(Some(path), window, cx)
 						}
 					}
 					SavedTab::Remote { host, path } => {
@@ -415,7 +431,7 @@ impl TabsRoot {
 						if let Some(ix) = root.find(&identity, cx) {
 							ix
 						} else {
-							let ix = root.add_tab(None, false, window, cx);
+							let ix = root.add_tab(None, window, cx);
 							let tab = &root.tabs[ix];
 							with_log_tab(Some(tab.id), || {
 								tab.model.update(cx, |m, cx| {
@@ -444,14 +460,14 @@ impl TabsRoot {
 				let identity = WsIdentity::Local(path.clone());
 				Some(match root.find(&identity, cx) {
 					Some(ix) => ix,
-					None => root.add_tab(Some(path), false, window, cx),
+					None => root.add_tab(Some(path), window, cx),
 				})
 			}
 			FirstTab::Empty => None,
 		};
 		let ix = match launch_tab.or(shown) {
 			Some(ix) => ix,
-			None => root.add_tab(None, false, window, cx),
+			None => root.add_tab(None, window, cx),
 		};
 		if restoring && crate::e2e_on() {
 			root_log!(
@@ -563,7 +579,6 @@ impl TabsRoot {
 	fn add_tab(
 		&mut self,
 		workspace: Option<PathBuf>,
-		menu_open: bool,
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) -> usize {
@@ -581,7 +596,6 @@ impl TabsRoot {
 				let mut m = WorkbenchModel::new_tab(
 					workspace, None, mode, id, probes, cx,
 				);
-				m.workspace_menu = menu_open;
 				if let Some((b, l, d)) = layout {
 					m.bottom_h = b;
 					m.left_w = l;
@@ -611,8 +625,20 @@ impl TabsRoot {
 	/// The "+" button and Cmd/Ctrl+Shift+O with no tab: an empty tab with
 	/// the workspace menu open.
 	pub fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-		let ix = self.add_tab(None, true, window, cx);
+		let ix = self.add_tab(None, window, cx);
 		self.activate(ix, window, cx);
+		// A floating layer belongs to the tab that is shown: opened once
+		// the new tab is.
+		let model = self.tabs[ix].model.clone();
+		model.update(cx, |m, cx| {
+			m.open_overlay(
+				crate::overlay::OverlayKind::WorkspaceMenu,
+				crate::overlay::ReturnFocus::Root,
+				Some(crate::overlay::TriggerId::Workspace),
+				None,
+				cx,
+			)
+		});
 	}
 
 	pub fn activate(
@@ -634,8 +660,10 @@ impl TabsRoot {
 			return;
 		}
 		if let Some(old) = self.active.and_then(|i| self.tabs.get(i)) {
-			// The tab gets back the pane it had the keyboard in; a field
-			// or a menu it had open does not outlive the switch.
+			// The tab gets back the pane it had the keyboard in; a floating
+			// layer it had open does not outlive the switch, so a keyboard
+			// inside one resumes where the layer would have given it back
+			// (an inline layer, the find bar, stays with the pane).
 			let old_id = old.id;
 			let keep = window.focused(cx).and_then(|f| {
 				let m = old.model.read(cx);
@@ -643,6 +671,7 @@ impl TabsRoot {
 					.into_iter()
 					.find(|pane| pane.contains(&f, window))
 					.cloned()
+					.or_else(|| m.overlays.return_target_for(&f, window))
 			});
 			with_log_tab(Some(old_id), || {
 				old.model.update(cx, |m, cx| m.leave_tab(keep, cx))
@@ -787,7 +816,7 @@ impl TabsRoot {
 		}
 		let ix = match from_ix {
 			Some(f) if self.tabs[f].model.read(cx).is_empty_tab() => f,
-			_ => self.add_tab(None, false, window, cx),
+			_ => self.add_tab(None, window, cx),
 		};
 		self.activate(ix, window, cx);
 		let tab = &self.tabs[ix];
@@ -1004,15 +1033,15 @@ impl TabsRoot {
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().tab_hover_bg)))
 					.child(icon_tinted(Icon::Plus, 16., pal().text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							t("tip_ws_tab_new", loc).into()
-						})
+						}
 					})
 					.debug_selector(|| "ws-tab-new".into())
 					.on_click(cx.listener(|this, _, window, cx| {
@@ -1106,16 +1135,16 @@ impl TabsRoot {
 					.rounded(px(3.))
 					.hover(|s| s.bg(rgb(p.hover_bg)))
 					.child(icon_tinted(Icon::Close, 12., p.text_muted))
-					.tooltip({
+					.live_tip({
 						let root = cx.weak_entity();
-						live_tip(move |cx| {
+						move |cx| {
 							let loc = root
 								.upgrade()
 								.map(|r| r.read(cx).locale(cx))
 								.unwrap_or_default();
 							crate::ui::mac_keys(t("tip_ws_tab_close", loc))
 								.into()
-						})
+						}
 					})
 					.debug_selector(move || close_selector)
 					.on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -1127,13 +1156,13 @@ impl TabsRoot {
 					}))
 					.children(probe(&self.probes, close_id)),
 			)
-			.tooltip({
+			.live_tip({
 				let root = cx.weak_entity();
-				live_tip(move |cx| {
+				move |cx| {
 					root.upgrade()
 						.map(|r| r.read(cx).tab_tip(ix, cx))
 						.unwrap_or_default()
-				})
+				}
 			})
 			.debug_selector(move || selector)
 			.on_mouse_down(
@@ -1384,16 +1413,52 @@ mod tests {
 		assert_eq!(got, ["repo", "sub"]);
 	}
 
+	/// One rule for every line: the tag is the first field after `KIND: `, so
+	/// nothing the line ends in (a folder named `... ws_tab=2`, a free-text
+	/// id) can pass for it.
 	#[test]
-	fn background_lines_are_tagged_inside_the_brackets() {
-		assert_eq!(
-			tag_with("[APP:WORKSPACE: state=open generation=2]".into(), 3),
-			"[APP:WORKSPACE: state=open generation=2 ws_tab=3]"
-		);
-		assert_eq!(
-			tag_with("[APP:PASTE_APPLYING]".into(), 3),
-			"[APP:PASTE_APPLYING: ws_tab=3]"
-		);
+	fn background_lines_are_tagged_right_after_the_kind() {
+		for (line, tagged) in [
+			(
+				"[APP:WORKSPACE: state=open generation=2]",
+				"[APP:WORKSPACE: ws_tab=3 state=open generation=2]",
+			),
+			("[APP:PASTE_APPLYING]", "[APP:PASTE_APPLYING: ws_tab=3]"),
+			(
+				"[APP:WS_TAB_ACTIVE: id=2 ix=1]",
+				"[APP:WS_TAB_ACTIVE: ws_tab=3 id=2 ix=1]",
+			),
+			(
+				"[APP:REPO_SELECTING: 0 (name ws_tab=2) root=/w/name ws_tab=2]",
+				"[APP:REPO_SELECTING: ws_tab=3 0 (name ws_tab=2) root=/w/name ws_tab=2]",
+			),
+			(
+				"[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=report ws_tab=2]",
+				"[APP:CTRL_BOUNDS: ws_tab=3 x=1 y=2 w=3 h=4 id=report ws_tab=2]",
+			),
+			(
+				"[APP:CTRL_GONE: id=a b]",
+				"[APP:CTRL_GONE: ws_tab=3 id=a b]",
+			),
+			(
+				"[APP:CTRL_DUPLICATE: id=x id=y]",
+				"[APP:CTRL_DUPLICATE: ws_tab=3 id=x id=y]",
+			),
+			(
+				"[APP:CTRL_COVERED: by=b%20id=c id=a ws_tab=1]",
+				"[APP:CTRL_COVERED: ws_tab=3 by=b%20id=c id=a ws_tab=1]",
+			),
+			(
+				"[APP:TEXT_FIT_GONE: id=text-fit:a ws_tab=2]",
+				"[APP:TEXT_FIT_GONE: ws_tab=3 id=text-fit:a ws_tab=2]",
+			),
+			(
+				"[APP:TEXT_FIT_DRIFT: fit=1 drawn=2 id=t]",
+				"[APP:TEXT_FIT_DRIFT: ws_tab=3 fit=1 drawn=2 id=t]",
+			),
+		] {
+			assert_eq!(tag_with(line.into(), 3), tagged);
+		}
 		assert_eq!(tag_with("[READY:IDLE]".into(), 3), "[READY:IDLE]");
 	}
 
@@ -1405,7 +1470,7 @@ mod tests {
 		let root = tag_line("[APP:X: a=1]".into());
 		set_active_tab(None);
 		assert_eq!(shown, "[APP:X: a=1]");
-		assert_eq!(hidden, "[APP:X: a=1 ws_tab=2]");
+		assert_eq!(hidden, "[APP:X: ws_tab=2 a=1]");
 		assert_eq!(root, "[APP:X: a=1]");
 	}
 }

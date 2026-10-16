@@ -274,7 +274,9 @@ pub mod lifecycle;
 mod menu;
 mod multi_log;
 pub mod open_tabs;
+mod overlay;
 pub mod paste;
+mod paste_dest;
 mod reader;
 mod reason;
 mod recent;
@@ -327,7 +329,6 @@ actions!(
 		CopySelection,
 		PastePreview,
 		ApplyPaste,
-		CancelPaste,
 		Refresh,
 		NavUp,
 		NavDown,
@@ -359,7 +360,6 @@ actions!(
 		ReaderDown,
 		ReaderPageUp,
 		ReaderPageDown,
-		ReaderClear,
 		TreeUp,
 		TreeDown,
 		TreeExpand,
@@ -380,7 +380,6 @@ actions!(
 		MenuUp,
 		MenuDown,
 		MenuConfirm,
-		MenuCancel,
 		LogParent,
 		LogChild,
 		LogPageUp,
@@ -388,7 +387,6 @@ actions!(
 		ToolPageUp,
 		ToolPageDown,
 		HideToolWindow,
-		FocusEditor,
 		OpenTabMenu,
 		// Workspace tabs.
 		PrevWorkspaceTab,
@@ -738,7 +736,7 @@ impl From<snip_core::gitview::FoundRepo> for RepoEntry {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Popover {
 	Repo,
 	Ref,
@@ -858,9 +856,6 @@ pub struct WorkbenchModel {
 	pub log_on_head: Vec<bool>,
 	/// The filter bar as edited; `log_search` is what the log shows.
 	pub log_filter: LogQuery,
-	pub log_menu: Option<ui::LogMenu>,
-	/// The menu a mouse-down outside it just closed, and when.
-	pub log_menu_dismissed: Option<(ui::LogMenu, std::time::Instant)>,
 	pub log_path_input: Entity<TextInput>,
 	/// The Branch chip's filter field, and its opened sections.
 	pub log_branch_menu_input: Entity<TextInput>,
@@ -881,6 +876,7 @@ pub struct WorkbenchModel {
 	/// The log panel's width at the last layout.
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
 	pub log_filter_layout: ui::LogFilterLayout,
+	pub log_fit: ui::LogFit,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
 	/// The changed-files pane groups by directory (else a flat list).
@@ -890,37 +886,20 @@ pub struct WorkbenchModel {
 	pub commit_rows_cache: std::cell::RefCell<
 		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
 	>,
-	pub commit_details: Option<crate::history::CommitDetails>,
 	/// Details pane height under the changed files once dragged; `None`
 	/// keeps the default share (the files get most of the pane).
 	pub log_details_h: Option<f32>,
 	/// The multi-selection's commit list is open (collapsed by default).
 	pub log_selection_expanded: bool,
-	/// Details of an open multi-selection's commits, newest first.
-	pub selection_details: Vec<crate::history::CommitDetails>,
 	/// Commits whose details list every containing branch read.
 	pub log_branches_all: Vec<String>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
 
-	// Files of the selected commit or compare.
-	pub commit_files: Vec<(String, Option<ChangeType>)>,
-	/// Per file of a multi-selection: index in `log_selected` of the newest
-	/// selected commit that touched it.
-	pub commit_file_origin: Vec<u32>,
-	/// Listed files that are submodule commits (no content to copy).
-	pub commit_file_gitlinks: Vec<String>,
-	/// The listing was cut to `MAX_COMMIT_FILES`.
-	pub commit_files_truncated: bool,
-	/// For the selected merge commit: its files unchanged against the first
-	/// parent (listed only through another parent), keyed by the raw SHA.
-	pub commit_files_first_parent_same:
-		Option<(String, std::collections::HashSet<String>)>,
-	pub selected_commit_file: Option<String>,
-	/// Cmd/Shift multi-selection in the changed files; empty means just
-	/// `selected_commit_file`. Cleared with every change of that one.
-	pub commit_file_sel: Vec<String>,
+	/// Everything shown for the Log selection; replaced whole whenever the
+	/// selection changes (`reset_commit_view`), so no member outlives it.
+	pub commit_view: crate::history::CommitView,
 	pub compare: Option<(String, String)>,
 
 	// Tool windows.
@@ -945,6 +924,11 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
+	/// The selection the shown preview belongs to, held while a file read
+	/// that may replace it is in flight. It follows the shown content, not
+	/// one request: a read that supersedes another keeps it, and it ends only
+	/// when the preview is replaced, cleared or its reads are dropped.
+	held_selection: Option<ShownSelection>,
 	/// The latest preview read came from the Log (commit, compare,
 	/// multi-selection, commit file or commit tree). Only a Project/Changes
 	/// read or `clear_commit_selection` resets it, so it outlives
@@ -956,8 +940,8 @@ pub struct WorkbenchModel {
 	pub goto_input: Entity<TextInput>,
 	pub log_search_input: Entity<TextInput>,
 	pub selector_input: Entity<TextInput>,
-	pub popover: Option<Popover>,
-	pub popover_cursor: usize,
+	/// Every floating and inline layer, and the rules they share.
+	pub(crate) overlays: overlay::OverlayStack,
 
 	/// Project rows stay selected across a tree rebuild (repo switch,
 	/// Refresh): an outgoing tree leaves its selected paths here, by root.
@@ -992,7 +976,6 @@ pub struct WorkbenchModel {
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
 	restore_ws_expanded: Vec<String>,
 	add_cancel: Option<CancelToken>,
-	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
@@ -1024,6 +1007,12 @@ pub struct WorkbenchModel {
 	pub reader_active: bool,
 	pub log_focus: FocusHandle,
 	pub paste_focus: FocusHandle,
+	/// The open floating layer's panel (one is open at a time): a control
+	/// pressed inside it holds the keyboard under this handle, so the
+	/// layer still knows it as its own once it closes (`OverlayStack`).
+	pub panel_focus: FocusHandle,
+	/// The find bar's container, for the same reason and for Escape.
+	pub find_bar_focus: FocusHandle,
 	// Tool window layout; stored sizes survive collapse/restore.
 	pub left_w: f32,
 	pub bottom_h: f32,
@@ -1060,13 +1049,10 @@ pub struct WorkbenchModel {
 	#[cfg(test)]
 	pub(crate) e2e_paste_diff_hold: Option<std::time::Duration>,
 	pub workspace_open: bool,
-	pub workspace_menu: bool,
-	/// Where the workspace menu button was drawn: a press there toggles the
-	/// menu, so the menu's outside-press close must leave it alone.
-	pub workspace_menu_button:
-		std::rc::Rc<std::cell::Cell<Option<Bounds<gpui::Pixels>>>>,
-	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
+	/// The paste panel's typed destination folder. Open or closed is its
+	/// inline layer's (`OverlayKind::PasteDestField`); the text lives here.
+	pub paste_dest_input: Entity<TextInput>,
 	/// Remembered workspaces, newest first.
 	pub recent_workspaces: Vec<PathBuf>,
 	pub lifecycle: lifecycle::Lifecycle,
@@ -1086,8 +1072,6 @@ pub struct WorkbenchModel {
 	pub changes_generation: u64,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
-	/// Repo the shown preview was read from, with `preview_identity`.
-	pub preview_root: Option<(PathBuf, usize)>,
 	/// Repo of the failed preview load when `preview_error` is Some.
 	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1096,8 +1080,6 @@ pub struct WorkbenchModel {
 	pub log_scope_key: Vec<PathBuf>,
 	/// The merged log's per-repository feeds.
 	pub log_feeds: Vec<multi_log::Feed>,
-	/// Repository of the commit or compare the reader shows from the log.
-	pub log_commit_root: Option<PathBuf>,
 	/// A Replace load waited for discovery to reach the picked repositories.
 	pub log_deferred: bool,
 	/// The `generation` of the repo read whose landing reloads the Log: the
@@ -1117,9 +1099,26 @@ pub struct WorkbenchModel {
 
 impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
 
-/// Identity of a shown preview's text, as `reader.rs` compares it.
-pub(crate) fn preview_identity(p: &Preview) -> usize {
-	Arc::as_ptr(&p.text) as *const u8 as usize
+/// Everything a file read takes from the model while it is in flight, so a
+/// refusal by the retained budget can name the still shown preview again.
+/// The commit view goes back whole: the file list and its origins index
+/// `log_selected`, and a compare's list belongs to its endpoints.
+struct ShownSelection {
+	file: Option<String>,
+	source: Option<SourceKind>,
+	root: Option<PathBuf>,
+	commit: Option<String>,
+	view: crate::history::CommitView,
+	log_selected: Vec<String>,
+	range_head: Option<String>,
+	compare: Option<(String, String)>,
+	log_selection_expanded: bool,
+	log_branches_all: Vec<String>,
+	/// Set aside by a read of the commit view's own file list: only the
+	/// file selection (`file`, `source`, `root`, the view's selected file and
+	/// its multi-selection) is held, the rest of the commit state is still
+	/// on the model. `pending_from_log` is the flag that read replaced.
+	commit_file_only: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1251,7 +1250,6 @@ impl WorkbenchModel {
 					let p = input.read(cx).text().trim().to_string();
 					this.add_log_path(p, cx);
 				}
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
 				// The picker filters by the text as it is typed.
 				InputEvent::Changed => cx.notify(),
 				_ => {}
@@ -1261,20 +1259,18 @@ impl WorkbenchModel {
 		let log_branch_menu_input = cx.new(|cx| {
 			TextInput::new(i18n::t("log_branch_placeholder", loc), 0, cx)
 		});
-		cx.subscribe(&log_branch_menu_input, |this, _, ev: &InputEvent, cx| {
-			match ev {
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
-				InputEvent::Changed => cx.notify(),
-				_ => {}
+		cx.subscribe(&log_branch_menu_input, |_, _, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Changed) {
+				cx.notify();
 			}
 		})
 		.detach();
 		let date_input = |key: &'static str, cx: &mut Context<Self>| {
 			let input = cx.new(|cx| TextInput::new(i18n::t(key, loc), 0, cx));
-			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => this.apply_log_date_range(cx),
-				InputEvent::Dismiss => this.dismiss_log_menu(cx),
-				_ => {}
+			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
+					this.apply_log_date_range(cx);
+				}
 			})
 			.detach();
 			input
@@ -1305,32 +1301,22 @@ impl WorkbenchModel {
 				InputEvent::SubmitPrev | InputEvent::Up => {
 					this.find_step(false, cx)
 				}
-				InputEvent::Dismiss => this.close_find(cx),
 			}
 		})
 		.detach();
-		cx.subscribe(
-			&goto_input,
-			|this, input, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => {
-					let q = input.read(cx).text().to_string();
-					this.goto_line(&q, cx);
-					this.pending_focus = Some(this.reader_focus.clone());
-				}
-				InputEvent::Dismiss => this.close_find(cx),
-				_ => {}
-			},
-		)
+		cx.subscribe(&goto_input, |this, input, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Submit) {
+				let q = input.read(cx).text().to_string();
+				this.goto_line(&q, cx);
+				this.pending_focus = Some(this.reader_focus.clone());
+			}
+		})
 		.detach();
 		cx.subscribe(&log_search_input, |this, input, ev: &InputEvent, cx| {
 			match ev {
 				InputEvent::Submit => {
 					let q = input.read(cx).text().trim().to_string();
 					this.start_log_search(q, cx);
-				}
-				InputEvent::Dismiss => {
-					input.update(cx, |i, cx| i.set_text("", cx));
-					this.start_log_search(String::new(), cx);
 				}
 				InputEvent::Changed => {
 					let q = input.read(cx).text().trim().to_string();
@@ -1351,20 +1337,17 @@ impl WorkbenchModel {
 			TextInput::new(i18n::t("add_repo_placeholder", loc), 0, cx)
 		});
 		cx.subscribe(&add_repo_input, |this, input, ev: &InputEvent, cx| {
-			match ev {
-				InputEvent::Submit => {
-					let text = input.read(cx).text().trim().to_string();
-					if !text.is_empty() {
-						this.add_repo_path(PathBuf::from(text), cx);
-						input.update(cx, |i, cx| i.set_text("", cx));
-						this.is_adding_repo = false;
-					}
+			if matches!(ev, InputEvent::Submit) {
+				let text = input.read(cx).text().trim().to_string();
+				if !text.is_empty() {
+					this.add_repo_path(PathBuf::from(text), cx);
+					input.update(cx, |i, cx| i.set_text("", cx));
+					this.close_overlay(
+						overlay::OverlayKind::AddRepoField,
+						overlay::CloseWhy::Picked,
+						cx,
+					);
 				}
-				InputEvent::Dismiss => {
-					this.is_adding_repo = false;
-					cx.notify();
-				}
-				_ => {}
 			}
 		})
 		.detach();
@@ -1374,12 +1357,22 @@ impl WorkbenchModel {
 		});
 		cx.subscribe(
 			&workspace_path_input,
-			|this, input, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => {
+			|this, input, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
 					let text = input.read(cx).text().trim().to_string();
 					this.confirm_open_workspace(&text, cx);
 				}
-				InputEvent::Dismiss => this.close_workspace_menu(cx),
+			},
+		)
+		.detach();
+		let paste_dest_input = cx.new(|cx| {
+			TextInput::new(i18n::t("paste_dest_placeholder", loc), 58, cx)
+		});
+		cx.subscribe(
+			&paste_dest_input,
+			|this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.submit_paste_dest(cx),
+				InputEvent::Changed => this.paste_dest_changed(cx),
 				_ => {}
 			},
 		)
@@ -1387,14 +1380,11 @@ impl WorkbenchModel {
 		let remote_path_input = cx.new(|cx| {
 			TextInput::new(i18n::t("remote_path_placeholder", loc), 71, cx)
 		});
-		cx.subscribe(
-			&remote_path_input,
-			|this, _, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => this.open_remote_typed(cx),
-				InputEvent::Dismiss => this.close_workspace_menu(cx),
-				_ => {}
-			},
-		)
+		cx.subscribe(&remote_path_input, |this, _, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Submit) {
+				this.open_remote_typed(cx);
+			}
+		})
 		.detach();
 		cx.on_release(|this, _| {
 			this.lifecycle.cancel_cancellable();
@@ -1440,8 +1430,6 @@ impl WorkbenchModel {
 			history_autoload: true,
 			log_on_head: Vec::new(),
 			log_filter: LogQuery::default(),
-			log_menu: None,
-			log_menu_dismissed: None,
 			log_path_input,
 			log_branch_menu_input,
 			log_branch_menu_open: Vec::new(),
@@ -1457,24 +1445,17 @@ impl WorkbenchModel {
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
 			log_filter_layout: Default::default(),
+			log_fit: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
-			commit_details: None,
 			log_details_h: None,
 			log_selection_expanded: false,
-			selection_details: Vec::new(),
 			log_branches_all: Vec::new(),
 			details_generation: 0,
 			details_cancel: None,
 			git_user_email: None,
-			commit_files: Vec::new(),
-			commit_file_origin: Vec::new(),
-			commit_file_gitlinks: Vec::new(),
-			commit_files_truncated: false,
-			commit_files_first_parent_same: None,
-			selected_commit_file: None,
-			commit_file_sel: Vec::new(),
+			commit_view: Default::default(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -1490,6 +1471,7 @@ impl WorkbenchModel {
 			selected_list_row: 0,
 			preview: None,
 			preview_loading: false,
+			held_selection: None,
 			preview_pending_from_log: false,
 			preview_error: None,
 			reader: Reader::default(),
@@ -1498,8 +1480,7 @@ impl WorkbenchModel {
 			log_search_input,
 			selector_input,
 			add_repo_input,
-			popover: None,
-			popover_cursor: 0,
+			overlays: overlay::OverlayStack::new(),
 			tree_selections: Vec::new(),
 			history_cancel: None,
 			preview_cancel: None,
@@ -1525,7 +1506,6 @@ impl WorkbenchModel {
 			restore_expanded: Vec::new(),
 			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
-			is_adding_repo: false,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			paste_diff_cancel: None,
 			paste_diff_generation: 0,
@@ -1556,6 +1536,8 @@ impl WorkbenchModel {
 			reader_active: false,
 			log_focus: cx.focus_handle().tab_index(46).tab_stop(true),
 			paste_focus: cx.focus_handle(),
+			panel_focus: cx.focus_handle(),
+			find_bar_focus: cx.focus_handle(),
 			left_w: theme::LEFT_W_DEFAULT,
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
@@ -1578,10 +1560,8 @@ impl WorkbenchModel {
 			#[cfg(test)]
 			e2e_paste_diff_hold: None,
 			workspace_open: workspace.is_some(),
-			workspace_menu: false,
-			workspace_menu_button: Default::default(),
-			workspace_picker: false,
 			workspace_path_input,
+			paste_dest_input,
 			recent_workspaces: recent::load(),
 			lifecycle: lifecycle::Lifecycle::new(1),
 			watch_running: false,
@@ -1595,12 +1575,10 @@ impl WorkbenchModel {
 			changes_generation: 0,
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
-			preview_root: None,
 			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
 			log_feeds: Vec::new(),
-			log_commit_root: None,
 			log_deferred: false,
 			log_reload_for: None,
 			remote: remote::MasterState {
@@ -1620,25 +1598,14 @@ impl WorkbenchModel {
 		model
 	}
 
-	/// The repo the shown preview came from: a log commit's own repo, the
-	/// Changes row's repo, else the open repo.
+	/// The repo the shown text was read from: the preview carries it, so no
+	/// selection or commit view that moves on while a read is in flight
+	/// changes it. A failed read names the repo it was read from; with
+	/// nothing from a repo shown, the open repo.
 	pub fn preview_root(&self) -> Option<PathBuf> {
-		if self.preview.is_none() && self.preview_error.is_some() {
-			if let Some(root) = &self.preview_error_root {
-				return Some(root.clone());
-			}
-		}
-		match (&self.preview_root, &self.preview) {
-			(_, Some(p))
-				if matches!(
-					p.source,
-					PreviewSource::CommitDiff { .. }
-						| PreviewSource::Compare { .. }
-				) =>
-			{
-				self.log_commit_root.clone().or_else(|| self.repo_root())
-			}
-			(Some((root, id)), Some(p)) if *id == preview_identity(p) => {
+		match (&self.preview, &self.preview_error_root) {
+			(Some(p), _) => p.root.clone().or_else(|| self.repo_root()),
+			(None, Some(root)) if self.preview_error.is_some() => {
 				Some(root.clone())
 			}
 			_ => self.repo_root(),
@@ -1652,11 +1619,7 @@ impl WorkbenchModel {
 			return None;
 		}
 		match (&self.preview, &self.preview_error) {
-			(Some(p), _) => self
-				.preview_root
-				.as_ref()
-				.filter(|(_, id)| *id == preview_identity(p))
-				.map(|(root, _)| root.clone()),
+			(Some(p), _) => p.root.clone(),
 			(None, Some(_)) => self.preview_error_root.clone(),
 			(None, None) => None,
 		}
@@ -2170,8 +2133,7 @@ impl WorkbenchModel {
 				p.fingerprint()
 			);
 		}
-		// The caller that read it names its repo again after installing.
-		self.preview_root = None;
+		self.held_selection = None;
 		self.preview_error_root = None;
 		self.preview = Some(p);
 		self.preview_loading = false;
@@ -2183,8 +2145,8 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn clear_preview(&mut self) {
+		self.held_selection = None;
 		self.preview = None;
-		self.preview_root = None;
 		self.preview_error_root = None;
 		self.paste.release_ordinary();
 	}
@@ -2225,6 +2187,7 @@ impl WorkbenchModel {
 			(self.log_since_input.clone(), "log_date_from"),
 			(self.log_until_input.clone(), "log_date_to"),
 			(self.branch_filter_input.clone(), "log_branch_placeholder"),
+			(self.paste_dest_input.clone(), "paste_dest_placeholder"),
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
 		}
@@ -2492,6 +2455,7 @@ impl WorkbenchModel {
 				self.generation = self.generation.wrapping_add(1);
 				self.preview_generation =
 					self.preview_generation.wrapping_add(1);
+				self.held_selection = None;
 				self.history_generation =
 					self.history_generation.wrapping_add(1);
 				self.tree_generation = self.tree_generation.wrapping_add(1);
@@ -2639,6 +2603,7 @@ impl WorkbenchModel {
 	}
 
 	fn release_workspace_state(&mut self, cx: &mut Context<Self>) {
+		self.drop_overlays(overlay::DropScope::All);
 		self.selected_repo_idx = None;
 		self.release_repo_state();
 		self.ws_tree = None;
@@ -2652,11 +2617,13 @@ impl WorkbenchModel {
 		}
 		self.changes_generation = self.changes_generation.wrapping_add(1);
 		self.changes_queue.clear_pending();
-		self.preview_root = None;
 		self.preview_error_root = None;
 		self.paste.invalidate_job();
 		if !self.paste_busy() {
 			self.paste.clear(self.preview.as_ref());
+			// A vanished repo or a wiped remote scan ends the preview here,
+			// not through `restore_log_after_paste`: its typed field too.
+			self.drop_paste_dest_edit();
 		}
 		self.discovery = None;
 		self.discovery_status = None;
@@ -2672,9 +2639,6 @@ impl WorkbenchModel {
 		self.add_cancel = None;
 		self.is_loading = false;
 		self.is_copying = false;
-		self.is_adding_repo = false;
-		self.popover = None;
-		self.popover_cursor = 0;
 		self.scan_cancel = None;
 		self.copy_cancel = None;
 		release_path(&mut self.workspace_root);
@@ -2694,6 +2658,7 @@ impl WorkbenchModel {
 	fn release_repo_state(&mut self) {
 		self.generation = self.generation.wrapping_add(1);
 		self.preview_generation = self.preview_generation.wrapping_add(1);
+		self.held_selection = None;
 		self.history_generation = self.history_generation.wrapping_add(1);
 		self.tree_generation = self.tree_generation.wrapping_add(1);
 		self.tree_worker = self.tree_worker.wrapping_add(1);
@@ -2726,11 +2691,7 @@ impl WorkbenchModel {
 		self.range_head = None;
 		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
-		release_vec(&mut self.commit_files);
-		release_vec(&mut self.commit_file_origin);
-		release_vec(&mut self.commit_file_gitlinks);
-		self.commit_files_first_parent_same.take();
-		release_vec(&mut self.selection_details);
+		self.reset_commit_view();
 		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
@@ -2740,7 +2701,7 @@ impl WorkbenchModel {
 		self.history_autoload = true;
 		release_vec(&mut self.log_on_head);
 		self.log_filter = LogQuery::default();
-		self.log_menu = None;
+		self.drop_overlays(overlay::DropScope::AnyLogMenu);
 		release_vec(&mut self.changed_dirs_collapsed);
 		self.log_date_error = false;
 		release_vec(&mut self.log_paths_expanded);
@@ -2748,12 +2709,8 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_reload_for = None;
-		self.log_commit_root = None;
-		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
 		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
@@ -2777,19 +2734,12 @@ impl WorkbenchModel {
 	/// a find or a log search.
 	fn clear_workspace_inputs(&mut self, cx: &mut Context<Self>) {
 		self.reader.find_query = String::new();
-		for input in [
-			self.find_input.clone(),
-			self.goto_input.clone(),
-			self.log_search_input.clone(),
-			self.selector_input.clone(),
-			self.add_repo_input.clone(),
-			self.workspace_path_input.clone(),
-			self.log_path_input.clone(),
-			self.log_branch_menu_input.clone(),
-			self.log_since_input.clone(),
-			self.log_until_input.clone(),
-			self.branch_filter_input.clone(),
-		] {
+		let inputs: Vec<_> = self
+			.text_inputs()
+			.into_iter()
+			.map(|(_, input)| input.clone())
+			.collect();
+		for input in inputs {
 			input.update(cx, |field, _| field.clear_retained());
 		}
 	}
@@ -2810,8 +2760,13 @@ impl WorkbenchModel {
 			cx.emit(tabs::TabEvent::Closed);
 			return;
 		}
-		self.workspace_menu = true;
-		self.workspace_picker = false;
+		self.open_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			overlay::ReturnFocus::Root,
+			Some(overlay::TriggerId::Workspace),
+			None,
+			cx,
+		);
 		if e2e_on() {
 			app_log!(
 				"[APP:WORKSPACE: state=closed generation={}]",
@@ -2833,8 +2788,6 @@ impl WorkbenchModel {
 		recent::remember(&mut self.recent_workspaces, &path);
 		self.remote.restoring = None;
 		self.workspace_open = true;
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
 		if e2e_on() {
 			app_log!(
 				"[APP:WORKSPACE: state=open path={} generation={}]",
@@ -2846,38 +2799,40 @@ impl WorkbenchModel {
 		self.reload_repos(cx);
 	}
 
-	/// Escape in one of its fields, or a press outside it.
-	pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
-		cx.notify();
-	}
-
-	/// Closes the workspace menu; its host browse and that browse's ssh end with it (#187).
-	pub(crate) fn hide_workspace_menu(&mut self) {
-		self.workspace_menu = false;
-		self.remote.end_browse();
-	}
-
+	/// The workspace button, without a window: the keyboard goes back to
+	/// the root when the menu closes.
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = !self.workspace_menu;
-		if self.workspace_menu && recent::config_dir().is_some() {
-			// Another workspace tab may have opened something since.
-			self.recent_workspaces = recent::load();
-			self.remote.recent = remote::load_recent();
-		} else if !self.workspace_menu {
-			self.workspace_picker = false;
-			self.remote.end_browse();
-		}
-		cx.notify();
+		self.toggle_workspace_menu_at(None, cx);
+	}
+
+	/// The workspace button (or Cmd+Shift+W / O): a press closes the menu
+	/// it opened.
+	pub(crate) fn toggle_workspace_menu_at(
+		&mut self,
+		window: Option<&mut gpui::Window>,
+		cx: &mut Context<Self>,
+	) {
+		let ret = match window.as_deref() {
+			Some(w) => self.return_here(w, cx),
+			None => overlay::ReturnFocus::Root,
+		};
+		self.toggle_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			Some(overlay::TriggerId::Workspace),
+			ret,
+			window,
+			cx,
+		);
 	}
 
 	/// The OS folder dialog. Without one (Linux with no portal) the typed
 	/// path field opens instead.
 	pub fn open_folder_dialog(&mut self, cx: &mut Context<Self>) {
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
-		cx.notify();
+		self.close_overlay(
+			overlay::OverlayKind::WorkspaceMenu,
+			overlay::CloseWhy::Picked,
+			cx,
+		);
 		let picked = cx.prompt_for_paths(PathPromptOptions {
 			files: false,
 			directories: true,
@@ -2904,9 +2859,22 @@ impl WorkbenchModel {
 	}
 
 	pub fn show_workspace_picker(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = true;
-		self.workspace_picker = true;
-		self.pending_focus = Some(self.workspace_path_input.read(cx).handle());
+		if !self.overlays.is_open(overlay::OverlayKind::WorkspaceMenu) {
+			self.open_overlay(
+				overlay::OverlayKind::WorkspaceMenu,
+				overlay::ReturnFocus::Root,
+				Some(overlay::TriggerId::Workspace),
+				None,
+				cx,
+			);
+		}
+		// A callback that lands in a background tab opens nothing: no field
+		// is drawn to take the keyboard when the tab is shown again.
+		if self.overlays.is_open(overlay::OverlayKind::WorkspaceMenu) {
+			self.overlays.set_workspace_picker(true);
+			self.pending_focus =
+				Some(self.workspace_path_input.read(cx).handle());
+		}
 		cx.notify();
 	}
 
@@ -2947,8 +2915,11 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if self.ws_tab.is_some() {
-			self.hide_workspace_menu();
-			self.workspace_picker = false;
+			self.close_overlay(
+				overlay::OverlayKind::WorkspaceMenu,
+				overlay::CloseWhy::Picked,
+				cx,
+			);
 			cx.emit(tabs::TabEvent::Open(target));
 			cx.notify();
 		} else {
@@ -3070,10 +3041,12 @@ impl WorkbenchModel {
 		self.resume_focus = keep;
 		self.focus_lost_guard = None;
 		self.escape_guard = None;
-		self.chrome.menu = None;
+		// A floating layer needs the pointer and the frame: it does not
+		// outlive the switch, and the host browse it owned ends with it. An
+		// inline layer is part of its pane and stays.
+		self.drop_overlays(overlay::DropScope::Floating);
+		self.overlays.clear_pending_return();
 		self.dragging = None;
-		// A background tab keeps no browse ssh.
-		self.remote.end_browse();
 		cx.notify();
 	}
 
@@ -4018,6 +3991,11 @@ impl WorkbenchModel {
 		if idx >= self.repos.len() {
 			return;
 		}
+		// A read in flight is dropped by this reload, so the selection must
+		// name what is shown again before it is judged or kept: the model
+		// holds the dropped read's path, and the shown preview's commit
+		// state is in the snapshot.
+		self.restore_shown_selection();
 		// The log shows the workspace: a plain switch keeps it.
 		let reload_log = self.log_reloads_on_repo_switch(preserve_anchors);
 		// A Changes row is kept across a reload only when its shown preview
@@ -4037,6 +4015,8 @@ impl WorkbenchModel {
 		}
 		self.generation += 1;
 		self.preview_generation += 1;
+		// The reads that could have restored it are dropped.
+		self.held_selection = None;
 		let task_generation = self.generation;
 		if reload_log {
 			self.history_generation += 1;
@@ -4097,7 +4077,16 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.commit_files.clear();
+		// The same commit stays selected while the repo is read again, so
+		// its details and its repository stay (the Log may be pinned to
+		// another repo than the one now open); the rest is read anew.
+		let details = self.commit_view.commit_details.take();
+		let root = self.commit_view.log_commit_root.take();
+		self.reset_commit_view();
+		if self.selected_commit.is_some() {
+			self.commit_view.commit_details = details;
+			self.commit_view.log_commit_root = root;
+		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
 		let reloading = self.repos[idx].root.clone();
@@ -4122,9 +4111,6 @@ impl WorkbenchModel {
 			self.hidden_commits.clear();
 			self.history_walk = None;
 			self.history_error = None;
-		}
-		if !preserve_anchors {
-			self.commit_details = None;
 		}
 		if !preserve_anchors && reload_log {
 			self.log_filter = LogQuery::default();
@@ -4429,20 +4415,10 @@ impl WorkbenchModel {
 		}
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		// Restored if the budget refuses the new text and the old one stays.
-		let shown_selection = (
-			self.selected_file.replace(path.to_string()),
-			self.selected_file_source.replace(source.clone()),
-			self.selected_file_root.clone(),
-			self.selected_commit.take(),
-		);
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
-		self.commit_files.clear();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
+		self.hold_shown_selection(path, &source);
 		let fs_only = matches!(source, SourceKind::File);
 		if fs_only {
 			self.selected_file_root = Some(repo_root.clone());
@@ -4515,11 +4491,12 @@ impl WorkbenchModel {
 					}
 					return;
 				}
-				if model.apply_source_preview(file_path.clone(), result) {
-					model.preview_root = model
-						.preview
-						.as_ref()
-						.map(|p| (shown_root, preview_identity(p)));
+				if model.apply_source_preview(
+					file_path.clone(),
+					shown_root.clone(),
+					result,
+				) {
+					model.held_selection = None;
 					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
 					if model.mode == "preview" {
 						ready_marker("PREVIEW");
@@ -4529,12 +4506,7 @@ impl WorkbenchModel {
 				{
 					// Refused by the retained budget: the previous text is
 					// still shown, so the selection must name it again.
-					(
-						model.selected_file,
-						model.selected_file_source,
-						model.selected_file_root,
-						model.selected_commit,
-					) = shown_selection;
+					model.restore_shown_selection();
 				} else {
 					model.preview_error_root = Some(shown_root);
 				}
@@ -4543,31 +4515,144 @@ impl WorkbenchModel {
 		});
 	}
 
+	/// Names `path` as the selection and sets aside what the shown preview's
+	/// selection was, unless an earlier read already did: its snapshot still
+	/// describes the shown preview, while what is on the model now is only
+	/// what that read left behind.
+	fn hold_shown_selection(&mut self, path: &str, source: &SourceKind) {
+		let file = self.selected_file.replace(path.to_string());
+		let file_source = self.selected_file_source.replace(source.clone());
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		// A commit file read left the commit state on the model: this read
+		// takes it, and the snapshot keeps that read's file selection.
+		let partial = match self.held_selection.take() {
+			Some(h) if h.commit_file_only.is_some() => Some(h),
+			other => {
+				self.held_selection = other;
+				None
+			}
+		};
+		if self.held_selection.is_some() {
+			// The earlier read took the rest already.
+			return;
+		}
+		let mut held = ShownSelection {
+			file,
+			source: file_source,
+			root: self.selected_file_root.clone(),
+			commit: self.selected_commit.take(),
+			// Taking the view resets it.
+			view: std::mem::take(&mut self.commit_view),
+			log_selected: std::mem::take(&mut self.log_selected),
+			range_head: self.range_head.take(),
+			compare: self.compare.take(),
+			log_selection_expanded: std::mem::take(
+				&mut self.log_selection_expanded,
+			),
+			log_branches_all: std::mem::take(&mut self.log_branches_all),
+			commit_file_only: None,
+		};
+		if let Some(early) = partial {
+			held.file = early.file;
+			held.source = early.source;
+			held.root = early.root;
+			held.view.selected_commit_file = early.view.selected_commit_file;
+			held.view.commit_file_sel = early.view.commit_file_sel;
+		}
+		self.held_selection = shown.then_some(held);
+	}
+
+	/// Names `path` as the commit view's file and sets aside what the shown
+	/// preview's file selection was, unless an earlier read already did.
+	/// `clear_file` is for a read that leaves the working-file selection
+	/// (a commit tree's file). The commit, its list and its details stay: a
+	/// refusal puts the file selection back, a landed read releases it.
+	pub(crate) fn hold_shown_commit_file(
+		&mut self,
+		path: &str,
+		clear_file: bool,
+	) {
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		if shown && self.held_selection.is_none() {
+			self.held_selection = Some(ShownSelection {
+				file: self.selected_file.clone(),
+				source: self.selected_file_source.clone(),
+				root: self.selected_file_root.clone(),
+				commit: None,
+				view: crate::history::CommitView {
+					selected_commit_file: self
+						.commit_view
+						.selected_commit_file
+						.clone(),
+					commit_file_sel: self.commit_view.commit_file_sel.clone(),
+					..Default::default()
+				},
+				log_selected: Vec::new(),
+				range_head: None,
+				compare: None,
+				log_selection_expanded: false,
+				log_branches_all: Vec::new(),
+				commit_file_only: Some(self.preview_pending_from_log),
+			});
+		}
+		if clear_file {
+			self.selected_file = None;
+			self.selected_file_root = None;
+		}
+		self.commit_view.selected_commit_file = Some(path.to_string());
+		self.commit_view.commit_file_sel.clear();
+	}
+
+	/// Puts the held selection back; the shown preview is still its own.
+	fn restore_shown_selection(&mut self) {
+		let Some(held) = self.held_selection.take() else {
+			return;
+		};
+		self.selected_file = held.file;
+		self.selected_file_source = held.source;
+		self.selected_file_root = held.root;
+		if let Some(pending) = held.commit_file_only {
+			self.commit_view.selected_commit_file =
+				held.view.selected_commit_file;
+			self.commit_view.commit_file_sel = held.view.commit_file_sel;
+			self.preview_pending_from_log = pending;
+			return;
+		}
+		self.selected_commit = held.commit;
+		self.commit_view = held.view;
+		self.log_selected = held.log_selected;
+		self.range_head = held.range_head;
+		self.compare = held.compare;
+		self.log_selection_expanded = held.log_selection_expanded;
+		self.log_branches_all = held.log_branches_all;
+	}
+
 	/// Turns a core `SourcePreview` into the single retained preview.
 	pub fn apply_source_preview(
 		&mut self,
 		path: String,
+		root: PathBuf,
 		result: Result<(browser::SourcePreview, PreviewSource), PreviewErr>,
 	) -> bool {
 		match result {
 			Ok((p, source)) => {
 				if !p.patch.is_empty() {
-					self.set_preview(Preview::new(
-						source,
-						Some(path),
-						p.patch,
-						true,
-						Language::Diff,
-					))
+					self.set_preview(
+						Preview::new(
+							source,
+							Some(path),
+							p.patch,
+							true,
+							Language::Diff,
+						)
+						.with_root(Some(root)),
+					)
 				} else if let Some(content) = p.content {
 					let lang = Language::from_path_or_ext(&path, false);
-					self.set_preview(Preview::new(
-						source,
-						Some(path),
-						content,
-						false,
-						lang,
-					))
+					self.set_preview(
+						Preview::new(source, Some(path), content, false, lang)
+							.with_root(Some(root)),
+					)
 				} else {
 					self.show_preview_error(Msg::new("error_binary", [path]));
 					false
@@ -5094,10 +5179,17 @@ impl WorkbenchModel {
 		request: paste::PasteRequest,
 		cx: &mut Context<Self>,
 	) {
+		let retarget = matches!(request, paste::PasteRequest::Retarget { .. });
 		if let Err(err) = self.paste.enqueue(request) {
 			// A remap's plan is idle again, without its writes.
 			self.refresh_paste_candidates(cx);
-			self.set_status_msg(err);
+			if retarget {
+				// The disarmed shell stays open on the folder the user
+				// picked: it says why there is nothing to apply.
+				self.set_paste_error(err);
+			} else {
+				self.set_status_msg(err);
+			}
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
@@ -5132,8 +5224,8 @@ impl WorkbenchModel {
 			self.refresh_paste_candidates(cx);
 		}
 		match landed {
-			Some(paste::preview::Landed::Shown { remap }) => {
-				self.show_landed_plan(remap);
+			Some(paste::preview::Landed::Shown { remap, retargeted }) => {
+				self.show_landed_plan(remap, retargeted, cx);
 				// A folder under the cursor has no file to read.
 				let on_item =
 					self.paste.plan().and_then(|p| match p.cursor() {
@@ -5196,7 +5288,12 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn show_landed_plan(&mut self, remap: Option<paste::Remap>) {
+	fn show_landed_plan(
+		&mut self,
+		remap: Option<paste::Remap>,
+		retargeted: bool,
+		cx: &mut Context<Self>,
+	) {
 		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
 		let items_count = plan.items.len();
@@ -5223,12 +5320,24 @@ impl WorkbenchModel {
 					);
 				}
 			}
-			app_log!(
-				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
-				items_count,
-				plan.shown(&plan.destination),
-				plan.mapping_ready()
-			);
+			if retargeted {
+				app_log!(
+					"[APP:PASTE_RETARGETED: items={} dest={} executable={} error={}]",
+					items_count,
+					plan.shown(&plan.destination),
+					plan.executable(),
+					plan.error.as_ref().map_or("-", |e| e.key)
+				);
+			} else {
+				app_log!(
+					"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
+					items_count,
+					plan.shown(&plan.destination),
+					plan.mapping_ready()
+				);
+			}
+			// A retarget is a new plan for a new folder: the hint it
+			// shows is what that folder's engine suggested.
 			if let Some(hint) = plan.restore_hint() {
 				let (kind, value) = match &hint.base {
 					snip_core::restore::RestoreBase::Strip { segment } => {
@@ -5245,11 +5354,27 @@ impl WorkbenchModel {
 				);
 			}
 		}
-		self.set_status("status_paste_preview", [items_count.to_string()]);
+		// A folder the engine refused is said at once, in its own words; a
+		// mapping still to choose is not a refusal.
+		let refusal = plan.error.clone().filter(|_| {
+			retargeted && plan.mapping_ready() && !plan.executable()
+		});
+		match refusal {
+			Some(err) => self.set_status_msg(err),
+			None => self
+				.set_status("status_paste_preview", [items_count.to_string()]),
+		}
 		if self.paste.collapse_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
-		self.pending_focus = Some(self.paste_focus.clone());
+		// A plan landing under the open destination field (a prefix chosen
+		// with the pointer while typing) leaves the focus where the user
+		// is typing: the panel's Enter would apply into the old folder.
+		self.pending_focus = Some(if self.paste_dest_edit().is_some() {
+			self.paste_dest_input.read(cx).handle()
+		} else {
+			self.paste_focus.clone()
+		});
 	}
 
 	/// Keep full write/read diagnostics in status, but do not let a newly
@@ -5260,6 +5385,17 @@ impl WorkbenchModel {
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.trigger_paste_preview_into(None, cx);
+	}
+
+	/// Opens the paste preview from the clipboard: into `folder`, or, when
+	/// none is named, the default destination (`--restore-dir`, else the
+	/// pinned repo, else the workspace folder).
+	pub fn trigger_paste_preview_into(
+		&mut self,
+		folder: Option<paste::dest::DestFolder>,
+		cx: &mut Context<Self>,
+	) {
 		self.user_action();
 		if self.refuse_while_applying("preview", cx) {
 			return;
@@ -5279,6 +5415,7 @@ impl WorkbenchModel {
 			app_log!("[APP:PASTE_PLAN_CLEARED]");
 		}
 		self.paste.clear(self.preview.as_ref());
+		self.drop_paste_dest_edit();
 		let text = match clip::read_text() {
 			Ok(t) => t,
 			Err(e) => {
@@ -5299,9 +5436,15 @@ impl WorkbenchModel {
 			return;
 		}
 
-		let target_dest = self.current_restore_destination();
+		let folder = folder.unwrap_or_else(|| {
+			self.dest_folder(self.current_restore_destination())
+		});
+		let target_dest = folder.path.clone();
 		let known_roots = self.repos.roots();
 		self.pending_focus = Some(self.paste_focus.clone());
+		// After the early returns above (a failed read leaves no folder
+		// behind) and after `clear`, which resets it.
+		self.paste.set_folder(folder);
 		self.queue_paste(
 			paste::PasteRequest::Clipboard {
 				text,
@@ -5907,6 +6050,15 @@ impl WorkbenchModel {
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
 		self.user_action();
+		// A path typed but not yet confirmed would be pasted into the old
+		// folder. The button is locked while the field is open; Enter in
+		// the panel is refused here, whoever holds the focus.
+		if self.paste_dest_edit().is_some() {
+			app_log!("[APP:APPLY_IGNORED: editing]");
+			self.set_status("paste_dest_editing", []);
+			cx.notify();
+			return;
+		}
 		let apply = match self.paste.begin_apply() {
 			Ok(w) => w,
 			Err(paste::preview::ApplyRefused::Loading) => {
@@ -6016,6 +6168,8 @@ impl WorkbenchModel {
 
 	/// Called on every path that closes the paste preview.
 	fn restore_log_after_paste(&mut self) {
+		// The typed destination belongs to the preview that is closing.
+		self.drop_paste_dest_edit();
 		if self.paste.restore_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
@@ -6056,9 +6210,7 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
-		self.selected_commit_file = None;
-		self.commit_file_sel.clear();
-		self.commit_files.clear();
+		self.reset_commit_view();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
 	}
@@ -6638,7 +6790,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("shift-f3", FindPrev, None),
 		// Paste preview panel.
 		KeyBinding::new("enter", ApplyPaste, Some("PastePanel")),
-		KeyBinding::new("escape", CancelPaste, Some("PastePanel")),
 		KeyBinding::new("up", NavUp, Some("PastePanel")),
 		KeyBinding::new("down", NavDown, Some("PastePanel")),
 		KeyBinding::new("space", NavToggle, Some("PastePanel")),
@@ -6652,7 +6803,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("down", ReaderDown, Some("Reader")),
 		KeyBinding::new("pageup", ReaderPageUp, Some("Reader")),
 		KeyBinding::new("pagedown", ReaderPageDown, Some("Reader")),
-		KeyBinding::new("escape", ReaderClear, Some("Reader")),
 		// Project / Changes list.
 		KeyBinding::new("up", TreeUp, Some("ToolList")),
 		KeyBinding::new("down", TreeDown, Some("ToolList")),
@@ -6663,12 +6813,10 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("secondary-d", TreeOpen, Some("ToolList")),
 		KeyBinding::new("pageup", ToolPageUp, Some("ToolList")),
 		KeyBinding::new("pagedown", ToolPageDown, Some("ToolList")),
-		KeyBinding::new("escape", FocusEditor, Some("ToolList")),
 		// Context menu.
 		KeyBinding::new("up", MenuUp, Some("ContextMenu")),
 		KeyBinding::new("down", MenuDown, Some("ContextMenu")),
 		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
-		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
 		KeyBinding::new("ctrl-c", LogCopy, Some("GitLog")),
 		KeyBinding::new("cmd-c", LogCopy, Some("GitLog")),
@@ -6683,7 +6831,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("right", LogChild, Some("GitLog")),
 		KeyBinding::new("pagedown", LogPageDown, Some("GitLog")),
 		KeyBinding::new("pageup", LogPageUp, Some("GitLog")),
-		KeyBinding::new("escape", FocusEditor, Some("GitLog")),
 		// No IntelliJ key for "go to HEAD" in the Log; kept.
 		KeyBinding::new("h", LogHead, Some("GitLog")),
 	];
@@ -7207,7 +7354,12 @@ mod tests {
 			cx: &mut VisualTestContext,
 		) {
 			model.update(cx, |m, cx| {
-				assert!(!m.workspace_menu, "{:?}", m.remote.message);
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"{:?}",
+					m.remote.message
+				);
 				if m.remote.session.is_none() {
 					assert_eq!(
 						m.lifecycle.intent_name(),
@@ -7272,7 +7424,13 @@ mod tests {
 			});
 			cx.run_until_parked();
 			model.update(cx, |m, cx| {
-				m.workspace_menu = true;
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.remote.hosts = hosts;
 				m.remote.recent.clear();
 				cx.notify();
@@ -7372,7 +7530,13 @@ mod tests {
 			cx.run_until_parked();
 			let path = shared.display().to_string();
 			model.update(cx, |m, cx| {
-				m.workspace_menu = true;
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.remote.hosts = vec![host];
 				m.remote.recent.clear();
 				m.browse_remote_host(0, cx);
@@ -7721,7 +7885,12 @@ mod tests {
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
 
-				assert!(m.workspace_open && !m.workspace_menu);
+				assert!(
+					m.workspace_open
+						&& !m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						)
+				);
 				assert_eq!(
 					m.changes_empty_state(),
 					Some(crate::ChangesEmpty::NoRepository)
@@ -7869,7 +8038,12 @@ mod tests {
 			assert_eq!(folders, ["x", "y"]);
 			model.read_with(cx, |m, cx| {
 				assert!(m.remote.session.is_none(), "entering opens nothing");
-				assert!(!m.workspace_open && m.workspace_menu);
+				assert!(
+					!m.workspace_open
+						&& m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						)
+				);
 				assert_eq!(m.lifecycle.intent_name(), "none");
 				assert_eq!(
 					m.remote_path_input.read(cx).text(),
@@ -7934,7 +8108,11 @@ mod tests {
 			});
 			model.read_with(cx, |m, _| {
 				assert!(m.remote.session.is_none());
-				assert!(m.workspace_menu, "the menu stays open");
+				assert!(
+					m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"the menu stays open"
+				);
 				let back =
 					client_of(m).expect("the browse got its client back");
 				assert!(std::sync::Arc::ptr_eq(&back, &c), "same connection");
@@ -8162,7 +8340,11 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape closes the menu");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape closes the menu"
+				);
 				assert!(m.remote.browse.is_none(), "browse ends with the menu");
 			});
 			let mut rounds = 0;
@@ -8539,7 +8721,7 @@ mod tests {
 				.to_string();
 			let (model, cx) = remote_menu(cx);
 			let host = model.update(cx, |m, _| {
-				m.workspace_menu = false;
+				m.drop_overlays(crate::overlay::DropScope::Floating);
 				m.remote.hosts[0].name.clone()
 			});
 
@@ -9082,15 +9264,16 @@ mod tests {
 			});
 			for _ in 0..50 {
 				settle(cx);
-				let done =
-					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				let done = model.read_with(cx, |m, _| {
+					!m.commit_view.commit_files.is_empty()
+				});
 				if done {
 					break;
 				}
 			}
 			let commit_file = model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty());
-				m.commit_files[0].0.clone()
+				assert!(!m.commit_view.commit_files.is_empty());
+				m.commit_view.commit_files[0].0.clone()
 			});
 			model.update(cx, |m, cx| {
 				m.select_commit_file(&commit_file, cx);
@@ -11736,7 +11919,10 @@ mod tests {
 			cx.simulate_click(open.center(), gpui::Modifiers::none());
 			// The open replies on a worker thread; the menu closes with it.
 			let deadline = std::time::Instant::now() + Duration::from_secs(10);
-			while model.read_with(cx, |m, _| m.workspace_menu) {
+			while model.read_with(cx, |m, _| {
+				m.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu)
+			}) {
 				assert!(
 					std::time::Instant::now() < deadline,
 					"the open never replied"
@@ -11755,7 +11941,11 @@ mod tests {
 			settle(cx);
 			cx.simulate_keystrokes("escape");
 			settle(cx);
-			model.read_with(cx, |m, _| assert!(!m.workspace_menu));
+			model.read_with(cx, |m, _| {
+				assert!(!m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu))
+			});
 			assert!(reaches(cx), "after Escape in the path field");
 		}
 
@@ -11779,7 +11969,9 @@ mod tests {
 			});
 			settle(cx);
 			let field = model.read_with(cx, |m, cx| {
-				assert!(m.workspace_menu);
+				assert!(m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu));
 				m.remote_path_input.read(cx).handle()
 			});
 			assert!(
@@ -11789,7 +11981,11 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape in the path field");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape in the path field"
+				);
 			});
 
 			// Opened by its button, nothing inside focused: Escape still closes.
@@ -11798,11 +11994,19 @@ mod tests {
 				.expect("menu button drawn");
 			cx.simulate_click(button.center(), gpui::Modifiers::none());
 			settle(cx);
-			model.read_with(cx, |m, _| assert!(m.workspace_menu));
+			model.read_with(cx, |m, _| {
+				assert!(m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu))
+			});
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape with no field focused");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"Escape with no field focused"
+				);
 			});
 
 			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
@@ -11813,7 +12017,11 @@ mod tests {
 			cx.simulate_click(button.center(), gpui::Modifiers::none());
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "second press of the button");
+				assert!(
+					!m.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
+					"second press of the button"
+				);
 			});
 		}
 
@@ -11824,15 +12032,18 @@ mod tests {
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let files = ["a.txt", "b.txt", "c.txt", "d.txt"];
 			model.update(cx, |m, cx| {
-				m.commit_files =
+				m.commit_view.commit_files =
 					files.iter().map(|f| (f.to_string(), None)).collect();
-				m.selected_commit_file = Some("b.txt".into());
+				m.commit_view.selected_commit_file = Some("b.txt".into());
 				m.toggle_commit_file("d.txt", cx);
-				assert_eq!(m.commit_file_sel, ["b.txt", "d.txt"]);
+				assert_eq!(m.commit_view.commit_file_sel, ["b.txt", "d.txt"]);
 				m.toggle_commit_file("b.txt", cx);
-				assert_eq!(m.commit_file_sel, ["d.txt"]);
+				assert_eq!(m.commit_view.commit_file_sel, ["d.txt"]);
 				m.extend_commit_files(&files, "d.txt", cx);
-				assert_eq!(m.commit_file_sel, ["b.txt", "c.txt", "d.txt"]);
+				assert_eq!(
+					m.commit_view.commit_file_sel,
+					["b.txt", "c.txt", "d.txt"]
+				);
 			});
 		}
 
@@ -11848,9 +12059,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("src/a.rs", Modified),
 					("src/gone.rs", Deleted),
 					("pom.xml", Modified),
@@ -11858,7 +12069,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("src/a.rs".into());
+				m.commit_view.selected_commit_file = Some("src/a.rs".into());
 				m.toggle_commit_file("src/", cx);
 				m.toggle_commit_file("pom.xml", cx);
 				let menu = m.commit_file_menu("src", true);
@@ -11903,9 +12114,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("common.txt", Modified),
 					("emoji.txt", Modified),
 					("dir/gone.txt", Deleted),
@@ -11913,7 +12124,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("emoji.txt".into());
+				m.commit_view.selected_commit_file = Some("emoji.txt".into());
 				m.toggle_commit_file("common.txt", cx);
 				let menu = m.commit_file_menu("common.txt", false);
 				menu.into_iter()
@@ -11952,10 +12163,10 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
 				m.log_details_by_dir = false;
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("z.txt", Modified),
 					("a/x.txt", Modified),
 					("b.txt", Modified),
@@ -11963,7 +12174,7 @@ mod tests {
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
 				// Click order: b.txt, a/x.txt, z.txt.
-				m.selected_commit_file = Some("b.txt".into());
+				m.commit_view.selected_commit_file = Some("b.txt".into());
 				m.toggle_commit_file("a/x.txt", cx);
 				m.toggle_commit_file("z.txt", cx);
 				let menu = m.commit_file_menu("z.txt", false);
@@ -12007,9 +12218,9 @@ mod tests {
 			let root = repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
 			let copied = model.update(cx, |m, cx| {
-				m.log_commit_root = Some(root.clone());
+				m.commit_view.log_commit_root = Some(root.clone());
 				m.compare = Some(("old".into(), "new".into()));
-				m.commit_files = [
+				m.commit_view.commit_files = [
 					("common.txt", Modified),
 					("emoji.txt", Modified),
 					("dir/gone.txt", Deleted),
@@ -12017,7 +12228,8 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.selected_commit_file = Some("dir/keep.txt".into());
+				m.commit_view.selected_commit_file =
+					Some("dir/keep.txt".into());
 				m.toggle_commit_file("dir/", cx);
 				let menu = m.commit_file_menu("dir", true);
 				menu.into_iter()
@@ -12346,8 +12558,6 @@ mod tests {
 			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
 			let mut last_chip = None;
 			for _ in 0..10 {
-				// ALLOWED-TEST-REFRESH: test harness needs redraw frames for search field width re-measurement before clicking branch chip
-				cx.update(|window, _| window.refresh());
 				settle(cx);
 				let pos = cx
 					.debug_bounds("log-filter-branch")
@@ -12389,7 +12599,8 @@ mod tests {
 						b.center().y + gpui::px(dy),
 					);
 					cx.simulate_click(pos, gpui::Modifiers::none());
-					let menu = model.read_with(cx, |m, _| m.log_menu);
+					let menu =
+						model.read_with(cx, |m, _| m.overlays.log_menu());
 					if menu.is_some() {
 						break;
 					}
@@ -12436,8 +12647,14 @@ mod tests {
 				WorkbenchModel::new(None, None, "normal".into(), cx)
 			});
 			cx.run_until_parked();
-			model.update(cx, |m, _| {
-				m.workspace_menu = true;
+			model.update(cx, |m, cx| {
+				m.open_overlay(
+					crate::overlay::OverlayKind::WorkspaceMenu,
+					crate::overlay::ReturnFocus::Root,
+					Some(crate::overlay::TriggerId::Workspace),
+					None,
+					cx,
+				);
 				m.recent_workspaces = vec![local.path().to_path_buf()];
 				m.remote.hosts =
 					vec![snip_remote::RemoteHost::in_process(worker.clone())];
@@ -12500,65 +12717,6 @@ mod tests {
 					m.status.key,
 				);
 			});
-		}
-
-		/// The log list width and, per laid-out row, the widths of its graph
-		/// gutter and subject cell.
-		struct LogMeasure {
-			list_w: f32,
-			rows: Vec<(f32, f32)>,
-		}
-
-		/// Six repositories with three feature branches of long names each,
-		/// so the graph is wide and rows carry ref labels; shown in a
-		/// `w` x 752 window.
-		fn measure_wide_log(cx: &mut TestAppContext, w: f32) -> LogMeasure {
-			let ws = tempfile::tempdir().unwrap();
-			for i in 0..6 {
-				let r = repo(ws.path(), &format!("repo{i}"), &[]);
-				for b in 0..3 {
-					let name = format!("feature/a-rather-long-branch-{i}-{b}");
-					git(&r, &["checkout", "-q", "-b", &name, "main"]);
-					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
-					git(&r, &["add", "."]);
-					git(
-						&r,
-						&["commit", "-q", "-m", &format!("commit {i} {b}")],
-					);
-				}
-				git(&r, &["checkout", "-q", "main"]);
-			}
-			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
-			settle(cx);
-			// The list reads its own width from the previous frame.
-			for _ in 0..2 {
-				// ALLOWED-TEST-REFRESH: test harness needs a redraw after resize so log list reads its width from previous frame
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
-			let (n, list_w) = model.read_with(cx, |m, _| {
-				let bounds = m.log_scroll.0.borrow().base_handle.bounds();
-				(m.display_commits().len(), f32::from(bounds.size.width))
-			});
-			assert!(n > 10, "log did not load: {n} commits");
-			let mut rows = Vec::new();
-			for ix in 0..n {
-				// `debug_bounds` wants a 'static selector; a test may leak.
-				let key = |what: &str| -> &'static str {
-					Box::leak(format!("log-{what}:{ix}").into_boxed_str())
-				};
-				if let (Some(g), Some(s)) = (
-					cx.debug_bounds(key("gutter")),
-					cx.debug_bounds(key("subject-room")),
-				) {
-					rows.push((
-						f32::from(g.size.width),
-						f32::from(s.size.width),
-					));
-				}
-			}
-			LogMeasure { list_w, rows }
 		}
 
 		/// Writes a file over the preview limit and commits it in `r`.
@@ -13800,37 +13958,94 @@ mod tests {
 			});
 		}
 
-		/// Every row shares one gutter, and the subject of each row keeps at
-		/// least `min` wide.
-		fn assert_log_layout(m: &LogMeasure, min: f32) {
-			assert!(!m.rows.is_empty(), "no rows were laid out");
-			for (gutter, subject) in &m.rows {
-				assert_eq!(*gutter, m.rows[0].0, "{:?}", m.rows);
-				assert!(
-					*subject >= min,
-					"list {}: subject {subject} < {min}: {:?}",
-					m.list_w,
-					m.rows
-				);
+		/// Six repositories with three feature branches of long names each,
+		/// so the graph is wide and rows carry ref labels; shown in a
+		/// `w` x 752 window and resized from the default one, with no input
+		/// after the resize. What breaks the one policy on its rows.
+		fn wide_log_violations(cx: &mut TestAppContext, w: f32) -> Vec<String> {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..6 {
+				let r = repo(ws.path(), &format!("repo{i}"), &[]);
+				for b in 0..3 {
+					let name = format!("feature/a-rather-long-branch-{i}-{b}");
+					git(&r, &["checkout", "-q", "-b", &name, "main"]);
+					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
+					git(&r, &["add", "."]);
+					git(
+						&r,
+						&["commit", "-q", "-m", &format!("commit {i} {b}")],
+					);
+				}
+				git(&r, &["checkout", "-q", "main"]);
 			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			enable_probes(&model, cx);
+			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+			settle(cx);
+			let n = model.read_with(cx, |m, _| m.display_commits().len());
+			assert!(n > 10, "log did not load: {n} commits");
+			let mut bad = Vec::new();
+			let mut gutters = Vec::new();
+			let mut drawn = 0;
+			for ix in 0..n {
+				if bounds_of(cx, format!("log-row:{ix}")).is_none() {
+					continue;
+				}
+				drawn += 1;
+				bad.extend(
+					row_policy_violations(&model, cx, ix, 0.)
+						.into_iter()
+						.map(|v| format!("{w}: row {ix}: {v}")),
+				);
+				if let Some(g) = seen_cell(&model, cx, ix, RowCell::Gutter) {
+					gutters.push(g.w);
+				}
+				// From a 1080 window on, a row with refs has its labels.
+				let has_refs = model.read_with(cx, |m, _| {
+					m.graph_layout
+						.as_ref()
+						.is_some_and(|l| !l.rows[ix].refs.is_empty())
+				});
+				if w >= 1080.
+					&& has_refs && seen_cell(&model, cx, ix, RowCell::Label(0))
+					.is_none()
+				{
+					bad.push(format!("{w}: row {ix} lost its labels"));
+				}
+			}
+			assert!(drawn > 0, "no rows were laid out");
+			if gutters.iter().any(|g| (*g - gutters[0]).abs() > 0.01) {
+				bad.push(format!("{w}: the gutters differ: {gutters:?}"));
+			}
+			bad
 		}
 
+		/// At 1080 the list is ~574px: every row keeps its subject's floor
+		/// and a whole date, and a row with refs has its labels.
 		#[gpui::test]
 		fn wide_multi_repo_log_keeps_a_subject_at_1080(
 			cx: &mut TestAppContext,
 		) {
-			let m = measure_wide_log(cx, 1080.);
-			// ui::log::MIN_SUBJECT_W
-			assert_log_layout(&m, 160.);
+			let bad = wide_log_violations(cx, 1080.);
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
 		}
 
-		/// At 900 the list is ~430px: the gutter sits at its floor and the
-		/// date and author cells shrink, so the subject still gets its
-		/// minimum with the labels dropped.
+		/// At 900 the list is ~430px: the gutter sits at its floor, the
+		/// date stays whole and the author column or the labels give way.
 		#[gpui::test]
 		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
-			let m = measure_wide_log(cx, 900.);
-			assert_log_layout(&m, 160.);
+			let bad = wide_log_violations(cx, 900.);
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
 		}
 
 		/// `git` with both dates fixed, so one repository's commits sort
@@ -13936,94 +14151,1496 @@ mod tests {
 		}
 
 		/// On a 1160 window the list is 654px: both labels fit whole beside
-		/// a subject of about 96px.
+		/// the subject and the columns.
 		#[gpui::test]
 		fn head_row_labels_stay_whole_at_1160(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1160., 720.);
-			settle_until(cx, "the log rows", |cx| {
-				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
-			});
-			settle(cx);
+			let (model, cx) = open_log_window(cx, ws.path(), 1160., false);
 			let texts = head_label_texts(&model, cx);
 			assert_eq!(texts, ["main, origin/main", "v0.3.0"]);
-			for n in 0..2 {
-				// The label's natural width, capped as `ref_label_elements` caps it.
-				let natural = cx
-					.update(|w, _| {
-						17. + crate::ui::text_width(
-							w,
-							&texts[n],
-							crate::theme::SMALL_TEXT,
-						)
-					})
-					.min(320.);
-				let selector = ["log-ref-label:0:0", "log-ref-label:0:1"][n];
-				let width =
-					cx.debug_bounds(selector).expect("label").size.width;
+			for (n, text) in texts.iter().enumerate() {
+				let label =
+					seen_cell(&model, cx, 0, RowCell::Label(n)).expect("label");
 				assert!(
-					f32::from(width) >= natural - 1.0,
-					"label {n} {:?} cut: {width:?} < {natural}",
-					texts[n]
+					label.visible >= label.natural - 1.0,
+					"label {n} {text:?} cut: {label:?}"
 				);
 			}
-			let subject = cx.debug_bounds("log-subject:0").expect("subject");
-			// ui::log::MIN_SUBJECT_BESIDE_LABELS
-			assert!(
-				f32::from(subject.size.width) >= 96. - 1.0,
-				"subject {:?}",
-				subject.size.width
-			);
-			// ui::log::MIN_SUBJECT_W: the subject gave way to keep the labels whole.
-			assert!(
-				f32::from(subject.size.width) < 160.,
-				"subject {:?}",
-				subject.size.width
-			);
+			let subject =
+				seen_cell(&model, cx, 0, RowCell::Subject).expect("subject");
+			assert!(subject.visible >= subject.floor - 1., "{subject:?}");
 		}
 
-		/// On a 1080 window the list is 574px. The labels cannot both fit whole
-		/// beside the subject there, so the branch label is ellipsized and the
-		/// tag keeps its icon and a few characters, never a bare icon (#195).
+		/// On a 1080 window the list is 574px. The labels keep their
+		/// rule's floor (the label kind: 6 characters), the subject keeps
+		/// its own, and the HEAD row has its labels (#195).
 		#[gpui::test]
 		fn head_row_labels_stay_readable_at_1080(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			for hash in [false, true] {
+				let (model, cx) = open_log_window(cx, ws.path(), 1080., hash);
+				assert_eq!(
+					head_label_texts(&model, cx),
+					["main, origin/main", "v0.3.0"]
+				);
+				let bad = row_policy_violations(&model, cx, 0, 1080.);
+				assert!(bad.is_empty(), "hash={hash}: {bad:?}");
+				for n in 0..2 {
+					let label = seen_cell(&model, cx, 0, RowCell::Label(n))
+						.expect("label");
+					assert!(label.rule_holds(), "hash={hash}: {label:?}");
+					assert!(label.visible >= label.floor - 1., "{label:?}");
+				}
+			}
+		}
+
+		// ───────── #228: one fit rule for the log's texts (S0 helpers) ─────────
+
+		/// Probes on, so `click_probed` and the probe readers have bounds.
+		fn enable_probes(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| {
+				m.probes = Some(crate::ui::Probes::for_test());
+				cx.notify();
+			});
+			settle(cx);
+		}
+
+		/// Like `open_sized`, but measuring with the OS text system and the
+		/// embedded fonts, as the app does (`use_real_text_system` alone
+		/// leaves "Inter" to fall back to a system font, 7% off). `None`
+		/// where the platform has no real text system.
+		///
+		/// The text system is swapped once per `TestAppContext`. A `FontId`
+		/// is an index into the text system that resolved it: a window
+		/// shapes with the one it was opened under, but gpui paints with
+		/// the app's current one (`paint_line_background` reads
+		/// `cx.text_system()`), so a second swap with an older window still
+		/// open painted ids of one cosmic-text instance against another and
+		/// panicked out of bounds on Linux. For the same reason the windows
+		/// opened under the Noop system before the swap are closed.
+		fn open_real_text(
+			cx: &mut TestAppContext,
+			ws: PathBuf,
+			w: f32,
+			h: f32,
+		) -> Option<(Entity<WorkbenchModel>, &mut VisualTestContext)> {
+			let swapped = cx
+				.text_system()
+				.all_font_names()
+				.iter()
+				.any(|n| n == crate::theme::UI_FONT);
+			if !swapped {
+				cx.update(|cx| {
+					for window in cx.windows() {
+						let _ = window
+							.update(cx, |_, window, _| window.remove_window());
+					}
+				});
+				cx.run_until_parked();
+				if !cx.use_real_text_system() {
+					assert!(
+						std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+							|| cfg!(windows),
+						"no real text system on this OS"
+					);
+					return None;
+				}
+				cx.update(|cx| crate::theme::register_fonts(cx));
+			}
+			let names = cx.text_system().all_font_names();
+			for family in [crate::theme::UI_FONT, crate::theme::CODE_FONT] {
+				assert!(
+					names.iter().any(|n| n == family),
+					"the embedded font {family} does not resolve"
+				);
+			}
+			let (model, cx) = open_sized(cx, ws, None, w, h);
+			enable_probes(&model, cx);
+			// The measuring really is the real one: CJK is about twice as
+			// wide as the 0.6em NoopTextSystem reports.
+			const TAG: &str = "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}";
+			let size = crate::theme::SMALL_TEXT;
+			let real = cx.update(|w, _| crate::ui::text_width(w, TAG, size));
+			let noop = TAG.chars().count() as f32 * 0.6 * size;
+			assert!(real > noop * 1.3, "real {real} vs noop {noop}");
+			Some((model, cx))
+		}
+
+		/// Like `head_with_labels`, but the HEAD commit has a long-format
+		/// date ("2025/12/21 15:30", 16 characters).
+		fn head_with_labels_dated(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
+			fs::write(r.join("long.txt"), "l").unwrap();
+			git(&r, &["add", "."]);
+			git_dated(
+				&r,
+				&[
+					"commit",
+					"-q",
+					"-m",
+					"a subject long enough to want the whole row for itself and then some more words",
+				],
+				"2025-12-21T15:30:00Z",
+			);
+			git(&r, &["tag", "v0.3.0"]);
+			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+			git(
+				&r,
+				&[
+					"symbolic-ref",
+					"refs/remotes/origin/HEAD",
+					"refs/remotes/origin/main",
+				],
+			);
+		}
+
+		/// Width of `s` in the UI font (`code`: the code font) at `size`.
+		fn text_w(
+			cx: &mut VisualTestContext,
+			s: &str,
+			code: bool,
+			size: f32,
+		) -> f32 {
+			let s = s.to_string();
+			cx.update(|w, _| {
+				let family = if code {
+					crate::theme::CODE_FONT
+				} else {
+					crate::theme::UI_FONT
+				};
+				let run = gpui::TextRun {
+					len: s.len(),
+					font: gpui::font(family),
+					color: gpui::black(),
+					background_color: None,
+					underline: None,
+					strikethrough: None,
+				};
+				f32::from(
+					w.text_system()
+						.shape_line(
+							s.clone().into(),
+							gpui::px(size),
+							&[run],
+							None,
+						)
+						.width,
+				)
+			})
+		}
+
+		/// The cells of a log row.
+		#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+		enum RowCell {
+			Gutter,
+			Subject,
+			Collapsed,
+			Label(usize),
+			Author,
+			Date,
+			Hash,
+		}
+
+		/// One drawn cell of a row: what `TEXT_FIT` (the graph gutter, which
+		/// is no text: its `debug_bounds`) saw of it.
+		#[derive(Clone, Debug)]
+		struct SeenCell {
+			cell: RowCell,
+			role: Option<crate::ui::FitRole>,
+			text: String,
+			/// Where the box starts, and how wide it was drawn.
+			x: f32,
+			w: f32,
+			/// How much of the box no ancestor clips away.
+			visible: f32,
+			/// What the text needs whole, and what its rule keeps at least.
+			natural: f32,
+			floor: f32,
+			/// The width the solver gave.
+			fit: Option<f32>,
+			shown: usize,
+			total: usize,
+			key_graphemes: usize,
+		}
+
+		impl SeenCell {
+			/// What is in sight: from the box's left to the visible width.
+			fn vis_l(&self) -> f32 {
+				self.x
+			}
+
+			fn vis_r(&self) -> f32 {
+				self.x + self.visible
+			}
+
+			fn rule_holds(&self) -> bool {
+				match self.role {
+					Some(role) => crate::ui::rule_holds(
+						role.rule(),
+						self.shown,
+						self.total,
+						self.key_graphemes,
+					),
+					None => true,
+				}
+			}
+		}
+
+		fn bounds_of(
+			cx: &mut VisualTestContext,
+			selector: String,
+		) -> Option<gpui::Bounds<gpui::Pixels>> {
+			let s: &'static str = Box::leak(selector.into_boxed_str());
+			cx.debug_bounds(s)
+		}
+
+		/// The `TEXT_FIT` of the text of row `ix` in `role`.
+		fn row_text_fit(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			ix: usize,
+			role: crate::ui::FitRole,
+		) -> Option<crate::ui::TextFit> {
+			model.read_with(cx, |m, _| {
+				let key = m.log_row_key(m.display_commits()[ix]);
+				m.probes
+					.as_ref()
+					.expect("probes are on")
+					.text_fit(&format!("text-fit:row:{key}:{}", role.key()))
+			})
+		}
+
+		/// Where row `ix` drew `cell`, `None` where it drew none (a dropped
+		/// text has a `TEXT_FIT` of width 0, but is not drawn).
+		fn seen_cell(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			ix: usize,
+			cell: RowCell,
+		) -> Option<SeenCell> {
+			use crate::ui::FitRole;
+			let role = match cell {
+				RowCell::Gutter => {
+					let b = bounds_of(cx, format!("log-gutter:{ix}"))?;
+					return Some(SeenCell {
+						cell,
+						role: None,
+						text: String::new(),
+						x: f32::from(b.left()),
+						w: f32::from(b.size.width),
+						visible: f32::from(b.size.width),
+						natural: f32::from(b.size.width),
+						floor: f32::from(b.size.width),
+						fit: Some(f32::from(b.size.width)),
+						shown: 0,
+						total: 0,
+						key_graphemes: 0,
+					});
+				}
+				RowCell::Subject => FitRole::Subject,
+				RowCell::Collapsed => FitRole::Collapsed,
+				RowCell::Author => FitRole::Author,
+				RowCell::Date => FitRole::Date,
+				RowCell::Hash => FitRole::Hash,
+				// The first label is the branches' if the row has one.
+				RowCell::Label(n) => {
+					let mut present = Vec::new();
+					for r in [FitRole::BranchLabel, FitRole::TagLabel] {
+						if row_text_fit(model, cx, ix, r)
+							.is_some_and(|f| f.fit != Some(0.))
+						{
+							present.push(r);
+						}
+					}
+					*present.get(n)?
+				}
+			};
+			let f = row_text_fit(model, cx, ix, role)?;
+			if f.fit == Some(0.) {
+				return None;
+			}
+			Some(SeenCell {
+				cell,
+				role: Some(role),
+				text: f.text.to_string(),
+				x: f.x,
+				w: f.drawn,
+				visible: f.visible,
+				natural: f.natural,
+				floor: f.floor,
+				fit: f.fit,
+				shown: f.shown,
+				total: f.total,
+				key_graphemes: f.key_graphemes,
+			})
+		}
+
+		/// The row's cells that were drawn, in row order.
+		fn row_cells(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			ix: usize,
+		) -> Vec<SeenCell> {
+			let mut out = Vec::new();
+			for cell in [
+				RowCell::Gutter,
+				RowCell::Subject,
+				RowCell::Collapsed,
+				RowCell::Label(0),
+				RowCell::Label(1),
+				RowCell::Author,
+				RowCell::Date,
+				RowCell::Hash,
+			] {
+				if let Some(s) = seen_cell(model, cx, ix, cell) {
+					out.push(s);
+				}
+			}
+			out
+		}
+
+		/// A row's cells as (cell, drawn?, x, w), to compare two windows.
+		type RowShape = Vec<(RowCell, bool, f32, f32)>;
+
+		/// (cell, drawn?, x, w) of row `ix`, to compare two windows.
+		fn log_row_shape(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			ix: usize,
+		) -> RowShape {
+			[
+				RowCell::Gutter,
+				RowCell::Subject,
+				RowCell::Label(0),
+				RowCell::Label(1),
+				RowCell::Author,
+				RowCell::Date,
+				RowCell::Hash,
+			]
+			.into_iter()
+			.map(|cell| match seen_cell(model, cx, ix, cell) {
+				Some(s) => (cell, true, s.x, s.w),
+				None => (cell, false, 0., 0.),
+			})
+			.collect()
+		}
+
+		/// What breaks the one fit policy on row `ix`, as text. Empty when
+		/// the row is right.
+		fn row_policy_violations(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			ix: usize,
+			window_w: f32,
+		) -> Vec<String> {
+			let mut bad = Vec::new();
+			let cells = row_cells(model, cx, ix);
+			let Some(row) = bounds_of(cx, format!("log-row:{ix}")) else {
+				return vec![format!("row {ix}: not drawn")];
+			};
+			let (row_l, row_r) =
+				(f32::from(row.left()), f32::from(row.right()));
+			// A1: what is in sight never overlaps, and stays in the row.
+			for (i, a) in cells.iter().enumerate() {
+				if a.visible <= 0.5 {
+					continue;
+				}
+				if a.vis_l() < row_l - 0.5 || a.vis_r() > row_r + 0.5 {
+					bad.push(format!("A1 {:?} leaves the row: {a:?}", a.cell));
+				}
+				for b in &cells[i + 1..] {
+					if b.visible <= 0.5 {
+						continue;
+					}
+					if a.vis_l() < b.vis_r() - 0.5
+						&& b.vis_l() < a.vis_r() - 0.5
+					{
+						bad.push(format!(
+							"A1 {:?} [{:.1},{:.1}] overlaps {:?} [{:.1},{:.1}]",
+							a.cell,
+							a.vis_l(),
+							a.vis_r(),
+							b.cell,
+							b.vis_l(),
+							b.vis_r()
+						));
+					}
+				}
+			}
+			let cell = |c: RowCell| cells.iter().find(|s| s.cell == c);
+			// A2: the subject keeps its readable floor.
+			if let Some(s) = cell(RowCell::Subject) {
+				if s.visible < s.floor - 1. {
+					bad.push(format!(
+						"A2 subject {:.1} < floor {:.1}: {s:?}",
+						s.visible, s.floor
+					));
+				}
+			}
+			// A3: the shorter label is not squeezed below the longer one.
+			if let (Some(a), Some(b)) =
+				(cell(RowCell::Label(0)), cell(RowCell::Label(1)))
+			{
+				let (short, long) = if a.natural <= b.natural {
+					(a, b)
+				} else {
+					(b, a)
+				};
+				let want = short.natural.min(long.visible) - 1.;
+				if short.visible < want {
+					bad.push(format!(
+						"A3 label {:?} {:.1} < min({:.1}, other {:.1}) - 1",
+						short.text, short.visible, short.natural, long.visible
+					));
+				}
+			}
+			// A4: no drift from the solver, and no ancestor clips a text.
+			for s in &cells {
+				if s.role.is_none() {
+					continue;
+				}
+				if s.fit.is_some_and(|fit| (s.w - fit).abs() > 1.) {
+					bad.push(format!("A4 {:?} drifts: {s:?}", s.cell));
+				}
+				if s.visible < s.w - 0.5 {
+					bad.push(format!("A4 {:?} is clipped: {s:?}", s.cell));
+				}
+			}
+			// A5: a date is whole, or absent.
+			if let Some(d) = cell(RowCell::Date) {
+				if d.visible < d.natural - 1. {
+					bad.push(format!(
+						"A5 date {:?} {:.1} < {:.1} - 1",
+						d.text, d.visible, d.natural
+					));
+				}
+			}
+			// A6: from a 1080 window on, the HEAD row has its labels.
+			if ix == 0
+				&& window_w >= 1080.
+				&& (cell(RowCell::Label(0)).is_none()
+					|| cell(RowCell::Label(1)).is_none())
+			{
+				bad.push("A6 the HEAD row lost its labels".into());
+			}
+			bad
+		}
+
+		/// Opens `w`x720 on a fresh window with the hash column `hash`.
+		fn open_log_window<'a>(
+			cx: &'a mut TestAppContext,
+			ws: &Path,
+			w: f32,
+			hash: bool,
+		) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
+			open_log_window_in(cx, ws, w, hash, false)
+				.expect("the Noop text system is always there")
+		}
+
+		/// Like `open_log_window`; with `real` the OS text system measures
+		/// (`None` where the platform has none).
+		fn open_log_window_in<'a>(
+			cx: &'a mut TestAppContext,
+			ws: &Path,
+			w: f32,
+			hash: bool,
+			real: bool,
+		) -> Option<(Entity<WorkbenchModel>, &'a mut VisualTestContext)> {
+			let (model, cx) = if real {
+				open_real_text(cx, ws.to_path_buf(), w, 720.)?
+			} else {
+				let (model, cx) =
+					open_sized(cx, ws.to_path_buf(), None, w, 720.);
+				(model, cx)
+			};
 			settle_until(cx, "the log rows", |cx| {
 				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
 			});
 			settle(cx);
-			assert_eq!(
-				head_label_texts(&model, cx),
-				["main, origin/main", "v0.3.0"]
+			enable_probes(&model, cx);
+			if hash {
+				click_probed(&model, cx, "btn-log-more");
+				click_probed(&model, cx, "log-more:hash");
+			}
+			assert_eq!(model.read_with(cx, |m, _| m.log_show_hash), hash);
+			settle(cx);
+			Some((model, cx))
+		}
+
+		/// A1, A2, A3, A5, A6 on the HEAD row at every window width and
+		/// with the hash column on and off. A6, from 1080 on: the HEAD row
+		/// has its labels.
+		#[gpui::test]
+		fn log_row_cells_follow_one_policy_at_every_width(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels_dated(ws.path());
+			let mut bad = Vec::new();
+			for w in [900., 1000., 1040., 1080., 1120., 1160., 1400.] {
+				for hash in [false, true] {
+					let (model, cx) = open_log_window(cx, ws.path(), w, hash);
+					for v in row_policy_violations(&model, cx, 0, w) {
+						bad.push(format!("{w} hash={hash}: {v}"));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
 			);
-			for selector in ["log-ref-label:0:0", "log-ref-label:0:1"] {
-				let width =
-					cx.debug_bounds(selector).expect("label").size.width;
-				// Icon (14px), its gap (3px) and 30px of text: ui::log::LABEL_FLOOR_W.
-				assert!(
-					f32::from(width) >= 47. - 1.0,
-					"{selector} shows only its icon: {width:?}"
+		}
+
+		/// A merge of a three-commit side branch at HEAD, tagged and on
+		/// `origin/main`: collapsed, its row has the chip and two labels.
+		fn merge_with_labels(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
+			git(&r, &["checkout", "-q", "-b", "side"]);
+			for i in 0..3 {
+				fs::write(r.join(format!("s{i}.txt")), "s").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", &format!("side {i}")]);
+			}
+			git(&r, &["checkout", "-q", "main"]);
+			fs::write(r.join("m.txt"), "m").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main work"]);
+			git(
+				&r,
+				&[
+					"merge",
+					"-q",
+					"--no-ff",
+					"side",
+					"-m",
+					"a merge subject long enough to want the whole row for itself and more",
+				],
+			);
+			git(&r, &["tag", "v0.3.0"]);
+			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+		}
+
+		/// A merge row collapsed to "N hidden": the subject keeps a readable
+		/// floor and the chip is whole (or, with the hash column on, gone:
+		/// the labels come before it).
+		#[gpui::test]
+		fn a_collapsed_merge_row_keeps_a_readable_subject(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			merge_with_labels(ws.path());
+			let mut bad = Vec::new();
+			for w in [1000., 1080., 1160.] {
+				for hash in [false, true] {
+					let (model, cx) = open_log_window(cx, ws.path(), w, hash);
+					let sha7 = model.read_with(cx, |m, _| {
+						m.display_commits()[0].sha[..7].to_string()
+					});
+					click_probed(&model, cx, &format!("collapse:{sha7}"));
+					assert_eq!(
+						model.read_with(cx, |m, _| m.collapsed_merges.len()),
+						1,
+						"the merge did not collapse"
+					);
+					let collapsed =
+						seen_cell(&model, cx, 0, RowCell::Collapsed);
+					match collapsed {
+						// The chip is only an explanation: with the hash
+						// column on it gives way to the labels.
+						None if hash => {}
+						None => bad.push(format!(
+							"{w} hash={hash}: no collapsed chip"
+						)),
+						Some(c) if c.visible < c.natural - 1. => {
+							bad.push(format!("{w} hash={hash}: chip cut {c:?}"))
+						}
+						Some(_) => {}
+					}
+					for v in row_policy_violations(&model, cx, 0, w) {
+						bad.push(format!("{w} hash={hash}: {v}"));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// A collapsed merge row from a 1080 window on: the labels are always
+		/// there (the user's rule), the explanation chip is only drawn whole
+		/// or not at all, and it is what gives way when both do not fit
+		/// (ADR 0005). English and Chinese chips, Noop and real text widths.
+		#[gpui::test]
+		fn a_collapsed_merge_row_keeps_its_labels_over_the_chip(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::Locale;
+			let ws = tempfile::tempdir().unwrap();
+			merge_with_labels(ws.path());
+			let mut bad = Vec::new();
+			let mut chip_dropped = 0;
+			for real in [false, true] {
+				for loc in [Locale::ZhTw, Locale::En] {
+					for w in [1080., 1120., 1160.] {
+						for hash in [false, true] {
+							let Some((model, cx)) = open_log_window_in(
+								cx,
+								ws.path(),
+								w,
+								hash,
+								real,
+							) else {
+								continue;
+							};
+							model.update(cx, |m, cx| {
+								if m.locale != loc {
+									m.toggle_locale(cx);
+								}
+							});
+							let sha7 = model.read_with(cx, |m, _| {
+								m.display_commits()[0].sha[..7].to_string()
+							});
+							click_probed(
+								&model,
+								cx,
+								&format!("collapse:{sha7}"),
+							);
+							settle(cx);
+							assert_eq!(
+								model.read_with(cx, |m, _| m
+									.collapsed_merges
+									.len()),
+								1,
+								"the merge did not collapse"
+							);
+							let t =
+								format!("{w} hash={hash} real={real} {loc:?}");
+							match seen_cell(&model, cx, 0, RowCell::Collapsed) {
+								None => chip_dropped += 1,
+								Some(c) if c.visible < c.natural - 1. => {
+									bad.push(format!("{t}: chip cut {c:?}"))
+								}
+								Some(_) => {}
+							}
+							// A6: both labels of the HEAD row are there.
+							for v in row_policy_violations(&model, cx, 0, w) {
+								bad.push(format!("{t}: {v}"));
+							}
+						}
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+			assert!(
+				chip_dropped > 0,
+				"no cell made the chip give way, so nothing was tested"
+			);
+		}
+
+		/// On a list too narrow for the subject (it gets no width at all),
+		/// the subject's box takes no margin: the solver did not pay the
+		/// gap, so a margin would push the fixed columns after it out of the
+		/// row. The box starts where the gutter ends.
+		#[gpui::test]
+		fn a_subject_without_room_leaves_no_margin(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let mut unplaced = 0;
+			let mut bad = Vec::new();
+			for w in (440..=520).step_by(16).map(|w| w as f32) {
+				for hash in [false, true] {
+					let (model, cx) = open_log_window(cx, ws.path(), w, hash);
+					let Some(f) = row_text_fit(
+						&model,
+						cx,
+						0,
+						crate::ui::FitRole::Subject,
+					) else {
+						continue;
+					};
+					if f.fit != Some(0.) {
+						continue;
+					}
+					unplaced += 1;
+					let gutter = seen_cell(&model, cx, 0, RowCell::Gutter)
+						.expect("the gutter is drawn");
+					if (f.x - (gutter.x + gutter.w)).abs() > 0.5 {
+						bad.push(format!(
+							"{w} hash={hash}: the subject starts at {} but the gutter ends at {}",
+							f.x,
+							gutter.x + gutter.w
+						));
+					}
+				}
+			}
+			assert!(unplaced > 0, "no width left the subject without room");
+			assert!(bad.is_empty(), "{}", bad.join("\n"));
+		}
+
+		/// A window resized where the filter bar's chips do not move: their
+		/// container is held at the width of the "more" chip, so the bar's own
+		/// canvas sees the same width and asks for no redraw. The list and
+		/// the log panel have their own canvases for exactly this: without
+		/// them the rows would keep the old width's columns until some
+		/// input.
+		#[gpui::test]
+		fn log_rows_follow_a_resize_the_filter_bar_does_not_see(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			for (from, to) in [(640., 740.), (760., 640.)] {
+				for hash in [false, true] {
+					let (model, rcx) =
+						open_log_window(cx, ws.path(), from, hash);
+					let chips = |m: &WorkbenchModel| {
+						(
+							m.log_filter_layout.container_w.get(),
+							m.log_filter_layout.last_mask.get(),
+						)
+					};
+					let before = model.read_with(rcx, |m, _| chips(m));
+					rcx.simulate_resize(gpui::size(
+						gpui::px(to),
+						gpui::px(720.),
+					));
+					settle(rcx);
+					let after = model.read_with(rcx, |m, _| chips(m));
+					assert_eq!(
+						before, after,
+						"the filter bar's chips moved: this resize is one it would have redrawn for"
+					);
+					let shape = log_row_shape(&model, rcx, 0);
+					let (fresh_model, fcx) =
+						open_log_window(cx, ws.path(), to, hash);
+					let fresh = log_row_shape(&fresh_model, fcx, 0);
+					assert_same_shape(
+						&format!("{from} -> {to} hash={hash}"),
+						&shape,
+						&fresh,
+					);
+				}
+			}
+		}
+
+		/// The `log_row_shape` of the HEAD row after `from` -> `to` resize with no
+		/// input, the filter bar's mask before and after and its refresh count.
+		fn row_shape_after_resize(
+			cx: &mut TestAppContext,
+			ws: &Path,
+			hash: bool,
+			from: f32,
+			to: f32,
+		) -> (RowShape, [u8; 2], u8) {
+			let (model, cx) = open_log_window(cx, ws, from, hash);
+			let has = model
+				.read_with(cx, |m, _| m.log_filter_split_has_values(m.locale));
+			assert_eq!(has, [false; 4], "no active chip");
+			let before =
+				model.read_with(cx, |m, _| m.log_filter_layout.last_mask.get());
+			cx.simulate_resize(gpui::size(gpui::px(to), gpui::px(720.)));
+			settle(cx);
+			let (after, refreshes) = model.read_with(cx, |m, _| {
+				(
+					m.log_filter_layout.last_mask.get(),
+					m.log_filter_layout.refresh_count.get(),
+				)
+			});
+			(log_row_shape(&model, cx, 0), [before, after], refreshes)
+		}
+
+		fn assert_same_shape(
+			tag: &str,
+			resized: &[(RowCell, bool, f32, f32)],
+			fresh: &[(RowCell, bool, f32, f32)],
+		) {
+			let mut bad = Vec::new();
+			for (a, b) in resized.iter().zip(fresh) {
+				if a.1 != b.1
+					|| (a.2 - b.2).abs() > 0.5
+					|| (a.3 - b.3).abs() > 0.5
+				{
+					bad.push(format!(
+						"{:?}: resized (drawn={}, x={:.1}, w={:.1}) vs fresh (drawn={}, x={:.1}, w={:.1})",
+						a.0, a.1, a.2, a.3, b.1, b.2, b.3
+					));
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{tag}: the resized window differs from a fresh one:\n{}",
+				bad.join("\n")
+			);
+		}
+
+		/// A window widened from 1080 to 1600 draws its rows as a fresh
+		/// 1600 window does, with no input in between. No filter chip is
+		/// active, so the bar's split stays, and once the frames settle the
+		/// bar has no redraw left to ask for (`refresh_count` is back to 0).
+		/// The bar's container does move with this resize, so its canvas may
+		/// well be what redraws the list here: the list's own canvas is
+		/// pinned by `log_rows_follow_a_resize_the_filter_bar_does_not_see`.
+		#[gpui::test]
+		fn log_rows_follow_a_widening_without_input(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			for hash in [false, true] {
+				let (shape, masks, refreshes) =
+					row_shape_after_resize(cx, ws.path(), hash, 1080., 1600.);
+				assert_eq!(masks[0], masks[1], "the chips' split changed");
+				assert_eq!(refreshes, 0, "the filter bar asked for a redraw");
+				let (model, fcx) = open_log_window(cx, ws.path(), 1600., hash);
+				let fresh = log_row_shape(&model, fcx, 0);
+				assert_same_shape(
+					&format!("widen hash={hash}"),
+					&shape,
+					&fresh,
 				);
 			}
-			// About 94px here: a little under MIN_SUBJECT_BESIDE_LABELS, which
-			// the labels' floors cannot all be fitted beside at this width.
-			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+		}
+
+		/// The same for a window narrowed from 1400 to 1160.
+		#[gpui::test]
+		fn log_rows_follow_a_narrowing_without_input(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			for hash in [false, true] {
+				let (shape, masks, refreshes) =
+					row_shape_after_resize(cx, ws.path(), hash, 1400., 1160.);
+				assert_eq!(masks[0], masks[1], "the chips' split changed");
+				assert_eq!(refreshes, 0, "the filter bar asked for a redraw");
+				let (model, fcx) = open_log_window(cx, ws.path(), 1160., hash);
+				let fresh = log_row_shape(&model, fcx, 0);
+				assert_same_shape(
+					&format!("narrow hash={hash}"),
+					&shape,
+					&fresh,
+				);
+			}
+		}
+
+		/// G6: the probe reports each fitted text of the HEAD row, the solver's
+		/// width is the drawn one, a dropped group has width 0, and an idle
+		/// frame prints nothing.
+		#[gpui::test]
+		fn text_fit_probe_reports_each_fitted_text_once(
+			cx: &mut TestAppContext,
+		) {
+			use crate::ui::FitRole;
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels_dated(ws.path());
+			{
+				let (model, cx) = open_log_window(cx, ws.path(), 1080., false);
+				for role in [
+					FitRole::Subject,
+					FitRole::BranchLabel,
+					FitRole::TagLabel,
+					FitRole::Author,
+					FitRole::Date,
+				] {
+					let f = row_text_fit(&model, cx, 0, role)
+						.unwrap_or_else(|| panic!("{role:?} has no TEXT_FIT"));
+					let fit = f.fit.unwrap_or(0.);
+					assert!(fit > 0., "{role:?}: {f:?}");
+					assert!((f.drawn - fit).abs() <= 1., "{role:?}: {f:?}");
+					assert!(!f.clipped, "{role:?}: {f:?}");
+				}
+				let (drift, clipped) = model.read_with(cx, |m, _| {
+					let p = m.probes.as_ref().unwrap();
+					(p.text_fit_drift(), p.text_fit_clipped())
+				});
+				assert!(drift.is_empty(), "drift: {drift:?}");
+				assert!(clipped.is_empty(), "clipped: {clipped:?}");
+			}
+			// With the hash column on, a 900 window has no room for the
+			// labels: the dropped group is reported with width 0.
+			let (model, cx) = open_log_window(cx, ws.path(), 900., true);
+			for role in [FitRole::BranchLabel, FitRole::TagLabel] {
+				let f = row_text_fit(&model, cx, 0, role)
+					.unwrap_or_else(|| panic!("{role:?} has no TEXT_FIT"));
+				assert_eq!(f.fit, Some(0.), "{role:?}: {f:?}");
+				assert!(f.cut && f.shown == 0, "{role:?}: {f:?}");
+			}
+			// Two more frames print no TEXT_FIT line: nothing changed.
+			crate::test_log::take();
+			for _ in 0..2 {
+				model.update(cx, |_, cx| cx.notify());
+				settle(cx);
+			}
+			let lines: Vec<String> = crate::test_log::take()
+				.into_iter()
+				.filter(|l| l.contains("[APP:TEXT_FIT"))
+				.collect();
+			assert!(lines.is_empty(), "an idle frame printed {lines:?}");
+		}
+
+		/// What the whole window's `TEXT_FIT`s say at `w`x`h`: ids whose box
+		/// is not the solver's width, and ids an ancestor clips.
+		fn fit_defects(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> (Vec<String>, Vec<String>) {
+			model.read_with(cx, |m, _| {
+				let p = m.probes.as_ref().expect("probes are on");
+				(p.text_fit_drift(), p.text_fit_clipped())
+			})
+		}
+
+		/// Two repositories with refs and a long author, in every window size
+		/// the native smoke drives, with the real text system where there is
+		/// one: no text of the window is drawn in a width the solver did not
+		/// give it, and no ancestor clips one.
+		#[gpui::test]
+		fn no_text_drifts_or_is_clipped_at_the_smoke_viewports(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			real_text_fixture(ws.path());
+			let r = repo(ws.path(), "second-repository-with-a-long-name", &[]);
+			git(
+				&r,
+				&["branch", "feature/a-rather-long-branch-name-for-labels"],
+			);
+			let mut bad = Vec::new();
+			for real in [false, true] {
+				for (w, h) in [
+					(700., 632.),
+					(900., 600.),
+					(1080., 720.),
+					(1280., 860.),
+					(1600., 900.),
+				] {
+					for hash in [false, true] {
+						let opened = if real {
+							open_real_text(cx, ws.path().to_path_buf(), w, h)
+						} else {
+							let (model, vcx) = open_sized(
+								cx,
+								ws.path().to_path_buf(),
+								None,
+								w,
+								h,
+							);
+							enable_probes(&model, vcx);
+							Some((model, vcx))
+						};
+						let Some((model, cx)) = opened else { continue };
+						settle_until(cx, "the log rows", |cx| {
+							model.read_with(cx, |m, _| {
+								m.display_commits().len() >= 5
+							})
+						});
+						settle(cx);
+						if hash {
+							click_probed(&model, cx, "btn-log-more");
+							click_probed(&model, cx, "log-more:hash");
+							click_probed(&model, cx, "btn-log-more");
+							click_probed(&model, cx, "log-more:details");
+						}
+						settle(cx);
+						let (drift, clipped) = fit_defects(&model, cx);
+						for id in drift {
+							bad.push(format!(
+								"{w}x{h} real={real} hash={hash}: drift {id}"
+							));
+						}
+						for id in clipped {
+							bad.push(format!(
+								"{w}x{h} real={real} hash={hash}: clipped {id}"
+							));
+						}
+					}
+				}
+			}
 			assert!(
-				f32::from(subject.size.width) >= 92.,
-				"subject {:?}",
-				subject.size.width
+				bad.is_empty(),
+				"{} defects:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// Two repositories, the first with branches of 4, 6 .. 40 characters
+		/// only it has: a ref row names the repo or not at all.
+		fn repos_with_long_branch_names(dir: &Path) -> Vec<String> {
+			let mut names = Vec::new();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(dir, name, &[]);
+				if name == "repo-01-core" {
+					for n in (4..=40).step_by(2) {
+						let b: String = "b".repeat(n);
+						git(&r, &["branch", &b]);
+						names.push(b);
+					}
+				}
+			}
+			names
+		}
+
+		/// What a pane or menu row of the branch `b` breaks: its repo suffix
+		/// is whole or absent, its name keeps its readable floor.
+		fn ref_row_violations(
+			cx: &mut VisualTestContext,
+			b: &str,
+			name_selector: Option<String>,
+			repo_selector: String,
+		) -> Vec<String> {
+			use crate::theme::{SMALL_TEXT, UI_TEXT};
+			let mut bad = Vec::new();
+			let repo_nat = text_w(cx, "repo-01-core", false, SMALL_TEXT);
+			if let Some(r) = bounds_of(cx, repo_selector.clone()) {
+				let w = f32::from(r.size.width);
+				if (0.5..repo_nat - 1.).contains(&w) {
+					bad.push(format!(
+						"{b}: repo {w:.1} is neither whole ({repo_nat:.1}) nor gone"
+					));
+				}
+			}
+			if let Some(sel) = name_selector {
+				if let Some(n) = bounds_of(cx, sel) {
+					let nat = text_w(cx, b, false, UI_TEXT);
+					let floor = text_w(
+						cx,
+						&format!(
+							"{}\u{2026}",
+							b.chars().take(6).collect::<String>()
+						),
+						false,
+						UI_TEXT,
+					) + 1.;
+					let w = f32::from(n.size.width);
+					if w < nat.min(floor) - 1. {
+						bad.push(format!(
+							"{b}: name {w:.1} < min({nat:.1}, floor {floor:.1})"
+						));
+					}
+				}
+			}
+			bad
+		}
+
+		/// #194: in the branches pane a repo suffix is whole or gone, never
+		/// a piece of it, and a name keeps its readable floor.
+		#[gpui::test]
+		fn branches_pane_names_stay_readable_and_the_repo_is_whole_or_gone(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let names = repos_with_long_branch_names(ws.path());
+			let mut bad = Vec::new();
+			for (w, h) in [(1080., 720.), (1440., 900.)] {
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, w, h);
+				settle_until(cx, "the two feeds", |cx| {
+					model.read_with(cx, |m, _| {
+						m.log_feeds.len() == 2 && m.display_commits().len() >= 2
+					})
+				});
+				settle(cx);
+				for b in &names {
+					for v in ref_row_violations(
+						cx,
+						b,
+						Some(format!("ref-name:refs/heads/{b}")),
+						format!("ref-repo:refs/heads/{b}"),
+					) {
+						bad.push(format!("{w}: {v}"));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// #194: the same in the branch filter's menu.
+		#[gpui::test]
+		fn branch_menu_rows_keep_a_readable_name_and_a_whole_repo(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let names = repos_with_long_branch_names(ws.path());
+			let mut bad = Vec::new();
+			for (w, h) in [(1080., 720.), (1440., 900.)] {
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, w, h);
+				settle_until(cx, "the two feeds", |cx| {
+					model.read_with(cx, |m, _| {
+						m.log_feeds.len() == 2 && m.display_commits().len() >= 2
+					})
+				});
+				settle(cx);
+				enable_probes(&model, cx);
+				click_probed(&model, cx, "log-filter-branch");
+				click_probed(&model, cx, "log-branch-group:refs_local");
+				for b in &names {
+					for v in ref_row_violations(
+						cx,
+						b,
+						Some(format!("menu-name:refs/heads/{b}")),
+						format!("menu-repo:refs/heads/{b}"),
+					) {
+						bad.push(format!("{w}: {v}"));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// Clicks `id` if it is drawn; whether it was.
+		fn click_if_probed(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			id: &str,
+		) -> bool {
+			let drawn = model
+				.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id));
+			if drawn.is_some() {
+				click_probed(model, cx, id);
+			}
+			drawn.is_some()
+		}
+
+		/// #205: two active chips (a long repo name and a short branch) at
+		/// a width where both are on the bar: the shorter value stays whole
+		/// when a longer one is cut, and every value keeps its floor.
+		#[gpui::test]
+		fn the_shorter_active_chip_value_stays_whole(cx: &mut TestAppContext) {
+			use crate::theme::UI_TEXT;
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core-with-a-long-name", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				git(&r, &["checkout", "-q", "-b", "topic-03"]);
+				fs::write(r.join("b.txt"), "b").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "topic work"]);
+				git(&r, &["checkout", "-q", "main"]);
+			}
+			let mut bad = Vec::new();
+			let mut w = 1030.;
+			while w <= 1090. {
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, w, 720.);
+				settle_until(cx, "the two feeds", |cx| {
+					model.read_with(cx, |m, _| {
+						m.log_feeds.len() == 2 && m.display_commits().len() >= 4
+					})
+				});
+				settle(cx);
+				enable_probes(&model, cx);
+				click_probed(&model, cx, "ref:refs/heads/topic-03");
+				if !click_if_probed(&model, cx, "log-filter-repo") {
+					click_probed(&model, cx, "log-filter-more");
+					click_probed(&model, cx, "log-filter-more:repo");
+				}
+				click_probed(
+					&model,
+					cx,
+					"log-repo:repo-01-core-with-a-long-name",
+				);
+				settle(cx);
+				settle(cx);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				// (chip id, "<key>: <value>"), the values being the chips'
+				// texts.
+				let chips = [
+					(
+						"log-filter-repo",
+						format!(
+							"{}: repo-01-core-with-a-long-name",
+							crate::i18n::t("log_chip_repo", loc)
+						),
+						format!("{}: ", crate::i18n::t("log_chip_repo", loc)),
+					),
+					(
+						"log-filter-branch",
+						format!(
+							"{}: topic-03",
+							crate::i18n::t("log_chip_branch", loc)
+						),
+						format!("{}: ", crate::i18n::t("log_chip_branch", loc)),
+					),
+				];
+				// The chip's padding, gap and icon around its text.
+				const CHROME: f32 = 27.;
+				let mut on_bar: Vec<(f32, f32, f32)> = Vec::new();
+				for (id, text, key) in &chips {
+					let Some(b) = bounds_of(cx, id.to_string()) else {
+						continue;
+					};
+					let natural = text_w(cx, text, false, UI_TEXT);
+					let drawn = f32::from(b.size.width) - CHROME;
+					// The key whole and 4 characters of the value, "…", 1px.
+					let value: String = text
+						.strip_prefix(key.as_str())
+						.unwrap_or(text)
+						.chars()
+						.take(4)
+						.collect();
+					let floor = text_w(
+						cx,
+						&format!("{key}{value}\u{2026}"),
+						false,
+						UI_TEXT,
+					) + 1.;
+					if drawn < floor.min(natural) - 2. {
+						bad.push(format!(
+							"{w}: {id} {drawn:.1} < floor {floor:.1} ({natural:.1})"
+						));
+					}
+					on_bar.push((natural, drawn, floor));
+				}
+				for (i, a) in on_bar.iter().enumerate() {
+					for b in &on_bar[i + 1..] {
+						let (short, long) =
+							if a.0 <= b.0 { (a, b) } else { (b, a) };
+						// `short` is cut while `long` has more than its floor.
+						if short.1 < short.0 - 2. && long.1 > long.2 + 1. {
+							bad.push(format!(
+								"{w}: the shorter value is cut ({:.1} of {:.1}) while a longer one has {:.1} of {:.1}, its floor {:.1}",
+								short.1, short.0, long.1, long.0, long.2
+							));
+						}
+					}
+				}
+				w += 10.;
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// The rows of the long-text fixture: Chinese and long Latin
+		/// subjects, authors, a CJK tag, many tags, remote branches.
+		fn real_text_fixture(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
+			let commit =
+				|name: &str, subject: &str, author: &str, date: &str| {
+					fs::write(r.join(name), name).unwrap();
+					git(&r, &["add", "."]);
+					git_dated(
+						&r,
+						&["commit", "-q", "-m", subject, "--author", author],
+						date,
+					);
+				};
+			commit(
+				"c1.txt",
+				"fix",
+				"\u{9673}\u{5927}\u{6587}\u{6e2c}\u{8a66}\u{4f5c}\u{8005}\u{540d}\u{7a31} <c@x>",
+				"2025-12-28T15:59:00Z",
+			);
+			git(
+				&r,
+				&["branch", "feature/a-rather-long-branch-name-for-labels"],
+			);
+			commit(
+				"c2.txt",
+				"\u{4fee}\u{6b63}\u{9060}\u{7aef}\u{5de5}\u{4f5c}\u{5340}\u{5728}\u{6162}\u{901f}\u{9023}\u{7dda}\u{4e0b}\u{8b80}\u{53d6}\u{5927}\u{578b}\u{6a94}\u{6848}\u{903e}\u{6642}\u{5f8c}\u{7121}\u{6cd5}\u{91cd}\u{8a66}\u{7684}\u{554f}\u{984c}",
+				"Alexandra Konstantinopoulou <a@x>",
+				"2025-11-27T15:58:00Z",
+			);
+			git(
+				&r,
+				&["tag", "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}"],
+			);
+			commit(
+				"c3.txt",
+				"bump dependencies and regenerate the lockfile for the release",
+				"t <t@t>",
+				"2025-12-20T15:30:00Z",
+			);
+			for t in ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"] {
+				git(&r, &["tag", t]);
+			}
+			commit(
+				"c4.txt",
+				"a subject long enough to want the whole row for itself and then some more words",
+				"t <t@t>",
+				"2025-12-21T15:30:00Z",
+			);
+			git(&r, &["tag", "v0.3.0"]);
+			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+			git(
+				&r,
+				&[
+					"symbolic-ref",
+					"refs/remotes/origin/HEAD",
+					"refs/remotes/origin/main",
+				],
+			);
+		}
+
+		/// With the OS text system and the embedded fonts, the rows of the
+		/// long-text fixture keep every text within its rule: what a cell
+		/// shows (graphemes before the ellipsis) satisfies `rule_holds`, and
+		/// a date is whole. Measured only for what the text system gives
+		/// (CJK relies on the system's CJK font).
+		#[gpui::test]
+		fn real_text_log_rows_follow_the_rules(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			real_text_fixture(ws.path());
+			let mut bad = Vec::new();
+			// (window width, hash column, English).
+			for (w, hash, english) in [
+				(1080., true, false),
+				(900., true, false),
+				(900., false, true),
+			] {
+				let Some((model, cx)) =
+					open_real_text(cx, ws.path().to_path_buf(), w, 720.)
+				else {
+					return;
+				};
+				settle_until(cx, "the log rows", |cx| {
+					model.read_with(cx, |m, _| m.display_commits().len() >= 5)
+				});
+				settle(cx);
+				if english {
+					cx.simulate_keystrokes("alt-l");
+					settle(cx);
+				}
+				if hash {
+					click_probed(&model, cx, "btn-log-more");
+					click_probed(&model, cx, "log-more:hash");
+				}
+				settle(cx);
+				for ix in 0..4 {
+					for s in row_cells(&model, cx, ix) {
+						let Some(role) = s.role else { continue };
+						if !s.rule_holds() {
+							bad.push(format!(
+								"{w} hash={hash} en={english} row {ix} {:?} {:?}: {}/{} in {:.1}px breaks {:?}",
+								s.cell,
+								s.text,
+								s.shown,
+								s.total,
+								s.visible,
+								role.rule()
+							));
+						}
+						// A4: the solver's width is the drawn one, and no
+						// ancestor clips the text.
+						if s.fit.is_some_and(|fit| (s.w - fit).abs() > 1.)
+							|| s.visible < s.w - 0.5
+						{
+							bad.push(format!(
+								"{w} hash={hash} en={english} row {ix} {:?} drifts or is clipped: {s:?}",
+								s.cell
+							));
+						}
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
+		}
+
+		/// Inter's digits are proportional (1 is far narrower than 4), so a
+		/// date is only whole where the box fits its widest digits: dates with
+		/// "10/24" and "04:44" in them (zh and en long forms, and the today and
+		/// yesterday forms) are whole at 900 and 1080 with the hash column on.
+		/// `shown == total` alone has a +0.5 tolerance gpui's truncation does
+		/// not, so the box must also hold the raw text width.
+		#[gpui::test]
+		fn real_text_dates_with_wide_digits_are_whole(cx: &mut TestAppContext) {
+			use chrono::{Duration, Local};
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "solo", &[]);
+			let today = Local::now().date_naive();
+			let days = [
+				"2024-10-24T04:44:00".to_string(),
+				"2020-10-20T20:00:00".to_string(),
+				format!("{}T04:44:00", today - Duration::days(1)),
+				format!("{}T04:44:00", today),
+			];
+			for (i, date) in days.iter().enumerate() {
+				fs::write(r.join(format!("d{i}.txt")), "d").unwrap();
+				git(&r, &["add", "."]);
+				git_dated(
+					&r,
+					&["commit", "-q", "-m", &format!("subject number {i}")],
+					date,
+				);
+			}
+			let mut bad = Vec::new();
+			// (window width, English).
+			for (w, english) in
+				[(900., false), (900., true), (1080., false), (1080., true)]
+			{
+				let Some((model, cx)) =
+					open_real_text(cx, ws.path().to_path_buf(), w, 720.)
+				else {
+					return;
+				};
+				settle_until(cx, "the log rows", |cx| {
+					model.read_with(cx, |m, _| m.display_commits().len() >= 4)
+				});
+				settle(cx);
+				if english {
+					cx.simulate_keystrokes("alt-l");
+					settle(cx);
+				}
+				click_probed(&model, cx, "btn-log-more");
+				click_probed(&model, cx, "log-more:hash");
+				settle(cx);
+				for ix in 0..4 {
+					let Some(d) = seen_cell(&model, cx, ix, RowCell::Date)
+					else {
+						bad.push(format!("{w} en={english} row {ix}: no date"));
+						continue;
+					};
+					if d.shown != d.total || d.visible < d.natural {
+						bad.push(format!(
+							"{w} en={english} row {ix} {:?}: {}/{} in {:.1}px of {:.1}",
+							d.text, d.shown, d.total, d.visible, d.natural
+						));
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
 			);
 		}
 
 		/// The test platform measures with `NoopTextSystem` (every char 0.6em),
 		/// so CJK is undercounted and truncation never shows (#224).
 		/// `use_real_text_system` swaps in the OS text system (CoreText on
-		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md).
+		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md),
+		/// and `open_real_text` registers the embedded fonts as the app does.
 		/// Windows is skipped: building DirectWrite without a window was not
 		/// attempted. Without an installed CJK font the CJK check fails.
 		#[gpui::test]
@@ -14031,26 +15648,16 @@ mod tests {
 			cx: &mut TestAppContext,
 		) {
 			const TAG: &str = "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}";
-			let size = crate::theme::SMALL_TEXT;
-			if !cx.use_real_text_system() {
-				assert!(
-					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
-						|| cfg!(windows),
-					"no real text system on this OS"
-				);
-				return;
-			}
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
 			let r = ws.path().join("solo");
 			git(&r, &["tag", "-d", "v0.3.0"]);
 			git(&r, &["tag", TAG]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
-			let cjk = cx.update(|w, _| crate::ui::text_width(w, TAG, size));
-			// What NoopTextSystem reports: 0.6em per char.
-			let noop = TAG.chars().count() as f32 * 0.6 * size;
-			assert!(cjk > noop * 1.3, "cjk {cjk} vs noop {noop}");
+			let Some((model, cx)) =
+				open_real_text(cx, ws.path().to_path_buf(), 1080., 720.)
+			else {
+				return;
+			};
 			settle_until(cx, "the log rows", |cx| {
 				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
 			});
@@ -14059,17 +15666,1288 @@ mod tests {
 				head_label_texts(&model, cx),
 				["main, origin/main", TAG]
 			);
-			let tag = cx.debug_bounds("log-ref-label:0:1").expect("tag label");
-			let natural =
-				cx.update(|w, _| 17. + crate::ui::text_width(w, TAG, size));
-			// The CJK tag is wider than the list leaves it, so it is
-			// ellipsized at 1080, yet keeps the icon and a few characters.
-			assert!(
-				f32::from(tag.size.width) >= 47. - 1.0,
-				"tag {:?}",
-				tag.size.width
-			);
-			assert!(f32::from(tag.size.width) < natural, "tag not cut");
+			// Whatever width the list leaves the CJK tag, the rule holds:
+			// six of its characters at least, or all of it.
+			let tag = seen_cell(&model, cx, 0, RowCell::Label(1)).expect("tag");
+			assert!(tag.rule_holds(), "{tag:?}");
+			assert!(tag.visible >= tag.floor - 1., "{tag:?}");
+			let bad = row_policy_violations(&model, cx, 0, 1080.);
+			assert!(bad.is_empty(), "{bad:?}");
+		}
+
+		/// #229: the width x locale x hash x panes matrix. Every cell opens
+		/// a window with the OS text system and the embedded fonts, draws
+		/// the fixture's Log and reads the whole window's `TEXT_FIT` (#228):
+		/// what each text shows is checked against the rule of its role
+		/// (graphemes, never pixels). It is inline so that the redraw ban of
+		/// `check_test_refresh.sh`, which only reads what follows the
+		/// tests module's opening line, still covers it.
+		mod fit_matrix {
+			use super::*;
+			use crate::ui::{rule_holds, FitRole};
+			use std::collections::{BTreeMap, BTreeSet};
+
+			/// Which panes the Log shows beside the list.
+			#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+			enum Panes {
+				/// The details and branches panes, as the app opens.
+				Default,
+				/// Both switched off in the "more" menu: the widest list.
+				ListOnly,
+			}
+
+			/// One text of the latest frame, as the probe saw it.
+			#[derive(Clone, Debug)]
+			struct Seen {
+				id: String,
+				role: FitRole,
+				/// The display row of a commit row's text.
+				row: Option<usize>,
+				/// Drawn at all: a dropped text only has a `fit` of 0.
+				present: bool,
+				x: f32,
+				visible: f32,
+				natural: f32,
+				shown: usize,
+				total: usize,
+				key_graphemes: usize,
+				clipped: bool,
+				drifts: bool,
+				text: String,
+			}
+
+			impl Seen {
+				/// What is in sight, from left to right.
+				fn span(&self) -> (f32, f32) {
+					(self.x, self.x + self.visible)
+				}
+
+				fn describe(&self) -> String {
+					format!(
+						"{} {:?} shown {}/{} rule {} visible {:.1} natural {:.1}",
+						self.id,
+						self.text,
+						self.shown,
+						self.total,
+						self.role.rule().name(),
+						self.visible,
+						self.natural
+					)
+				}
+			}
+
+			/// Every text of the latest frame. A commit row's is tied to its
+			/// display row by the row key (`log_row_key`).
+			fn snapshot(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> Vec<Seen> {
+				model.read_with(cx, |m, _| {
+					let keys: BTreeMap<String, usize> = m
+						.display_commits()
+						.iter()
+						.enumerate()
+						.map(|(ix, c)| (m.log_row_key(c), ix))
+						.collect();
+					m.probes
+						.as_ref()
+						.expect("probes are on")
+						.text_fits()
+						.into_iter()
+						.map(|(id, f)| {
+							let rest =
+								id.strip_prefix("text-fit:").unwrap_or(&id);
+							let scope =
+								rest.rsplit_once(':').map_or(rest, |(s, _)| s);
+							let row = scope
+								.strip_prefix("row:")
+								.and_then(|k| keys.get(k).copied());
+							Seen {
+								row,
+								present: f.fit != Some(0.),
+								role: f.role,
+								x: f.x,
+								visible: f.visible,
+								natural: f.natural,
+								shown: f.shown,
+								total: f.total,
+								key_graphemes: f.key_graphemes,
+								clipped: f.clipped,
+								drifts: f.drifts() || f.style_drifts(),
+								text: f.text.to_string(),
+								id,
+							}
+						})
+						.collect()
+				})
+			}
+
+			/// What a cell's checks need to know besides the texts.
+			struct CellCtx {
+				hash: bool,
+				width: f32,
+				/// The first rows that must have been drawn.
+				drawn_rows: usize,
+				/// Rows that have refs, and collapsed merges.
+				ref_rows: Vec<usize>,
+				collapsed_rows: Vec<usize>,
+				/// The list's left and right edge, and each row's gutter.
+				list: (f32, f32),
+				gutters: BTreeMap<usize, (f32, f32)>,
+			}
+
+			fn cell_ctx(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				width: f32,
+				hash: bool,
+				drawn_rows: usize,
+			) -> CellCtx {
+				let (ref_rows, collapsed_rows, n) =
+					model.read_with(cx, |m, _| {
+						let rows = m.display_commits();
+						let refs = (0..rows.len())
+							.filter(|&ix| {
+								m.graph_layout.as_ref().is_some_and(|l| {
+									!l.rows[ix].refs.is_empty()
+								})
+							})
+							.collect();
+						let collapsed = (0..rows.len())
+							.filter(|&ix| {
+								m.collapsed_merges.contains(&rows[ix].sha)
+							})
+							.collect();
+						(refs, collapsed, rows.len())
+					});
+				let list = bounds_of(cx, "log-list".into())
+					.map(|b| (f32::from(b.left()), f32::from(b.right())))
+					.expect("the Log's list is drawn");
+				let mut gutters = BTreeMap::new();
+				for ix in 0..n {
+					if let Some(b) = bounds_of(cx, format!("log-gutter:{ix}")) {
+						gutters.insert(
+							ix,
+							(f32::from(b.left()), f32::from(b.right())),
+						);
+					}
+				}
+				CellCtx {
+					hash,
+					width,
+					drawn_rows,
+					ref_rows,
+					collapsed_rows,
+					list,
+					gutters,
+				}
+			}
+
+			/// I1 to I4 over one snapshot; every violation, each naming the
+			/// cell, the text, how much of it shows and the rule.
+			fn check(cell: &str, s: &[Seen], ctx: &CellCtx) -> Vec<String> {
+				let mut bad = Vec::new();
+				let mut say = |i: &str, what: String| {
+					bad.push(format!("{cell}: {i} {what}"));
+				};
+				for t in s {
+					if t.id.starts_with("text-fit:row:") && t.row.is_none() {
+						say(
+							"stale",
+							format!("{} is of no displayed row", t.id),
+						);
+					}
+					if !t.present {
+						continue;
+					}
+					// I1: what shows satisfies the role's rule.
+					if !rule_holds(
+						t.role.rule(),
+						t.shown,
+						t.total,
+						t.key_graphemes,
+					) {
+						say("I1", format!("breaks its rule: {}", t.describe()));
+					}
+					// I2: nothing is clipped by an ancestor or drawn in a
+					// width the solver did not give.
+					if t.clipped || t.drifts {
+						say(
+							"I2",
+							format!(
+								"clipped={} drift={}: {}",
+								t.clipped,
+								t.drifts,
+								t.describe()
+							),
+						);
+					}
+				}
+				// Per row.
+				let mut rows: BTreeMap<usize, Vec<&Seen>> = BTreeMap::new();
+				for t in s {
+					if let Some(ix) = t.row {
+						rows.entry(ix).or_default().push(t);
+					}
+				}
+				for ix in 0..ctx.drawn_rows {
+					let subject = rows.get(&ix).and_then(|r| {
+						r.iter().find(|t| t.role == FitRole::Subject)
+					});
+					assert!(
+						subject.is_some(),
+						"{cell}: row {ix} was not drawn: fixture or window height is wrong"
+					);
+				}
+				for (ix, texts) in &rows {
+					let has = |r: FitRole| {
+						texts.iter().find(|t| t.role == r).map(|t| t.present)
+					};
+					// I3: what is in sight never overlaps and stays in the
+					// list.
+					let mut spans: Vec<(String, (f32, f32))> = texts
+						.iter()
+						.filter(|t| t.present && t.visible > 0.5)
+						.map(|t| (format!("{:?}", t.role), t.span()))
+						.collect();
+					if let Some(g) = ctx.gutters.get(ix) {
+						spans.push(("Gutter".into(), *g));
+					}
+					for (i, (an, a)) in spans.iter().enumerate() {
+						if a.0 < ctx.list.0 - 0.5 || a.1 > ctx.list.1 + 0.5 {
+							say(
+								"I3",
+								format!(
+									"row {ix} {an} [{:.1},{:.1}] leaves the list [{:.1},{:.1}]",
+									a.0, a.1, ctx.list.0, ctx.list.1
+								),
+							);
+						}
+						for (bn, b) in &spans[i + 1..] {
+							if a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5 {
+								say(
+									"I3",
+									format!(
+										"row {ix} {an} [{:.1},{:.1}] overlaps {bn} [{:.1},{:.1}]",
+										a.0, a.1, b.0, b.1
+									),
+								);
+							}
+						}
+					}
+					// I4: what a row has.
+					if ctx.hash != (has(FitRole::Hash) == Some(true)) {
+						say(
+							"I4",
+							format!(
+								"row {ix}: the hash column is {:?} with the hash setting {}",
+								has(FitRole::Hash),
+								ctx.hash
+							),
+						);
+					}
+					let group: Vec<(FitRole, bool)> = [
+						FitRole::BranchLabel,
+						FitRole::TagLabel,
+						FitRole::RefMore,
+					]
+					.into_iter()
+					.filter_map(|r| has(r).map(|p| (r, p)))
+					.collect();
+					if group.iter().any(|(_, p)| *p != group[0].1) {
+						say(
+							"I4",
+							format!(
+								"row {ix}: the labels do not come and go together: {group:?}"
+							),
+						);
+					}
+					if ctx.width >= 1080.
+						&& ctx.ref_rows.contains(ix)
+						&& !group.iter().any(|(_, p)| *p)
+					{
+						say(
+							"I4",
+							format!(
+								"row {ix} has refs but no labels at {}",
+								ctx.width
+							),
+						);
+					}
+					if ctx.collapsed_rows.contains(ix)
+						&& has(FitRole::Collapsed).is_none()
+					{
+						say(
+							"I4",
+							format!("collapsed row {ix} has no chip text"),
+						);
+					}
+					for r in [FitRole::Date, FitRole::Subject] {
+						if has(r) != Some(true) {
+							say("I4", format!("row {ix} has no {r:?}"));
+						}
+					}
+				}
+				bad
+			}
+
+			/// I3 for what is not a row: the filter chips stay clear of the
+			/// buttons beside them and inside the list's width; the header's
+			/// buttons stay inside the panel and clear of the hint.
+			fn check_bars(
+				cell: &str,
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				ctx: &CellCtx,
+				s: &[Seen],
+			) -> Vec<String> {
+				let scale = cx.update(|w, _| w.scale_factor());
+				let window_w =
+					cx.update(|w, _| f32::from(w.viewport_size().width));
+				let (ids, bounds): (Vec<String>, BTreeMap<String, [i32; 4]>) =
+					model.read_with(cx, |m, _| {
+						let p = m.probes.as_ref().expect("probes are on");
+						let ids = p.drawn();
+						let b = ids
+							.iter()
+							.filter_map(|id| Some((id.clone(), p.bounds(id)?)))
+							.collect();
+						(ids, b)
+					});
+				let span = |id: &str| -> Option<(f32, f32)> {
+					let b = bounds.get(id)?;
+					Some((b[0] as f32 / scale, (b[0] + b[2]) as f32 / scale))
+				};
+				let mut bad = Vec::new();
+				let chips: Vec<&String> = ids
+					.iter()
+					.filter(|id| {
+						id.starts_with("log-filter-")
+							&& !id.ends_with("-clear")
+							&& !id.contains(':')
+					})
+					.collect();
+				let blockers = [
+					"btn-log-refresh",
+					"btn-head",
+					"btn-compare",
+					"btn-copy-commits",
+				];
+				let overlaps = |a: (f32, f32), b: (f32, f32)| {
+					a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5
+				};
+				for chip in &chips {
+					let Some(c) = span(chip) else { continue };
+					if c.1 > ctx.list.1 + 0.5 {
+						bad.push(format!(
+							"{cell}: I3 chip {chip} ends at {:.1} past the list's {:.1}",
+							c.1, ctx.list.1
+						));
+					}
+					for other in blockers {
+						if span(other).is_some_and(|o| overlaps(c, o)) {
+							bad.push(format!(
+								"{cell}: I3 chip {chip} overlaps {other}"
+							));
+						}
+					}
+					for other in &chips {
+						if *other != *chip
+							&& span(other).is_some_and(|o| overlaps(c, o))
+						{
+							bad.push(format!(
+								"{cell}: I3 chip {chip} overlaps chip {other}"
+							));
+						}
+					}
+				}
+				let hint = s
+					.iter()
+					.find(|t| t.role == FitRole::RefHint && t.present)
+					.map(Seen::span);
+				for button in ["btn-log-more", "btn-log-hide"] {
+					let Some(b) = span(button) else { continue };
+					// The panel runs from the list's left edge to the
+					// window's right one (the details pane is inside it).
+					if b.0 < ctx.list.0 - 0.5 || b.1 > window_w + 0.5 {
+						bad.push(format!(
+							"{cell}: I3 {button} [{:.1},{:.1}] is not whole in the panel [{:.1},{:.1}]",
+							b.0, b.1, ctx.list.0, window_w
+						));
+					}
+					if hint.is_some_and(|h| overlaps(b, h)) {
+						bad.push(format!(
+							"{cell}: I3 {button} overlaps the ref hint {hint:?}"
+						));
+					}
+				}
+				bad
+			}
+
+			fn assert_clean(bad: Vec<String>) {
+				assert!(
+					bad.is_empty(),
+					"{} violations:\n{}",
+					bad.len(),
+					bad.join("\n")
+				);
+			}
+
+			/// The Log of the row matrix: the main history with a merge of a
+			/// side branch, a CJK subject and author, a CJK tag, five tags
+			/// (their `+N`), a long branch name, dates with wide digits
+			/// ("10/24", "04:44"). Collapsed, rows 0 to 5 are HEAD, bump,
+			/// the CJK one, fix, the merge and init.
+			struct FitFixture {
+				merge7: String,
+			}
+
+			/// The viewer's own commit on HEAD: 56 of the widest capital,
+			/// whose three-letter floor is wider in the weight it is drawn
+			/// in than in the regular one (#229 review).
+			const OWN_AUTHOR: &str = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW <me@x>";
+
+			/// A name whose letters kern (T-a, a-y): gpui cuts it by the sum of
+			/// its characters, which the shaped line is narrower than.
+			const KERNED_AUTHOR: &str = "Taylor Smith <ts@x>";
+
+			fn fit_fixture(dir: &Path) -> FitFixture {
+				let r = dir.join("solo");
+				fs::create_dir(&r).unwrap();
+				git(&r, &["init", "-q", "-b", "main"]);
+				// The viewer is `me@x`: the HEAD commit below is theirs, so
+				// its author is drawn in the viewer's own weight.
+				git(&r, &["config", "user.email", "me@x"]);
+				let commit = |file: &str,
+				              subject: &str,
+				              author: Option<&str>,
+				              date: &str| {
+					fs::write(r.join(file), file).unwrap();
+					git(&r, &["add", "."]);
+					let mut args = vec!["commit", "-q", "-m", subject];
+					if let Some(a) = author {
+						args.extend(["--author", a]);
+					}
+					git_dated(&r, &args, date);
+				};
+				commit(
+					"init.txt",
+					"init",
+					Some("AVAVAV Tomas <av@x>"),
+					"2025-10-01T10:00:00Z",
+				);
+				git(&r, &["checkout", "-q", "-b", "side"]);
+				commit("side.txt", "side work", None, "2025-10-02T10:00:00Z");
+				git(&r, &["checkout", "-q", "main"]);
+				git_dated(
+					&r,
+					&[
+						"merge",
+						"-q",
+						"--no-ff",
+						"side",
+						"-m",
+						"merge side work into main",
+					],
+					"2025-10-03T10:00:00Z",
+				);
+				let merge7 = {
+					let out = Command::new("git")
+						.current_dir(&r)
+						.args(["rev-parse", "--short=7", "HEAD"])
+						.output()
+						.expect("git rev-parse");
+					String::from_utf8(out.stdout).unwrap().trim().to_string()
+				};
+				commit(
+					"fix.txt",
+					"fix",
+					Some("\u{9673}\u{5927}\u{6587}\u{6e2c}\u{8a66}\u{4f5c}\u{8005}\u{540d}\u{7a31} <c@x>"),
+					"2025-10-10T15:59:00Z",
+				);
+				git(
+					&r,
+					&["branch", "feature/a-rather-long-branch-name-for-labels"],
+				);
+				commit(
+					"zh.txt",
+					"\u{4fee}\u{6b63}\u{9060}\u{7aef}\u{5de5}\u{4f5c}\u{5340}\u{5728}\u{6162}\u{901f}\u{9023}\u{7dda}\u{4e0b}\u{8b80}\u{53d6}\u{5927}\u{578b}\u{6a94}\u{6848}\u{903e}\u{6642}\u{5f8c}\u{7121}\u{6cd5}\u{91cd}\u{8a66}\u{7684}\u{554f}\u{984c}",
+					Some("Alexandra Konstantinopoulou <a@x>"),
+					"2025-10-24T04:44:00Z",
+				);
+				git(
+					&r,
+					&["tag", "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}"],
+				);
+				commit(
+					"bump.txt",
+					"bump dependencies and regenerate the lockfile for the release",
+					Some(KERNED_AUTHOR),
+					"2025-12-20T15:30:00Z",
+				);
+				for t in ["v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4"] {
+					git(&r, &["tag", t]);
+				}
+				commit(
+					"head.txt",
+					"a subject long enough to want the whole row for itself and then some more words",
+					Some(OWN_AUTHOR),
+					"2025-12-21T15:30:00Z",
+				);
+				git(&r, &["tag", "release-0.3.0-candidate-2"]);
+				git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+				git(
+					&r,
+					&[
+						"symbolic-ref",
+						"refs/remotes/origin/HEAD",
+						"refs/remotes/origin/main",
+					],
+				);
+				FitFixture { merge7 }
+			}
+
+			/// Two repositories with a `topic-03` each, and a branch of each
+			/// that only it has: `only-in-core` (its repo's name is too wide
+			/// for any pane or menu row, so it is dropped) and `ci` (a short
+			/// name with a repo name that fits whole).
+			fn chip_fixture(dir: &Path) {
+				for (name, own) in [
+					("repo-01-core-with-a-long-name", "only-in-core"),
+					("repo-02-api", "ci"),
+				] {
+					let r = repo(dir, name, &[]);
+					for branch in ["topic-03", own] {
+						git(&r, &["checkout", "-q", "-b", branch]);
+						fs::write(r.join(format!("{branch}.txt")), "b")
+							.unwrap();
+						git(&r, &["add", "."]);
+						git(
+							&r,
+							&["commit", "-q", "-m", &format!("{branch} work")],
+						);
+						git(&r, &["checkout", "-q", "main"]);
+					}
+				}
+			}
+
+			/// The locales a cell goes through, with `check` run for each:
+			/// the first is what the app opens in, `alt-l` switches.
+			fn each_locale(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				mut run: impl FnMut(&Entity<WorkbenchModel>, &mut VisualTestContext),
+			) {
+				let mut seen = BTreeSet::new();
+				for _ in 0..2 {
+					let loc = model.read_with(cx, |m, _| m.locale);
+					assert!(
+						seen.insert(format!("{loc:?}")),
+						"alt-l did not switch"
+					);
+					run(model, cx);
+					cx.simulate_keystrokes("alt-l");
+					settle(cx);
+				}
+				assert_eq!(seen.len(), 2);
+			}
+
+			/// Opens the row matrix's window: the fixture, merge collapsed,
+			/// hash and panes as the cell says. `None` without a real text
+			/// system.
+			fn open_rows<'a>(
+				cx: &'a mut TestAppContext,
+				ws: &Path,
+				fx: &FitFixture,
+				w: f32,
+				h: f32,
+				hash: bool,
+				panes: Panes,
+			) -> Option<(Entity<WorkbenchModel>, &'a mut VisualTestContext)>
+			{
+				let (model, cx) = open_real_text(cx, ws.to_path_buf(), w, h)?;
+				settle_until(cx, "the log rows", |cx| {
+					model.read_with(cx, |m, _| m.display_commits().len() >= 7)
+				});
+				settle(cx);
+				click_probed(&model, cx, &format!("collapse:{}", fx.merge7));
+				assert_eq!(
+					model.read_with(cx, |m, _| m.collapsed_merges.len()),
+					1,
+					"the merge did not collapse"
+				);
+				if hash {
+					click_probed(&model, cx, "btn-log-more");
+					click_probed(&model, cx, "log-more:hash");
+				}
+				if panes == Panes::ListOnly {
+					for pane in ["log-more:details", "log-more:branches"] {
+						click_probed(&model, cx, "btn-log-more");
+						click_probed(&model, cx, pane);
+					}
+				}
+				settle(cx);
+				assert_eq!(model.read_with(cx, |m, _| m.log_show_hash), hash);
+				Some((model, cx))
+			}
+
+			fn rows_cell(
+				cx: &mut TestAppContext,
+				name: &str,
+				w: f32,
+				h: f32,
+				hash: bool,
+				panes: Panes,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some((model, cx)) =
+					open_rows(cx, ws.path(), &fx, w, h, hash, panes)
+				else {
+					return;
+				};
+				let mut bad = Vec::new();
+				let mut roles: BTreeSet<String> = BTreeSet::new();
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc}");
+					let ctx = cell_ctx(model, cx, w, hash, 5);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+				});
+				// The branches pane, when drawn: a ref's click puts it in the
+				// header's hint.
+				if click_if_probed(
+					&model,
+					cx,
+					"ref:refs/heads/feature/a-rather-long-branch-name-for-labels",
+				) {
+					settle(cx);
+					let name = format!("{name} ref-hint");
+					let ctx = cell_ctx(&model, cx, w, hash, 0);
+					let s = snapshot(&model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, &model, cx, &ctx, &s));
+				}
+				for role in FitRole::ALL {
+					if matrix_cell(role) == name
+						&& !roles.contains(&format!("{role:?}"))
+					{
+						bad.push(format!(
+							"{name}: {role:?} is named to this cell but was never drawn in it"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			/// How many whole graphemes of `text` a box `visible` wide shows
+			/// when drawn in `weight`, from gpui's own cut
+			/// (`LineWrapper::truncate_line`, the call `text_ellipsis` makes)
+			/// and not through the code under test: the oracle is the
+			/// function that draws.
+			fn shown_in_weight(
+				window: &gpui::Window,
+				text: &str,
+				visible: f32,
+				weight: gpui::FontWeight,
+				chrome: f32,
+			) -> usize {
+				use unicode_segmentation::UnicodeSegmentation;
+				let mut font = gpui::font(crate::theme::UI_FONT);
+				font.weight = weight;
+				let mut runs = vec![gpui::TextRun {
+					len: text.len(),
+					font: font.clone(),
+					color: gpui::black(),
+					background_color: None,
+					underline: None,
+					strikethrough: None,
+				}];
+				let mut wrapper = window
+					.text_system()
+					.line_wrapper(font, gpui::px(crate::theme::UI_TEXT));
+				let cut = wrapper.truncate_line(
+					text.to_string().into(),
+					gpui::px(visible - chrome),
+					"\u{2026}",
+					&mut runs,
+				);
+				match cut
+					.strip_suffix('\u{2026}')
+					.filter(|_| cut.as_ref() != text)
+				{
+					Some(kept) => kept.graphemes(true).count(),
+					None => text.graphemes(true).count(),
+				}
+			}
+
+			/// The viewer's own name is drawn in semibold, and the column,
+			/// the rule's floor and TEXT_FIT must all count that weight: at
+			/// 1080 wide with the default panes and long labels the author
+			/// column is at its floor, and three letters must be in sight
+			/// as drawn, not as a regular face would draw them.
+			#[gpui::test]
+			fn the_viewers_own_author_keeps_three_graphemes_in_the_weight_drawn(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1080.,
+					720.,
+					false,
+					Panes::Default,
+				) else {
+					return;
+				};
+				let s = snapshot(&model, cx);
+				let author = s
+					.iter()
+					.find(|t| {
+						t.row == Some(0)
+							&& t.role == FitRole::Author
+							&& t.present
+					})
+					.expect("the HEAD row draws its author");
+				assert!(
+					author.text.starts_with("WWW"),
+					"{}",
+					author.describe()
+				);
+				let chrome = FitRole::Author.chrome();
+				let own = cx.update(|window, _| {
+					shown_in_weight(
+						window,
+						&author.text,
+						author.visible,
+						gpui::FontWeight::SEMIBOLD,
+						chrome,
+					)
+				});
+				assert!(
+					own >= 3,
+					"semibold shows {own} graphemes, below the rule: {}",
+					author.describe()
+				);
+				assert_eq!(
+					author.shown,
+					own,
+					"TEXT_FIT counts what is drawn: {}",
+					author.describe()
+				);
+				// Every other author, kerned ones among them ("Taylor Smith",
+				// "AVAVAV Tomas"), is counted as gpui cuts it, in regular.
+				let mut others = 0;
+				for t in s.iter().filter(|t| {
+					t.role == FitRole::Author && t.present && t.row != Some(0)
+				}) {
+					others += 1;
+					let kept = cx.update(|window, _| {
+						shown_in_weight(
+							window,
+							&t.text,
+							t.visible,
+							gpui::FontWeight::NORMAL,
+							chrome,
+						)
+					});
+					assert_eq!(
+						t.shown,
+						kept,
+						"TEXT_FIT counts what is drawn: {}",
+						t.describe()
+					);
+					assert!(
+						kept >= 3.min(t.total),
+						"{kept} graphemes, below the rule: {}",
+						t.describe()
+					);
+				}
+				assert!(others >= 3, "{others} other authors drawn");
+				let names: Vec<&str> = s
+					.iter()
+					.filter(|t| t.role == FitRole::Author && t.present)
+					.map(|t| t.text.as_str())
+					.collect();
+				for kerned in ["Taylor Smith", "AVAVAV Tomas"] {
+					assert!(
+						names.contains(&kerned),
+						"{kerned} not drawn: {names:?}"
+					);
+				}
+			}
+
+			macro_rules! fit_rows_cells {
+				($($name:ident: ($w:expr, $h:expr, $hash:expr, $panes:expr)),* $(,)?) => {
+					const FIT_ROWS_CELLS: &[&str] = &[$(stringify!($name)),*];
+					$(
+						#[gpui::test]
+						fn $name(cx: &mut TestAppContext) {
+							rows_cell(cx, stringify!($name), $w, $h, $hash, $panes);
+						}
+					)*
+				};
+			}
+
+			fit_rows_cells! {
+				fit_rows_w0900_hash_off_panes_default: (900., 600., false, Panes::Default),
+				fit_rows_w0900_hash_off_panes_listonly: (900., 600., false, Panes::ListOnly),
+				fit_rows_w0900_hash_on_panes_default: (900., 600., true, Panes::Default),
+				fit_rows_w0900_hash_on_panes_listonly: (900., 600., true, Panes::ListOnly),
+				fit_rows_w1080_hash_off_panes_default: (1080., 720., false, Panes::Default),
+				fit_rows_w1080_hash_off_panes_listonly: (1080., 720., false, Panes::ListOnly),
+				fit_rows_w1080_hash_on_panes_default: (1080., 720., true, Panes::Default),
+				fit_rows_w1080_hash_on_panes_listonly: (1080., 720., true, Panes::ListOnly),
+				fit_rows_w1440_hash_off_panes_default: (1440., 900., false, Panes::Default),
+				fit_rows_w1440_hash_off_panes_listonly: (1440., 900., false, Panes::ListOnly),
+				fit_rows_w1440_hash_on_panes_default: (1440., 900., true, Panes::Default),
+				fit_rows_w1440_hash_on_panes_listonly: (1440., 900., true, Panes::ListOnly),
+			}
+
+			/// The matrix cell that draws `role`: the structural test checks
+			/// each is a cell that exists, and each cell checks that what it
+			/// is named for was drawn in it.
+			fn matrix_cell(role: FitRole) -> &'static str {
+				match role {
+					FitRole::Hash => "fit_rows_w1080_hash_on_panes_default",
+					FitRole::Author => "fit_rows_w1440_hash_off_panes_default",
+					FitRole::RefHint
+					| FitRole::PaneGroup
+					| FitRole::PaneRefName => "fit_rows_w1440_hash_off_panes_default",
+					FitRole::PaneRepo
+					| FitRole::MenuRefName
+					| FitRole::MenuRepo
+					| FitRole::ChipRepo
+					| FitRole::ChipBranch
+					| FitRole::ChipUser
+					| FitRole::ChipMore => "fit_chips_w1080",
+					FitRole::ChipDate => "fit_chips_w1440",
+					FitRole::Subject
+					| FitRole::BranchLabel
+					| FitRole::TagLabel
+					| FitRole::RefMore
+					| FitRole::Collapsed
+					| FitRole::Date => "fit_rows_w1080_hash_off_panes_default",
+				}
+			}
+
+			/// The chip matrix: two active filters (a long repo name and a
+			/// short branch), the branches pane and the branch menu, in both
+			/// locales.
+			fn chips_cell(cx: &mut TestAppContext, name: &str, w: f32, h: f32) {
+				let ws = tempfile::tempdir().unwrap();
+				chip_fixture(ws.path());
+				let Some((model, cx)) =
+					open_real_text(cx, ws.path().to_path_buf(), w, h)
+				else {
+					return;
+				};
+				settle_until(cx, "the two feeds", |cx| {
+					model.read_with(cx, |m, _| {
+						m.log_feeds.len() == 2 && m.display_commits().len() >= 4
+					})
+				});
+				settle(cx);
+				let mut bad = Vec::new();
+				let mut roles: BTreeSet<String> = BTreeSet::new();
+				// Before any filter every repo is in scope: the pane and the
+				// menu name the repo of a branch that only one has.
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc} unfiltered");
+					let ctx = cell_ctx(model, cx, w, false, 0);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+					for own in ["only-in-core", "ci"] {
+						let id =
+							format!("text-fit:ref:refs/heads/{own}:pane-name");
+						if !s.iter().any(|t| t.id == id) {
+							bad.push(format!(
+								"{name}: the branches pane drew no row of {own}"
+							));
+						}
+					}
+					open_menu(model, cx, "branch");
+					click_probed(model, cx, "log-branch-group:refs_local");
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&format!("{name} menu"), &s, &ctx));
+					for own in ["only-in-core", "ci"] {
+						let id = format!(
+							"text-fit:log-branch:refs/heads/{own}:menu-name"
+						);
+						if !s.iter().any(|t| t.id == id) {
+							bad.push(format!(
+								"{name}: the branch menu drew no row of {own}"
+							));
+						}
+					}
+					cx.simulate_keystrokes("escape");
+					settle(cx);
+				});
+				click_probed(&model, cx, "ref:refs/heads/topic-03");
+				open_menu(&model, cx, "repo");
+				click_probed(
+					&model,
+					cx,
+					"log-repo:repo-01-core-with-a-long-name",
+				);
+				settle(cx);
+				settle(cx);
+				each_locale(&model, cx, |model, cx| {
+					let loc =
+						model.read_with(cx, |m, _| format!("{:?}", m.locale));
+					let name = format!("{name} {loc}");
+					let ctx = cell_ctx(model, cx, w, false, 0);
+					let s = snapshot(model, cx);
+					roles.extend(
+						s.iter()
+							.filter(|t| t.present)
+							.map(|t| format!("{:?}", t.role)),
+					);
+					bad.extend(check(&name, &s, &ctx));
+					bad.extend(check_bars(&name, model, cx, &ctx, &s));
+					// Of the chips on the bar with a value, a shorter one is
+					// whole when a longer one is cut.
+					let valued: Vec<&Seen> = s
+						.iter()
+						.filter(|t| {
+							t.present
+								&& t.id.contains(":chip-")
+								&& t.total > t.key_graphemes
+						})
+						.collect();
+					assert!(!valued.is_empty(), "{name}: no chip has a value");
+					for cut in valued.iter().filter(|t| t.shown < t.total) {
+						for short in
+							valued.iter().filter(|t| t.natural < cut.natural)
+						{
+							if short.shown < short.total {
+								bad.push(format!(
+									"{name}: the shorter chip is cut while a longer one is: {} / {}",
+									short.describe(),
+									cut.describe()
+								));
+							}
+						}
+					}
+					// An active chip the bar folded into "more" has its clear
+					// item there.
+					for (key, chip) in
+						[("repo", "chip-repo"), ("branch", "chip-branch")]
+					{
+						let on_bar = s.iter().any(|t| {
+							t.present
+								&& t.id
+									== format!(
+										"text-fit:log-filter-{key}:{chip}"
+									)
+						});
+						if on_bar {
+							continue;
+						}
+						click_probed(model, cx, "log-filter-more");
+						let clear = format!("log-filter-{key}-clear");
+						let drawn = model.read_with(cx, |m, _| {
+							m.probes.as_ref().unwrap().bounds(&clear).is_some()
+						});
+						if !drawn {
+							bad.push(format!(
+								"{name}: the {key} filter is on neither the bar nor the more menu"
+							));
+						}
+						click_probed(model, cx, "log-filter-more");
+					}
+				});
+				for role in FitRole::ALL {
+					if matrix_cell(role) == name
+						&& !roles.contains(&format!("{role:?}"))
+					{
+						bad.push(format!(
+							"{name}: {role:?} is named to this cell but was never drawn in it"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			/// Opens the filter menu `key` (repo, branch, user, date): from
+			/// its chip on the bar, else from the "more" chip's menu.
+			fn open_menu(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				key: &str,
+			) {
+				if !click_if_probed(model, cx, &format!("log-filter-{key}")) {
+					click_probed(model, cx, "log-filter-more");
+					click_probed(model, cx, &format!("log-filter-more:{key}"));
+				}
+			}
+
+			macro_rules! fit_chips_cells {
+				($($name:ident: ($w:expr, $h:expr)),* $(,)?) => {
+					const FIT_CHIPS_CELLS: &[&str] = &[$(stringify!($name)),*];
+					$(
+						#[gpui::test]
+						fn $name(cx: &mut TestAppContext) {
+							chips_cell(cx, stringify!($name), $w, $h);
+						}
+					)*
+				};
+			}
+
+			fit_chips_cells! {
+				fit_chips_w0900: (900., 600.),
+				fit_chips_w1080: (1080., 720.),
+				fit_chips_w1440: (1440., 900.),
+			}
+
+			/// The axes the row matrix crosses, as cell names.
+			#[test]
+			fn fit_matrix_cells_cover_every_axis_combination() {
+				let mut want = BTreeSet::new();
+				for w in ["0900", "1080", "1440"] {
+					for hash in ["off", "on"] {
+						for panes in ["default", "listonly"] {
+							want.insert(format!(
+								"fit_rows_w{w}_hash_{hash}_panes_{panes}"
+							));
+						}
+					}
+				}
+				let have: BTreeSet<String> =
+					FIT_ROWS_CELLS.iter().map(|c| c.to_string()).collect();
+				assert_eq!(have, want);
+				assert_eq!(
+					FIT_ROWS_CELLS.len(),
+					want.len(),
+					"a cell is listed twice"
+				);
+			}
+
+			/// Every role is named to a cell that exists; the cell itself
+			/// checks that it drew it.
+			#[test]
+			fn every_fit_role_names_the_cell_that_draws_it() {
+				let cells: BTreeSet<&str> = FIT_ROWS_CELLS
+					.iter()
+					.chain(FIT_CHIPS_CELLS)
+					.copied()
+					.collect();
+				for role in FitRole::ALL {
+					assert!(
+						cells.contains(matrix_cell(role)),
+						"{role:?} is named to {}, which is no cell",
+						matrix_cell(role)
+					);
+				}
+			}
+
+			// ───────── the resize paths (M3) ─────────
+
+			/// (id, present, shown, clipped) of every text: what two ways to
+			/// a width must agree on.
+			fn shape(s: &[Seen]) -> BTreeMap<String, (bool, usize, bool)> {
+				s.iter()
+					.map(|t| (t.id.clone(), (t.present, t.shown, t.clipped)))
+					.collect()
+			}
+
+			fn assert_same(
+				tag: &str,
+				resized: &BTreeMap<String, (bool, usize, bool)>,
+				fresh: &BTreeMap<String, (bool, usize, bool)>,
+			) {
+				let mut bad = Vec::new();
+				for id in
+					resized.keys().chain(fresh.keys()).collect::<BTreeSet<_>>()
+				{
+					let (a, b) = (resized.get(id), fresh.get(id));
+					if a != b {
+						bad.push(format!(
+							"{tag}: {id}: resized {a:?} vs fresh {b:?} (present, shown, clipped)"
+						));
+					}
+				}
+				assert_clean(bad);
+			}
+
+			/// A fresh window at `w`x`h`, as the row matrix opens one.
+			fn fresh_rows(
+				cx: &mut TestAppContext,
+				ws: &Path,
+				fx: &FitFixture,
+				w: f32,
+				h: f32,
+				hash: bool,
+			) -> Option<Vec<Seen>> {
+				let (model, cx) =
+					open_rows(cx, ws, fx, w, h, hash, Panes::Default)?;
+				Some(snapshot(&model, cx))
+			}
+
+			/// I5: what is drawn at a width is drawn at every wider one.
+			/// The author column is left out: the labels come before it, so
+			/// at 900 it may be there while at 950 the labels took its room
+			/// (ADR 0005). So is the collapsed chip, which gives way to the
+			/// labels that come back as the list widens.
+			fn assert_monotone(
+				narrow: (f32, &[Seen]),
+				wide: (f32, &[Seen]),
+				bad: &mut Vec<String>,
+			) {
+				for t in narrow.1.iter().filter(|t| {
+					t.present
+						&& t.row.is_some() && !matches!(
+						t.role,
+						FitRole::Author | FitRole::Collapsed
+					)
+				}) {
+					let there = wide.1.iter().find(|u| u.id == t.id);
+					if !there.is_some_and(|u| u.present) {
+						bad.push(format!(
+							"I5: {} is drawn at {} but not at {}",
+							t.describe(),
+							narrow.0,
+							wide.0
+						));
+					}
+				}
+			}
+
+			fn resize_walk(cx: &mut TestAppContext, hash: bool) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let sizes = [(1440., 900.), (1080., 720.), (900., 600.)];
+				let mut reference = Vec::new();
+				for (w, h) in sizes {
+					let Some(s) = fresh_rows(cx, ws.path(), &fx, w, h, hash)
+					else {
+						return;
+					};
+					reference.push((w, s));
+				}
+				let mut bad = Vec::new();
+				for pair in reference.windows(2) {
+					assert_monotone(
+						(pair[1].0, &pair[1].1),
+						(pair[0].0, &pair[0].1),
+						&mut bad,
+					);
+				}
+				assert_monotone(
+					(reference[2].0, &reference[2].1),
+					(reference[0].0, &reference[0].1),
+					&mut bad,
+				);
+				assert_clean(bad);
+				let reference: BTreeMap<u32, _> = reference
+					.iter()
+					.map(|(w, s)| (*w as u32, shape(s)))
+					.collect();
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1440.,
+					900.,
+					hash,
+					Panes::Default,
+				) else {
+					return;
+				};
+				for (w, h) in
+					[(1080., 720.), (900., 600.), (1080., 720.), (1440., 900.)]
+				{
+					cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+					settle(cx);
+					assert_same(
+						&format!("walk to {w} hash={hash}"),
+						&shape(&snapshot(&model, cx)),
+						&reference[&(w as u32)],
+					);
+				}
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_resize_walk_hash_off(cx: &mut TestAppContext) {
+				resize_walk(cx, false);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_resize_walk_hash_on(cx: &mut TestAppContext) {
+				resize_walk(cx, true);
+			}
+
+			/// 1080 to 1600 crosses the 1200 the panes' widths change at.
+			fn widening(cx: &mut TestAppContext, hash: bool) {
+				let ws = tempfile::tempdir().unwrap();
+				let fx = fit_fixture(ws.path());
+				let Some(fresh) =
+					fresh_rows(cx, ws.path(), &fx, 1600., 900., hash)
+				else {
+					return;
+				};
+				let Some((model, cx)) = open_rows(
+					cx,
+					ws.path(),
+					&fx,
+					1080.,
+					720.,
+					hash,
+					Panes::Default,
+				) else {
+					return;
+				};
+				cx.simulate_resize(gpui::size(gpui::px(1600.), gpui::px(900.)));
+				settle(cx);
+				assert_same(
+					&format!("widen 1080 to 1600 hash={hash}"),
+					&shape(&snapshot(&model, cx)),
+					&shape(&fresh),
+				);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_widening_1080_to_1600_hash_off(
+				cx: &mut TestAppContext,
+			) {
+				widening(cx, false);
+			}
+
+			#[gpui::test]
+			fn fit_rows_follow_a_widening_1080_to_1600_hash_on(
+				cx: &mut TestAppContext,
+			) {
+				widening(cx, true);
+			}
 		}
 
 		/// A merge lists the files changed against any parent. Those the
@@ -14099,13 +16977,18 @@ mod tests {
 			cx.simulate_click(merge.center(), gpui::Modifiers::none());
 			settle_until(cx, "the merge's files", |cx| {
 				model.read_with(cx, |m, _| {
-					m.commit_files.len() == 2
-						&& m.commit_files_first_parent_same.is_some()
+					m.commit_view.commit_files.len() == 2
+						&& m.commit_view
+							.commit_files_first_parent_same
+							.is_some()
 				})
 			});
 			model.read_with(cx, |m, _| {
-				let (_, same) =
-					m.commit_files_first_parent_same.as_ref().expect("marker");
+				let (_, same) = m
+					.commit_view
+					.commit_files_first_parent_same
+					.as_ref()
+					.expect("marker");
 				assert!(same.contains("main.txt"), "{same:?}");
 				assert!(!same.contains("side.txt"), "{same:?}");
 			});
@@ -15813,14 +18696,16 @@ mod tests {
 			});
 		}
 
-		/// The same path twice: the engine refuses the plan as it stands,
-		/// before any adjustment is chosen.
+		/// The same path twice at the root: the engine refuses the plan as
+		/// it stands, before any adjustment is chosen, and has nothing to
+		/// suggest (no folder to strip).
 		const RESTORE_BASE_REFUSED_PAYLOAD: &str =
-			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/a.ts\ny\n";
+			"// clipcode-root: mono\n// FILE: a.ts\nx\n// FILE: a.ts\ny\n";
 
-		/// A first plan the engine refuses opens no preview, so there is no
-		/// hint row to leave behind (#240): the panel needs a plan to hang
-		/// the hint on, and it says why on the status line.
+		/// A first plan the engine refuses without a suggestion opens no
+		/// preview, so there is no hint row to leave behind (#240): it says
+		/// why on the status line. One that carries a suggestion lands as a
+		/// panel instead (`a_new_paste_into_a_refused_folder_...`).
 		fn assert_first_plan_refused_without_a_panel(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
@@ -16263,7 +19148,7 @@ mod tests {
 		}
 
 		/// The branch name keeps its width before the repo count gives way
-		/// (#194): the `×N` suffix shrinks to nothing first.
+		/// (#194): the `×N` suffix is dropped first, whole or not at all.
 		#[gpui::test]
 		fn branch_name_keeps_its_width_before_the_repo_count(
 			cx: &mut TestAppContext,
@@ -16321,14 +19206,13 @@ mod tests {
 				.expect("the long name is rendered")
 				.size
 				.width;
+			// The suffix is whole or gone: it is not drawn at all.
 			let long_suffix = cx
 				.debug_bounds(repo_sel)
-				.expect("the long branch's suffix is rendered")
-				.size
-				.width;
+				.map_or(0., |b| f32::from(b.size.width));
 			assert!(
-				f32::from(long_suffix) <= 1.0,
-				"the suffix shrinks to nothing first: {long_suffix:?}"
+				long_suffix <= 1.0,
+				"the suffix gives way first: {long_suffix:?}"
 			);
 			assert!(
 				f32::from(long_name) > natural,
@@ -17097,17 +19981,17 @@ mod tests {
 			cx.simulate_keystrokes("alt-shift-r");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.popover, Some(crate::Popover::Repo));
+				assert_eq!(m.overlays.selector(), Some(crate::Popover::Repo));
 			});
 			cx.simulate_keystrokes("down");
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.repos[m.popover_cursor].name, "c");
+				assert_eq!(m.repos[m.overlays.selector_cursor()].name, "c");
 			});
 			repo(ws.path(), "b", &[]);
 			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
 			repos_settled(&model, cx, 3);
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.popover, Some(crate::Popover::Repo));
+				assert_eq!(m.overlays.selector(), Some(crate::Popover::Repo));
 			});
 			cx.simulate_keystrokes("enter");
 			settle(cx);
@@ -19044,184 +21928,6 @@ mod tests {
 			}
 		}
 
-		/// Escape closes the Log "more" menu opened by its chip, with no
-		/// text field focused (#212).
-		#[gpui::test]
-		fn log_more_menu_closes_on_escape(cx: &mut TestAppContext) {
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "my-repo", &[]);
-			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
-			git(&r, &["add", "."]);
-			git(&r, &["commit", "-q", "-m", "commit c1"]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
-			for _ in 0..50 {
-				settle(cx);
-				let ready = model.read_with(cx, |m, _| {
-					!m.commits.is_empty() && m.log_width.get() > 0.
-				});
-				if ready {
-					break;
-				}
-			}
-			settle(cx);
-			let more_b = cx
-				.debug_bounds("log-filter-more")
-				.expect("log-filter-more drawn at 900w");
-			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
-			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.log_menu, Some(crate::ui::LogMenu::FilterMore));
-			});
-			cx.simulate_keystrokes("escape");
-			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.log_menu, None, "Escape closes the more menu");
-			});
-		}
-
-		/// One rule (#212): while a workbench popover is open, Escape closes
-		/// it first, whatever pane had the focus when it was opened.
-		#[gpui::test]
-		fn escape_closes_every_popover_from_every_focus(
-			cx: &mut TestAppContext,
-		) {
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "my-repo", &[]);
-			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
-			git(&r, &["add", "."]);
-			git(&r, &["commit", "-q", "-m", "commit c1"]);
-			// A dirty tracked file gives the Changes list a row to preview.
-			fs::write(r.join("base.txt"), "dirty").unwrap();
-			// A second repo makes the repo filter chip appear.
-			repo(ws.path(), "other-repo", &[]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
-			for _ in 0..50 {
-				settle(cx);
-				if model.read_with(cx, |m, _| {
-					!m.commits.is_empty() && m.log_width.get() > 0.
-				}) {
-					break;
-				}
-			}
-			settle(cx);
-			// Reader origin: a real preview, picked through the Changes list.
-			cx.simulate_keystrokes("alt-0");
-			settle(cx);
-			let row = model.read_with(cx, |m, _| {
-				m.files.iter().position(|f| f.path == "base.txt")
-			});
-			assert!(row.is_some(), "the dirty file is listed");
-			click_probed(&model, cx, "change-repo-toggle:unstaged:my-repo");
-			click_probed(&model, cx, "change-row@my-repo:unstaged:base.txt");
-			settle(cx);
-			assert!(
-				model.read_with(cx, |m, _| m.preview.is_some()),
-				"clicking the change opened a preview"
-			);
-			let popover_open = |cx: &mut VisualTestContext| {
-				model.read_with(cx, |m, _| {
-					m.workspace_menu
-						|| m.log_menu.is_some()
-						|| m.popover.is_some()
-				})
-			};
-			let menus = [
-				"btn-workspace-menu",
-				"btn-repo-selector",
-				"btn-ref-selector",
-				"log-filter-more",
-				"log-filter-repo",
-			];
-			// At 900w the branch and paths chips fold into "more"; the exact
-			// set drawn is pinned so a layout change cannot drop a case.
-			let drawn: Vec<&str> = [
-				"btn-workspace-menu",
-				"btn-repo-selector",
-				"btn-ref-selector",
-				"log-filter-more",
-				"log-filter-branch",
-				"log-filter-paths",
-				"log-filter-repo",
-			]
-			.into_iter()
-			.filter(|id| cx.debug_bounds(id).is_some())
-			.collect();
-			assert_eq!(drawn, menus, "the popover openers drawn at 900w");
-			// Origins come from the Escape bindings in the key map: GitLog,
-			// ToolList, Reader, TextInput (Dismiss), the find bar (a
-			// TextInput) and the bare root. PastePanel and ContextMenu cannot
-			// be open together with these menus: opening either takes the
-			// focus and the click that opened the menu closes the other. The
-			// root rule covers them all the same.
-			let mut cases = 0;
-			for origin in [
-				"log-row",
-				"tree",
-				"reader",
-				"none",
-				"log-search",
-				"find-bar",
-				"goto-bar",
-			] {
-				for id in menus {
-					click(cx, id);
-					settle(cx);
-					assert!(popover_open(cx), "{id} opened");
-					// The menu is open; the focus is in `origin` (a click on a
-					// button leaves it at the root, a row or Alt+N moves it).
-					if origin == "find-bar" || origin == "goto-bar" {
-						let goto = origin == "goto-bar";
-						model
-							.update_in(cx, |m, w, cx| m.open_find(goto, w, cx));
-					}
-					let focused = cx.update(|window, cx| {
-						let m = model.read(cx);
-						let h = match origin {
-							"find-bar" | "goto-bar" => window
-								.focused(cx)
-								.unwrap_or_else(|| m.focus_handle.clone()),
-							"log-search" => {
-								m.log_search_input.read(cx).handle()
-							}
-							"log-row" => m.log_focus.clone(),
-							"tree" => m.tree_focus.clone(),
-							"reader" => m.reader_focus.clone(),
-							_ => m.focus_handle.clone(),
-						};
-						window.focus(&h);
-						(h.clone(), m.focus_handle.clone())
-					});
-					settle(cx);
-					cx.update(|window, _| {
-						assert!(
-							focused.0.is_focused(window),
-							"{origin} holds the focus before Escape ({id})"
-						);
-						if origin == "find-bar" || origin == "goto-bar" {
-							assert!(
-								focused.0 != focused.1,
-								"the {origin} field took the focus"
-							);
-						}
-					});
-					assert!(
-						popover_open(cx),
-						"{id} is still open with the focus in {origin}"
-					);
-					cx.simulate_keystrokes("escape");
-					settle(cx);
-					assert!(
-						!popover_open(cx),
-						"Escape closes {id} opened from {origin}"
-					);
-					cases += 1;
-				}
-			}
-			assert_eq!(cases, 7 * menus.len());
-		}
-
 		/// The same rule when only the user's gestures set the focus: click a
 		/// log row, click a popover opener (the click moves the focus to the
 		/// root), press Alt+1 (the tree takes the focus, the menu stays
@@ -19268,9 +21974,10 @@ mod tests {
 				let (open, focused) = cx.update(|window, cx| {
 					let m = model.read(cx);
 					(
-						m.workspace_menu
-							|| m.log_menu.is_some()
-							|| m.popover.is_some(),
+						m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu,
+						) || m.overlays.log_menu().is_some()
+							|| m.overlays.selector().is_some(),
 						m.tree_focus.is_focused(window),
 					)
 				});
@@ -19283,9 +21990,10 @@ mod tests {
 				settle(cx);
 				model.read_with(cx, |m, _| {
 					assert!(
-						!(m.workspace_menu
-							|| m.log_menu.is_some()
-							|| m.popover.is_some()),
+						!(m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						) || m.overlays.log_menu().is_some()
+							|| m.overlays.selector().is_some()),
 						"Escape closes {opener} opened after a log click"
 					);
 				});
@@ -19351,7 +22059,7 @@ mod tests {
 			// Verify User menu is now open, and refresh was not triggered
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -19475,16 +22183,19 @@ mod tests {
 
 			cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(632.)));
 			settle(cx);
-			let (drawn, wanted) = model.read_with(cx, |m, _| {
+			let (drawn, split_for, measured) = model.read_with(cx, |m, _| {
 				let layout = &m.log_filter_layout;
-				let has = m.log_filter_split_has_values(m.locale);
 				(
 					layout.last_mask.get(),
-					layout.compute_split(layout.container_w.get(), has),
+					layout.used_w.get(),
+					layout.container_w.get(),
 				)
 			});
-			assert_ne!(wanted, 0b1111, "700 wide must not fit every chip");
-			assert_eq!(drawn, wanted, "the drawn split follows the new width");
+			assert_ne!(drawn, 0b1111, "700 wide must not fit every chip");
+			assert!(
+				(split_for - measured).abs() < 0.5,
+				"the drawn split is for the bar's new width: {split_for} vs {measured}"
+			);
 		}
 
 		/// At the default 1080x720 window with the details pane open, an
@@ -19546,11 +22257,11 @@ mod tests {
 			}
 		}
 
-		/// The drawn text cap follows a resize that keeps the split mask: the
-		/// bar widened, so the truncated values get their room back with no
-		/// input (#205).
+		/// The chips follow a resize that keeps the split mask: the bar
+		/// widened, so the cut values get their room back with no input
+		/// (#205).
 		#[gpui::test]
-		fn log_chip_text_cap_follows_a_resize_that_keeps_the_mask(
+		fn log_chips_follow_a_resize_that_keeps_the_mask(
 			cx: &mut TestAppContext,
 		) {
 			let ws = tempfile::tempdir().unwrap();
@@ -19584,27 +22295,39 @@ mod tests {
 			for _ in 0..5 {
 				settle(cx);
 			}
-			let before =
-				model.read_with(cx, |m, _| m.log_filter_layout.text_cap());
+			let chip_w = |cx: &mut VisualTestContext, id: &'static str| {
+				cx.debug_bounds(id)
+					.map(|b| f32::from(b.size.width))
+					.unwrap_or(0.)
+			};
+			let mut before = [
+				chip_w(cx, "log-filter-repo"),
+				chip_w(cx, "log-filter-branch"),
+			];
 			for w in [1110., 1140.] {
 				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
 				for _ in 0..5 {
 					settle(cx);
 				}
-				let (drawn, wanted, mask) = model.read_with(cx, |m, _| {
-					let l = &m.log_filter_layout;
-					(
-						l.text_cap(),
-						l.text_cap_for(l.container_w.get()),
-						l.last_mask.get(),
-					)
-				});
+				let (split_for, measured, mask) =
+					model.read_with(cx, |m, _| {
+						let l = &m.log_filter_layout;
+						(l.used_w.get(), l.container_w.get(), l.last_mask.get())
+					});
 				assert_eq!(mask & 0b11, 0b11, "both chips stay on the bar");
 				assert!(
-					(drawn - wanted).abs() < 0.5,
-					"at {w}: drawn cap {drawn} follows the bar ({wanted})"
+					(split_for - measured).abs() < 0.5,
+					"at {w}: the chips were split for {split_for}, the bar is {measured}"
 				);
-				assert!(drawn >= before, "a wider bar never shrinks the cap");
+				let now = [
+					chip_w(cx, "log-filter-repo"),
+					chip_w(cx, "log-filter-branch"),
+				];
+				assert!(
+					now[0] >= before[0] - 0.5 && now[1] >= before[1] - 0.5,
+					"a wider bar never shrinks a chip: {before:?} -> {now:?}"
+				);
+				before = now;
 			}
 		}
 
@@ -19725,7 +22448,7 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -19773,7 +22496,7 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.log_menu,
+					m.overlays.log_menu(),
 					Some(crate::ui::LogMenu::User),
 					"User menu should be open"
 				);
@@ -19927,14 +22650,18 @@ mod tests {
 			for _ in 0..50 {
 				settle(cx);
 				let loaded = model.read_with(cx, |m, _| {
-					!m.commit_files.is_empty() && m.preview.is_some()
+					!m.commit_view.commit_files.is_empty()
+						&& m.preview.is_some()
 				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files must load first"
+				);
 				assert!(m.preview.is_some(), "the diff must load first");
 			});
 
@@ -19955,8 +22682,14 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
-				assert!(m.commit_files.is_empty(), "stale files kept");
-				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					m.commit_view.commit_files.is_empty(),
+					"stale files kept"
+				);
+				assert!(
+					m.commit_view.commit_details.is_none(),
+					"stale details kept"
+				);
 				assert!(
 					!commit_preview_shown(m),
 					"stale commit diff kept after the branch filter",
@@ -20004,14 +22737,18 @@ mod tests {
 			for _ in 0..50 {
 				settle(cx);
 				let loaded = model.read_with(cx, |m, _| {
-					!m.commit_files.is_empty() && commit_preview_shown(m)
+					!m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
 				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
-				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files must load first"
+				);
 				assert!(commit_preview_shown(m), "the diff must load first");
 			});
 
@@ -20030,12 +22767,852 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
-				assert!(m.commit_files.is_empty(), "stale files kept");
-				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					m.commit_view.commit_files.is_empty(),
+					"stale files kept"
+				);
+				assert!(
+					m.commit_view.commit_details.is_none(),
+					"stale details kept"
+				);
 				assert!(
 					!commit_preview_shown(m),
 					"stale commit diff kept after the repository filter",
 				);
+			});
+		}
+
+		/// Every member of the commit view goes with the selection, whichever
+		/// path dropped it (#230). A multi-selection fills `commit_file_origin`;
+		/// a repository filter that hides it used to leave that behind.
+		#[gpui::test]
+		fn commit_view_resets_with_the_selection(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			for i in 0..3 {
+				fs::write(alpha.join(format!("a{i}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {i}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 5)
+			});
+			// Two rows of one repository: the merged log sorts by date, so
+			// rows 0 and 1 may belong to different repositories, and a
+			// toggle across them is refused.
+			let (i, j) = model.read_with(cx, |m, _| {
+				let rows = m.display_commits();
+				let feeds: Vec<_> = rows
+					.iter()
+					.map(|c| crate::multi_log::split_id(&c.sha).1)
+					.collect();
+				(0..feeds.len())
+					.flat_map(|i| (i + 1..feeds.len()).map(move |j| (i, j)))
+					.find(|&(i, j)| feeds[i] == feeds[j])
+					.expect("two rows of one repository")
+			});
+			let at = |cx: &mut VisualTestContext,
+			          ix: usize,
+			          mods: gpui::Modifiers| {
+				cx.run_until_parked();
+				let id: &'static str =
+					Box::leak(format!("log-subject:{ix}").into_boxed_str());
+				let row = cx.debug_bounds(id).expect("a commit row");
+				cx.simulate_click(row.center(), mods);
+			};
+			at(cx, i, gpui::Modifiers::none());
+			settle_until(cx, "the first commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
+				})
+			});
+			at(cx, j, gpui::Modifiers::secondary_key());
+			settle_until(cx, "the multi-selection's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_file_origin.is_empty()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "a multi-selection");
+			});
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			settle_until(cx, "the selection to leave", |cx| {
+				model.read_with(cx, |m, _| {
+					m.selected_commit.is_none() && m.history_loaded
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.log_selected.is_empty(), "multi-selection kept");
+				assert!(
+					m.commit_view.is_reset(),
+					"a commit view member stayed"
+				);
+			});
+		}
+
+		/// A file the retained budget refuses leaves the previous text shown
+		/// and the selection naming it again, so the commit view must come
+		/// back with it (#230): the shown commit diff still belongs to its
+		/// own repository, not to the repository the refused file was in.
+		#[gpui::test]
+		fn a_file_the_budget_refuses_keeps_the_commit_view_of_the_shown_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			fs::write(beta.join("b.txt"), "beta content\n").unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta commit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta commit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			let shown_root = model.read_with(cx, |m, _| {
+				let root = m.preview_root().expect("a preview root");
+				assert!(root.ends_with("beta"), "the commit's repo: {root:?}");
+				root
+			});
+
+			// Nearly all of the retained budget is held by a queued paste,
+			// so the 128 KiB file cannot replace the commit diff.
+			model.update(cx, |m, _| {
+				m.paste
+					.enqueue(crate::paste::PasteRequest::Clipboard {
+						text: "n".repeat(
+							crate::paste::MAX_RETAINED_PREVIEW_BYTES
+								- 32 * 1024,
+						),
+						dest: PathBuf::new(),
+						roots: Vec::new(),
+						generation: 0,
+						remote: None,
+					})
+					.expect("the queued paste fits");
+			});
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(alpha),
+					"big.txt",
+					snip_core::transfer::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff stays");
+				assert!(m.selected_commit.is_some(), "selection restored");
+				assert!(
+					m.commit_view.commit_details.is_some(),
+					"details cleared while the selection came back",
+				);
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files cleared while the selection came back",
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(shown_root.as_path()),
+					"the shown diff must keep its own repository",
+				);
+			});
+		}
+
+		/// Two repos: alpha (open) with a small file, beta with a 40-line
+		/// file whose second commit changes line 20, so its diff has folds.
+		/// The beta commit's diff is shown from the merged Log.
+		fn open_with_beta_commit_shown(
+			cx: &mut TestAppContext,
+		) -> (
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			tempfile::TempDir,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let body: String =
+				(1..=40).map(|n| format!("line {n}\n")).collect();
+			fs::write(beta.join("f.txt"), &body).unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta add"]);
+			fs::write(beta.join("f.txt"), body.replace("line 20", "LINE 20"))
+				.unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta edit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta edit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta edit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.repo_root().is_some_and(|r| r.ends_with("alpha")),
+					"alpha is the open repo: {:?}",
+					m.repo_root()
+				);
+				assert!(
+					m.preview_root().is_some_and(|r| r.ends_with("beta")),
+					"the commit's repo: {:?}",
+					m.preview_root()
+				);
+			});
+			(model, cx, ws)
+		}
+
+		/// A Project file of the open repo is clicked while the beta commit's
+		/// diff is still on screen: the diff keeps naming its own repository
+		/// in the breadcrumb, and Expand All reads from it, until the new
+		/// read lands (#228 #229).
+		#[gpui::test]
+		fn a_diff_still_shown_while_a_file_loads_keeps_its_repository(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_with_beta_commit_shown(cx);
+			open_project_tool(&model, cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			click_probed(&model, cx, "tree-row:a.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.preview_loading, "the read is held back");
+				assert!(commit_preview_shown(m), "the beta diff stays");
+				let root = m.preview_root().expect("a preview root");
+				assert!(
+					root.ends_with("beta"),
+					"the shown diff's repo: {root:?}"
+				);
+				let crumbs = m.source_labels().1;
+				assert!(
+					crumbs.contains("beta") && !crumbs.contains("alpha"),
+					"the breadcrumb names the open repo: {crumbs}"
+				);
+			});
+			let _ = crate::test_log::take();
+			click_probed(&model, cx, "btn-expand-folds");
+			settle(cx);
+			let lines = crate::test_log::take();
+			assert!(
+				lines.iter().any(|l| l.starts_with("[APP:FOLD_EXPANDED: ")),
+				"Expand All read from the wrong repository: {lines:#?}"
+			);
+			assert!(
+				!lines.iter().any(|l| l.starts_with("[APP:FOLD_REFUSED: ")),
+				"{lines:#?}"
+			);
+		}
+
+		/// A diff keeps its repository through Expand All, which rebuilds
+		/// the preview: a Changes row of a repo that is not the open one
+		/// (#228 #229).
+		#[gpui::test]
+		fn a_diff_keeps_its_repository_after_expand_all(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let body: String =
+				(1..=40).map(|n| format!("line {n}\n")).collect();
+			fs::write(beta.join("f.txt"), &body).unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta add"]);
+			fs::write(beta.join("f.txt"), body.replace("line 20", "LINE 20"))
+				.unwrap();
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "beta's change", |cx| {
+				model.read_with(cx, |m, _| {
+					m.files.iter().any(|f| f.path == "f.txt")
+				})
+			});
+			click_probed(&model, cx, "change-repo-toggle:unstaged:beta");
+			settle(cx);
+			click_probed(&model, cx, "change-row@beta:unstaged:f.txt");
+			settle_until(cx, "beta's diff", |cx| {
+				model.read_with(cx, |m, _| {
+					m.preview.is_some() && !m.preview_loading
+				})
+			});
+			let beta_root = model.read_with(cx, |m, _| {
+				let root = m.preview_root().expect("a preview root");
+				assert!(root.ends_with("beta"), "{root:?}");
+				assert!(
+					m.repo_root().is_some_and(|r| r.ends_with("alpha")),
+					"alpha is the open repo"
+				);
+				root
+			});
+			click_probed(&model, cx, "btn-expand-folds");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.preview.as_ref().is_some_and(|p| p.lines.len() > 40),
+					"the folds were expanded"
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(beta_root.as_path()),
+					"the rebuilt preview forgot its repository"
+				);
+			});
+		}
+
+		/// Opens the Project tool window with the rail button, as a user does.
+		fn open_project_tool(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let open = model.read_with(cx, |m, _| {
+				m.active_tab == WorkbenchTab::FileExplorer
+			});
+			if !open {
+				click_probed(model, cx, "rail-project");
+			}
+			settle_until(cx, "the Project tree", |cx| {
+				model.read_with(cx, |m, _| m.file_tree.is_some())
+			});
+		}
+
+		/// Two file reads in flight, the last one refused by the budget: the
+		/// second read must not capture the emptied selection the first one
+		/// left behind. The snapshot belongs to the diff still shown, not to
+		/// one request, so the refusal puts the real selection back.
+		#[gpui::test]
+		fn a_superseded_file_read_keeps_the_snapshot_of_the_shown_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			fs::write(alpha.join("small.txt"), "small\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			fs::write(beta.join("b.txt"), "beta content\n").unwrap();
+			git(&beta, &["add", "."]);
+			git(&beta, &["commit", "-q", "-m", "beta commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "beta commit"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "beta commit")
+					.expect("beta commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the beta commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			let shown_root = model.read_with(cx, |m, _| {
+				m.preview_root().expect("a preview root")
+			});
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			open_project_tool(&model, cx);
+			// Two reads by the user's gesture (Project tree rows), the second
+			// superseding the first before it lands.
+			for name in ["small.txt", "big.txt"] {
+				click_probed(&model, cx, &format!("tree-row:{name}"));
+			}
+			settle(cx);
+			// Nearly all of the retained budget is held, so the 128 KiB file
+			// cannot replace the commit diff.
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff stays");
+				assert!(m.selected_commit.is_some(), "selection restored");
+				assert!(
+					m.commit_view.commit_details.is_some(),
+					"details lost to the superseded read",
+				);
+				assert!(
+					!m.commit_view.commit_files.is_empty(),
+					"files lost to the superseded read",
+				);
+				assert_eq!(
+					m.preview_root().as_deref(),
+					Some(shown_root.as_path()),
+					"the shown diff must keep its own repository",
+				);
+			});
+		}
+
+		/// The snapshot ends with the diff it belongs to: after a superseding
+		/// read lands, a later refusal restores that file's selection, never
+		/// the commit that an earlier snapshot still named.
+		#[gpui::test]
+		fn a_landed_file_read_releases_the_snapshot_of_the_replaced_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			fs::write(alpha.join("small.txt"), "small\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.any(|c| c.subject == "alpha commit")
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "alpha commit")
+					.expect("commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the commit's diff and files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_files.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			open_project_tool(&model, cx);
+			let read = |model: &Entity<WorkbenchModel>,
+			            cx: &mut VisualTestContext,
+			            name: &str| {
+				click_probed(model, cx, &format!("tree-row:{name}"));
+			};
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			read(&model, cx, "big.txt");
+			read(&model, cx, "small.txt");
+			settle(cx);
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("small.txt"));
+				assert!(m.selected_commit.is_none(), "the file replaced it");
+			});
+			model.update(cx, |m, _| {
+				m.e2e_read_delay = None;
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			read(&model, cx, "big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_file.as_deref(),
+					Some("small.txt"),
+					"the refusal restored a selection older than the shown file",
+				);
+				assert!(
+					m.selected_commit.is_none(),
+					"a released snapshot came back",
+				);
+				assert!(m.commit_view.is_reset());
+			});
+		}
+
+		/// One commit of two files: a small one (listed, so shown, first) and
+		/// a big one the retained budget will refuse once it is held.
+		fn open_commit_of_small_and_big(
+			cx: &mut TestAppContext,
+		) -> (
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			tempfile::TempDir,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			fs::write(alpha.join("a_small.txt"), "small\n").unwrap();
+			fs::write(alpha.join("z_big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "two files"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| {
+					m.display_commits().iter().any(|c| c.subject == "two files")
+				})
+			});
+			let ix = model.read_with(cx, |m, _| {
+				m.display_commits()
+					.iter()
+					.position(|c| c.subject == "two files")
+					.expect("commit listed")
+			});
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			settle_until(cx, "the commit's first file diff", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& commit_preview_shown(m)
+						&& m.commit_view.commit_files.len() == 2
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the first listed file is shown",
+				);
+			});
+			(model, cx, ws)
+		}
+
+		/// A commit file the retained budget refuses leaves the previous diff
+		/// shown, so the selection must keep naming that diff's file and no
+		/// error root may be set: a selection that points at a file nothing
+		/// shows is the state a refused Project read already avoids.
+		#[gpui::test]
+		fn a_commit_file_the_budget_refuses_keeps_the_shown_diffs_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			click_probed(&model, cx, "commit-file:z_big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.preview.as_ref().and_then(|p| p.path.as_deref()),
+					Some("a_small.txt"),
+				);
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the selection names a file nothing shows",
+				);
+				assert!(
+					m.preview_error_root.is_none(),
+					"an error root was set for a diff that shows no error",
+				);
+			});
+		}
+
+		/// The same refusal on a file of a browsed commit tree: the shown
+		/// diff keeps its own file selected, and the Project tree's row does
+		/// not take over the commit view's selection.
+		#[gpui::test]
+		fn a_tree_file_the_budget_refuses_keeps_the_shown_diffs_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			let sha = model.read_with(cx, |m, _| {
+				let id = m.selected_commit.clone().expect("a commit");
+				crate::multi_log::split_id(&id).0.to_string()
+			});
+			click_probed(&model, cx, &format!("btn-browse-tree:{sha}"));
+			settle_until(cx, "the commit tree", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("rev-row:z_big.txt").is_some()
+					})
+				})
+			});
+			model.update(cx, |m, _| {
+				m.paste.hold_retained_for_test(
+					crate::paste::MAX_RETAINED_PREVIEW_BYTES - 32 * 1024,
+				);
+			});
+			click_probed(&model, cx, "rev-row:z_big.txt");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.commit_view.selected_commit_file.as_deref(),
+					Some("a_small.txt"),
+					"the selection names a file nothing shows",
+				);
+				assert!(
+					m.preview_error_root.is_none() && m.preview_error.is_none()
+				);
+			});
+		}
+
+		/// A refresh while a file read is held back drops that read; the
+		/// diff still shown keeps its own selection (#230): the reload used
+		/// to forget the snapshot and leave the discarded read's path as the
+		/// selection, with no commit selected over a commit's diff.
+		#[gpui::test]
+		fn a_reload_that_keeps_the_preview_keeps_its_selection(
+			cx: &mut TestAppContext,
+		) {
+			let (model, cx, _ws) = open_commit_of_small_and_big(cx);
+			open_project_tool(&model, cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			click_probed(&model, cx, "tree-row:a_small.txt");
+			settle(cx);
+			model.update(cx, |m, _| m.e2e_read_delay = None);
+			click_probed(&model, cx, "btn-refresh");
+			settle_until(cx, "the reload to settle", |cx| {
+				model.read_with(cx, |m, _| {
+					m.changes_loaded && !m.preview_loading && m.history_loaded
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the commit diff is shown");
+				assert!(
+					m.selected_file.is_none(),
+					"the discarded read's path is selected: {:?}",
+					m.selected_file,
+				);
+				assert!(
+					m.selected_commit.is_some(),
+					"a commit's diff is shown with no commit selected",
+				);
+				assert!(!m.commit_view.commit_files.is_empty());
+			});
+		}
+
+		/// The budget's refusal puts the whole selection back, the
+		/// multi-selection with it (#230): a file list that outlived its
+		/// `log_selected` named origins past its end, so a copy took the
+		/// file from the wrong commit.
+		#[gpui::test]
+		fn a_file_the_budget_refuses_keeps_the_multi_selection(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("big.txt"), "x".repeat(128 * 1024)).unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+			for name in ["b1", "b2"] {
+				fs::write(beta.join(format!("{name}.txt")), "beta\n").unwrap();
+				git(&beta, &["add", "."]);
+				git(&beta, &["commit", "-q", "-m", name]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the merged log", |cx| {
+				model.read_with(cx, |m, _| {
+					["alpha commit", "b1", "b2"].iter().all(|s| {
+						m.display_commits().iter().any(|c| c.subject == *s)
+					})
+				})
+			});
+			let row_of = |cx: &mut VisualTestContext, subject: &str| {
+				model.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == subject)
+						.expect("commit listed")
+				})
+			};
+			let (i2, i1) = (row_of(cx, "b2"), row_of(cx, "b1"));
+			let b2_id =
+				model.read_with(cx, |m, _| m.display_commits()[i2].sha.clone());
+			let at = |cx: &mut VisualTestContext,
+			          ix: usize,
+			          mods: gpui::Modifiers| {
+				cx.run_until_parked();
+				let id: &'static str =
+					Box::leak(format!("log-subject:{ix}").into_boxed_str());
+				let row = cx.debug_bounds(id).expect("a commit row");
+				cx.simulate_click(row.center(), mods);
+			};
+			at(cx, i2, gpui::Modifiers::none());
+			settle_until(cx, "the first commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
+				})
+			});
+			at(cx, i1, gpui::Modifiers::secondary_key());
+			settle_until(cx, "the multi-selection's files and diff", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading
+						&& !m.commit_view.commit_file_origin.is_empty()
+						&& commit_preview_shown(m)
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "a multi-selection");
+			});
+
+			model.update(cx, |m, _| {
+				m.paste
+					.enqueue(crate::paste::PasteRequest::Clipboard {
+						text: "n".repeat(
+							crate::paste::MAX_RETAINED_PREVIEW_BYTES
+								- 32 * 1024,
+						),
+						dest: PathBuf::new(),
+						roots: Vec::new(),
+						generation: 0,
+						remote: None,
+					})
+					.expect("the queued paste fits");
+			});
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(alpha),
+					"big.txt",
+					snip_core::transfer::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(commit_preview_shown(m), "the shown diff stays");
+				assert_eq!(
+					m.log_selected.len(),
+					2,
+					"the multi-selection must come back with its file list",
+				);
+				assert!(
+					m.commit_view
+						.commit_file_origin
+						.iter()
+						.all(|&o| (o as usize) < m.log_selected.len()),
+					"an origin past the end of the selection",
+				);
+				let (_, want) =
+					m.log_root_for(&b2_id).expect("b2's repository");
+				let (_, got) = m
+					.commit_file_rev("b2.txt")
+					.expect("b2.txt names a revision");
+				assert_eq!(got, want, "b2.txt belongs to the newer commit");
+			});
+		}
+
+		/// A search the Log cannot run hides the commits it replaced, so it
+		/// drops the selection too (#230): the right side must not show a
+		/// commit that is no longer listed.
+		#[gpui::test]
+		fn a_failed_log_reload_drops_the_selection_it_hid(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			for i in 0..3 {
+				fs::write(alpha.join(format!("a{i}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {i}")]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle_until(cx, "the log", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 4)
+			});
+			click(cx, "log-subject:0");
+			settle_until(cx, "the commit's files", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.preview_loading && !m.commit_view.commit_files.is_empty()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_some(), "a commit is selected");
+			});
+
+			// An empty text does not reload; the unbalanced parenthesis then
+			// fails `git log --extended-regexp --grep=(` with status 128.
+			// (If a platform's regex accepts it, search `[` instead.)
+			click(cx, "btn-log-regex");
+			click(cx, "log-search-input");
+			cx.simulate_input("(");
+			cx.simulate_keystrokes("enter");
+			settle_until(
+				cx,
+				"the failed reload (if the platform's regex accepts `(`, \
+				 search `[` instead)",
+				|cx| model.read_with(cx, |m, _| m.history_error.is_some()),
+			);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.history_error.is_some(), "the search failed");
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.log_selected.is_empty(), "multi-selection kept");
+				assert!(
+					m.commit_view.is_reset(),
+					"a commit view member stayed"
+				);
+				assert!(!commit_preview_shown(m), "stale commit diff kept");
 			});
 		}
 
@@ -20126,7 +23703,7 @@ mod tests {
 			settle(cx);
 			assert!(
 				model.read_with(cx, |m, _| {
-					m.preview_loading && m.commit_files.is_empty()
+					m.preview_loading && m.commit_view.commit_files.is_empty()
 				}),
 				"the Log read must be held in flight",
 			);
@@ -20153,7 +23730,7 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(
-					m.commit_files.is_empty(),
+					m.commit_view.commit_files.is_empty(),
 					"the late Log read reinstalled files",
 				);
 				assert!(
@@ -20505,7 +24082,7 @@ mod tests {
 				(root, cx)
 			}
 
-			fn tab(
+			pub(super) fn tab(
 				root: &Entity<TabsRoot>,
 				cx: &mut VisualTestContext,
 				ix: usize,
@@ -20520,7 +24097,7 @@ mod tests {
 				root.read_with(cx, |r, _| r.tabs.len())
 			}
 
-			fn active(
+			pub(super) fn active(
 				root: &Entity<TabsRoot>,
 				cx: &mut VisualTestContext,
 			) -> Option<usize> {
@@ -20656,7 +24233,7 @@ mod tests {
 				(tmp, a, b)
 			}
 
-			fn two_tabs(
+			pub(super) fn two_tabs(
 				cx: &mut TestAppContext,
 			) -> (
 				tempfile::TempDir,
@@ -20680,7 +24257,7 @@ mod tests {
 				(tmp, a, b, root, cx)
 			}
 
-			fn wait_scaled(
+			pub(super) fn wait_scaled(
 				cx: &mut VisualTestContext,
 				what: &str,
 				mut ready: impl FnMut(&mut VisualTestContext) -> bool,
@@ -20950,7 +24527,9 @@ mod tests {
 				assert_eq!(count(&root, cx), 2);
 				assert_eq!(active(&root, cx), Some(1));
 				let empty = tab(&root, cx, 1);
-				assert!(empty.read_with(cx, |m, _| m.workspace_menu));
+				assert!(empty.read_with(cx, |m, _| m
+					.overlays
+					.is_open(crate::overlay::OverlayKind::WorkspaceMenu)));
 				assert!(focused_in(&empty, cx));
 
 				// Asking it for A shows tab A and drops the empty tab.
@@ -21157,6 +24736,85 @@ mod tests {
 				}
 				assert_eq!(count(&root, cx), 1, "B drains its own load first");
 				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				b_load.set(true);
+				wait(cx, "B closed", |cx| count(&root, cx) == 0);
+			}
+
+			/// A tab that waits for a held job before it closes still shows its
+			/// Log and still takes clicks. A click on a row starts nothing and
+			/// changes nothing: it must not leave a load flag no job will
+			/// ever clear (#230).
+			#[gpui::test]
+			fn a_log_click_during_a_drain_starts_nothing(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, b) = two_workspaces();
+				let beta = b.join("beta");
+				for i in 0..2 {
+					fs::write(beta.join(format!("b{i}.txt")), "x\n").unwrap();
+					git(&beta, &["add", "."]);
+					git(&beta, &["commit", "-q", "-m", &format!("beta {i}")]);
+				}
+				let (root, cx) = open_tabs(cx, FirstTab::Local(a), None);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "tab A loaded", |cx| workspace_ready(&ta, cx));
+				open_typed(&root, cx, &b);
+				wait(cx, "tab B opened", |cx| {
+					count(&root, cx) == 2 && {
+						let tb = tab(&root, cx, 1);
+						workspace_ready(&tb, cx)
+					}
+				});
+				let tb = tab(&root, cx, 1);
+
+				// A selection that already landed.
+				click_id(cx, "ws-tab:1".into());
+				wait(cx, "B's log", |cx| {
+					tb.read_with(cx, |m, _| m.display_commits().len() >= 3)
+				});
+				click_id(cx, "log-subject:0".into());
+				wait(cx, "B's selection", |cx| {
+					tb.read_with(cx, |m, _| {
+						m.selected_commit.is_some() && !m.preview_loading
+					})
+				});
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+
+				// A closes; B's own close waits for the held job.
+				click_id(cx, "ws-tab:0".into());
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "A closed", |cx| count(&root, cx) == 1);
+				cx.simulate_keystrokes("cmd-w");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert_eq!(count(&root, cx), 1, "B drains its own load first");
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+
+				let anchor = tb.read_with(cx, |m, _| m.selected_commit.clone());
+				let selected = tb.read_with(cx, |m, _| m.log_selected.clone());
+				let secondary = gpui::Modifiers::secondary_key();
+				let shift = gpui::Modifiers {
+					shift: true,
+					..Default::default()
+				};
+				for (row, mods) in
+					[(1, secondary), (2, shift), (1, gpui::Modifiers::none())]
+				{
+					cx.run_until_parked();
+					let id = sel(format!("log-subject:{row}"));
+					let bounds = cx.debug_bounds(id).expect("a commit row");
+					cx.simulate_click(bounds.center(), mods);
+					settle(cx);
+					tb.read_with(cx, |m, _| {
+						assert!(
+							!m.preview_loading,
+							"a click on {id} ({mods:?}) during a drain left a load flag"
+						);
+						assert_eq!(m.selected_commit, anchor, "{id} {mods:?}");
+						assert_eq!(m.log_selected, selected, "{id} {mods:?}");
+					});
+				}
 				b_load.set(true);
 				wait(cx, "B closed", |cx| count(&root, cx) == 0);
 			}
@@ -21552,7 +25210,13 @@ mod tests {
 						let m = tab(root, cx, ix);
 						let host = host.clone();
 						m.update(cx, |m, cx| {
-							m.workspace_menu = true;
+							m.open_overlay(
+								crate::overlay::OverlayKind::WorkspaceMenu,
+								crate::overlay::ReturnFocus::Root,
+								Some(crate::overlay::TriggerId::Workspace),
+								None,
+								cx,
+							);
 							m.remote.hosts = vec![host];
 							m.browse_remote_host(0, cx);
 							m.open_remote_path(0, path, cx);
@@ -21713,7 +25377,7 @@ mod tests {
 			}
 
 			/// Rests the mouse on control `id` until its tooltip is up.
-			fn hover_id(
+			pub(super) fn hover_id(
 				cx: &mut VisualTestContext,
 				id: &str,
 			) -> gpui::Point<gpui::Pixels> {
@@ -21921,7 +25585,9 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(700));
 				settle(cx);
 				assert!(
-					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					tab(&root, cx, 0).read_with(cx, |m, _| m
+						.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu)),
 					"the menu is open"
 				);
 				assert!(
@@ -21976,7 +25642,9 @@ mod tests {
 				assert!(tooltip_shown(cx, &text), "the tooltip is up");
 				click_id(cx, "btn-workspace-menu".into());
 				assert!(
-					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					tab(&root, cx, 0).read_with(cx, |m, _| m
+						.overlays
+						.is_open(crate::overlay::OverlayKind::WorkspaceMenu)),
 					"the menu is open"
 				);
 				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
@@ -23666,7 +27334,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(700));
 				settle(cx);
 				assert_eq!(
-					model.read_with(cx, |m, _| m.log_menu),
+					model.read_with(cx, |m, _| m.overlays.log_menu()),
 					Some(crate::ui::LogMenu::More),
 					"the menu is open"
 				);
@@ -23679,6 +27347,2962 @@ mod tests {
 					.expect("first item drawn")
 					.center();
 				assert!(!covered_by_tooltip(cx, item, &text));
+			}
+		}
+
+		/// Floating and inline layers have one owner (#226): the shared
+		/// rules (Escape, exclusion, return of the focus, a tab switch) are
+		/// pinned over every layer, not over the one that last broke.
+		mod overlays {
+			use super::workspace_tabs::{
+				active, click_id, hover_id, sel, tab, tooltip_shown, two_tabs,
+				wait_scaled,
+			};
+			use super::*;
+			use gpui::{Modifiers, MouseButton};
+
+			/// Every open layer by name: the one place a test reads them.
+			fn open_kinds(m: &WorkbenchModel) -> Vec<String> {
+				use crate::overlay::OverlayKind as K;
+				let mut v = Vec::new();
+				match m.overlays.floating() {
+					Some(K::WorkspaceMenu) => v.push("workspace-menu".into()),
+					Some(K::LogMenu(k)) => v.push(format!("log-menu:{k:?}")),
+					Some(K::Selector(k)) => v.push(format!("selector:{k:?}")),
+					Some(K::ContextMenu) => v.push("context-menu".into()),
+					Some(K::FindBar | K::AddRepoField | K::PasteDestField)
+					| None => {}
+				}
+				if m.overlays.is_open(K::FindBar) {
+					v.push("find-bar".to_string());
+				}
+				if m.overlays.is_open(K::AddRepoField) {
+					v.push("add-repo".to_string());
+				}
+				if m.overlays.is_open(K::PasteDestField) {
+					v.push("paste-dest".to_string());
+				}
+				v
+			}
+
+			fn is_inline(name: &str) -> bool {
+				matches!(name, "find-bar" | "add-repo" | "paste-dest")
+			}
+
+			fn floating(m: &WorkbenchModel) -> Vec<String> {
+				open_kinds(m)
+					.into_iter()
+					.filter(|k| !is_inline(k))
+					.collect()
+			}
+
+			fn inline(m: &WorkbenchModel) -> Vec<String> {
+				open_kinds(m).into_iter().filter(|k| is_inline(k)).collect()
+			}
+
+			fn floating_now(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> Vec<String> {
+				model.read_with(cx, |m, _| floating(m))
+			}
+
+			/// The pane or field that holds the keyboard, by name.
+			fn focus_name(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> &'static str {
+				cx.update(|window, cx| {
+					let m = model.read(cx);
+					let on = |h: &gpui::FocusHandle| h.is_focused(window);
+					if on(&m.tree_focus) {
+						"tree"
+					} else if on(&m.log_focus) {
+						"log"
+					} else if on(&m.reader_focus) {
+						"reader"
+					} else if on(&m.paste_focus) {
+						"paste"
+					} else if on(&m.chrome.menu_focus) {
+						"menu"
+					} else if on(&m.focus_handle) {
+						"root"
+					} else if on(&m.find_input.read(cx).handle())
+						|| on(&m.goto_input.read(cx).handle())
+					{
+						"find-field"
+					} else if on(&m.selector_input.read(cx).handle()) {
+						"selector-field"
+					} else if on(&m.log_path_input.read(cx).handle())
+						|| on(&m.log_branch_menu_input.read(cx).handle())
+					{
+						"log-menu-field"
+					} else if on(&m.workspace_path_input.read(cx).handle()) {
+						"workspace-field"
+					} else {
+						"other"
+					}
+				})
+			}
+
+			/// The centre of a probed control (tree rows and the editor tab
+			/// carry probe ids, not debug selectors), in window pixels.
+			fn probed_center(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> gpui::Point<gpui::Pixels> {
+				if model.read_with(cx, |m, _| m.probes.is_none()) {
+					model.update(cx, |m, cx| {
+						m.probes = Some(crate::ui::Probes::for_test());
+						cx.notify();
+					});
+				}
+				settle(cx);
+				let b = model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+					.unwrap_or_else(|| panic!("no probed control {id}"));
+				let scale = cx.update(|window, _| window.scale_factor());
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				)
+			}
+
+			/// A right press, the way the row's menu opens (on mouse down).
+			fn right_press(
+				cx: &mut VisualTestContext,
+				at: gpui::Point<gpui::Pixels>,
+			) {
+				cx.simulate_mouse_down(
+					at,
+					MouseButton::Right,
+					Modifiers::none(),
+				);
+				cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+				settle(cx);
+			}
+
+			/// Two repositories with a commit each and a dirty file in the
+			/// first, opened with its Changes row previewed in the reader:
+			/// every pane has something, and the Log has a repo chip.
+			fn fixture(
+				cx: &mut TestAppContext,
+				w: f32,
+				h: f32,
+			) -> (
+				tempfile::TempDir,
+				Entity<WorkbenchModel>,
+				&mut VisualTestContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				for name in ["alpha", "beta"] {
+					let r = repo(ws.path(), name, &[]);
+					fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+					git(&r, &["add", "."]);
+					git(&r, &["commit", "-q", "-m", "commit c1"]);
+				}
+				fs::write(ws.path().join("alpha").join("base.txt"), "dirty")
+					.unwrap();
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, w, h);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| {
+						!m.commits.is_empty() && m.log_width.get() > 0.
+					}) {
+						break;
+					}
+				}
+				settle(cx);
+				cx.simulate_keystrokes("alt-0");
+				settle(cx);
+				click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+				click_probed(&model, cx, "change-row@alpha:unstaged:base.txt");
+				settle(cx);
+				assert!(
+					model.read_with(cx, |m, _| m.preview.is_some()),
+					"the dirty file is previewed in the reader"
+				);
+				(ws, model, cx)
+			}
+
+			/// Every way a floating layer opens by a gesture.
+			#[derive(Clone, Copy, Debug)]
+			enum Opener {
+				Click(&'static str, &'static str),
+				RightLogRow,
+				RightRepoRow,
+				RightEditorTab,
+			}
+
+			impl Opener {
+				/// The layer it opens.
+				fn opens(self) -> &'static str {
+					match self {
+						Opener::Click(_, name) => name,
+						_ => "context-menu",
+					}
+				}
+
+				fn label(self) -> String {
+					match self {
+						Opener::Click(id, _) => id.to_string(),
+						other => format!("{other:?}"),
+					}
+				}
+
+				fn fire(
+					self,
+					model: &Entity<WorkbenchModel>,
+					cx: &mut VisualTestContext,
+				) {
+					match self {
+						Opener::Click(id, _) => {
+							let b = cx.debug_bounds(id).unwrap_or_else(|| {
+								panic!("opener {id} is not drawn")
+							});
+							cx.simulate_click(b.center(), Modifiers::none());
+							settle_checked(cx, model);
+						}
+						Opener::RightLogRow => {
+							let b = cx
+								.debug_bounds("log-subject:0")
+								.expect("a Log row is drawn");
+							right_press(cx, b.center());
+						}
+						Opener::RightRepoRow => {
+							cx.simulate_keystrokes("alt-1");
+							settle_checked(cx, model);
+							let at = probed_center(model, cx, "repo-row:alpha");
+							right_press(cx, at);
+						}
+						Opener::RightEditorTab => {
+							let at = probed_center(model, cx, "editor-tab");
+							right_press(cx, at);
+						}
+					}
+				}
+			}
+
+			const WIDE_OPENERS: [Opener; 11] = [
+				Opener::Click("btn-workspace-menu", "workspace-menu"),
+				Opener::Click("btn-repo-selector", "selector:Repo"),
+				Opener::Click("btn-ref-selector", "selector:Ref"),
+				Opener::Click("btn-log-more", "log-menu:More"),
+				Opener::Click("log-filter-repo", "log-menu:Repo"),
+				Opener::Click("log-filter-branch", "log-menu:Branch"),
+				Opener::Click("log-filter-user", "log-menu:User"),
+				Opener::Click("log-filter-date", "log-menu:Date"),
+				Opener::RightLogRow,
+				Opener::RightRepoRow,
+				Opener::RightEditorTab,
+			];
+
+			/// The focus origins: every key context the keymap names, and
+			/// the text fields that bind their own Escape.
+			const ORIGINS: [&str; 9] = [
+				"root",
+				"tree",
+				"log-row",
+				"reader",
+				"find-bar",
+				"goto-bar",
+				"log-search",
+				"branch-filter",
+				"own",
+			];
+
+			/// Settles, then holds every overlay invariant and the checks only
+			/// a driver can make (what is drawn, where the keyboard is).
+			pub(crate) fn settle_checked(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				settle(cx);
+				model.read_with(cx, |m, cx| {
+					let broken =
+						crate::overlay::OverlayStack::check_invariants(m, cx);
+					assert!(
+						broken.is_empty(),
+						"overlay invariants broken: {broken:?}"
+					);
+				});
+				assert_overlay_panels_match(cx, model);
+				assert_focus_not_in_closed_layer(cx, model);
+			}
+
+			/// A layer is open exactly when its panel is drawn. The add-repo
+			/// field belongs to the Project pane: drawn only while it shows.
+			pub(crate) fn assert_overlay_panels_match(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				use crate::overlay::OverlayKind;
+				let (open, project) = model.read_with(cx, |m, _| {
+					(
+						OverlayKind::ALL
+							.into_iter()
+							.filter(|k| m.overlays.is_open(*k))
+							.collect::<Vec<_>>(),
+						m.active_tab == crate::WorkbenchTab::FileExplorer,
+					)
+				});
+				let mut selectors: Vec<&'static str> = OverlayKind::ALL
+					.iter()
+					.map(|k| k.panel_selector())
+					.collect();
+				selectors.dedup();
+				selectors.sort_unstable();
+				selectors.dedup();
+				for sel in selectors {
+					if sel == OverlayKind::AddRepoField.panel_selector()
+						&& !project
+					{
+						continue;
+					}
+					let want = open.iter().any(|k| k.panel_selector() == sel);
+					let drawn = cx.debug_bounds(sel).is_some();
+					assert_eq!(
+						drawn, want,
+						"panel {sel}: drawn {drawn}, open layers {open:?}"
+					);
+				}
+			}
+
+			/// The keyboard is on no handle of a layer that is not open.
+			pub(crate) fn assert_focus_not_in_closed_layer(
+				cx: &mut VisualTestContext,
+				model: &Entity<WorkbenchModel>,
+			) {
+				use crate::overlay::OverlayKind;
+				cx.update(|window, cx| {
+					let m = model.read(cx);
+					for kind in OverlayKind::ALL {
+						if m.overlays.is_open(kind) {
+							continue;
+						}
+						// A handle two kinds share is open while either is.
+						for h in m.owned_handles(kind, cx) {
+							let shared =
+								OverlayKind::ALL.into_iter().any(|k| {
+									m.overlays.is_open(k)
+										&& m.owned_handles(k, cx).contains(&h)
+								});
+							assert!(
+								shared || !h.is_focused(window),
+								"the keyboard is on a handle of {kind:?}, which is closed"
+							);
+						}
+					}
+				});
+			}
+
+			/// Closes whatever a failed cell left open, so one failure does not
+			/// become every later cell's.
+			fn reset(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				model.update(cx, |m, cx| {
+					m.drop_overlays(crate::overlay::DropScope::All);
+					cx.notify();
+				});
+				focus_origin(model, cx, "root");
+			}
+
+			fn drawn_among(
+				cx: &mut VisualTestContext,
+				ids: &[&'static str],
+			) -> Vec<&'static str> {
+				ids.iter()
+					.copied()
+					.filter(|id| cx.debug_bounds(id).is_some())
+					.collect()
+			}
+
+			/// Puts the keyboard in `origin` the way a user leaves it there:
+			/// Alt+N or a click moves a pane, a field takes its own focus.
+			fn focus_origin(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				origin: &str,
+			) {
+				if origin == "own" {
+					return;
+				}
+				let h = cx.update(|_, cx| {
+					let m = model.read(cx);
+					match origin {
+						"find-bar" => m.find_input.read(cx).handle(),
+						"goto-bar" => m.goto_input.read(cx).handle(),
+						"log-search" => m.log_search_input.read(cx).handle(),
+						"branch-filter" => {
+							m.branch_filter_input.read(cx).handle()
+						}
+						"log-row" => m.log_focus.clone(),
+						"tree" => m.tree_focus.clone(),
+						"reader" => m.reader_focus.clone(),
+						_ => m.focus_handle.clone(),
+					}
+				});
+				cx.update(|window, _| window.focus(&h));
+				settle_checked(cx, model);
+				assert!(
+					cx.update(|window, _| h.is_focused(window)),
+					"{origin} holds the keyboard (it is drawn)"
+				);
+			}
+
+			/// The whole matrix: each opener against each origin. A failing
+			/// cell is named, and the cells are counted so a control that
+			/// stops being drawn cannot thin the matrix out.
+			fn escape_matrix(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				openers: &[Opener],
+			) {
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for origin in ORIGINS {
+					for opener in openers {
+						// A find bar is open before the layer is: opening a
+						// layer leaves an inline layer alone.
+						match origin {
+							"find-bar" => cx.simulate_keystrokes("ctrl-f"),
+							"goto-bar" => cx.simulate_keystrokes("ctrl-g"),
+							_ => {}
+						}
+						settle_checked(cx, model);
+						opener.fire(model, cx);
+						let open = floating_now(model, cx);
+						assert!(
+							open.iter().any(|k| k == opener.opens()),
+							"{} opened {} (open: {open:?})",
+							opener.label(),
+							opener.opens()
+						);
+						focus_origin(model, cx, origin);
+						let before = model.read_with(cx, |m, _| inline(m));
+						cx.simulate_keystrokes("escape");
+						settle_checked(cx, model);
+						let (after, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						if !after.is_empty() {
+							failures.push(format!(
+								"{} from {origin}: still open {after:?}",
+								opener.label()
+							));
+						}
+						if inl != before {
+							failures.push(format!(
+								"{} from {origin}: inline layers {before:?} -> {inl:?}",
+								opener.label()
+							));
+						}
+						cases += 1;
+						// Back to a bare state for the next cell.
+						reset(model, cx);
+					}
+				}
+				assert_eq!(cases, openers.len() * ORIGINS.len());
+				assert!(
+					failures.is_empty(),
+					"Escape left layers open in {} of {cases} cases:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// The key contexts the keymap names are all covered by an origin
+			/// or are explained: a new context needs a decision here.
+			#[test]
+			fn no_plain_escape_binding_outside_the_root_rule() {
+				use gpui::AsKeystroke;
+				let offenders: Vec<String> = crate::key_bindings()
+					.iter()
+					.filter(|b| {
+						b.keystrokes().first().is_some_and(|k| {
+							let k = k.as_keystroke();
+							k.key == "escape" && !k.modifiers.modified()
+						})
+					})
+					.map(|b| {
+						format!(
+							"escape -> {:?} in {:?}",
+							b.action().name(),
+							b.predicate().map(|p| p.to_string())
+						)
+					})
+					.collect();
+				assert!(
+					offenders.is_empty(),
+					"a bare Escape belongs to the root rule \
+					 (`WorkbenchModel::on_escape`), not to a pane or a field:\n{}",
+					offenders.join("\n")
+				);
+			}
+
+			/// Every key context the keymap names has a focus target, so the
+			/// one Escape rule decides for it.
+			#[test]
+			fn every_keymap_context_has_a_focus_target() {
+				use crate::overlay::FocusTarget;
+				use gpui::KeyBindingContextPredicate as P;
+				let mut named = std::collections::BTreeSet::new();
+				for b in crate::key_bindings() {
+					match b.predicate().as_deref() {
+						None => {}
+						Some(P::Identifier(name)) => {
+							named.insert(name.to_string());
+						}
+						Some(other) => {
+							panic!("a context this test cannot read: {other}")
+						}
+					}
+				}
+				let targets: std::collections::BTreeSet<String> =
+					FocusTarget::KINDS
+						.iter()
+						.filter_map(|t| t.context())
+						.map(String::from)
+						.collect();
+				assert_eq!(
+					named, targets,
+					"a key context needs a FocusTarget (and a decision in \
+					 `WorkbenchModel::on_escape`)"
+				);
+			}
+
+			/// Escape closes the floating layer whatever holds the keyboard
+			/// (#212): the matrix over every opener and every origin.
+			#[gpui::test]
+			fn escape_closes_the_floating_layer_from_every_focus_target(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let drawn = drawn_among(
+					cx,
+					&[
+						"btn-workspace-menu",
+						"btn-repo-selector",
+						"btn-ref-selector",
+						"btn-log-more",
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+						"log-filter-more",
+					],
+				);
+				assert_eq!(
+					drawn,
+					[
+						"btn-workspace-menu",
+						"btn-repo-selector",
+						"btn-ref-selector",
+						"btn-log-more",
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+					],
+					"the openers drawn at 1080w"
+				);
+				escape_matrix(&model, cx, &WIDE_OPENERS);
+			}
+
+			/// The same at the width where the filter chips fold into the
+			/// overflow chip.
+			#[gpui::test]
+			fn escape_closes_the_overflow_layout_layers_from_every_focus_target(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 900., 600.);
+				let drawn = drawn_among(
+					cx,
+					&[
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+						"log-filter-more",
+					],
+				);
+				assert_eq!(
+					drawn,
+					["log-filter-repo", "log-filter-more"],
+					"the chips drawn at 900w"
+				);
+				escape_matrix(
+					&model,
+					cx,
+					&[
+						Opener::Click("log-filter-repo", "log-menu:Repo"),
+						Opener::Click("log-filter-more", "log-menu:FilterMore"),
+						Opener::RightLogRow,
+					],
+				);
+			}
+
+			/// A context menu does not outlive a keyboard move to a pane
+			/// (#212): Alt+1 leaves the menu drawn, Escape still closes it.
+			#[gpui::test]
+			fn escape_closes_a_menu_after_keyboard_focus_moves(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				let at = probed_center(&model, cx, "repo-row:alpha");
+				right_press(cx, at);
+				assert_eq!(
+					floating_now(&model, cx),
+					["context-menu"],
+					"the row's menu is open"
+				);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"Escape after Alt+1 closes the menu (focus: {})",
+					focus_name(&model, cx)
+				);
+			}
+
+			/// Escape in another pane leaves the find bar open: it belongs to
+			/// the reader, not to whatever pane the key landed in.
+			#[gpui::test]
+			fn escape_in_another_pane_keeps_the_find_bar(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["find-bar"]);
+				// Alt+9 hides a visible Log; the keyboard moves there the way a
+				// click on a row leaves it.
+				focus_origin(&model, cx, "log-row");
+				assert_eq!(focus_name(&model, cx), "log");
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(
+					model.read_with(cx, |m, _| inline(m)),
+					["find-bar"],
+					"Escape in the Log leaves the find bar"
+				);
+				assert_eq!(focus_name(&model, cx), "reader");
+				// With a selection, the first Escape only clears it.
+				model.update(cx, |m, cx| m.select_all_text(cx));
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(
+					model.read_with(cx, |m, _| inline(m)),
+					["find-bar"],
+					"the first Escape clears the selection"
+				);
+				assert!(
+					model.read_with(cx, |m, _| m.reader.selection().is_none())
+				);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(
+					model.read_with(cx, |m, _| inline(m).is_empty()),
+					"the second Escape closes the find bar"
+				);
+			}
+
+			/// A second press on the button that opened a layer closes it,
+			/// fast or slow (#212): the chip's old 400 ms clock reopened it.
+			#[gpui::test]
+			fn a_second_press_on_a_trigger_closes_its_layer(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let buttons: Vec<Opener> = WIDE_OPENERS
+					.into_iter()
+					.filter(|o| matches!(o, Opener::Click(..)))
+					.collect();
+				for o in &buttons {
+					o.fire(&model, cx);
+					assert_eq!(
+						floating_now(&model, cx),
+						[o.opens()],
+						"{} opens its layer",
+						o.label()
+					);
+					o.fire(&model, cx);
+					let left = floating_now(&model, cx);
+					if !left.is_empty() {
+						failures.push(format!(
+							"{}: a second press left {left:?}",
+							o.label()
+						));
+						reset(&model, cx);
+					}
+				}
+				// The slow press: down, hold, up. The mouse down closes the
+				// layer; the click that follows must not reopen it.
+				for o in buttons.iter().filter(
+					|o| matches!(o, Opener::Click(id, _) if id.starts_with("log-filter-")),
+				) {
+					let Opener::Click(id, _) = o else {
+						unreachable!()
+					};
+					o.fire(&model, cx);
+					let at = cx.debug_bounds(id).unwrap().center();
+					cx.simulate_mouse_down(
+						at,
+						MouseButton::Left,
+						Modifiers::none(),
+					);
+					// Holding the button down is the point: not a wait.
+					std::thread::sleep(Duration::from_millis(450));
+					cx.simulate_mouse_up(
+						at,
+						MouseButton::Left,
+						Modifiers::none(),
+					);
+					settle_checked(cx, &model);
+					let left = floating_now(&model, cx);
+					if !left.is_empty() {
+						failures.push(format!(
+							"{id}: a slow press (450 ms) left {left:?}"
+						));
+						reset(&model, cx);
+					}
+				}
+				assert!(
+					failures.is_empty(),
+					"a second press must close the layer it opened:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// The overflow chip's menu holds sub-menus: the chip that opened
+			/// the first closes whatever it opened last.
+			#[gpui::test]
+			fn the_overflow_chip_closes_the_sub_menu_it_opened(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 900., 600.);
+				let more =
+					Opener::Click("log-filter-more", "log-menu:FilterMore");
+				more.fire(&model, cx);
+				let b = cx
+					.debug_bounds("log-filter-more:user")
+					.expect("the User filter is listed in the overflow menu");
+				cx.simulate_click(b.center(), Modifiers::none());
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["log-menu:User"]);
+				more.fire(&model, cx);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"the overflow chip closes the sub-menu it opened"
+				);
+			}
+
+			/// A layer opened by the keyboard closes the floating layer that
+			/// was open; opening an inline layer does too, and an inline layer
+			/// that was open stays.
+			#[gpui::test]
+			fn opening_a_layer_by_keyboard_closes_the_floating_one(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for opener in WIDE_OPENERS {
+					for key in
+						["alt-shift-r", "secondary-shift-`", "ctrl-f", "ctrl-g"]
+					{
+						opener.fire(&model, cx);
+						cx.simulate_keystrokes(key);
+						settle_checked(cx, &model);
+						let (open, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						let want: Vec<String> = match (key, opener) {
+							(
+								"alt-shift-r",
+								Opener::Click(_, "selector:Repo"),
+							)
+							| (
+								"secondary-shift-`",
+								Opener::Click(_, "selector:Ref"),
+							) => Vec::new(),
+							("alt-shift-r", _) => vec!["selector:Repo".into()],
+							("secondary-shift-`", _) => {
+								vec!["selector:Ref".into()]
+							}
+							_ => Vec::new(),
+						};
+						if open != want {
+							failures.push(format!(
+								"{} then {key}: floating {open:?}, want {want:?}",
+								opener.label()
+							));
+						}
+						if key.starts_with("ctrl") && inl != ["find-bar"] {
+							failures.push(format!(
+								"{} then {key}: inline {inl:?}",
+								opener.label()
+							));
+						}
+						cases += 1;
+						reset(&model, cx);
+					}
+				}
+				assert_eq!(cases, WIDE_OPENERS.len() * 4);
+				assert!(
+					failures.is_empty(),
+					"{} of {cases} cases left two layers or the wrong one:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// A background workspace tab shows no layer, and the host
+			/// browse a layer owned ends with it; the focus the layer would
+			/// have given back is where the tab resumes.
+			#[gpui::test]
+			fn a_tab_switch_closes_floating_layers_and_their_browse(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+				settle(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				let tab0 = tab(&root, cx, 0);
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				tab0.update(cx, |m, cx| {
+					m.remote.hosts =
+						vec![snip_remote::RemoteHost::in_process(worker)];
+					cx.notify();
+				});
+				for _ in 0..50 {
+					settle(cx);
+					if tab0.read_with(cx, |m, _| !m.commits.is_empty())
+						&& cx.debug_bounds("log-filter-branch").is_some()
+					{
+						break;
+					}
+				}
+				let mut failures = Vec::new();
+				for case in
+					["workspace-menu", "log-menu:Branch", "selector:Repo"]
+				{
+					match case {
+						"workspace-menu" => {
+							Opener::Click("btn-workspace-menu", case)
+								.fire(&tab0, cx);
+							Opener::Click("remote-host:0", case)
+								.fire(&tab0, cx);
+							wait_scaled(
+								cx,
+								"the host's folders are listed",
+								|cx| {
+									tab0.read_with(cx, |m, _| {
+										m.remote.browse.as_ref().is_some_and(
+											|b| b.listing.is_some(),
+										)
+									})
+								},
+							);
+						}
+						"log-menu:Branch" => {
+							Opener::Click("log-filter-branch", case)
+								.fire(&tab0, cx)
+						}
+						_ => {
+							cx.simulate_keystrokes("alt-1");
+							settle(cx);
+							cx.simulate_keystrokes("alt-shift-r");
+							settle(cx);
+							assert_eq!(focus_name(&tab0, cx), "selector-field");
+						}
+					}
+					assert_eq!(
+						floating_now(&tab0, cx),
+						[case],
+						"{case} is open in the shown tab"
+					);
+					for (step, key, shown) in
+						[("away", "cmd-2", 1), ("back", "cmd-1", 0)]
+					{
+						cx.simulate_keystrokes(key);
+						settle(cx);
+						assert_eq!(active(&root, cx), Some(shown));
+						let (open, browse, hosts_ok) =
+							tab0.read_with(cx, |m, _| {
+								(
+									floating(m),
+									m.remote.browse.is_some(),
+									// The menu open implies its browse is the host's.
+									!m.overlays.is_open(crate::overlay::OverlayKind::WorkspaceMenu)
+										|| m.remote
+											.browse
+											.as_ref()
+											.is_none_or(|b| b.host == 0),
+								)
+							});
+						if !open.is_empty() {
+							failures.push(format!(
+								"{case} {step}: still open {open:?}"
+							));
+						}
+						if browse && !open.iter().any(|k| k == "workspace-menu")
+						{
+							failures.push(format!(
+								"{case} {step}: a browse without its menu"
+							));
+						}
+						if !hosts_ok {
+							failures.push(format!(
+								"{case} {step}: a menu over another host's browse"
+							));
+						}
+					}
+					if case == "workspace-menu" {
+						// The menu is gone, so its browse must be too.
+						let browse = tab0
+							.read_with(cx, |m, _| m.remote.browse.is_some());
+						if browse {
+							failures
+								.push("workspace-menu: a browse kept".into());
+						}
+					}
+					if case == "selector:Repo" {
+						let at = focus_name(&tab0, cx);
+						if at != "tree" {
+							failures.push(format!(
+								"selector:Repo: focus resumes in {at}, not the tree it was opened from"
+							));
+						}
+					}
+					// Leave nothing open for the next case.
+					reset(&tab0, cx);
+				}
+				assert!(
+					failures.is_empty(),
+					"a tab switch must close the floating layers:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// The pointer rests in a corner no control is in.
+			fn park_mouse(cx: &mut VisualTestContext) {
+				cx.simulate_mouse_move(
+					gpui::point(gpui::px(2.), gpui::px(2.)),
+					None,
+					Modifiers::none(),
+				);
+				settle(cx);
+			}
+
+			/// Tab 0 of two workspaces at 1080 wide with its Log loaded and a
+			/// status line: the places a tooltip can rest while a layer is
+			/// open. Both tooltips are up when no layer is, so what follows is
+			/// the rule, not an accident of the fixture.
+			fn tooltip_fixture(
+				cx: &mut TestAppContext,
+			) -> (
+				tempfile::TempDir,
+				Entity<WorkbenchModel>,
+				String,
+				String,
+				gpui::Bounds<gpui::Pixels>,
+				&mut VisualTestContext,
+			) {
+				let (tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let tab0 = tab(&root, cx, 0);
+				for _ in 0..50 {
+					settle(cx);
+					if tab0.read_with(cx, |m, _| !m.commits.is_empty())
+						&& cx.debug_bounds("log-filter-branch").is_some()
+					{
+						break;
+					}
+				}
+				// A status line gives `status-text` something to say.
+				tab0.update(cx, |m, cx| {
+					m.set_status("workspace_opening", [String::from("here")]);
+					cx.notify();
+				});
+				settle(cx);
+				let status =
+					tab0.read_with(cx, |m, _| m.status.render(m.locale));
+				assert!(!status.is_empty());
+				let tab_tip = a.display().to_string();
+				let status_b =
+					cx.debug_bounds("status-text").expect("status drawn");
+				hover_id(cx, "status-text");
+				assert!(tooltip_shown(cx, &status), "the status tooltip is up");
+				hover_id(cx, "ws-tab:0");
+				assert!(tooltip_shown(cx, &tab_tip), "the tab tooltip is up");
+				park_mouse(cx);
+				(tmp, tab0, status, tab_tip, status_b, cx)
+			}
+
+			/// While a floating layer is open no tooltip shows, wherever the
+			/// pointer rests: a tooltip would land on the layer or on the
+			/// controls under it (#203 as a class, not one guard per button).
+			#[gpui::test]
+			fn no_tooltip_while_a_floating_layer_is_open(
+				cx: &mut TestAppContext,
+			) {
+				use crate::overlay::OverlayKind as K;
+				let (_tmp, tab0, status, tab_tip, status_b, cx) =
+					tooltip_fixture(cx);
+				let mut failures = Vec::new();
+				for opener in [
+					Opener::Click("btn-workspace-menu", "workspace-menu"),
+					Opener::Click("btn-repo-selector", "selector:Repo"),
+					Opener::Click("log-filter-branch", "log-menu:Branch"),
+					Opener::RightLogRow,
+				] {
+					opener.fire(&tab0, cx);
+					assert_eq!(floating_now(&tab0, cx), [opener.opens()]);
+					let panel = cx
+						.debug_bounds(match opener.opens() {
+							"workspace-menu" => {
+								K::WorkspaceMenu.panel_selector()
+							}
+							"selector:Repo" => {
+								K::Selector(crate::Popover::Repo)
+									.panel_selector()
+							}
+							"log-menu:Branch" => {
+								K::LogMenu(crate::ui::LogMenu::Branch)
+									.panel_selector()
+							}
+							_ => K::ContextMenu.panel_selector(),
+						})
+						.expect("the panel is drawn");
+					// A panel over the status line would hide it from the
+					// pointer by itself: that line is only tried where the
+					// panel leaves it free.
+					let status_free = !bounds_intersect(panel, status_b);
+					for (id, text) in
+						[("status-text", &status), ("ws-tab:0", &tab_tip)]
+					{
+						if id == "status-text" && !status_free {
+							continue;
+						}
+						hover_id(cx, id);
+						if tooltip_shown(cx, text) {
+							failures.push(format!(
+								"{}: the tooltip of {id} shows over the layer",
+								opener.label()
+							));
+						}
+					}
+					reset(&tab0, cx);
+					park_mouse(cx);
+				}
+				assert!(failures.is_empty(), "{}", failures.join("\n"));
+			}
+
+			/// A tooltip already up goes when a layer opens, and an inline
+			/// layer takes none away.
+			#[gpui::test]
+			fn a_shown_tooltip_goes_when_a_floating_layer_opens(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, tab0, status, tab_tip, _status_b, cx) =
+					tooltip_fixture(cx);
+				hover_id(cx, "status-text");
+				assert!(tooltip_shown(cx, &status), "the status tooltip is up");
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &tab0);
+				assert!(
+					!tooltip_shown(cx, &status),
+					"opening a layer takes the tooltip that was up"
+				);
+				reset(&tab0, cx);
+				park_mouse(cx);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &tab0);
+				hover_id(cx, "ws-tab:0");
+				assert!(
+					tooltip_shown(cx, &tab_tip),
+					"the find bar leaves the tooltips alone"
+				);
+			}
+
+			/// A press on each opener, rested on first, leaves no tooltip of
+			/// its own over the layer it opened (#203).
+			#[gpui::test]
+			fn opening_a_layer_drops_its_triggers_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let branch = model.read_with(cx, |m, _| m.header_ref_label());
+				let mut failures = Vec::new();
+				for (id, text) in [
+					(
+						"btn-repo-selector",
+						crate::i18n::t("tip_repo_selector", loc).to_string(),
+					),
+					(
+						"btn-ref-selector",
+						crate::i18n::tf("tip_ref_selector", loc, &[&branch]),
+					),
+					(
+						"btn-log-more",
+						crate::i18n::t("tip_log_more", loc).to_string(),
+					),
+				] {
+					let at =
+						cx.debug_bounds(id).expect("opener drawn").center();
+					cx.simulate_mouse_move(at, None, Modifiers::none());
+					cx.simulate_click(at, Modifiers::none());
+					cx.executor().advance_clock(Duration::from_millis(700));
+					settle_checked(cx, &model);
+					if cx.debug_bounds(sel(format!("tooltip:{text}"))).is_some()
+					{
+						failures.push(format!("{id}: its tooltip stays up"));
+					}
+					reset(&model, cx);
+					park_mouse(cx);
+				}
+				assert!(failures.is_empty(), "{}", failures.join("\n"));
+			}
+
+			/// The add-repo field is an inline layer of the Project pane: its
+			/// button toggles it, a floating layer opens over it without
+			/// closing it, and Escape in its field closes it and gives the
+			/// keyboard back to where the button left it.
+			#[gpui::test]
+			fn the_add_repo_field_is_an_inline_layer(cx: &mut TestAppContext) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				let button = Opener::Click("btn-add-repo", "add-repo");
+				button.fire(&model, cx);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				assert!(cx.debug_bounds("input-add-repo").is_some());
+				let at_open = focus_name(&model, cx);
+				// A second press on the button closes it.
+				button.fire(&model, cx);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				button.fire(&model, cx);
+				// A floating layer opens over it and closes first.
+				Opener::Click("btn-ref-selector", "selector:Ref")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["selector:Ref"]);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["add-repo"]);
+				// Escape in its field closes it.
+				let field = model
+					.read_with(cx, |m, cx| m.add_repo_input.read(cx).handle());
+				cx.update(|window, _| window.focus(&field));
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "other");
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				assert_eq!(
+					focus_name(&model, cx),
+					at_open,
+					"the keyboard is back where the button left it"
+				);
+			}
+
+			/// One rule for the keyboard after a layer closes (the user's
+			/// decision): back to where it was opened from, or the root.
+			#[gpui::test]
+			fn closing_a_layer_returns_focus_by_one_rule(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut check = |row: &str,
+				                 got: &'static str,
+				                 want: &'static str| {
+					if got != want {
+						failures
+							.push(format!("{row}: focus {got}, want {want}"));
+					}
+				};
+				// 1: a selector opened from the project tree.
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "tree");
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check("1 selector, Escape", focus_name(&model, cx), "tree");
+				assert!(floating_now(&model, cx).is_empty());
+
+				// 2: a Log chip, closed by a press on bare header space.
+				Opener::Click("log-filter-repo", "log-menu:Repo")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Repo"]);
+				let ref_b = cx.debug_bounds("btn-ref-selector").unwrap();
+				let paste = probed_center(&model, cx, "btn-paste");
+				let left = f32::from(ref_b.origin.x + ref_b.size.width);
+				let blank = gpui::point(gpui::px(left + 40.), ref_b.center().y);
+				assert!(
+					f32::from(paste.x) - (left + 40.) > 40.,
+					"bare header space: {left}..{:?}",
+					paste.x
+				);
+				cx.simulate_click(blank, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"2 Log chip, outside press",
+					focus_name(&model, cx),
+					"log",
+				);
+
+				// 3: a context menu opened on a tree row.
+				Opener::RightRepoRow.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["context-menu"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check("3 context menu, Escape", focus_name(&model, cx), "tree");
+
+				// 4: the find bar.
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check("4 find bar, Escape", focus_name(&model, cx), "reader");
+
+				// 5: the workspace menu's path field.
+				Opener::Click("btn-workspace-menu", "workspace-menu")
+					.fire(&model, cx);
+				let at = probed_center(&model, cx, "btn-open-workspace");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "workspace-field");
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"5 workspace field, Escape",
+					focus_name(&model, cx),
+					"root",
+				);
+
+				// 6: a press on another pane keeps what that pane took.
+				Opener::Click("btn-ref-selector", "selector:Ref")
+					.fire(&model, cx);
+				let at = probed_center(&model, cx, "repo-row:alpha");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"6 outside press on the tree",
+					focus_name(&model, cx),
+					"tree",
+				);
+
+				// 7: a layer opened over another's keyboard keeps its own
+				// place to give it back: the find bar's is the reader, not
+				// the pane the selector under it was opened from.
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check(
+					"7 find bar over a selector, Escape",
+					focus_name(&model, cx),
+					"reader",
+				);
+				// 8: a Log dropdown that takes the keyboard (its filter field)
+				// opened after a selector gives it back to the Log.
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				Opener::Click("log-filter-branch", "log-menu:Branch")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Branch"]);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				check(
+					"8 Log dropdown over a selector, Escape",
+					focus_name(&model, cx),
+					"log",
+				);
+				assert!(
+					failures.is_empty(),
+					"the focus after a layer closes:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// Ctrl+F / Ctrl+G with the find bar already open still close the
+			/// floating layer that was opened over it: the keyboard goes to
+			/// the bar, so no layer may stay drawn (and mute the tooltips)
+			/// behind it.
+			#[gpui::test]
+			fn reopening_an_open_inline_layer_closes_the_floating_one(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for opener in WIDE_OPENERS {
+					for (first, key) in [
+						("ctrl-f", "ctrl-f"),
+						("ctrl-f", "ctrl-g"),
+						("ctrl-g", "ctrl-f"),
+						("ctrl-g", "ctrl-g"),
+					] {
+						cx.simulate_keystrokes(first);
+						settle_checked(cx, &model);
+						opener.fire(&model, cx);
+						assert_eq!(
+							floating_now(&model, cx),
+							[opener.opens()],
+							"{} opened over the find bar",
+							opener.label()
+						);
+						cx.simulate_keystrokes(key);
+						settle_checked(cx, &model);
+						let (open, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						let at = focus_name(&model, cx);
+						let label = opener.label();
+						if !open.is_empty() {
+							failures.push(format!(
+								"{label}, {first} then {key}: floating {open:?}"
+							));
+						}
+						if inl != ["find-bar"] || at != "find-field" {
+							failures.push(format!(
+								"{label}, {first} then {key}: inline {inl:?}, focus {at}"
+							));
+						}
+						cases += 1;
+						reset(&model, cx);
+					}
+				}
+				assert_eq!(cases, WIDE_OPENERS.len() * 4);
+				assert!(
+					failures.is_empty(),
+					"{} of {cases} cases left a floating layer over the find bar:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// Where a trigger was drawn is forgotten when a frame does not
+			/// draw it: the chip a narrower window folds into "more" must not
+			/// keep its old place, or a press there would pass for a press on
+			/// it and the layer would survive an outside press.
+			#[gpui::test]
+			fn a_trigger_that_is_not_drawn_has_no_place(
+				cx: &mut TestAppContext,
+			) {
+				use crate::{overlay::TriggerId, ui::LogMenu};
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-branch", "log-menu:Branch")
+					.fire(&model, cx);
+				let slot = model.read_with(cx, |m, _| {
+					m.overlays.trigger_slot(TriggerId::LogChip(LogMenu::Branch))
+				});
+				let at =
+					slot.get().expect("the chip is drawn at 1080w").center();
+				cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+				settle(cx);
+				assert!(
+					cx.debug_bounds("log-filter-branch").is_none(),
+					"the chip is folded away at 900w"
+				);
+				assert_eq!(
+					slot.get(),
+					None,
+					"the folded chip keeps no place from the wide frame"
+				);
+				assert_eq!(
+					floating_now(&model, cx),
+					["log-menu:Branch"],
+					"the menu survives the resize, so the press below tests it"
+				);
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(
+					floating_now(&model, cx).is_empty(),
+					"a press where the chip used to be is an outside press"
+				);
+			}
+
+			/// A layer closed by a focusable control inside its own panel
+			/// still gives the keyboard back: the press put the focus on
+			/// the control, which is the layer's, not "somewhere else".
+			#[gpui::test]
+			fn the_find_bar_close_button_returns_to_the_reader(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				cx.simulate_keystrokes("ctrl-f");
+				settle_checked(cx, &model);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["find-bar"]);
+				let at = probed_center(&model, cx, "btn-find-close");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| inline(m).is_empty()));
+				assert_eq!(
+					focus_name(&model, cx),
+					"reader",
+					"the find bar's close button hands the keyboard to the reader"
+				);
+			}
+
+			#[gpui::test]
+			fn the_log_date_apply_button_returns_to_the_log(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-date", "log-menu:Date")
+					.fire(&model, cx);
+				model.update(cx, |m, cx| {
+					m.log_since_input
+						.update(cx, |i, cx| i.set_text("2020-01-01", cx));
+					m.log_until_input
+						.update(cx, |i, cx| i.set_text("2030-01-01", cx));
+				});
+				settle_checked(cx, &model);
+				let at = probed_center(&model, cx, "log-date-apply");
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert!(
+					floating_now(&model, cx).is_empty(),
+					"a valid range closes the menu"
+				);
+				assert_eq!(
+					focus_name(&model, cx),
+					"log",
+					"the Log keeps the keyboard after Apply"
+				);
+			}
+
+			/// The panel tracks the keyboard for its controls, but a press on
+			/// its blank part does not take it from the field typed in.
+			#[gpui::test]
+			fn a_press_on_a_panels_blank_part_keeps_the_field_focused(
+				cx: &mut TestAppContext,
+			) {
+				use crate::{overlay::OverlayKind, ui::LogMenu};
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				Opener::Click("log-filter-date", "log-menu:Date")
+					.fire(&model, cx);
+				let since = model
+					.read_with(cx, |m, cx| m.log_since_input.read(cx).handle());
+				cx.update(|window, _| window.focus(&since));
+				settle_checked(cx, &model);
+				let panel = cx
+					.debug_bounds(
+						OverlayKind::LogMenu(LogMenu::Date).panel_selector(),
+					)
+					.expect("the date menu is drawn");
+				let at = panel.origin + gpui::point(gpui::px(2.), gpui::px(2.));
+				cx.simulate_click(at, Modifiers::none());
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Date"]);
+				assert!(
+					cx.update(|window, _| since.is_focused(window)),
+					"the field keeps the keyboard"
+				);
+			}
+
+			/// A press on a find-bar control (not a field) leaves the bar
+			/// under the one Escape rule: Escape closes it.
+			#[gpui::test]
+			fn escape_after_a_find_bar_control_closes_the_find_bar(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				for id in ["btn-find-regex", "btn-find-case"] {
+					cx.simulate_keystrokes("ctrl-f");
+					settle_checked(cx, &model);
+					let at = probed_center(&model, cx, id);
+					cx.simulate_click(at, Modifiers::none());
+					settle_checked(cx, &model);
+					cx.simulate_keystrokes("escape");
+					settle_checked(cx, &model);
+					assert!(
+						model.read_with(cx, |m, _| inline(m).is_empty()),
+						"Escape after a press on {id} closes the find bar"
+					);
+					reset(&model, cx);
+				}
+			}
+
+			/// The tooltip gate invariant (O6) is the shown tab's: a tab that
+			/// went to the background with a layer open drew its last frame
+			/// with the gate closed, and that is not a mismatch.
+			#[gpui::test]
+			fn a_background_tab_holds_every_overlay_invariant(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let shown = tab(&root, cx, 1);
+				let at = cx
+					.debug_bounds("btn-repo-selector")
+					.expect("the shown tab draws its selector button")
+					.center();
+				cx.simulate_click(at, Modifiers::none());
+				settle(cx);
+				assert_eq!(floating_now(&shown, cx), ["selector:Repo"]);
+				click_id(cx, "ws-tab:0".into());
+				assert_eq!(active(&root, cx), Some(0));
+				shown.read_with(cx, |m, cx| {
+					assert!(m.overlays.floating().is_none());
+					let broken =
+						crate::overlay::OverlayStack::check_invariants(m, cx);
+					assert!(
+						broken.is_empty(),
+						"a background tab breaks {broken:?}"
+					);
+				});
+			}
+
+			/// A selector opened by a press on its header button gives the
+			/// keyboard back to that button: the button took the focus the
+			/// press, so it is where the keyboard was when the layer opened.
+			/// (The shortcut gives it back to the pane it was pressed in.)
+			#[gpui::test]
+			fn a_selector_opened_by_a_click_returns_to_its_button(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle_checked(cx, &model);
+				assert_eq!(focus_name(&model, cx), "tree");
+				Opener::Click("btn-repo-selector", "selector:Repo")
+					.fire(&model, cx);
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert!(floating_now(&model, cx).is_empty());
+				assert_eq!(
+					focus_name(&model, cx),
+					"other",
+					"back on the button that opened it, not the tree"
+				);
+			}
+
+			/// The folder dialog's failure lands after the tab went to the
+			/// background: the typed-path menu opens nothing there, and no
+			/// field is asked to take the keyboard when the tab is shown.
+			#[gpui::test]
+			fn the_workspace_picker_asks_for_no_focus_in_a_background_tab(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let background = tab(&root, cx, 0);
+				assert_eq!(active(&root, cx), Some(1));
+				background.update(cx, |m, cx| {
+					m.pending_focus = None;
+					m.show_workspace_picker(cx);
+				});
+				background.read_with(cx, |m, _| {
+					assert!(
+						!m.overlays.is_open(
+							crate::overlay::OverlayKind::WorkspaceMenu
+						),
+						"a background tab opens no menu"
+					);
+					assert!(
+						m.pending_focus.is_none(),
+						"and queues no focus for a field that is not drawn"
+					);
+				});
+			}
+
+			/// An IME composition owns Escape: the first one ends the
+			/// composition, the next closes the layer.
+			#[gpui::test]
+			fn escape_during_ime_composition_goes_to_the_ime(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle_checked(cx, &model);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				let input =
+					model.read_with(cx, |m, _| m.selector_input.clone());
+				input.update(cx, |i, _| {
+					i.handle_replace_and_mark(None, "\u{3110}\u{3127}", None)
+				});
+				assert!(input.read_with(cx, |i, _| i.marked_range().is_some()));
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(
+					floating_now(&model, cx),
+					["selector:Repo"],
+					"Escape during a composition is the IME's"
+				);
+				assert!(
+					input.read_with(cx, |i, _| i.marked_range().is_some()),
+					"the composition is untouched"
+				);
+				input.update(cx, |i, _| {
+					i.handle_unmark();
+				});
+				cx.simulate_keystrokes("escape");
+				settle_checked(cx, &model);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"Escape with no composition closes the selector"
+				);
+			}
+		}
+
+		/// The paste panel's destination folder (#238): picked with the
+		/// pointer or typed, then applied from the keyboard.
+		mod paste_destination {
+			use super::*;
+
+			/// `ws/` is a plain folder holding two repos, `docs/` with a
+			/// file, and a folder whose name has a space. Also returns the
+			/// temp dir's owner so a test can add siblings.
+			fn multi_repo_ws() -> (tempfile::TempDir, PathBuf) {
+				let tmp = tempfile::tempdir().unwrap();
+				let ws = tmp.path().join("ws");
+				fs::create_dir(&ws).unwrap();
+				repo(&ws, "repoA", &[]);
+				repo(&ws, "repoB", &[]);
+				fs::create_dir(ws.join("docs")).unwrap();
+				fs::write(ws.join("docs/readme.txt"), "readme").unwrap();
+				fs::create_dir(ws.join("my dir")).unwrap();
+				(tmp, ws)
+			}
+
+			/// Opens `ws` and waits (bounded) for the scan and its trees.
+			fn open_ready<'a>(
+				cx: &'a mut TestAppContext,
+				ws: &Path,
+			) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
+				let (model, cx) = open(cx, ws.to_path_buf(), None);
+				settle_until(cx, "the workspace scan", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.is_loading
+							&& m.repos.len() == 2 && m
+							.ws_tree
+							.as_ref()
+							.is_some_and(|t| t.is_loaded)
+					})
+				});
+				// The Project tool window, where the folders are.
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				(model, cx)
+			}
+
+			/// Puts `text` on the clipboard and opens its paste preview
+			/// with Cmd+V, waiting (bounded) for the plan.
+			fn preview(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				text: &str,
+			) {
+				clip::write_text(text).unwrap();
+				cx.simulate_keystrokes("cmd-v");
+				landed(model, cx);
+			}
+
+			fn landed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				settle_until(cx, "the paste plan", |cx| {
+					model.read_with(cx, |m, _| {
+						m.paste.plan().is_some() && !m.paste.is_loading()
+					})
+				});
+			}
+
+			/// The Enter that applies, then the wait for the write.
+			fn apply_with_enter(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				cx.simulate_keystrokes("enter");
+				settle_until(cx, "the write to finish", |cx| {
+					model.read_with(cx, |m, _| {
+						m.paste.plan().is_none() && !m.paste_busy()
+					})
+				});
+			}
+
+			/// Where the probe `id` is drawn, centred, in window points.
+			fn probed_point(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> gpui::Point<gpui::Pixels> {
+				if model.read_with(cx, |m, _| m.probes.is_none()) {
+					model.update(cx, |m, cx| {
+						m.probes = Some(crate::ui::Probes::for_test());
+						cx.notify();
+					});
+					settle(cx);
+				}
+				let b = model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+					.unwrap_or_else(|| panic!("no probed control {id}"));
+				let scale = cx.update(|window, _| window.scale_factor());
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				)
+			}
+
+			fn right_click_probed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) {
+				let pos = probed_point(model, cx, id);
+				cx.simulate_mouse_down(
+					pos,
+					gpui::MouseButton::Right,
+					gpui::Modifiers::none(),
+				);
+				cx.simulate_mouse_up(
+					pos,
+					gpui::MouseButton::Right,
+					gpui::Modifiers::none(),
+				);
+				settle(cx);
+			}
+
+			fn plan_destination(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> PathBuf {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().expect("a plan").destination.clone()
+				})
+			}
+
+			fn executable(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some_and(|p| p.executable())
+				})
+			}
+
+			fn paste_focused(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				cx.update(|w, cx| model.read(cx).paste_focus.is_focused(w))
+			}
+
+			fn probed(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> bool {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| p.bounds(id).is_some())
+				})
+			}
+
+			fn file(path: &Path) -> Option<String> {
+				// The payload's closing line break is not part of the file.
+				fs::read_to_string(path)
+					.ok()
+					.map(|text| text.trim_end().to_string())
+			}
+
+			/// The report of #236: in a workspace of several repos there was
+			/// no way to paste into the workspace folder itself.
+			#[gpui::test]
+			fn multi_repo_paste_targets_the_workspace_root_from_the_breadcrumb(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				// The default stays the pinned repo, whichever scans first.
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				assert_ne!(first, ws);
+				assert_eq!(plan_destination(&model, cx), first);
+				assert_eq!(folder(&model, cx).0, first);
+
+				click_probed(&model, cx, "paste-dest-crumb:0");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws);
+				assert_eq!(
+					folder(&model, cx),
+					(ws.clone(), Some(String::new()))
+				);
+				assert!(executable(&model, cx));
+				assert!(
+					paste_focused(&model, cx),
+					"focus returns to the panel"
+				);
+
+				apply_with_enter(&model, cx);
+				assert!(
+					file(&ws.join("x.txt")).is_some_and(|s| s.contains('X'))
+				);
+				assert!(!ws.join("repoA/x.txt").exists());
+				assert!(!ws.join("repoB/x.txt").exists());
+			}
+
+			/// Keeping a prefix follows the destination only until the
+			/// destination moves: the choice is asked for again (#238).
+			#[gpui::test]
+			fn moving_the_destination_asks_for_the_prefix_again(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: notes/x.txt\nN\n");
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				assert!(model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().mapping_ready()
+				}));
+				click_probed(&model, cx, "paste-dest-root");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws);
+				assert!(!model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().mapping_ready()
+				}));
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("notes/x.txt")).as_deref(), Some("N"));
+			}
+
+			/// Right-click a folder, pick "paste into this folder": the next
+			/// Enter applies (the menu's own Enter has been spent).
+			#[gpui::test]
+			fn paste_into_from_the_project_menu_applies_on_the_first_enter(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+
+				// (a) The pointer picks it, with no preview open.
+				{
+					let (model, cx) = open_ready(cx, &ws);
+					clip::write_text("// FILE: x.txt\nX\n").unwrap();
+					right_click_probed(&model, cx, "ws-tree-row:docs");
+					assert!(model.read_with(cx, |m, _| menu_has_enabled(
+						m,
+						"paste-into"
+					)));
+					click_probed(&model, cx, "menu-item:paste-into");
+					landed(&model, cx);
+					assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+					assert!(paste_focused(&model, cx));
+					assert!(model.read_with(cx, |m, _| m
+						.overlays
+						.context_menu()
+						.is_none()));
+					apply_with_enter(&model, cx);
+					assert_eq!(
+						file(&ws.join("docs/x.txt")).as_deref(),
+						Some("X")
+					);
+					fs::remove_file(ws.join("docs/x.txt")).unwrap();
+				}
+			}
+
+			/// Whether the open menu has an enabled item `id`.
+			fn menu_has_enabled(m: &WorkbenchModel, id: &str) -> bool {
+				m.overlays.context_menu().is_some_and(|menu| {
+					menu.entries.iter().any(|e| {
+						matches!(
+							e,
+							crate::menu::MenuEntry::Item {
+								id: i,
+								act: Some(_),
+								..
+							} if *i == id
+						)
+					})
+				})
+			}
+
+			/// The same, with the menu driven from the keyboard.
+			#[gpui::test]
+			fn paste_into_from_the_menu_by_keyboard_applies_on_the_next_enter(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs");
+				for _ in 0..8 {
+					let on_it = model.read_with(cx, |m, _| {
+						m.overlays.context_menu().is_some_and(|menu| {
+							matches!(
+								menu.cursor.and_then(|c| menu.entries.get(c)),
+								Some(crate::menu::MenuEntry::Item {
+									id: "paste-into",
+									..
+								})
+							)
+						})
+					});
+					if on_it {
+						break;
+					}
+					cx.simulate_keystrokes("down");
+				}
+				// The menu's Enter picks the item and applies nothing.
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(!ws.join("docs/x.txt").exists());
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+			}
+
+			/// With a preview already open the menu moves it, and the
+			/// payload is the one previewed, not the clipboard now.
+			#[gpui::test]
+			fn paste_into_with_a_preview_open_keeps_the_previewed_payload(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				clip::write_text("other").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.unwrap()
+						.items
+						.iter()
+						.any(|i| i.path == "x.txt")
+				}));
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+			}
+
+			/// The target of the item `paste-into` in `entries`, if it is
+			/// there and enabled.
+			fn paste_into_act(
+				entries: Vec<crate::menu::MenuEntry>,
+			) -> Option<PathBuf> {
+				entries.into_iter().find_map(|e| match e {
+					crate::menu::MenuEntry::Item {
+						id: "paste-into",
+						act: Some(crate::menu::MenuAct::PasteInto(path)),
+						..
+					} => Some(path),
+					_ => None,
+				})
+			}
+
+			fn has_paste_into(entries: &[crate::menu::MenuEntry]) -> bool {
+				entries.iter().any(|e| {
+					matches!(
+						e,
+						crate::menu::MenuEntry::Item {
+							id: "paste-into",
+							..
+						}
+					)
+				})
+			}
+
+			/// Folder rows and repo rows offer "paste into this folder", with
+			/// the folder as the target; file rows do not.
+			#[gpui::test]
+			fn project_menus_offer_paste_into_for_folders_only(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, ws) = multi_repo_ws();
+				fs::write(ws.join("top.txt"), "T").unwrap();
+				for repo in ["repoA", "repoB"] {
+					fs::create_dir(ws.join(repo).join("dir")).unwrap();
+					fs::write(ws.join(repo).join("dir/b.txt"), "B").unwrap();
+				}
+				let (model, cx) = open_ready(cx, &ws);
+				open_repo_tree(&model, cx, 0);
+				model.read_with(cx, |m, _| {
+					// A workspace folder row and its file.
+					let tree = m.ws_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let row = |rel: &str| {
+						rows.iter().find(|r| r.rel_path == rel).cloned()
+					};
+					let docs = row("docs").expect("docs row");
+					assert_eq!(
+						paste_into_act(m.work_row_menu(&docs, true)),
+						Some(m.ws_root().unwrap().join("docs"))
+					);
+					let top = row("top.txt").expect("top.txt row");
+					assert!(!top.is_dir);
+					assert!(!has_paste_into(&m.work_row_menu(&top, true)));
+					// A folder inside the open repo.
+					let tree = m.file_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let find = |rel: &str| {
+						rows.iter().find(|r| r.rel_path == rel).unwrap().clone()
+					};
+					let dir = find("dir");
+					assert!(dir.is_dir);
+					assert_eq!(
+						paste_into_act(m.work_row_menu(&dir, false)),
+						Some(m.repo_root().unwrap().join("dir"))
+					);
+					let base = find("base.txt");
+					assert!(!has_paste_into(&m.work_row_menu(&base, false)));
+					// Every repo row, first in its menu.
+					for i in 0..m.repos.len() {
+						let entries = m.repo_row_menu(i);
+						assert!(matches!(
+							entries.first(),
+							Some(crate::menu::MenuEntry::Item {
+								id: "paste-into",
+								..
+							})
+						));
+						assert_eq!(
+							paste_into_act(entries),
+							Some(m.repos[i].root.clone())
+						);
+					}
+				});
+			}
+
+			/// In a remote workspace the target is a tree path under the
+			/// session root, which is what the worker is asked about.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn remote_project_menus_paste_into_a_tree_path_under_the_session_root(
+				cx: &mut TestAppContext,
+			) {
+				let _serial = remote_lock();
+				let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+				model.read_with(cx, |m, _| {
+					let root = m.remote.session.as_ref().unwrap().root.clone();
+					let tree = m.ws_tree.as_ref().unwrap();
+					let rows = tree.flatten_visible(tree.visible_limit());
+					let notes = rows
+						.iter()
+						.find(|r| r.rel_path == "notes")
+						.expect("notes row");
+					assert_eq!(
+						paste_into_act(m.work_row_menu(notes, true)),
+						Some(root.join("notes"))
+					);
+					let repo = paste_into_act(m.repo_row_menu(0))
+						.expect("the repo row offers it");
+					assert!(
+						repo.starts_with(&root) && repo != root,
+						"{repo:?}"
+					);
+				});
+			}
+
+			/// At the narrowest window the bar wraps instead of overlapping:
+			/// its controls and Apply and Cancel stay apart and inside the
+			/// panel.
+			#[gpui::test]
+			fn paste_dest_bar_fits_at_900w(cx: &mut TestAppContext) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_sized(cx, ws.clone(), None, 900., 700.);
+				settle_until(cx, "the workspace scan", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.is_loading && m.repos.len() == 2
+					})
+				});
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				// Probes switch on with the first read and draw next frame.
+				let _ = probed_point(&model, cx, "btn-apply");
+				settle(cx);
+				let ids = [
+					"paste-dest-crumb:0",
+					"paste-dest-crumb:1",
+					"paste-dest-root",
+					"paste-dest-edit",
+					"paste-dest-browse",
+					"btn-apply",
+					"btn-cancel",
+				];
+				let bounds = |cx: &mut VisualTestContext, id: &str| {
+					model
+						.read_with(cx, |m, _| {
+							m.probes.as_ref().unwrap().bounds(id)
+						})
+						.unwrap_or_else(|| panic!("{id} is not drawn"))
+				};
+				let panel = bounds(cx, "paste-panel");
+				let inside = |b: [i32; 4]| {
+					b[0] >= panel[0]
+						&& b[1] >= panel[1]
+						&& b[0] + b[2] <= panel[0] + panel[2]
+						&& b[1] + b[3] <= panel[1] + panel[3]
+				};
+				let all: Vec<(&str, [i32; 4])> =
+					ids.iter().map(|id| (*id, bounds(cx, id))).collect();
+				for (id, b) in &all {
+					assert!(
+						inside(*b),
+						"{id} {b:?} leaves the panel {panel:?}"
+					);
+				}
+				for (i, (a_id, a)) in all.iter().enumerate() {
+					for (b_id, b) in &all[i + 1..] {
+						let apart = a[0] + a[2] <= b[0]
+							|| b[0] + b[2] <= a[0]
+							|| a[1] + a[3] <= b[1]
+							|| b[1] + b[3] <= a[1];
+						assert!(apart, "{a_id} {a:?} overlaps {b_id} {b:?}");
+					}
+				}
+			}
+
+			/// The Project selection offers its folder as a place to paste:
+			/// a file names its folder, and nothing is offered for several
+			/// rows (one cannot be guessed).
+			#[gpui::test]
+			fn the_left_chip_names_the_folder_of_the_single_selected_row(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				click_probed(&model, cx, "ws-tree-row:docs");
+				settle_until(cx, "docs to open", |cx| {
+					model.read_with(cx, |m, _| {
+						m.probes.as_ref().is_some_and(|p| {
+							p.bounds("ws-tree-row:docs/readme.txt").is_some()
+						})
+					})
+				});
+				click_probed(&model, cx, "ws-tree-row:docs/readme.txt");
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				assert!(probed(&model, cx, "paste-dest-left"));
+				click_probed(&model, cx, "paste-dest-left");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some("docs"));
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+
+				// Two rows selected: no chip.
+				model.update(cx, |m, cx| {
+					m.select_tree_rows_alone(
+						true,
+						&["docs".into(), "my dir".into()],
+						cx,
+					)
+				});
+				settle(cx);
+				preview(&model, cx, "// FILE: y.txt\nY\n");
+				assert!(!probed(&model, cx, "paste-dest-left"));
+			}
+
+			/// The engine suggests dropping `sub/` for a folder named `sub`,
+			/// then refuses the plan as it stands: a regular file `sub` is
+			/// where the directory `sub/` would go. The refusal keeps the
+			/// suggestion, so [Adjust paths] on the panel recovers the paste.
+			#[gpui::test]
+			fn a_refused_new_destination_still_offers_the_adjustment(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				fs::create_dir(ws.join("sub")).unwrap();
+				fs::write(ws.join("sub/sub"), "a file named like its folder")
+					.unwrap();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(
+					&model,
+					cx,
+					"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+				);
+				assert!(executable(&model, cx), "valid where it was opened");
+
+				click_probed(&model, cx, "ws-tree-row:sub");
+				click_probed(&model, cx, "paste-dest-left");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("sub"));
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(!plan.executable());
+					assert!(plan.error.is_some(), "the engine refused it");
+				});
+				assert!(
+					cx.debug_bounds("paste-restore-base").is_some(),
+					"the refusal lost the way back: no [Adjust paths]"
+				);
+
+				click_probed(&model, cx, "paste-adjust");
+				landed(&model, cx);
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(plan.executable(), "{:?}", plan.error);
+					assert_eq!(
+						plan.items
+							.iter()
+							.map(|i| i.path.clone())
+							.collect::<Vec<_>>(),
+						vec!["a.ts".to_string()]
+					);
+				});
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("sub/a.ts")).as_deref(), Some("x"));
+			}
+
+			/// A new paste opened on a folder the engine refuses as it
+			/// stands (a regular file `sub` is where the directory `sub/`
+			/// would go) lands like a retarget does: the panel stays open,
+			/// not executable, with the restore-base suggestion, and
+			/// [Adjust paths] recovers it (#240).
+			#[gpui::test]
+			fn a_new_paste_into_a_refused_folder_still_offers_the_adjustment(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				fs::create_dir(ws.join("sub")).unwrap();
+				fs::write(ws.join("sub/sub"), "a file named like its folder")
+					.unwrap();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text(
+					"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+				)
+				.unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:sub");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("sub"));
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(!plan.executable());
+					assert!(plan.error.is_some(), "the engine refused it");
+				});
+				assert!(
+					cx.debug_bounds("paste-restore-base").is_some(),
+					"the refusal closed the panel and lost the way back"
+				);
+
+				click_probed(&model, cx, "paste-adjust");
+				landed(&model, cx);
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().expect("a plan");
+					assert!(plan.executable(), "{:?}", plan.error);
+				});
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("sub/a.ts")).as_deref(), Some("x"));
+			}
+
+			/// `multi_repo_ws` plus folders whose names begin or end with a
+			/// space, or are nothing else (a real name on a real disk), next
+			/// to the plain ones they would be mistaken for. Unix only: Win32
+			/// strips a trailing space, so `docs ` would be `docs` there.
+			#[cfg(unix)]
+			fn spaced_ws() -> (tempfile::TempDir, PathBuf) {
+				let (tmp, ws) = multi_repo_ws();
+				for name in ["docs ", " docs", "   ", " lead", "lead"] {
+					fs::create_dir(ws.join(name)).unwrap();
+				}
+				fs::create_dir(ws.join(" lead").join("inner")).unwrap();
+				(tmp, ws)
+			}
+
+			/// Every folder a file system names is data: what the Project
+			/// menu hands over is the folder it was opened on, never its
+			/// trimmed spelling. ` docs` is not `docs`, and the paste is
+			/// written there.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn paste_into_a_folder_named_with_a_leading_space_lands_in_it(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row: docs");
+				click_probed(&model, cx, "menu-item:paste-into");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some(" docs"));
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join(" docs").join("x.txt")).as_deref(),
+					Some("X")
+				);
+				for elsewhere in ["docs", "docs ", "", "repoA"] {
+					assert!(
+						!ws.join(elsewhere).join("x.txt").exists(),
+						"written into {elsewhere:?}"
+					);
+				}
+			}
+
+			/// The engine trims the end of a destination root, so a folder
+			/// whose name ends with a space cannot be written into (the CLI
+			/// fails "unsafe path" there too). The bar says so at once and
+			/// the plan stays where it was: the paste is never redirected to
+			/// `docs`, and a name of spaces is not the workspace folder.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn a_folder_ending_with_a_space_is_refused_and_nothing_is_redirected(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				for name in ["docs ", "   "] {
+					right_click_probed(
+						&model,
+						cx,
+						&format!("ws-tree-row:{name}"),
+					);
+					click_probed(&model, cx, "menu-item:paste-into");
+					settle(cx);
+					let said = model
+						.read_with(cx, |m, _| m.paste.dest_refusal().cloned())
+						.unwrap_or_else(|| panic!("{name:?}: no refusal"));
+					assert_eq!(said.key, "paste_err_destination", "{name:?}");
+					assert!(
+						said.render(crate::i18n::Locale::En)
+							.contains("ends with a space"),
+						"{name:?}"
+					);
+					assert!(probed(&model, cx, "paste-dest-status"));
+					assert!(paste_focused(&model, cx));
+					assert_eq!(plan_destination(&model, cx), first, "{name:?}");
+					assert!(executable(&model, cx), "{name:?}");
+				}
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X"));
+				for elsewhere in ["docs", "docs ", "   ", ""] {
+					assert!(
+						!ws.join(elsewhere).join("x.txt").exists(),
+						"written into {elsewhere:?}"
+					);
+				}
+			}
+
+			/// With no preview open, the menu of such a folder opens none.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn paste_into_a_folder_ending_with_a_space_opens_no_preview(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				clip::write_text("// FILE: x.txt\nX\n").unwrap();
+				right_click_probed(&model, cx, "ws-tree-row:docs ");
+				click_probed(&model, cx, "menu-item:paste-into");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(!ws.join("docs").join("x.txt").exists());
+				assert!(!ws.join("docs ").join("x.txt").exists());
+			}
+
+			/// The breadcrumb names the folders it came from: a segment is
+			/// a folder to go back to, and ` lead` is not `lead`.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn a_breadcrumb_segment_with_a_leading_space_goes_to_that_folder(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let inner = ws.join(" lead").join("inner");
+				model
+					.update(cx, |m, cx| m.paste_dest_picked(inner.clone(), cx));
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), inner);
+				assert_eq!(
+					folder(&model, cx).1.as_deref(),
+					Some(" lead/inner")
+				);
+				click_probed(&model, cx, "paste-dest-crumb:1");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" lead"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some(" lead"));
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join(" lead").join("x.txt")).as_deref(),
+					Some("X")
+				);
+				assert!(!ws.join("lead").join("x.txt").exists());
+			}
+
+			/// The Project selection is a folder of the file system too.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn the_left_chip_keeps_the_leading_space_of_the_selected_folder(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				click_probed(&model, cx, "ws-tree-row: docs");
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				assert!(probed(&model, cx, "paste-dest-left"));
+				click_probed(&model, cx, "paste-dest-left");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
+				apply_with_enter(&model, cx);
+				assert_eq!(
+					file(&ws.join(" docs").join("x.txt")).as_deref(),
+					Some("X")
+				);
+				assert!(!ws.join("docs").join("x.txt").exists());
+			}
+
+			/// The folder the OS dialog returns is a name, not typed text:
+			/// ` docs` is that folder; `docs ` and `   ` are refused, not
+			/// read as `docs` and the workspace.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn a_folder_picked_in_the_dialog_keeps_its_spaces(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				model.update(cx, |m, cx| {
+					m.paste_dest_picked(ws.join(" docs"), cx)
+				});
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
+				for name in ["docs ", "   "] {
+					model.update(cx, |m, cx| {
+						m.paste_dest_picked(ws.join(name), cx)
+					});
+					settle(cx);
+					assert!(
+						model.read_with(cx, |m, _| m
+							.paste
+							.dest_refusal()
+							.is_some_and(|e| e.key == "paste_err_destination")),
+						"{name:?}"
+					);
+					assert_eq!(
+						plan_destination(&model, cx),
+						ws.join(" docs"),
+						"{name:?}"
+					);
+				}
+				assert_ne!(first, ws.join(" docs"));
+			}
+
+			/// What is typed is text: the spaces around it are not part of
+			/// the path. The field opened on a folder with a space in its
+			/// name, left as it is, still names that folder.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn typed_text_is_trimmed_but_an_untouched_field_names_its_folder(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = spaced_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				model.update(cx, |m, cx| {
+					m.paste_dest_picked(ws.join(" docs"), cx)
+				});
+				landed(&model, cx);
+				click_probed(&model, cx, "paste-dest-edit");
+				assert_eq!(editor_text(&model, cx), " docs");
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert!(!editor_open(&model, cx));
+				assert_eq!(plan_destination(&model, cx), ws.join(" docs"));
+
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("  docs  ");
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert_eq!(folder(&model, cx).1.as_deref(), Some("docs"));
+
+				// A typed name that only ends with a space once its slash is
+				// gone is the same refusal as the gesture's.
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs /");
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert_eq!(
+					editor_error(&model, cx).map(|e| e.key),
+					Some("paste_err_destination")
+				);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+			}
+
+			/// Opens the destination editor over a fresh preview.
+			fn open_editor(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				preview(model, cx, "// FILE: x.txt\nX\n");
+				click_probed(model, cx, "paste-dest-edit");
+				assert!(probed(model, cx, "paste-dest-input"));
+			}
+
+			#[gpui::test]
+			fn typed_destination_applies_on_enter_and_escape_restores(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				assert!(editor_focused(&model, cx));
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs");
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("docs"));
+				assert!(!editor_open(&model, cx));
+				assert!(paste_focused(&model, cx));
+				// The first Enter chose the folder; the second applies.
+				assert!(!ws.join("docs/x.txt").exists());
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&ws.join("docs/x.txt")).as_deref(), Some("X"));
+
+				// Escape drops what was typed and keeps the folder.
+				open_editor(&model, cx);
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("repoA");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!editor_open(&model, cx));
+				assert_eq!(plan_destination(&model, cx), first);
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(paste_focused(&model, cx));
+				// The second Escape closes the panel.
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+			}
+
+			/// The typed field is an inline layer of the overlay stack
+			/// (#226): its field is drawn exactly while the layer is open,
+			/// it outlives no preview, and a new preview opens without it.
+			#[gpui::test]
+			fn the_typed_destination_is_an_inline_layer_that_ends_with_its_preview(
+				cx: &mut TestAppContext,
+			) {
+				use super::overlays::{
+					assert_overlay_panels_match, settle_checked,
+				};
+				use crate::overlay::OverlayKind;
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				settle_checked(cx, &model);
+				assert!(model.read_with(cx, |m, _| m
+					.overlays
+					.is_open(OverlayKind::PasteDestField)));
+				assert_overlay_panels_match(cx, &model);
+				assert!(editor_focused(&model, cx));
+
+				// Cancel with the field open: the layer goes with the panel.
+				click_probed(&model, cx, "btn-cancel");
+				settle_checked(cx, &model);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(!editor_open(&model, cx));
+				assert_overlay_panels_match(cx, &model);
+
+				// The next preview starts on the folder, not in the field.
+				preview(&model, cx, "// FILE: y.txt\nY\n");
+				landed(&model, cx);
+				settle_checked(cx, &model);
+				assert!(!editor_open(&model, cx));
+				assert!(!probed(&model, cx, "paste-dest-input"));
+				assert!(paste_focused(&model, cx));
+				assert_overlay_panels_match(cx, &model);
+			}
+
+			/// Refused folders stay in the editor, and the open plan stays
+			/// ready for the folder it already had.
+			#[gpui::test]
+			fn typed_destination_errors_stay_in_the_editor_and_keep_the_plan(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (tmp, ws) = multi_repo_ws();
+				#[cfg(unix)]
+				{
+					let outside = tmp.path().join("outside");
+					fs::create_dir(&outside).unwrap();
+					std::os::unix::fs::symlink(&outside, ws.join("link"))
+						.unwrap();
+				}
+				#[cfg(not(unix))]
+				let _ = &tmp;
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				let mut cases = vec![
+					("missing/dir", "paste_err_destination", None),
+					(
+						"../outside",
+						"paste_err_destination",
+						Some("not under the workspace"),
+					),
+					("docs/readme.txt", "paste_err_destination_not_dir", None),
+				];
+				// A runtime guard, not a `cfg`: `mut` is used on every platform.
+				if cfg!(unix) {
+					cases.push((
+						"link",
+						"paste_err_destination",
+						Some("not under the workspace"),
+					));
+				}
+				for (typed, key, words) in cases {
+					cx.simulate_keystrokes("cmd-a");
+					cx.simulate_input(typed);
+					cx.simulate_keystrokes("enter");
+					settle(cx);
+					let err = editor_error(&model, cx)
+						.unwrap_or_else(|| panic!("{typed}: no error"));
+					assert_eq!(err.key, key, "{typed}");
+					if let Some(words) = words {
+						let en = err.render(crate::i18n::Locale::En);
+						assert!(en.contains(words), "{typed}: {en}");
+					}
+					assert!(editor_open(&model, cx), "{typed}: editor closed");
+					assert!(probed(&model, cx, "paste-dest-status"), "{typed}");
+					assert_eq!(plan_destination(&model, cx), first, "{typed}");
+					assert!(executable(&model, cx), "{typed}: plan disarmed");
+				}
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!editor_open(&model, cx));
+				apply_with_enter(&model, cx);
+				assert_eq!(file(&first.join("x.txt")).as_deref(), Some("X"));
+			}
+
+			/// A space typed in the field is text, not the preview's row
+			/// toggle.
+			#[gpui::test]
+			fn a_space_typed_in_the_destination_reaches_the_input(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				open_editor(&model, cx);
+				cx.simulate_keystrokes("cmd-a");
+				// The key itself, through the keymap: `simulate_input` skips
+				// it, and without the field's `NoAction` binding the preview
+				// takes the space as its row toggle.
+				cx.simulate_input("my");
+				cx.simulate_keystrokes("space");
+				cx.simulate_input("dir");
+				assert_eq!(editor_text(&model, cx), "my dir");
+				assert!(model.read_with(cx, |m, _| {
+					m.paste.plan().unwrap().items.iter().all(|i| i.selected)
+				}));
+				cx.simulate_keystrokes("enter");
+				landed(&model, cx);
+				assert_eq!(plan_destination(&model, cx), ws.join("my dir"));
+			}
+
+			/// A path typed but not yet confirmed must not be pasted into
+			/// the old folder, by any route to Apply: a plan that lands
+			/// while the field is open leaves the focus in the field, and a
+			/// panel that does hold the focus refuses Enter.
+			#[gpui::test]
+			fn enter_never_applies_while_the_destination_field_is_open(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: notes/x.txt\nN\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs");
+				// A plan landing under the open field (the report: a prefix
+				// choice made with the pointer while typing).
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				assert!(editor_open(&model, cx));
+				assert!(
+					editor_focused(&model, cx),
+					"the field keeps the focus a landing plan would take"
+				);
+				assert!(!paste_focused(&model, cx));
+
+				// The panel holds the focus all the same (a click on a row):
+				// Enter is refused, the field stays.
+				click_probed(&model, cx, "paste-row:0:notes/x.txt");
+				settle(cx);
+				assert!(paste_focused(&model, cx));
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert!(editor_open(&model, cx));
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()
+					&& !m.paste_busy()));
+				assert!(!first.join("notes/x.txt").exists());
+				assert!(!ws.join("docs/notes/x.txt").exists());
+				assert!(!ws.join("notes/x.txt").exists());
+			}
+
+			/// A folder the bar's gestures cannot take is said on the bar,
+			/// beside the plan that stays as it was, until the destination
+			/// moves or the user types; the focus stays with the panel.
+			#[gpui::test]
+			fn a_refused_folder_is_said_on_the_bar_and_the_plan_stays(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				// Turns the probes on.
+				probed_point(&model, cx, "paste-dest-root");
+				model.update(cx, |m, cx| {
+					m.paste_into_rel(
+						&crate::paste::dest::WsRel::parse_typed("missing")
+							.unwrap(),
+						"crumb",
+						cx,
+					)
+				});
+				settle(cx);
+				let said = model.read_with(cx, |m, _| {
+					m.paste.dest_refusal().map(|e| e.key)
+				});
+				assert_eq!(said, Some("paste_err_destination"));
+				assert!(probed(&model, cx, "paste-dest-status"));
+				assert!(paste_focused(&model, cx));
+				assert_eq!(plan_destination(&model, cx), first);
+				assert!(executable(&model, cx));
+
+				// Moving the destination clears it.
+				click_probed(&model, cx, "paste-dest-root");
+				landed(&model, cx);
+				assert!(model
+					.read_with(cx, |m, _| m.paste.dest_refusal().is_none()));
+			}
+
+			/// A folder that comes back from the OS dialog after the preview
+			/// was cancelled leaves nothing behind.
+			#[gpui::test]
+			fn a_destination_after_the_preview_closed_changes_nothing(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				model.update(cx, |m, cx| {
+					m.paste_dest_picked(ws.join("docs"), cx)
+				});
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					assert!(m.paste.folder().is_none());
+					assert!(m.paste.dest_refusal().is_none());
+					assert!(!m.paste.is_open());
+				});
+			}
+
+			/// The workspace root of a remote workspace is a destination of
+			/// its own, not the repo the paste would default to.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn remote_root_chip_plans_and_writes_the_workspace_itself(
+				cx: &mut TestAppContext,
+			) {
+				let _serial = remote_lock();
+				let Some(_clip) = clipboard() else { return };
+				let tmp = tempfile::tempdir().unwrap();
+				let shared = tmp.path().join("shared");
+				fs::create_dir(&shared).unwrap();
+				for name in ["repoA", "repoB"] {
+					let r = shared.join(name);
+					fs::create_dir(&r).unwrap();
+					crate::paste::tests::git_init(&r);
+					fs::write(r.join("init.txt"), "hello\n").unwrap();
+					crate::paste::tests::git_run(&r, &["add", "init.txt"]);
+					crate::paste::tests::git_run(&r, &["commit", "-m", "init"]);
+				}
+				let (model, cx, _worker) = open_remote(
+					cx,
+					&shared,
+					snip_remote::WorkerOptions {
+						name: "test-worker".into(),
+						..Default::default()
+					},
+				);
+				model.update(cx, |m, cx| m.select_repo(0, cx));
+				settle(cx);
+				remote_paste_preview(&model, cx, "// FILE: x.txt\nX\n");
+				let (root, first) = model.read_with(cx, |m, _| {
+					(
+						m.remote.session.as_ref().unwrap().root.clone(),
+						m.repo_root().unwrap(),
+					)
+				});
+				assert_ne!(first, root);
+				assert_eq!(plan_destination(&model, cx), first);
+				assert_eq!(folder(&model, cx).0, first);
+
+				click_probed(&model, cx, "paste-dest-root");
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				assert_eq!(plan_destination(&model, cx), root);
+				assert_eq!(
+					crate::remote::remote_rel(&root, &root).as_deref(),
+					Some("")
+				);
+				assert!(executable(&model, cx));
+				remote_paste_apply(&model, cx);
+				assert_eq!(file(&shared.join("x.txt")).as_deref(), Some("X"));
+				assert!(!shared.join("repoA/x.txt").exists());
+				assert!(!shared.join("repoB/x.txt").exists());
+
+				// A folder the worker has none of: its refusal, in the
+				// interface language, and nothing to apply.
+				remote_paste_preview(&model, cx, "// FILE: y.txt\nY\n");
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("nope");
+				cx.simulate_keystrokes("enter");
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				assert_eq!(plan_destination(&model, cx), root.join("nope"));
+				assert!(!executable(&model, cx));
+				let said = model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.and_then(|p| p.error.as_ref())
+						.map(|e| e.render(crate::i18n::Locale::ZhTw))
+				});
+				let said = said.expect("the worker's refusal is shown");
+				assert!(said.contains("找不到"), "{said}");
+				assert!(!said.contains("No such file"), "{said}");
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()));
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert!(!shared.join("nope").exists());
+				assert!(!shared.join("y.txt").exists());
+			}
+
+			fn editor_open(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				model.read_with(cx, |m, _| m.paste_dest_edit().is_some())
+			}
+
+			fn editor_focused(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				cx.update(|w, cx| {
+					model
+						.read(cx)
+						.paste_dest_input
+						.read(cx)
+						.handle()
+						.is_focused(w)
+				})
+			}
+
+			fn editor_text(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> String {
+				model.read_with(cx, |m, cx| {
+					m.paste_dest_input.read(cx).text().to_string()
+				})
+			}
+
+			fn editor_error(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> Option<crate::i18n::Msg> {
+				model.read_with(cx, |m, _| {
+					m.paste_dest_edit().and_then(|e| e.error.clone())
+				})
+			}
+
+			/// The folder the session holds, and where it lies in the
+			/// workspace.
+			fn folder(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> (PathBuf, Option<String>) {
+				model.read_with(cx, |m, _| {
+					let f = m.paste.folder().expect("a destination folder");
+					(
+						f.path.clone(),
+						f.rel.as_ref().map(|r| r.as_str().to_string()),
+					)
+				})
 			}
 		}
 	}

@@ -51,7 +51,7 @@ impl WorkbenchModel {
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
 						.when(preview, |d| {
-							d.tooltip(tip(t("tip_preview_tab", loc)))
+							d.tip(t("tip_preview_tab", loc))
 								// Double-click keeps the tab, as in IntelliJ.
 								.on_click(cx.listener(
 									|this, ev: &gpui::ClickEvent, _, cx| {
@@ -152,7 +152,7 @@ impl WorkbenchModel {
 				let file_path = self
 					.selected_file
 					.as_deref()
-					.or(self.selected_commit_file.as_deref());
+					.or(self.commit_view.selected_commit_file.as_deref());
 				if let Some(path) = file_path {
 					let name =
 						path.rsplit('/').next().unwrap_or(path).to_string();
@@ -294,6 +294,8 @@ impl WorkbenchModel {
 			);
 		div()
 			.id("find-bar")
+			.track_focus(&self.find_bar_focus)
+			.debug_selector(|| OverlayKind::FindBar.panel_selector().into())
 			.relative()
 			.flex()
 			.flex_row()
@@ -369,7 +371,7 @@ impl WorkbenchModel {
 					.border_1()
 					.border_color(rgb(pal().button_border))
 					.bg(rgb(pal().button_bg))
-					.tooltip(tip(t("tip_goto", loc)))
+					.tip(t("tip_goto", loc))
 					.child(icon(Icon::GoToLine, 14.))
 					.child(
 						div()
@@ -389,7 +391,13 @@ impl WorkbenchModel {
 					true,
 					39,
 				)
-				.on_click(cx.listener(|this, _, _, cx| this.close_find(cx)))
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.close_overlay(
+						crate::overlay::OverlayKind::FindBar,
+						crate::overlay::CloseWhy::Picked,
+						cx,
+					)
+				}))
 				.children(probe(log, "btn-find-close")),
 			)
 			.children(probe(log, "find-bar"))
@@ -601,16 +609,6 @@ impl WorkbenchModel {
 				.on_action(cx.listener(|this, _: &ReaderPageDown, _, cx| {
 					this.move_cursor_line(30, cx)
 				}))
-				.on_action(cx.listener(|this, _: &ReaderClear, _, cx| {
-					// Esc clears the selection, then closes the find bar.
-					if this.reader.selection().is_some() {
-						this.reader.anchor = None;
-						this.reader.head = None;
-						cx.notify();
-					} else {
-						this.close_find(cx);
-					}
-				}))
 				.flex()
 				.flex_col()
 				.flex_1()
@@ -685,7 +683,7 @@ impl WorkbenchModel {
 							.line_clamp(1)
 							.text_ellipsis()
 							.text_color(rgb(pal().text_muted))
-							.tooltip(tip(crumbs.clone()))
+							.tip(crumbs.clone())
 							.child(crumbs)
 							.children(probe(log, "breadcrumb")),
 					)
@@ -703,14 +701,17 @@ impl WorkbenchModel {
 								.overflow_hidden()
 								.line_clamp(1)
 								.text_ellipsis()
-								.tooltip(tip(badge.clone()))
+								.tip(badge.clone())
 								.child(badge)
 								.children(probe(log, "source-badge")),
 						)
 					})
 					.child(toolbar),
 			)
-			.when(self.reader.find_open, |d| d.child(self.find_bar(cx)))
+			.when(
+				self.overlays.is_open(crate::overlay::OverlayKind::FindBar),
+				|d| d.child(self.find_bar(cx)),
+			)
 			.child(body)
 			.into_any_element()
 	}

@@ -54,6 +54,7 @@ from bench_native_memory import (  # noqa: E402
     click_control,
     click_repo,
     close_shown_tab,
+    line_tab,
     open_repo_name,
     open_workspace_tab,
     change_row_group,
@@ -166,32 +167,127 @@ class TestOpenRepoName(unittest.TestCase):
         self.assertEqual(open_repo_name(lines), "repo-02")
         closed = [*lines, "[APP:WORKSPACE: state=closed generation=3]", "[APP:WS_TAB_ACTIVE: id=1 ix=0]"]
         self.assertEqual(open_repo_name(closed), "repo-01")
-        background = [*closed, "[APP:REPO_SELECTING: 3 (repo-04) root=/w/repo-04 ws_tab=2]"]
+        background = [*closed, "[APP:REPO_SELECTING: ws_tab=2 3 (repo-04) root=/w/repo-04]"]
         self.assertEqual(open_repo_name(background), "repo-01")
+
+
+class TestTabTagPosition(unittest.TestCase):
+    """`ws_tab=<n>` is the first field after `KIND: ` on every line a background tab prints."""
+
+    def test_a_folder_named_like_the_tag_is_not_the_tag(self) -> None:
+        shown = "[APP:REPO_SELECTING: 0 (name ws_tab=2) root=/w/name ws_tab=2]"
+        self.assertIsNone(line_tab(shown))
+        self.assertTrue(shown_tab_line(shown))
+        self.assertEqual(open_repo_name([shown]), "name ws_tab=2")
+        background = "[APP:REPO_SELECTING: ws_tab=2 0 (name ws_tab=2) root=/w/name ws_tab=2]"
+        self.assertEqual(line_tab(background), 2)
+        self.assertEqual(parse_repo_select(background), (0, "name ws_tab=2"))
+        # The background tab's selection is not the shown tab's.
+        self.assertEqual(open_repo_name([shown.replace("name", "other"), background]), "other ws_tab=2")
+
+    def test_every_kind_round_trips_its_tab(self) -> None:
+        for line in (
+            "[APP:WORKSPACE: state=open generation=2]",
+            "[APP:PASTE_APPLYING]",
+            "[APP:READY_REPOS: n=2]",
+            "[APP:REPO_SELECTING: 0 (a ws_tab=9) root=/w/a ws_tab=9]",
+            "[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=a ws_tab=9]",
+            "[APP:CTRL_GONE: id=a ws_tab=9]",
+            "[APP:CTRL_COVERED: by=b id=a ws_tab=9]",
+            "[APP:TEXT_FIT_GONE: id=a ws_tab=9]",
+        ):
+            kind, _, rest = line[len("[APP:"):-1].partition(": ")
+            tagged = f"[APP:{kind}: ws_tab=3" + (f" {rest}]" if rest else "]")
+            with self.subTest(line=line):
+                self.assertIsNone(line_tab(line))
+                self.assertEqual(line_tab(tagged), 3)
 
 
 class TestBoundsAndGone(unittest.TestCase):
     def test_parse_single_and_update(self) -> None:
         lines = [
-            "[APP:CTRL_BOUNDS: id=btn-paste x=777 y=8 w=91 h=22]",
-            "[APP:CTRL_BOUNDS: id=repo-row:repo-a x=36 y=66 w=280 h=24]",
+            "[APP:CTRL_BOUNDS: x=777 y=8 w=91 h=22 id=btn-paste]",
+            "[APP:CTRL_BOUNDS: x=36 y=66 w=280 h=24 id=repo-row:repo-a]",
         ]
         bounds = parse_bounds(lines)
         self.assertEqual(bounds["btn-paste"], (777, 8, 91, 22))
         self.assertEqual(bounds["repo-row:repo-a"], (36, 66, 280, 24))
 
         # Position updates on new report
-        lines.append("[APP:CTRL_BOUNDS: id=repo-row:repo-a x=36 y=90 w=280 h=24]")
+        lines.append("[APP:CTRL_BOUNDS: x=36 y=90 w=280 h=24 id=repo-row:repo-a]")
         updated = parse_bounds(lines)
         self.assertEqual(updated["repo-row:repo-a"], (36, 90, 280, 24))
 
     def test_parse_removes_on_ctrl_gone(self) -> None:
         lines = [
-            "[APP:CTRL_BOUNDS: id=ref:refs/tags/v0.1.0 x=36 y=100 w=100 h=20]",
+            "[APP:CTRL_BOUNDS: x=36 y=100 w=100 h=20 id=ref:refs/tags/v0.1.0]",
             "[APP:CTRL_GONE: id=ref:refs/tags/v0.1.0]",
         ]
         bounds = parse_bounds(lines)
         self.assertNotIn("ref:refs/tags/v0.1.0", bounds)
+
+
+def encode_by(by: str) -> str:
+    """What the app writes for a CTRL_COVERED's second id: no space, `]`, `%` or line break."""
+    out = by.replace("%", "%25").replace(" ", "%20").replace("]", "%5D")
+    return out.replace("\n", "%0A").replace("\r", "%0D")
+
+
+class TestBoundsOfOddIds(unittest.TestCase):
+    """An id is the last field of its line: it runs from `id=` to the closing `]`, whatever it holds."""
+
+    IDS = [
+        "commit-row:my repo:ab12cd3",
+        "commit-row:a=b:c d:ab12cd3",
+        "commit-row:odd ] name:ab12cd3",
+        "commit-row:x x=1 y=2 w=3 h=4:ab12cd3",
+        "commit-row: lead and trail :ab12cd3",
+        # Ids that end in what the line's own fields look like.
+        "change-row:report ws_tab=2",
+        "row:ends in by=",
+        "row:ends in x=",
+        "row:ends in id=",
+        "row:has id=inside it",
+        "row:ws_tab=2 id=x",
+    ]
+
+    def test_bounds_and_gone_of_every_odd_id(self) -> None:
+        for control in self.IDS:
+            for tab in ("", "ws_tab=2 "):
+                with self.subTest(id=control, tab=tab):
+                    lines = [f"[APP:CTRL_BOUNDS: {tab}x=7 y=-8 w=90 h=12 id={control}]"]
+                    self.assertEqual(parse_bounds(lines), {control: (7, -8, 90, 12)})
+                    lines.append(f"[APP:CTRL_GONE: {tab}id={control}]")
+                    self.assertEqual(parse_bounds(lines), {})
+
+    def test_a_covered_pair_reads_both_ids(self) -> None:
+        from bench_native_memory import parse_covered
+
+        for control in self.IDS:
+            for by in ("btn-log-refresh", "pick-repo:my repo", "row: id=x ws_tab=2", "row ends in by=", "100% ] done"):
+                for tab in ("", "ws_tab=2 "):
+                    with self.subTest(id=control, by=by, tab=tab):
+                        line = f"[APP:CTRL_COVERED: {tab}by={encode_by(by)} id={control}]"
+                        self.assertEqual(parse_covered(line), (control, by))
+
+    def test_a_covering_name_with_other_whitespace_is_read_whole(self) -> None:
+        """The app encodes only `%`, ` `, `]` and line breaks, so a Tab, a no-break space and U+3000
+        stay in `by`; the Rust reader cuts `by` at ' ' only, and so must this one."""
+        from bench_native_memory import parse_covered
+
+        for by in ("a\tb", "a\u00a0b", "a\u3000b", "\u3000", "x\ty\u00a0z\u3000"):
+            for tab in ("", "ws_tab=2 "):
+                with self.subTest(by=by, tab=tab):
+                    line = f"[APP:CTRL_COVERED: {tab}by={encode_by(by)} id=row:id]"
+                    self.assertEqual(parse_covered(line), ("row:id", by))
+
+    def test_a_shown_tab_line_whose_id_ends_in_a_tab_tag_is_a_shown_line(self) -> None:
+        self.assertTrue(shown_tab_line("[APP:CTRL_GONE: id=change-row:report ws_tab=2]"))
+        self.assertTrue(shown_tab_line("[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=row:ws_tab=2 id=x]"))
+        self.assertFalse(shown_tab_line("[APP:CTRL_GONE: ws_tab=2 id=change-row:report ws_tab=2]"))
+        self.assertFalse(shown_tab_line("[APP:CTRL_BOUNDS: ws_tab=2 x=1 y=2 w=3 h=4 id=row:a]"))
+        self.assertFalse(shown_tab_line("[APP:READY_REPOS: ws_tab=3 n=2]"))
+        self.assertTrue(shown_tab_line("[APP:READY_REPOS: n=2]"))
 
 
 class TestParseXwininfo(unittest.TestCase):
@@ -261,8 +357,8 @@ class TestVisibleIn(unittest.TestCase):
 class TestLeftViewport(unittest.TestCase):
     def test_computes_left_viewport_geometry(self) -> None:
         lines = [
-            "[APP:CTRL_BOUNDS: id=left-list x=36 y=66 w=280 h=398]",
-            "[APP:CTRL_BOUNDS: id=splitter-bottom x=36 y=464 w=280 h=4]",
+            "[APP:CTRL_BOUNDS: x=36 y=66 w=280 h=398 id=left-list]",
+            "[APP:CTRL_BOUNDS: x=36 y=464 w=280 h=4 id=splitter-bottom]",
         ]
         vp = left_viewport(lines)
         self.assertEqual(vp, (36, 66, 280, 398))
@@ -272,7 +368,7 @@ class TestLeftViewport(unittest.TestCase):
             left_viewport([])
 
     def test_left_scroll_is_not_accepted(self) -> None:
-        lines = ["[APP:CTRL_BOUNDS: id=left-scroll x=36 y=66 w=280 h=800]"]
+        lines = ["[APP:CTRL_BOUNDS: x=36 y=66 w=280 h=800 id=left-scroll]"]
         with self.assertRaises(NativeBenchError) as cm:
             left_viewport(lines)
         self.assertIn("left-list", str(cm.exception))
@@ -287,7 +383,7 @@ class TestSourceAwareControls(unittest.TestCase):
         self.assertEqual((idx, name), (1, "repo-02-api"))
 
     def test_path_only_change_row_is_not_accepted(self) -> None:
-        lines = ["[APP:CTRL_BOUNDS: id=change-row:both.txt x=1 y=2 w=10 h=10]"]
+        lines = ["[APP:CTRL_BOUNDS: x=1 y=2 w=10 h=10 id=change-row:both.txt]"]
         with self.assertRaises(NativeBenchError) as cm:
             require_control(lines, "change-row:staged:both.txt")
         self.assertIn("not accepted", str(cm.exception))
@@ -623,8 +719,8 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
         body = b"INDEX_A\n"
         payload = _wire("idx-repo", "both.txt", body, b"[MODIFIED]")
         lines = [
-            "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=400]",
-            "[APP:CTRL_BOUNDS: id=change-row:staged:both.txt x=8 y=80 w=280 h=22]",
+            "[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=400 id=left-list]",
+            "[APP:CTRL_BOUNDS: x=8 y=80 w=280 h=22 id=change-row:staged:both.txt]",
         ]
         session = _ScriptedCopySession(lines, payload, self.tmp.name)
         win = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 600}
@@ -731,7 +827,7 @@ class ChangeTreeSession:
         on_click: dict[str, list[list[str]]],
         on_wheel: list[list[str]] | None = None,
     ) -> None:
-        self.lines = ["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", *lines]
+        self.lines = ["[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", *lines]
         self.on_click = {key: list(replies) for key, replies in on_click.items()}
         self.on_wheel = list(on_wheel or [])
         self.clicked: list[str] = []
@@ -764,7 +860,7 @@ class ChangeTreeSession:
 
 
 def _bounds(control: str, y: int) -> str:
-    return f"[APP:CTRL_BOUNDS: id={control} x=8 y={y} w=280 h=22]"
+    return f"[APP:CTRL_BOUNDS: x=8 y={y} w=280 h=22 id={control}]"
 
 
 class TestChangeDirectoryExpansion(unittest.TestCase):
@@ -851,7 +947,7 @@ class TestChangesSweep(unittest.TestCase):
 
     @staticmethod
     def top(y: int = 40, h: int = 22) -> str:
-        return f"[APP:CTRL_BOUNDS: id=change-list-top x=8 y={y} w=280 h={h}]"
+        return f"[APP:CTRL_BOUNDS: x=8 y={y} w=280 h={h} id=change-list-top]"
 
     def sweep(self, session: ChangeTreeSession) -> tuple[list[str] | None, list[str]]:
         directions: list[str] = []
@@ -871,14 +967,14 @@ class TestChangesSweep(unittest.TestCase):
 
     def test_top_is_the_whole_first_row_at_the_top_of_the_list(self) -> None:
         header = _bounds("change-header:staged", 40)
-        self.assertTrue(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), header]))
+        self.assertTrue(changes_list_at_top(["[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", self.top(), header]))
         # A first row cut by the list's top edge reports only its visible part.
-        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(h=9), header]))
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", self.top(h=9), header]))
         # A header lined up with the top is a later group's whenever the offset is whole rows.
-        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", _bounds("change-header:unstaged", 40)]))
-        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(y=64)]))
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", _bounds("change-header:unstaged", 40)]))
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", self.top(y=64)]))
         self.assertFalse(changes_list_at_top([
-            "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), "[APP:CTRL_GONE: id=change-list-top]",
+            "[APP:CTRL_BOUNDS: x=0 y=40 w=320 h=600 id=left-list]", self.top(), "[APP:CTRL_GONE: id=change-list-top]",
         ]))
         self.assertFalse(changes_list_at_top([self.top()]))
 
@@ -932,7 +1028,7 @@ class _ScriptedCopySession:
             )
         elif n == 2 and button == "3":
             self.lines.append("[APP:MENU_OPEN: Left items=copy-files,show-diff,copy-path]")
-            self.lines.append("[APP:CTRL_BOUNDS: id=menu-item:copy-files x=20 y=100 w=180 h=22]")
+            self.lines.append("[APP:CTRL_BOUNDS: x=20 y=100 w=180 h=22 id=menu-item:copy-files]")
         elif n == 3:
             self.lines.append("[APP:MENU_ACTION: copy-files]")
             self.lines.append("[APP:COPY_PREP: files=1]")
@@ -1077,8 +1173,8 @@ class TestMatchedNative(unittest.TestCase):
         self.window = {"width": 1080, "height": 720}
         self.lines = ["[APP:LOCALE: En]", f"[APP:REF_FILTER: {MATCHED_REF}]", "[APP:GRAPH_LOADED: commits=2]",
                       "[APP:E2E_LOG: mode=graph n=2 first=aaaaaaa page=1]",
-                      "[APP:CTRL_BOUNDS: id=commit-row:aaaaaaa x=10 y=600 w=600 h=20]",
-                      "[APP:CTRL_BOUNDS: id=commit-row:bbbbbbb x=10 y=620 w=600 h=20]",
+                      "[APP:CTRL_BOUNDS: x=10 y=600 w=600 h=20 id=commit-row:aaaaaaa]",
+                      "[APP:CTRL_BOUNDS: x=10 y=620 w=600 h=20 id=commit-row:bbbbbbb]",
                       f"[APP:E2E_PREVIEW: source=commit_diff rev={'a' * 40} path=a.txt lines=1 fnv=a430d84680aabd0b]"]
 
     def test_matches_retained_patch_and_displayed_history(self) -> None:
@@ -1116,18 +1212,18 @@ class TestMatchedNative(unittest.TestCase):
     def test_ref_picker_types_short_label_and_ignores_retired_bounds(self) -> None:
         from unittest.mock import MagicMock
         session = MagicMock()
-        lines = ["[APP:CTRL_BOUNDS: id=btn-locale x=1000 y=10 w=40 h=20]",
-                 "[APP:CTRL_BOUNDS: id=btn-ref-selector x=10 y=10 w=100 h=20]",
-                 "[APP:CTRL_BOUNDS: id=selector-input x=10 y=40 w=100 h=20]",
-                 f"[APP:CTRL_BOUNDS: id=pick-ref:{MATCHED_REF} x=10 y=80 w=100 h=20]",
+        lines = ["[APP:CTRL_BOUNDS: x=1000 y=10 w=40 h=20 id=btn-locale]",
+                 "[APP:CTRL_BOUNDS: x=10 y=10 w=100 h=20 id=btn-ref-selector]",
+                 "[APP:CTRL_BOUNDS: x=10 y=40 w=100 h=20 id=selector-input]",
+                 f"[APP:CTRL_BOUNDS: x=10 y=80 w=100 h=20 id=pick-ref:{MATCHED_REF}]",
                  f"[APP:CTRL_GONE: id=pick-ref:{MATCHED_REF}]"]
         session.texts.side_effect = lambda: lines
         session.lines = lines
         def typed(*args: str) -> None:
             self.assertEqual(args, ("xdotool", "type", "--clearmodifiers", "feat/divergent"))
-            lines.extend([f"[APP:CTRL_BOUNDS: id=pick-ref:{MATCHED_REF} x=10 y=100 w=100 h=20]",
-                          "[APP:CTRL_BOUNDS: id=commit-row:aaaaaaa x=10 y=600 w=600 h=20]",
-                          "[APP:CTRL_BOUNDS: id=commit-file:a.txt x=10 y=200 w=100 h=20]"])
+            lines.extend([f"[APP:CTRL_BOUNDS: x=10 y=100 w=100 h=20 id=pick-ref:{MATCHED_REF}]",
+                          "[APP:CTRL_BOUNDS: x=10 y=600 w=600 h=20 id=commit-row:aaaaaaa]",
+                          "[APP:CTRL_BOUNDS: x=10 y=200 w=100 h=20 id=commit-file:a.txt]"])
         session.x.side_effect = typed
         select_native_matched(session, {**self.window, "wid": "1"}, self.oracle)
         session.set_clipboard.assert_called_once_with(MATCHED_SENTINEL)
@@ -1306,7 +1402,7 @@ class TestNativeSessionWaitApp(unittest.TestCase):
 
 
 class TestScrollHintScope(unittest.TestCase):
-    VIEWPORT = "[APP:CTRL_BOUNDS: id=left-list x=36 y=66 w=280 h=398]"
+    VIEWPORT = "[APP:CTRL_BOUNDS: x=36 y=66 w=280 h=398 id=left-list]"
     EAST = "[APP:REPO_SELECTING: 5 (east/docs) root=/fixture/machine-a/east/docs]"
     WEST = "[APP:REPO_SELECTING: 14 (west/docs) root=/fixture/machine-a/west/docs]"
 
@@ -1349,11 +1445,11 @@ class TestScrollHintScope(unittest.TestCase):
             with self.subTest(selection=selection):
                 self.assertEqual(self.first_wheel([
                     self.VIEWPORT, self.EAST,
-                    "[APP:CTRL_BOUNDS: id=tree-row:src x=36 y=204 w=280 h=24]",
+                    "[APP:CTRL_BOUNDS: x=36 y=204 w=280 h=24 id=tree-row:src]",
                     selection,
                     "[APP:CTRL_GONE: id=tree-row:src]",
                     "[APP:TREE_PAGE: rel= kind=Expand children=9 has_more=false selected=0]",
-                    "[APP:CTRL_BOUNDS: id=tree-row:assets x=36 y=426 w=280 h=24]",
+                    "[APP:CTRL_BOUNDS: x=36 y=426 w=280 h=24 id=tree-row:assets]",
                 ], "tree-row:src"), "5")
 
     def test_repo_selection_keeps_workspace_repo_row_upward_hint(self) -> None:
@@ -1361,11 +1457,11 @@ class TestScrollHintScope(unittest.TestCase):
         # repo12..15 load. Its workspace identity survives those selections.
         self.assertEqual(self.first_wheel([
             self.VIEWPORT,
-            "[APP:CTRL_BOUNDS: id=repo-row:repo-01-core x=36 y=66 w=280 h=24]",
+            "[APP:CTRL_BOUNDS: x=36 y=66 w=280 h=24 id=repo-row:repo-01-core]",
             "[APP:CTRL_GONE: id=repo-row:repo-01-core]",
             "[APP:REPO_SELECTING: 11 (repo-12-cli) root=/fixture/repo-12-cli]",
             "[APP:REPO_SELECTING: 14 (repo-15-admin) root=/fixture/repo-15-admin]",
-            "[APP:CTRL_BOUNDS: id=repo-row:repo-15-admin x=36 y=368 w=280 h=24]",
+            "[APP:CTRL_BOUNDS: x=36 y=368 w=280 h=24 id=repo-row:repo-15-admin]",
         ], "repo-row:repo-01-core"), "4")
 
     def test_same_view_retains_gone_row_upward_hint(self) -> None:
@@ -1373,14 +1469,14 @@ class TestScrollHintScope(unittest.TestCase):
             with self.subTest(control=control):
                 self.assertEqual(self.first_wheel([
                     self.VIEWPORT, self.WEST, "[APP:REV_TREE: bbbbbbb]",
-                    f"[APP:CTRL_BOUNDS: id={control} x=36 y=80 w=280 h=24]",
+                    f"[APP:CTRL_BOUNDS: x=36 y=80 w=280 h=24 id={control}]",
                     f"[APP:CTRL_GONE: id={control}]",
                 ], control), "4")
 
     def test_revision_switch_retires_prior_path_hint(self) -> None:
         self.assertEqual(self.first_wheel([
             self.VIEWPORT, self.WEST, "[APP:REV_TREE: aaaaaaa]",
-            "[APP:CTRL_BOUNDS: id=rev-row:src x=36 y=80 w=280 h=24]",
+            "[APP:CTRL_BOUNDS: x=36 y=80 w=280 h=24 id=rev-row:src]",
             "[APP:REV_TREE: off]", "[APP:REV_TREE: bbbbbbb]",
             "[APP:CTRL_GONE: id=rev-row:src]",
         ], "rev-row:src"), "5")
@@ -1397,12 +1493,12 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
                 self.n += 1
                 y = 259 if self.n < 4 else 211
                 return [
-                    "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=300 h=400]",
-                    f"[APP:CTRL_BOUNDS: id=repo-row:repo-04-auth x=10 y={y} w=200 h=24]",
+                    "[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]",
+                    f"[APP:CTRL_BOUNDS: x=10 y={y} w=200 h=24 id=repo-row:repo-04-auth]",
                 ]
 
             def wait_line(self, pred: Any, start: int = 0, timeout: float = 10) -> tuple[int, float, str]:
-                return 0, 0.0, "id=left-list x=0"
+                return 0, 0.0, "[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]"
 
             def focus(self, wid: str) -> None:
                 return None
@@ -1426,16 +1522,16 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
                 self.wheels = 0
 
             def texts(self, start: int = 0) -> list[str]:
-                rows = ["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=300 h=400]"]
+                rows = ["[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]"]
                 if self.wheels >= 2:
-                    rows.append("[APP:CTRL_BOUNDS: id=tree-row:src x=10 y=200 w=200 h=24]")
+                    rows.append("[APP:CTRL_BOUNDS: x=10 y=200 w=200 h=24 id=tree-row:src]")
                 return rows
 
             def wait_line(self, pred: Any, start: int = 0, timeout: float = 10) -> tuple[int, float, str]:
                 # The pre-scroll paint wait (0.5s) and the first wheel get no reaction.
                 if timeout < 1 or self.wheels == 1:
                     raise NativeBenchError("timed out waiting for app log line")
-                return 0, 0.0, "id=left-list x=0"
+                return 0, 0.0, "[APP:CTRL_BOUNDS: x=0 y=40 w=300 h=400 id=left-list]"
 
             def focus(self, wid: str) -> None:
                 return None
@@ -1744,14 +1840,14 @@ class TestWorkspaceTabDriver(unittest.TestCase):
                 "ws-tab-new": ["[APP:WS_TAB_OPENED: id=7 count=2]"],
                 "btn-workspace-open-confirm": [
                     f"[APP:WORKSPACE: state=open path={real} repos=1]",
-                    "[APP:READY_REPOS: n=1 ws_tab=3]",
+                    "[APP:READY_REPOS: ws_tab=3 n=1]",
                     "[APP:READY_REPOS: n=1]",
                 ],
             },
         )
 
     def test_shown_tab_line_rejects_background_tab_tags(self) -> None:
-        self.assertFalse(shown_tab_line("[APP:READY_REPOS: n=2 ws_tab=3]"))
+        self.assertFalse(shown_tab_line("[APP:READY_REPOS: ws_tab=3 n=2]"))
         self.assertTrue(shown_tab_line("[APP:READY_REPOS: n=2]"))
 
     def test_open_clicks_each_control_in_order_and_returns_tab_and_count(self) -> None:
@@ -1775,7 +1871,7 @@ class TestWorkspaceTabDriver(unittest.TestCase):
         open_workspace_tab(s, WIN, self.workspace)
         ready_preds = [pred for pred in s.preds if pred("[APP:READY_REPOS: n=1]")]
         self.assertEqual(len(ready_preds), 1)
-        self.assertFalse(ready_preds[0]("[APP:READY_REPOS: n=1 ws_tab=3]"))
+        self.assertFalse(ready_preds[0]("[APP:READY_REPOS: ws_tab=3 n=1]"))
 
     def test_close_reports_drained_when_the_close_drain_left_nothing(self) -> None:
         lifecycle = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 tab=7]"

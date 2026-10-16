@@ -42,7 +42,6 @@ gpui::actions!(
 		Copy,
 		Submit,
 		SubmitPrev,
-		Dismiss,
 		MoveUp,
 		MoveDown,
 	]
@@ -72,9 +71,12 @@ pub fn bindings() -> Vec<gpui::KeyBinding> {
 		KeyBinding::new("cmd-x", Cut, c),
 		KeyBinding::new("enter", Submit, c),
 		KeyBinding::new("shift-enter", SubmitPrev, c),
-		KeyBinding::new("escape", Dismiss, c),
 		KeyBinding::new("up", MoveUp, c),
 		KeyBinding::new("down", MoveDown, c),
+		// A deeper context's `NoAction` switches the shallower binding of a
+		// key off, so a space typed here is text, not the preview's row
+		// toggle (`PastePanel` binds it).
+		KeyBinding::new("space", gpui::NoAction, c),
 	]
 }
 
@@ -84,7 +86,6 @@ pub enum InputEvent {
 	Changed,
 	Submit,
 	SubmitPrev,
-	Dismiss,
 	Up,
 	Down,
 }
@@ -201,6 +202,14 @@ impl TextInput {
 		self.selected_range = len..len;
 		self.marked_range = None;
 		cx.emit(InputEvent::Changed);
+		cx.notify();
+	}
+
+	/// Selects the whole text, as Select All does, for a field opened over
+	/// text the user is likely to replace.
+	pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+		self.selected_range = 0..self.content.len();
+		self.selection_reversed = false;
 		cx.notify();
 	}
 
@@ -991,9 +1000,6 @@ impl Render for TextInput {
 			}))
 			.on_action(cx.listener(|this, _: &SubmitPrev, _, cx| {
 				this.emit(InputEvent::SubmitPrev, cx)
-			}))
-			.on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-				this.emit(InputEvent::Dismiss, cx)
 			}))
 			.on_action(cx.listener(|this, _: &MoveUp, _, cx| {
 				this.emit(InputEvent::Up, cx)
