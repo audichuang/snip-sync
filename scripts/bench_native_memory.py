@@ -516,29 +516,59 @@ THREE_TABS = 3
 # Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
 APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
-# The `[APP:...: id=<id> ...]` lines carry an id that can hold any character a repository, branch or
-# file name can: spaces, `=`, `:`, `]`, even a field's own name (`x=`, `rule=`). So no reader cuts an
-# id at its first space or `=`. The id is everything between `id=` and the fixed fields at the end of
-# the line (`x= y= w= h=`, `rule= ... shown=`, `fit= drawn=`), so these patterns are anchored at the
-# end and take the id greedily. A line of a background tab ends in ` ws_tab=<n>` before the `]`, which
-# every pattern allows. `crates/native-e2e/src/lib.rs` reads the same lines by the same rule;
-# scripts/real_ui_round.py and scripts/check_native_ime.py use these patterns instead of their own.
-APP_TAB = r"(?: ws_tab=\d+)?"
+# The `[APP:<KIND>: <fixed fields> [ws_tab=<n> ]id=<id>]` lines carry an id that can hold any character
+# a repository, branch or file name can: spaces, `=`, `:`, `]`, even a field's own name (`x=`, `by=`,
+# `ws_tab=2`). So `id=` is the last field of its line and the id is everything after it up to the
+# closing `]`; every other field comes before it and has no space in its value, so no reader cuts an
+# id at a space or a `=`, and none reads anything from the end of the line. A background tab's
+# `ws_tab=<n>` is a field before `id=`. `crates/native-e2e/src/lib.rs` reads the same lines by the
+# same rule; scripts/real_ui_round.py and scripts/check_native_ime.py use these patterns instead of
+# their own (docs/real-ui-operator-protocol.md, section 3).
+APP_TAB = r"(?:ws_tab=\d+ )?"
 BOUNDS_RE = re.compile(
-    rf"\[APP:CTRL_BOUNDS: id=(?P<id>.+) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+){APP_TAB}\]\s*$"
+    rf"\[APP:CTRL_BOUNDS: x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
 )
-CTRL_GONE_RE = re.compile(rf"\[APP:CTRL_GONE: id=(?P<id>.+?){APP_TAB}\]\s*$")
+CTRL_GONE_RE = re.compile(rf"\[APP:CTRL_GONE: {APP_TAB}id=(?P<id>.*)\]\s*$")
+# The covering control is written without a space, `]`, `%` or line break (`%20`, `%5D`, `%25`, `%0A`, `%0D`).
+CTRL_COVERED_RE = re.compile(rf"\[APP:CTRL_COVERED: by=(?P<by>\S*) {APP_TAB}id=(?P<id>.*)\]\s*$")
 TEXT_FIT_RE = re.compile(
-    r"\[APP:TEXT_FIT: id=(?P<id>.+) rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
+    r"\[APP:TEXT_FIT: rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
     r"fit=(?P<fit>-|-?\d+) drawn=(?P<drawn>-?\d+) visible=(?P<visible>-?\d+) clipped=(?P<clipped>[01]) "
-    rf"cut=(?P<cut>[01]) shown=(?P<shown>\d+)/(?P<total>\d+){APP_TAB}\]\s*$"
+    rf"cut=(?P<cut>[01]) shown=(?P<shown>\d+)/(?P<total>\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
 )
-TEXT_FIT_DRIFT_RE = re.compile(rf"\[APP:TEXT_FIT_DRIFT: id=(?P<id>.+) fit=(?P<fit>-?\d+) drawn=(?P<drawn>-?\d+){APP_TAB}\]\s*$")
+TEXT_FIT_DRIFT_RE = re.compile(
+    rf"\[APP:TEXT_FIT_DRIFT: fit=(?P<fit>-?\d+) drawn=(?P<drawn>-?\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
+)
 # A family can have spaces ("JetBrains Mono/13/400"), so the styles run to the next field.
 TEXT_FIT_STYLE_DRIFT_RE = re.compile(
-    rf"\[APP:TEXT_FIT_STYLE_DRIFT: id=(?P<id>.+) measured=(?P<measured>.+) drawn=(?P<drawn>.+?){APP_TAB}\]\s*$"
+    rf"\[APP:TEXT_FIT_STYLE_DRIFT: measured=(?P<measured>.+?) drawn=(?P<drawn>.+?) {APP_TAB}id=(?P<id>.*)\]\s*$"
 )
-TEXT_FIT_GONE_RE = re.compile(rf"\[APP:TEXT_FIT_GONE: id=(?P<id>.+?){APP_TAB}\]\s*$")
+TEXT_FIT_GONE_RE = re.compile(rf"\[APP:TEXT_FIT_GONE: {APP_TAB}id=(?P<id>.*)\]\s*$")
+
+
+def decode_by(encoded: str) -> str:
+    """A CTRL_COVERED `by=` value with its `%XX` escapes undone."""
+    return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m[1], 16)), encoded)
+
+
+def parse_covered(line: str) -> tuple[str, str] | None:
+    """`(covered id, covering id)` of a `[APP:CTRL_COVERED: by=<encoded> id=<id>]` line."""
+    m = CTRL_COVERED_RE.search(line)
+    return (m["id"], decode_by(m["by"])) if m else None
+
+
+def bounds_id(line: str) -> str | None:
+    """The control a `CTRL_BOUNDS` line reports, else None."""
+    m = BOUNDS_RE.search(line)
+    return m["id"] if m else None
+
+
+def control_event_id(line: str) -> str | None:
+    """The control a `CTRL_BOUNDS` or `CTRL_GONE` line is about, else None."""
+    m = BOUNDS_RE.search(line) or CTRL_GONE_RE.search(line)
+    return m["id"] if m else None
+
+
 REPO_SELECT_RE = re.compile(r"\[APP:REPO_SELECTING: (?P<idx>\d+) \((?P<name>[^)]+)\)")
 FILE_HEADER_RE = re.compile(
     rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*([^\r\n]+)\r?\n"
@@ -1914,7 +1944,7 @@ def scroll_into_view(
     A repo click reflows the project tree. Clicking the first in-view sample
     hits whichever row has since moved onto that rectangle.
     """
-    s.wait_line(lambda line: "id=left-list " in line, timeout=10)
+    s.wait_line(lambda line: bounds_id(line) == "left-list", timeout=10)
     steps = 0
     last: tuple[int, int, int, int] | None = None
     stable_at: float | None = None
@@ -1930,7 +1960,7 @@ def scroll_into_view(
             # The row may just not be painted yet; give it a frame before scrolling away.
             waited = True
             try:
-                s.wait_line(lambda line: f"id={control} " in line, start=before, timeout=0.5)
+                s.wait_line(lambda line: bounds_id(line) == control, start=before, timeout=0.5)
                 continue
             except NativeBenchError:
                 pass
@@ -1958,7 +1988,7 @@ def scroll_into_view(
         cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
         s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if direction > 0 else "4")
         try:
-            s.wait_line(lambda line: "id=left-list " in line or f"id={control} " in line, start=before, timeout=5)
+            s.wait_line(lambda line: bounds_id(line) in ("left-list", control), start=before, timeout=5)
         except NativeBenchError:
             pass  # a wheel event can be dropped; the next step sends another
         steps += 1
@@ -1986,7 +2016,7 @@ def _wheel_left_list(s: NativeSession, win: dict[str, Any], down: bool) -> bool:
     cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
     s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if down else "4")
     try:
-        s.wait_line(lambda line: "id=change-" in line, start=before, timeout=1.5)
+        s.wait_line(lambda line: (control_event_id(line) or "").startswith("change-"), start=before, timeout=1.5)
     except NativeBenchError:
         pass  # a wheel event can be dropped, or the list is already at its end
     time.sleep(0.1)
@@ -2186,6 +2216,25 @@ def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
 
 TAB_ACTIVE_RE = re.compile(r"\[APP:WS_TAB_ACTIVE: id=(\d+) ")
 TAB_TAG_RE = re.compile(r" ws_tab=(\d+)\]$")
+ID_LAST_KIND_RE = re.compile(
+    r"\[APP:(?:CTRL_BOUNDS|CTRL_GONE|CTRL_DUPLICATE|CTRL_COVERED|TEXT_FIT|TEXT_FIT_DRIFT|TEXT_FIT_STYLE_DRIFT|TEXT_FIT_GONE): "
+)
+FIELD_TAB_RE = re.compile(r"(?:^| )ws_tab=(\d+) $")
+
+
+def line_tab(line: str) -> int | None:
+    """The background workspace tab that printed `line`, None for the shown tab and the root.
+
+    A line that ends in a free-text id has `ws_tab=<n>` as a field before `id=`, which is the
+    last field (an id can itself end in ` ws_tab=2`); any other line has it before its `]`."""
+    kind = ID_LAST_KIND_RE.match(line)
+    if kind:
+        rest = line[kind.end():]
+        at = 0 if rest.startswith("id=") else rest.find(" id=") + 1
+        tag = FIELD_TAB_RE.search(rest[:at]) if at > 0 else None
+        return int(tag[1]) if tag else None
+    tag = TAB_TAG_RE.search(line)
+    return int(tag[1]) if tag else None
 
 
 def open_repo_name(lines: list[str]) -> str | None:
@@ -2199,8 +2248,8 @@ def open_repo_name(lines: list[str]) -> str | None:
         if active:
             shown = int(active[1])
             continue
-        tag = TAB_TAG_RE.search(line)
-        tab = int(tag[1]) if tag else shown
+        tag = line_tab(line)
+        tab = tag if tag is not None else shown
         if "[APP:WORKSPACE: state=" in line:
             selected[tab] = None
         elif "[APP:REPO_SELECTING:" in line:
@@ -2235,7 +2284,7 @@ def narrow_log(s: NativeSession, win: dict[str, Any], name: str, timeout: float 
 
 def shown_tab_line(line: str) -> bool:
     """A line of the shown workspace tab or of the root: a background tab tags its own."""
-    return " ws_tab=" not in line
+    return line_tab(line) is None
 
 
 def click_control(s: NativeSession, win: dict[str, Any], control_id: str, timeout: float = 6.0) -> None:
@@ -2289,7 +2338,7 @@ def close_shown_tab(s: NativeSession, win: dict[str, Any], tab: int) -> dict[str
     start = len(s.lines)
     s.key(win["wid"], "ctrl+w")
     at, _, closed = s.wait_line(lambda line: f"[APP:WS_TAB_CLOSED: id={tab} count=" in line, start=start, timeout=e2e_scaled(30.0))
-    s.wait_line(lambda line: "[APP:CTRL_BOUNDS: id=ws-tab-new " in line, start=at + 1, timeout=e2e_scaled(10.0))
+    s.wait_line(lambda line: bounds_id(line) == "ws-tab-new", start=at + 1, timeout=e2e_scaled(10.0))
     count = int(re.search(r"count=(\d+)", closed)[1])
     drained = any(
         "phase=drained intent=close-workspace" in line and all(f in line for f in ("jobs=0", "inflight=0", "queued=0", "leaked=0"))

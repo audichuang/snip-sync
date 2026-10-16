@@ -1084,7 +1084,7 @@ def scroll_in_view(native: Any, session: Any, win: dict[str, Any], control: str,
         session.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if direction > 0 else "4")
         try:
             session.wait_line(
-                lambda item: f"id={control} " in item or f"id={viewport_id} " in item,
+                lambda item: native.bounds_id(item) in (control, viewport_id),
                 start=before,
                 timeout=min(2, max(0.0, deadline - time.monotonic())),
             )
@@ -1209,7 +1209,7 @@ def _open_selector(native: Any, session: Any, win: dict[str, Any], timeout: floa
     bound = native.e2e_scaled(timeout)
     try:
         index, _stamp, _line = session.wait_line(lambda item: "[APP:SELECTOR_OPEN: Repo" in item, start=before, timeout=bound)
-        session.wait_line(lambda item: "id=selector-input " in item, start=index, timeout=bound)
+        session.wait_line(lambda item: native.bounds_id(item) == "selector-input", start=index, timeout=bound)
     except Exception as exc:
         raise OperationTimeout(f"repo selector did not open and draw its input: {exc}") from exc
 
@@ -1346,7 +1346,7 @@ def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row
     while (found := find_node()) == [] and time.monotonic() < deadline:
         time.sleep(0.1)
     # Only a multi-repo workspace has repo rows.
-    if found == [] and any("id=change-repo:" in line for line in session.texts()):
+    if found == [] and any((native.bounds_id(line) or "").startswith("change-repo:") for line in session.texts()):
         found = native.scroll_to_change_dirs(session, win, find_node)
     if found is None:
         return

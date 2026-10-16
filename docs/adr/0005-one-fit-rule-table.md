@@ -42,7 +42,7 @@ Log 工具視窗裡一段文字和別的文字搶寬度時（commit 列的 subje
 
 ## TEXT_FIT 是執行期的對帳
 
-`[APP:TEXT_FIT: id=text-fit:<scope>:<role> rule= natural= floor= fit= drawn= visible= clipped= cut= shown=/]` 在內容改變時印一行。`visible` 是盒子與 `window.content_mask()`（所有祖先裁切框的交集）的橫向交集，所以 `drift`（`TEXT_FIT_DRIFT`：畫出來的盒子與求解器給的寬度差超過 1px，代表有一層繞過了求解器）與 `clipped`（祖先裁掉了它）是兩件事。`#[gpui::test]` 與 native-e2e smoke 斷言兩者都沒有，`scripts/real_ui_round.py text-fit --check` 在真實 UI 的日誌上做同一件事。
+`[APP:TEXT_FIT: rule= natural= floor= fit= drawn= visible= clipped= cut= shown=/ id=text-fit:<scope>:<role>]` 在內容改變時印一行（`id=` 永遠是最後一個欄位，見 `docs/real-ui-operator-protocol.md` 第 3 節）。`visible` 是盒子與 `window.content_mask()`（所有祖先裁切框的交集）的橫向交集，所以 `drift`（`TEXT_FIT_DRIFT`：畫出來的盒子與求解器給的寬度差超過 1px，代表有一層繞過了求解器）與 `clipped`（祖先裁掉了它）是兩件事。`#[gpui::test]` 與 native-e2e smoke 斷言兩者都沒有，`scripts/real_ui_round.py text-fit --check` 在真實 UI 的日誌上做同一件事。
 
 ## 量測與繪製用同一個文字樣式
 

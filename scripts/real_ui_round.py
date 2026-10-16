@@ -660,7 +660,7 @@ def clean_provable_leftovers(
 # -----------------------------------------------------------------------------
 
 # An id holds any character (spaces, `=`, `:`, `]`): the patterns that read it live in
-# bench_native_memory.py, anchored at the end of the line where the fixed fields are, and every
+# bench_native_memory.py (`id=` is the last field of the line, the id runs to its `]`), and every
 # harness uses them (crates/native-e2e/src/lib.rs reads the same lines by the same rule).
 RE_CTRL_BOUNDS = BOUNDS_RE
 RE_CTRL_GONE = CTRL_GONE_RE
@@ -717,8 +717,8 @@ def parse_latest_viewport(lines: List[str]) -> Tuple[int, int]:
 
 
 # `TEXT_FIT` is the app's check of one text's box against the rule of its role
-# (docs/adr/0005-one-fit-rule-table.md). A line of a background tab ends with
-# ` ws_tab=<id>` inside its brackets.
+# (docs/adr/0005-one-fit-rule-table.md). A line of a background tab has `ws_tab=<id>` as a field
+# before `id=`, which is the last field.
 RE_TEXT_FIT = TEXT_FIT_RE
 RE_TEXT_FIT_DRIFT = TEXT_FIT_DRIFT_RE
 # A box drawn in another family, size or weight than the one its floor and counts
@@ -760,19 +760,19 @@ def parse_text_fit(lines: List[str]) -> Tuple[Dict[str, TextFitEntry], List[str]
             continue
         m = RE_TEXT_FIT.match(line)
         if m:
-            tid = m.group(1)
+            tid = m["id"]
             latest[tid] = TextFitEntry(
                 id=tid,
-                rule=m.group(2),
-                natural=int(m.group(3)),
-                floor=int(m.group(4)),
-                fit=None if m.group(5) == "-" else int(m.group(5)),
-                drawn=int(m.group(6)),
-                visible=int(m.group(7)),
-                clipped=m.group(8) == "1",
-                cut=m.group(9) == "1",
-                shown=int(m.group(10)),
-                total=int(m.group(11)),
+                rule=m["rule"],
+                natural=int(m["natural"]),
+                floor=int(m["floor"]),
+                fit=None if m["fit"] == "-" else int(m["fit"]),
+                drawn=int(m["drawn"]),
+                visible=int(m["visible"]),
+                clipped=m["clipped"] == "1",
+                cut=m["cut"] == "1",
+                shown=int(m["shown"]),
+                total=int(m["total"]),
                 line_number=n,
             )
             if tid in drift:
@@ -780,14 +780,14 @@ def parse_text_fit(lines: List[str]) -> Tuple[Dict[str, TextFitEntry], List[str]
             continue
         m = RE_TEXT_FIT_DRIFT.match(line) or RE_TEXT_FIT_STYLE_DRIFT.match(line)
         if m:
-            if m.group(1) not in drift:
-                drift.append(m.group(1))
+            if m["id"] not in drift:
+                drift.append(m["id"])
             continue
         m = RE_TEXT_FIT_GONE.match(line)
         if m:
-            latest.pop(m.group(1), None)
-            if m.group(1) in drift:
-                drift.remove(m.group(1))
+            latest.pop(m["id"], None)
+            if m["id"] in drift:
+                drift.remove(m["id"])
     return latest, drift
 
 

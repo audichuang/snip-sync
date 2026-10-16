@@ -2,11 +2,30 @@
 //! `CTRL_DUPLICATE`, `CTRL_COVERED`, `TEXT_FIT_GONE`; `ui/fit.rs` builds the
 //! `TEXT_FIT` family the same way). One place spells them, so the producers
 //! and the tests of the parsers read the same text.
+//!
+//! An id can hold any character a repository, branch or file name can, so
+//! `id=` is the last field of every such line and the id runs to the closing
+//! `]`: `[APP:<KIND>: <fixed fields> id=<id>]`. A background tab's
+//! `ws_tab=<n>` is put in front of `id=` by [`crate::tabs::tag_line`], never
+//! behind it. See `docs/real-ui-operator-protocol.md`, section 3.
 
-/// `[APP:CTRL_BOUNDS: id=<id> x=<n> y=<n> w=<n> h=<n>]`
+/// The kinds of line that end in an id: the background tab's tag goes in
+/// front of it for these ([`crate::tabs::tag_line`]).
+pub(crate) const ID_LAST_KINDS: [&str; 8] = [
+	"CTRL_BOUNDS",
+	"CTRL_GONE",
+	"CTRL_DUPLICATE",
+	"CTRL_COVERED",
+	"TEXT_FIT",
+	"TEXT_FIT_DRIFT",
+	"TEXT_FIT_STYLE_DRIFT",
+	"TEXT_FIT_GONE",
+];
+
+/// `[APP:CTRL_BOUNDS: x=<n> y=<n> w=<n> h=<n> id=<id>]`
 pub(crate) fn bounds(id: &str, v: [i32; 4]) -> String {
 	format!(
-		"[APP:CTRL_BOUNDS: id={id} x={} y={} w={} h={}]",
+		"[APP:CTRL_BOUNDS: x={} y={} w={} h={} id={id}]",
 		v[0], v[1], v[2], v[3]
 	)
 }
@@ -21,9 +40,27 @@ pub(crate) fn duplicate(id: &str) -> String {
 	format!("[APP:CTRL_DUPLICATE: id={id}]")
 }
 
-/// `[APP:CTRL_COVERED: id=<id> by=<by>]`
+/// `[APP:CTRL_COVERED: by=<by, encoded> id=<id>]`: the control that covers
+/// is a free-text id too, so it is written without a space, `]`, `%` or
+/// line break (`%20`, `%5D`, `%25`, `%0A`, `%0D`) and the first ` id=` of the
+/// line is the covered control's.
 pub(crate) fn covered(id: &str, by: &str) -> String {
-	format!("[APP:CTRL_COVERED: id={id} by={by}]")
+	format!("[APP:CTRL_COVERED: by={} id={id}]", encode_by(by))
+}
+
+fn encode_by(by: &str) -> String {
+	let mut out = String::with_capacity(by.len());
+	for c in by.chars() {
+		match c {
+			'%' => out.push_str("%25"),
+			' ' => out.push_str("%20"),
+			']' => out.push_str("%5D"),
+			'\n' => out.push_str("%0A"),
+			'\r' => out.push_str("%0D"),
+			c => out.push(c),
+		}
+	}
+	out
 }
 
 /// `[APP:TEXT_FIT_GONE: id=<id>]`

@@ -102,44 +102,49 @@ pub fn lookup_bounds(
 	bounds.get(first).copied()
 }
 
-// The `[APP:…: id=<id> …]` lines carry an id that can hold any character a
-// repository, branch or file name can: spaces, `=`, `:`, `]`, even a field's
-// own name. So no parser cuts an id at the first space or `=`. The text after
-// `id=` is read from its end, where the line's fixed fields are (`x= y= w= h=`,
-// `rule= … shown=`, `fit= drawn=`, `by=`), after the closing `]` and a
-// background tab's ` ws_tab=<n>` are taken off. `scripts/bench_native_memory.py`
-// reads the same lines by the same rule.
+// The `[APP:<KIND>: <fixed fields> [ws_tab=<n> ]id=<id>]` lines carry an id that
+// can hold any character a repository, branch or file name can: spaces, `=`,
+// `:`, `]`, even a field's own name (`x=`, `by=`, `ws_tab=2`). So `id=` is the
+// last field of its line and the id is everything after it up to the closing
+// `]`; every other field comes before it and has no space in its value, so
+// the first ` id=` is where the id starts. Nothing is read from the end of
+// the line. `scripts/bench_native_memory.py` reads the same lines by the same
+// rule (see `docs/real-ui-operator-protocol.md`, section 3).
 
-/// What follows `[APP:<kind>: id=` in `line`, without the closing `]` and
-/// the tab tag.
-fn id_body<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
-	let marker = format!("[APP:{kind}: id=");
+/// The fixed fields of a `[APP:<kind>: …]` line and its id, which is the
+/// last field.
+fn id_line<'a>(line: &'a str, kind: &str) -> Option<(&'a str, &'a str)> {
+	let marker = format!("[APP:{kind}: ");
 	let rest = &line[line.find(&marker)? + marker.len()..];
-	Some(strip_tab_tag(rest.trim_end().strip_suffix(']')?))
-}
-
-/// `s` without a trailing ` ws_tab=<digits>`.
-fn strip_tab_tag(s: &str) -> &str {
-	match s.rfind(" ws_tab=") {
-		Some(i)
-			if !s[i + 8..].is_empty()
-				&& s[i + 8..].bytes().all(|b| b.is_ascii_digit()) =>
-		{
-			&s[..i]
+	let rest = rest.trim_end().strip_suffix(']')?;
+	match rest.strip_prefix("id=") {
+		Some(id) => Some(("", id)),
+		None => {
+			let at = rest.find(" id=")?;
+			Some((&rest[..at], &rest[at + 4..]))
 		}
-		_ => s,
 	}
 }
 
-/// Parses a `[APP:CTRL_BOUNDS: id=<id> x=<n> y=<n> w=<n> h=<n>]` line into
+/// The id of a `[APP:<kind>: … id=<id>]` line.
+fn id_body<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
+	id_line(line, kind).map(|(_, id)| id)
+}
+
+/// The value of field `name` (`x`, `clipped`, …) among a line's fixed fields.
+fn field<'a>(fields: &'a str, name: &str) -> Option<&'a str> {
+	fields
+		.split(' ')
+		.find_map(|f| f.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Parses a `[APP:CTRL_BOUNDS: x=<n> y=<n> w=<n> h=<n> id=<id>]` line into
 /// the control id and its `[x, y, w, h]`.
 pub fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
-	let (id, nums) = id_body(line, "CTRL_BOUNDS")?.rsplit_once(" x=")?;
-	let mut vals = nums.split(' ');
-	let x = vals.next()?.parse().ok()?;
-	let mut v = [x, 0, 0, 0];
-	for slot in &mut v[1..] {
-		*slot = vals.next()?.split('=').nth(1)?.parse().ok()?;
+	let (fields, id) = id_line(line, "CTRL_BOUNDS")?;
+	let mut v = [0; 4];
+	for (slot, name) in v.iter_mut().zip(["x", "y", "w", "h"]) {
+		*slot = field(fields, name)?.parse().ok()?;
 	}
 	Some((id.to_string(), v))
 }
@@ -154,19 +159,46 @@ pub fn parse_duplicate(line: &str) -> Option<String> {
 	Some(id_body(line, "CTRL_DUPLICATE")?.to_string())
 }
 
-/// Parses a covered control audit line `[APP:CTRL_COVERED: id=<id> by=<id>]`;
-/// the two ids are told apart at the last ` by=`.
+/// Parses a covered control audit line
+/// `[APP:CTRL_COVERED: by=<encoded id> id=<id>]` into `(covered, by)`.
+/// `by` has no space, `]`, `%` or line break in it (they are `%20`, `%5D`,
+/// `%25`, `%0A`, `%0D`), so it ends at the first space and `id=` is last.
 pub fn parse_covered(line: &str) -> Option<(String, String)> {
-	let (id, by) = id_body(line, "CTRL_COVERED")?.rsplit_once(" by=")?;
-	Some((id.to_string(), by.to_string()))
+	let (fields, id) = id_line(line, "CTRL_COVERED")?;
+	Some((id.to_string(), decode_by(field(fields, "by")?)))
 }
 
-/// Parses a `TEXT_FIT` line `[APP:TEXT_FIT: id=<id> rule=… clipped=<0|1> …]`:
-/// the id of the text and whether an ancestor clips it.
+/// `by` as the app wrote it, with its `%XX` escapes undone.
+fn decode_by(encoded: &str) -> String {
+	let mut out = String::with_capacity(encoded.len());
+	let mut rest = encoded;
+	while let Some(at) = rest.find('%') {
+		out.push_str(&rest[..at]);
+		let hex = rest
+			.get(at + 1..at + 3)
+			.and_then(|h| u8::from_str_radix(h, 16).ok());
+		match hex {
+			Some(b) if b.is_ascii() => {
+				out.push(b as char);
+				rest = &rest[at + 3..];
+			}
+			_ => {
+				out.push('%');
+				rest = &rest[at + 1..];
+			}
+		}
+	}
+	out.push_str(rest);
+	out
+}
+
+/// Parses a `TEXT_FIT` line
+/// `[APP:TEXT_FIT: rule=… clipped=<0|1> … id=<id>]`: the id of the text and
+/// whether an ancestor clips it.
 pub fn parse_text_fit(line: &str) -> Option<(String, bool)> {
-	let (id, fields) = id_body(line, "TEXT_FIT")?.rsplit_once(" rule=")?;
-	let clipped = fields.split(" clipped=").nth(1)?.starts_with('1');
-	Some((id.to_string(), clipped))
+	let (fields, id) = id_line(line, "TEXT_FIT")?;
+	field(fields, "rule")?;
+	Some((id.to_string(), field(fields, "clipped")? == "1"))
 }
 
 /// The id of a `TEXT_FIT` line that has `clipped=1`: an ancestor cuts the
@@ -176,18 +208,15 @@ pub fn parse_text_fit_clipped(line: &str) -> Option<String> {
 	clipped.then_some(id)
 }
 
-/// Parses a `[APP:TEXT_FIT_DRIFT: id=<id> fit=<n> drawn=<n>]` line: the box
+/// Parses a `[APP:TEXT_FIT_DRIFT: fit=<n> drawn=<n> id=<id>]` line: the box
 /// drawn is not the width the solver gave. A
-/// `[APP:TEXT_FIT_STYLE_DRIFT: id=<id> measured=<style> drawn=<style>]` line
+/// `[APP:TEXT_FIT_STYLE_DRIFT: measured=<style> drawn=<style> id=<id>]` line
 /// counts as well: the box is drawn in another family, size or weight than
 /// the one its floor and counts were measured in (a family may have spaces).
 pub fn parse_text_fit_drift(line: &str) -> Option<String> {
-	if let Some(body) = id_body(line, "TEXT_FIT_DRIFT") {
-		return Some(body.rsplit_once(" fit=")?.0.to_string());
-	}
-	let body = id_body(line, "TEXT_FIT_STYLE_DRIFT")?;
-	let (before_drawn, _) = body.rsplit_once(" drawn=")?;
-	Some(before_drawn.rsplit_once(" measured=")?.0.to_string())
+	id_body(line, "TEXT_FIT_DRIFT")
+		.or_else(|| id_body(line, "TEXT_FIT_STYLE_DRIFT"))
+		.map(str::to_string)
 }
 
 /// Parses a `[APP:TEXT_FIT_GONE: id=<id>]` line: the text is not drawn any

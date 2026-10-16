@@ -2,7 +2,7 @@
 //! Automated real-window OS input driver smoke and integration test for snip-desktop-native.
 //!
 //! Every click targets bounds the app reports for the rendered control
-//! (`[APP:CTRL_BOUNDS: id=...]`, only emitted when the test opts in with
+//! (`[APP:CTRL_BOUNDS: ... id=...]`, only emitted when the test opts in with
 //! `SNIP_NATIVE_E2E=1`), never hard-coded coordinates, and every clicked
 //! control is asserted to lie fully inside the window. Controls the app
 //! reports as gone (`[APP:CTRL_GONE: id=...]`) are forgotten, so a stale

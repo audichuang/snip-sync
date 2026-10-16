@@ -91,11 +91,33 @@ fn tag_with(line: String, tab: u32) -> String {
 	if !line.starts_with("[APP:") || !line.ends_with(']') {
 		return line;
 	}
+	// A line that ends in an id keeps `id=` as its last field, whatever the
+	// id says: the tag is a field before it.
+	if let Some(at) = id_field_at(&line) {
+		return format!("{}ws_tab={tab} {}", &line[..at], &line[at..]);
+	}
 	let body = &line[..line.len() - 1];
 	if body.contains(": ") {
 		format!("{body} ws_tab={tab}]")
 	} else {
 		format!("{body}: ws_tab={tab}]")
+	}
+}
+
+/// Where the `id=` field of a probe line starts: right after `[APP:<kind>: `
+/// or after the fixed fields, which have no ` id=` in them (a `by=` is
+/// written without spaces, `ui::probe_line`).
+fn id_field_at(line: &str) -> Option<usize> {
+	let rest = line.strip_prefix("[APP:")?;
+	let (kind, fields) = rest.split_once(": ")?;
+	if !crate::ui::probe_line::ID_LAST_KINDS.contains(&kind) {
+		return None;
+	}
+	let start = line.len() - fields.len();
+	if fields.starts_with("id=") {
+		Some(start)
+	} else {
+		fields.find(" id=").map(|at| start + at + 1)
 	}
 }
 

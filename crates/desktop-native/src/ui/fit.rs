@@ -867,7 +867,7 @@ impl TextFit {
 			None => "-".into(),
 		};
 		format!(
-			"[APP:TEXT_FIT: id={id} rule={} natural={:.0} floor={:.0} fit={fit} drawn={:.0} visible={:.0} clipped={} cut={} shown={}/{}]",
+			"[APP:TEXT_FIT: rule={} natural={:.0} floor={:.0} fit={fit} drawn={:.0} visible={:.0} clipped={} cut={} shown={}/{} id={id}]",
 			self.role.rule().name(),
 			self.natural,
 			self.floor,
@@ -882,7 +882,7 @@ impl TextFit {
 
 	pub(super) fn drift_line(&self, id: &str) -> String {
 		format!(
-			"[APP:TEXT_FIT_DRIFT: id={id} fit={:.0} drawn={:.0}]",
+			"[APP:TEXT_FIT_DRIFT: fit={:.0} drawn={:.0} id={id}]",
 			self.fit.unwrap_or(0.),
 			self.drawn
 		)
@@ -890,7 +890,7 @@ impl TextFit {
 
 	pub(super) fn style_drift_line(&self, id: &str) -> String {
 		format!(
-			"[APP:TEXT_FIT_STYLE_DRIFT: id={id} measured={} drawn={}]",
+			"[APP:TEXT_FIT_STYLE_DRIFT: measured={} drawn={} id={id}]",
 			style_text(self.style.family, self.style.size, self.style.weight),
 			self.style_drift.as_deref().unwrap_or("-")
 		)

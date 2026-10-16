@@ -199,12 +199,12 @@ Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜
 1. 從這一次啟動的日誌取這個控制項最新的一行。閘門 A 讀 `$RUN/app-gate-a.log`，閘門 B 讀 `$RUN/app-gate-b.log`。
 
 ```text
-[APP:CTRL_BOUNDS: id=<完整 ID> x= y= w= h=]
+[APP:CTRL_BOUNDS: x= y= w= h= id=<完整 ID>]
 ```
 
 ID 整段相等。`paste-overwrite:0:common.txt` 不能拿去點 `paste-overwrite:2:common.txt`，也不能拿去點 `paste-overwrite:0:common.txt.bak`。不要照 native-e2e driver 的寬鬆查法（`lookup_bounds` 仍接受只給路徑的 `paste-overwrite:<path>`）；人工操作一律用完整 ID。
 
-ID 可以含任何字元：空白、`=`、`:`、`]`，甚至欄位自己的名字（repo 資料夾叫 `my repo` 或 `a x=1`）。所有讀日誌的地方（`scripts/bench_native_memory.py` 的 `BOUNDS_RE`／`TEXT_FIT_RE` 等、`scripts/real_ui_round.py`、`scripts/check_native_ime.py`、`crates/native-e2e/src/lib.rs`）都用同一條規則：ID 是 `id=` 之後、到該行尾端固定欄位（`x= y= w= h=`、`rule= … shown=`、`fit= drawn=`、`by=`）之前的全部文字，從行尾往回讀；背景分頁的行尾端還有 ` ws_tab=<n>`，先拿掉。人工讀日誌也照這條，不要用空白切。
+ID 可以含任何字元：空白、`=`、`:`、`]`，甚至欄位自己的名字（repo 資料夾叫 `my repo`、`a x=1`，檔名叫 `report ws_tab=2`）。所以有 ID 的行（`CTRL_BOUNDS`、`CTRL_GONE`、`CTRL_DUPLICATE`、`CTRL_COVERED`、`TEXT_FIT`、`TEXT_FIT_DRIFT`、`TEXT_FIT_STYLE_DRIFT`、`TEXT_FIT_GONE`）只有一種格式：`[APP:<KIND>: <固定欄位> [ws_tab=<n> ]id=<ID>]`。`id=` **永遠是最後一個欄位**，ID 就是 `id=` 之後、到該行最後一個 `]` 之前的全部文字；其他欄位（`x= y= w= h=`、`rule= … shown=`、`fit= drawn=`、`measured= drawn=`、`by=`、背景分頁的 `ws_tab=<n>`）一律在它前面，值裡都沒有空白（`measured=`／`drawn=` 的字型家族除外，那是 App 自己定的字串，不含 ` id=`），所以第一個 ` id=`（或緊接冒號後的 `id=`）就是 ID 的開頭。`scripts/bench_native_memory.py` 的 `BOUNDS_RE`／`TEXT_FIT_RE` 等、`scripts/real_ui_round.py`、`scripts/check_native_ime.py`、`crates/native-e2e/src/lib.rs` 都用這條規則讀；人工讀日誌也照這條，不要用空白切，也不要用「結尾是不是 ` ws_tab=`」判斷是哪一個分頁印的（ID 本身可以以它結尾），要看 `id=` 前面那個欄位。沒有自由文字 ID 的行（例如 `WS_TAB_OPENED: id=2 count=2` 的 `id` 是數字，由分頁列印，永不帶 `ws_tab=`）不受這條規則影響。
 
 2. 沒有這一行，或 `w < 1`，或 `h < 1`，或這一行之後又出現同一 ID 的 `[APP:CTRL_GONE: id=<ID>]`（控制項已收合或關閉，矩形是舊的）：判定 `fail`，證據欄寫 `missing-control`，停止。點擊前要確認沒有比最新 `CTRL_BOUNDS` 更晚的 `CTRL_GONE`。改點旁邊看起來像的列，不算測過。
 3. 同一 ID 出現兩列是回歸。此時兩列輪流以同一個 ID 回報矩形，日誌可能在兩個矩形之間來回跳，也可能只剩一個，所以不要用日誌矩形的數量辨識；改用 T03／T18 的規則：相異 ID 數要等於同路徑列數，並比對 `PASTE_TOGGLED` 的 idx。不成立時判定 `fail`，證據欄寫 `identity-fail` 與兩欄數字，不能按 Apply。
@@ -224,7 +224,7 @@ ID 可以含任何字元：空白、`=`、`:`、`]`，甚至欄位自己的名�
 
 `CTRL_BOUNDS` 是控制項真正看得到的部分（已扣掉被父容器裁掉的範圍）；整個被裁掉時是 `CTRL_GONE`。視窗寬度至少 700 時，App 還會稽核每一幀：
 
-- `[APP:CTRL_COVERED: id=<A> by=<B>]`：A 的可見中心被後畫的 B 蓋住，點 A 的中心會點到 B。不要點；這一格判 `ui-defect`，證據欄寫 `covered A by B`。若已經點了而觸發 B 的動作，判 `fail`。
+- `[APP:CTRL_COVERED: by=<B 的編碼> id=<A>]`：A 的可見中心被後畫的 B 蓋住，點 A 的中心會點到 B。A 是 `id=` 之後的全部文字；B 是另一個自由文字 ID，所以寫成 `by=` 欄位時把 `%`、空白、`]`、換行編成 `%25`、`%20`、`%5D`、`%0A`／`%0D`（其餘照原樣），日誌裡 `by=` 到第一個空白之間就是 B，讀的人把這幾個 `%XX` 還原。不要點；這一格判 `ui-defect`，證據欄寫 `covered A by B`。若已經點了而觸發 B 的動作，判 `fail`。
 - `[APP:CTRL_DUPLICATE: id=<ID>]`：同一幀有兩個控制項用同一個 ID。涉及這個 ID 的格子判 `fail`，證據欄寫 `identity-fail`。
 
 macOS 輔助使用在這個 App 上只到視窗。沒有 `CTRL_BOUNDS` 的點擊，不能記 `pass`。
