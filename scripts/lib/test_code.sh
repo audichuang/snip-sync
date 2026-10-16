@@ -1,27 +1,57 @@
 # shellcheck shell=bash
 # Which lines of a Rust file are test code, for every lint that holds product
 # code to a rule tests may break (check_test_refresh.sh, check_msg_raw.sh).
-# One rule, so the lints cannot disagree:
-#   - a file named `*_tests.rs` is a test module, whole;
-#   - otherwise test code runs from the first top-level `mod tests {`
-#     (any visibility) to the end of the file.
+# One rule, so the lints cannot disagree. The unit is the block, never "from
+# some line to the end of the file": a `#[cfg(test)] mod x {` can be followed
+# by product code (desktop main.rs has a `test_log` module near the top). Test
+# code is
+#   - a file named `*_tests.rs`, whole;
+#   - every top-level block `#[cfg(test)]` + `(pub(..) )?mod NAME {`, from the
+#     `mod` line to the top-level `}` that closes it, whatever NAME is
+#     (`tests`, `row_width_tests`, `test_log`). Other attributes may sit
+#     between `#[cfg(test)]` and `mod`; a `mod x { }` on one line is that line.
 # A file-level test module named otherwise would read as product code, so
 # misnamed_test_modules reports `#[cfg(test)] mod x;` whose x is not `*_tests`.
-# Limit: it sees only `#[cfg(test)]` on the line right above `mod x;`. The
-# one-line form or an attribute in between (`#[path = ...]`) is not seen; write
-# out-of-line test modules in the plain two-line form.
+# Limits: the block must start at column 0 and end at a `}` at column 0 (what
+# rustfmt writes; a `}` at column 0 inside a multi-line string literal would
+# end it early); a test item that is not a module (`#[cfg(test)] fn helper`) is
+# product code to the lints; and misnamed_test_modules sees only `#[cfg(test)]`
+# on the line right above `mod x;`, so write out-of-line test modules in the
+# plain two-line form.
 
-test_code_start() { # FILE -> first line of test code, or nothing
-	case "$1" in
-	*_tests.rs) echo 1 ;;
-	*) grep -nE '^(pub(\([a-z]+\))? )?mod tests \{' "$1" | head -1 | cut -d: -f1 || true ;;
-	esac
+test_code_ranges() { # FILE -> "first last" per test block, one per line
+	awk '
+		function flush() { if (start) print start, FNR; start = 0 }
+		start {
+			if ($0 ~ /^}/) flush()
+			next
+		}
+		/^#\[cfg\(test\)\][[:space:]]*$/ { pending = 1; next }
+		pending && /^#\[/ { next }
+		pending && /^(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*[{]/ {
+			pending = 0
+			if ($0 ~ /[}][[:space:]]*$/) print FNR, FNR
+			else start = FNR
+			next
+		}
+		{ pending = 0 }
+		END { if (start) print start, 2147483647 }' "$1"
 }
 
+_test_code_file=""
+_test_code_cache=""
+
 is_test_line() { # FILE LINE
-	local start
-	start=$(test_code_start "$1")
-	[[ -n "$start" && "$2" -ge "$start" ]]
+	local first last
+	[[ "$1" == *_tests.rs ]] && return 0
+	if [[ "$_test_code_file" != "$1" ]]; then
+		_test_code_file="$1"
+		_test_code_cache=$(test_code_ranges "$1")
+	fi
+	while read -r first last; do
+		[[ -n "$first" && "$2" -ge "$first" && "$2" -le "$last" ]] && return 0
+	done <<<"$_test_code_cache"
+	return 1
 }
 
 misnamed_test_modules() { # DIR... -> "file:line: text" per misnamed module

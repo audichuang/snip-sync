@@ -3,8 +3,9 @@ set -euo pipefail
 
 # Check for banned window.refresh() calls in test code within crates/desktop-native
 # outside the explicit, commented allowlist marked with '// ALLOWED-TEST-REFRESH: <reason>'.
-# Which lines are test code is decided by scripts/lib/test_code.sh, shared with
-# check_msg_raw.sh.
+# Which lines are test code is decided by scripts/lib/test_code.sh (a
+# `*_tests.rs` file, or a top-level `#[cfg(test)] mod NAME {` block), shared
+# with check_msg_raw.sh.
 #
 # Usage: check_test_refresh.sh [ROOT]   (ROOT defaults to the repository root)
 

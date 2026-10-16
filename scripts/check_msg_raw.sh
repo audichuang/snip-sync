@@ -17,7 +17,8 @@ set -euo pipefail
 #     only where its source is typed (a Reason, or a translation function of
 #     reason.rs);
 #   - an error's `Display` on its way to the screen: `e.to_string()`, or
-#     `{e}` / `{err}` / `{error}` inside a `format!(`. Word the error by its
+#     `{e}` / `{err}` / `{error}` inside a `format!(`, or one of them as a
+#     positional argument (`format!("..{}", e)`) on the same line. Word the error by its
 #     Reason, or by a typed translation (`graph_error_msg`, `clip_fault_msg`).
 #     A line of an `[APP:...]` log (`app_log!`, `println!` ...) may print it;
 #     `// ALLOWED-ERR-TEXT: <reason>` on the line or the one above allows the
@@ -28,12 +29,15 @@ set -euo pipefail
 #     what git, ssh or an old peer said;
 #   - a whole-file test module (`#[cfg(test)]` then `mod x;`) is named
 #     `*_tests`, so the test-code rule below sees it.
-# Which lines are test code is decided by scripts/lib/test_code.sh, shared with
-# check_test_refresh.sh. A string with no wording of its own is a Reason: there
+# Which lines are test code is decided by scripts/lib/test_code.sh (a
+# `*_tests.rs` file, or a top-level `#[cfg(test)] mod NAME {` block), shared
+# with check_test_refresh.sh. A string with no wording of its own is a Reason: there
 # is nothing to allow for the first rules.
 #
 # This catches a backdoor written by accident, not code written to dodge it
-# (a macro that builds the name, say).
+# (a macro that builds the name, say). The error rule reads one line: an
+# error under another name (`why`, `cause`), or a `format!` spread over
+# several lines, is not seen.
 #
 # Usage: check_msg_raw.sh [ROOT]   (ROOT defaults to the repository root)
 
@@ -105,7 +109,10 @@ while IFS=: read -r file line_num line_content; do
 	if [[ "$line_content" =~ (^|[^A-Za-z0-9_])(e|err|error)\.to_string\(\) ]] ||
 		{
 			[[ "$line_content" =~ format!\( ]] &&
-				[[ "$line_content" =~ \{(e|err|error)(:[^\}]*)?\} ]]
+				{
+					[[ "$line_content" =~ \{(e|err|error)(:[^\}]*)?\} ]] ||
+						[[ "$line_content" =~ \{[^\}]*\}.*,[[:space:]]*(e|err|error)[[:space:]]*[,\)] ]]
+				}
 		}; then
 		if [[ "$line_content" =~ app_log!|root_log!|println!|eprintln! ]]; then
 			continue
@@ -119,7 +126,7 @@ while IFS=: read -r file line_num line_content; do
 		fi
 		reject "an error's Display on its way to the screen" "Word it by its Reason (reason_msg) or a typed translation (graph_error_msg, clip_fault_msg). Only an [APP:...] log line may print it; mark an e2e contract with // ALLOWED-ERR-TEXT: <reason>."
 	fi
-done < <(grep -rnE --include='*.rs' 'Msg[[:space:]]*::[[:space:]]*detail[[:space:]]*\(|(^|[^A-Za-z0-9_])(e|err|error)\.to_string\(\)|format!\(.*\{(e|err|error)(:[^}]*)?\}' "$SRC" || true)
+done < <(grep -rnE --include='*.rs' 'Msg[[:space:]]*::[[:space:]]*detail[[:space:]]*\(|(^|[^A-Za-z0-9_])(e|err|error)\.to_string\(\)|format!\(.*\{(e|err|error)(:[^}]*)?\}|format!\(.*\{[^}]*\}.*,[[:space:]]*(e|err|error)[[:space:]]*[,)]' "$SRC" || true)
 
 # Text an external source wrote is not a string literal of ours.
 for crate in core remote cli desktop-native; do
