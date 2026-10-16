@@ -2013,6 +2013,9 @@ impl PastePreviewPlan {
 		limit: usize,
 	) -> Result<(), Msg> {
 		check_budget(self.retained_bytes(), limit)?;
+		// `restore_base` is left as it was on the early returns below: they
+		// run before any engine hears the payload, so the last suggestion
+		// still describes it and keeps [Use as-is] reachable.
 		if !self.mapping_ready() {
 			self.error = Some(Msg::new("mapping_required", []));
 			return Ok(());
@@ -2031,9 +2034,13 @@ impl PastePreviewPlan {
 				};
 			target.plan_files(&self.raw_payload, &route, opts, note)
 		};
-		// Kept whether or not the plan succeeded: a local engine hears the
-		// suggestion before it resolves the destination.
-		self.restore_base = heard;
+		// A refusal that carried no suggestion (a worker's does not) keeps
+		// the last one: the hint row must stay so [Use as-is] can undo an
+		// adjustment the engine refused. A local engine hears the suggestion
+		// before it resolves the destination, so its refusal updates it.
+		if planned.is_ok() || heard.is_some() {
+			self.restore_base = heard;
+		}
 		let file_plan = match planned {
 			Ok(plan) => plan,
 			// No engine answered: the destination did not resolve or the

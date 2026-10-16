@@ -15448,11 +15448,7 @@ mod tests {
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
-			remote_paste_preview(
-				&model,
-				cx,
-				RESTORE_BASE_COLLIDING_PAYLOAD,
-			);
+			remote_paste_preview(&model, cx, RESTORE_BASE_COLLIDING_PAYLOAD);
 			assert!(cx.debug_bounds("paste-restore-base").is_some());
 			let wait_landed =
 				|model: &Entity<WorkbenchModel>, cx: &mut VisualTestContext| {

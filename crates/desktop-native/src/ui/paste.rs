@@ -24,7 +24,8 @@ impl WorkbenchModel {
 	// ───────────────────────── paste ─────────────────────────
 
 	/// The hint row's text for the open paste plan, if the row is shown.
-	#[cfg(test)]
+	/// Read again by the row's tooltip so it follows the interface language
+	/// (#148).
 	pub(crate) fn paste_hint_text(&self) -> Option<String> {
 		let hint = self.paste.plan()?.restore_hint()?;
 		Some(restore_hint_text(hint, self.locale))
@@ -760,6 +761,7 @@ impl WorkbenchModel {
 		});
 
 		// The restore-base hint: a non-modal row, never applied unasked.
+		let model = cx.weak_entity();
 		let restore_hint = plan.restore_hint().map(|hint| {
 			let text = restore_hint_text(hint, loc);
 			let adjusted = plan.adjust_paths;
@@ -815,7 +817,13 @@ impl WorkbenchModel {
 						.id("paste-restore-base-text")
 						.flex_1()
 						.min_w(px(180.))
-						.tooltip(tip(text)),
+						.tooltip(live_tip(move |cx| {
+							model
+								.upgrade()
+								.and_then(|m| m.read(cx).paste_hint_text())
+								.unwrap_or_default()
+								.into()
+						})),
 				)
 				.child(pick("paste-adjust", t("paste_adjust", loc), true, 52))
 				.child(pick("paste-as-is", t("paste_as_is", loc), false, 53))
