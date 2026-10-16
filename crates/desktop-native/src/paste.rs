@@ -21,7 +21,8 @@ use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::GitError;
 use snip_core::restore::{
-	RestoreExecutionResult, RestorePlan, RestoreSelection,
+	RestoreBase, RestoreBaseSuggestion, RestoreExecutionResult, RestorePlan,
+	RestoreSelection,
 };
 use snip_core::transfer::{
 	detect_clipboard_prefixes, CanonicalRootId, CommitReplayPreview,
@@ -103,10 +104,25 @@ pub enum PasteRequest {
 		/// under its session root, and its worker plans and writes.
 		remote: Option<RemotePaste>,
 	},
-	Remap {
-		prefix: String,
-		keep: bool,
-	},
+	Remap(Remap),
+}
+
+/// What a deferred re-plan changes, for its log line once it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remap {
+	/// A prefix row: kept under the destination, or a candidate folder.
+	Prefix { prefix: String, keep: bool },
+	/// The restore-base hint: plan with the suggestion (true) or as-is.
+	AdjustPaths(bool),
+}
+
+impl Remap {
+	fn heap_bytes(&self) -> usize {
+		match self {
+			Self::Prefix { prefix, .. } => prefix.capacity(),
+			Self::AdjustPaths(_) => 0,
+		}
+	}
 }
 
 impl PasteRequest {
@@ -120,14 +136,14 @@ impl PasteRequest {
 					.saturating_add(roots.capacity() * size_of::<PathBuf>()),
 				|n, p| n.saturating_add(p.capacity()),
 			),
-			Self::Remap { prefix, .. } => prefix.capacity(),
+			Self::Remap(remap) => remap.heap_bytes(),
 		})
 	}
 }
 
 pub struct PasteOutcome {
 	pub result: Result<PastePreviewPlan, Msg>,
-	pub remap: Option<(String, bool)>,
+	pub remap: Option<Remap>,
 }
 
 impl PasteOutcome {
@@ -136,7 +152,7 @@ impl PasteOutcome {
 			Ok(plan) => plan.retained_bytes(),
 			Err(err) => err.heap_bytes(),
 		}
-		.saturating_add(self.remap.as_ref().map_or(0, |(p, _)| p.capacity()))
+		.saturating_add(self.remap.as_ref().map_or(0, Remap::heap_bytes))
 	}
 }
 
@@ -329,12 +345,11 @@ impl PastePending {
 		};
 		let input = match request {
 			PasteRequest::Clipboard { .. } => PasteInput::Clipboard(request),
-			PasteRequest::Remap { prefix, keep } => {
+			PasteRequest::Remap(remap) => {
 				let Some(plan) = plan else { return Ok(None) };
 				PasteInput::Remap {
 					plan: plan.clone(),
-					prefix,
-					keep,
+					remap,
 				}
 			}
 		};
@@ -376,16 +391,15 @@ enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
 		plan: PastePreviewPlan,
-		prefix: String,
-		keep: bool,
+		remap: Remap,
 	},
 }
 impl PasteInput {
 	fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard(request) => request.bytes(),
-			Self::Remap { plan, prefix, .. } => {
-				plan.retained_bytes().saturating_add(prefix.capacity())
+			Self::Remap { plan, remap } => {
+				plan.retained_bytes().saturating_add(remap.heap_bytes())
 			}
 		})
 	}
@@ -420,15 +434,11 @@ impl PasteWorker {
 				),
 				remap: None,
 			},
-			PasteInput::Remap {
-				mut plan,
-				prefix,
-				keep,
-			} => {
+			PasteInput::Remap { mut plan, remap } => {
 				let result = plan.rebuild_file_plan_with(opts).map(|()| plan);
 				PasteOutcome {
 					result,
-					remap: Some((prefix, keep)),
+					remap: Some(remap),
 				}
 			}
 			_ => unreachable!(
@@ -994,6 +1004,12 @@ pub struct PastePreviewPlan {
 	/// Digest of the repo roots the candidates were last built from, so a
 	/// landing that brings the same set skips the canonicalize.
 	seen_roots: u64,
+	/// The restore-base suggestion the last plan heard (local engine or the
+	/// worker). Only kept when there are no prefix rows: see `restore_hint`.
+	restore_base: Option<RestoreBaseSuggestion>,
+	/// The hint's [Adjust paths]: plan with `restore_base`. Off on every
+	/// paste, so nothing is adjusted unasked.
+	pub adjust_paths: bool,
 	/// Shared so starting an apply does not copy every file body.
 	pub plan: Arc<RestorePlan>,
 	pub items: Vec<PasteItem>,
@@ -1006,6 +1022,15 @@ pub struct PastePreviewPlan {
 	/// Set in a remote workspace. `import_plan` and `commit_preview` then
 	/// hold the worker's plan, with the worker's paths.
 	pub remote: Option<RemotePaste>,
+}
+
+/// Heap bytes of a suggestion, charged to the plan that keeps it.
+fn suggestion_heap(s: &RestoreBaseSuggestion) -> usize {
+	s.label.capacity()
+		+ match &s.base {
+			RestoreBase::Strip { segment } => segment.capacity(),
+			RestoreBase::Add { prefix } => prefix.capacity(),
+		}
 }
 
 fn empty_plan() -> Arc<RestorePlan> {
@@ -1327,6 +1352,9 @@ impl PastePreviewPlan {
 				.saturating_add(plan.retained_heap_bytes())
 				.saturating_add(self.commit_prepared.retained_heap_bytes());
 		}
+		if let Some(hint) = &self.restore_base {
+			bytes = bytes.saturating_add(suggestion_heap(hint));
+		}
 		if let Some(error) = &self.error {
 			bytes = bytes
 				.saturating_add(error.args.capacity() * size_of::<String>());
@@ -1357,7 +1385,11 @@ impl PastePreviewPlan {
 				.saturating_add(item.dest_root_name.capacity())
 				.saturating_add(item.dest_path.capacity());
 		}
-		bytes.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
+		bytes
+			.saturating_add(
+				self.restore_base.as_ref().map_or(0, suggestion_heap),
+			)
+			.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
 	}
 
 	/// A complete mapping shell alone does not authorize any write.
@@ -1625,6 +1657,8 @@ impl PastePreviewPlan {
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
 			seen_roots: roots_digest(known_roots),
+			restore_base: None,
+			adjust_paths: false,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -1704,6 +1738,8 @@ impl PastePreviewPlan {
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
 			seen_roots: 0,
+			restore_base: None,
+			adjust_paths: false,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -1903,6 +1939,31 @@ impl PastePreviewPlan {
 		Ok(())
 	}
 
+	/// The restore-base suggestion the panel offers: only for a payload
+	/// without prefix rows (a `clipcode-root` export) and not for a commit
+	/// replay. With prefix rows the user routes each prefix instead (D4).
+	pub fn restore_hint(&self) -> Option<&RestoreBaseSuggestion> {
+		if self.whole_commit || !self.prefix_choices.is_empty() {
+			return None;
+		}
+		self.restore_base.as_ref()
+	}
+
+	/// Records the hint's choice only, like [`Self::choose_keep_relative`].
+	pub fn choose_adjust_paths(&mut self, on: bool) -> Result<(), Msg> {
+		if self.restore_hint().is_none() {
+			return Err(Msg::new("paste_adjust_unavailable", []));
+		}
+		self.adjust_paths = on;
+		Ok(())
+	}
+
+	/// Plans with (`true`) or without the suggestion. Blocking, for tests.
+	pub fn set_adjust_paths(&mut self, on: bool) -> Result<(), Msg> {
+		self.choose_adjust_paths(on)?;
+		self.rebuild_file_plan_with(&RunOptions::default())
+	}
+
 	/// Drops the planned writes so a changed mapping cannot apply the old
 	/// ones. A whole-commit replay has no mapping and keeps its plan.
 	pub fn clear_file_plan(&mut self) {
@@ -1957,49 +2018,64 @@ impl PastePreviewPlan {
 			return Ok(());
 		}
 		let (target, route) = self.target_route()?;
-		let file_plan =
-			match target.plan_files(&self.raw_payload, &route, opts, None) {
-				Ok(plan) => plan,
-				// No engine answered: the destination did not resolve or the
-				// worker could not be reached.
-				Err(
-					err @ (PasteError::Destination { .. }
-					| PasteError::Remote(
-						RemoteError::Io(_)
-						| RemoteError::Connect(_)
-						| RemoteError::Start { .. }
-						| RemoteError::PatchTooLarge { .. }
-						| RemoteError::Protocol(_)
-						| RemoteError::Cancelled
-						| RemoteError::TimedOut
-						| RemoteError::Stalled { .. }
-						| RemoteError::WorkerTooOld { .. },
-					)
-					| PasteError::OutcomeUnknown(_)
-					| PasteError::NoReplayResult),
-				) => {
-					return Err(destination_msg(
-						self.remote.as_ref(),
-						&self.destination,
-						err,
-					));
+		let mut heard: Option<RestoreBaseSuggestion> = None;
+		let planned = {
+			let mut note = |s: &RestoreBaseSuggestion| heard = Some(s.clone());
+			// Only a payload without prefix rows (a `clipcode-root` export)
+			// shows the hint; with rows the user routes each prefix (D4).
+			let note: Option<&mut dyn FnMut(&RestoreBaseSuggestion)> =
+				if self.prefix_choices.is_empty() {
+					Some(&mut note)
+				} else {
+					None
+				};
+			target.plan_files(&self.raw_payload, &route, opts, note)
+		};
+		// Kept whether or not the plan succeeded: a local engine hears the
+		// suggestion before it resolves the destination.
+		self.restore_base = heard;
+		let file_plan = match planned {
+			Ok(plan) => plan,
+			// No engine answered: the destination did not resolve or the
+			// worker could not be reached.
+			Err(
+				err @ (PasteError::Destination { .. }
+				| PasteError::Remote(
+					RemoteError::Io(_)
+					| RemoteError::Connect(_)
+					| RemoteError::Start { .. }
+					| RemoteError::PatchTooLarge { .. }
+					| RemoteError::Protocol(_)
+					| RemoteError::Cancelled
+					| RemoteError::TimedOut
+					| RemoteError::Stalled { .. }
+					| RemoteError::WorkerTooOld { .. },
+				)
+				| PasteError::OutcomeUnknown(_)
+				| PasteError::NoReplayResult),
+			) => {
+				return Err(destination_msg(
+					self.remote.as_ref(),
+					&self.destination,
+					err,
+				));
+			}
+			// An engine refused the plan, locally or on the worker.
+			Err(err) => {
+				if crate::e2e_on() && err.is_collision() {
+					app_log!(
+						"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+					);
 				}
-				// An engine refused the plan, locally or on the worker.
-				Err(err) => {
-					if crate::e2e_on() && err.is_collision() {
-						app_log!(
-							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-						);
-					}
-					self.error = Some(Msg::with_msg_arg(
-						"paste_err_plan",
-						[String::new()],
-						0,
-						reason_msg(&err.reason()),
-					));
-					return Ok(());
-				}
-			};
+				self.error = Some(Msg::with_msg_arg(
+					"paste_err_plan",
+					[String::new()],
+					0,
+					reason_msg(&err.reason()),
+				));
+				return Ok(());
+			}
+		};
 		let base = self
 			.retained_bytes()
 			.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
@@ -2027,7 +2103,10 @@ impl PastePreviewPlan {
 	/// This plan's target and the chosen prefix folders, spelled for it.
 	fn target_route(&self) -> Result<(PasteTarget, PasteRoute), Msg> {
 		let target = paste_target(self.remote.as_ref(), &self.destination)?;
-		let mut route = PasteRoute::default();
+		let mut route = PasteRoute {
+			adjust_paths: self.adjust_paths,
+			..Default::default()
+		};
 		for choice in &self.prefix_choices {
 			if choice.keep_relative {
 				continue;
@@ -2865,6 +2944,135 @@ pub(crate) mod tests {
 		}
 	}
 
+	/// Exported from the folder above the destination `sub`: the first path
+	/// segment repeats the destination's name.
+	const RESTORE_BASE_PAYLOAD: &str =
+		"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+
+	fn item_paths(plan: &PastePreviewPlan) -> Vec<&str> {
+		plan.items.iter().map(|i| i.path.as_str()).collect()
+	}
+
+	#[test]
+	fn a_clipcode_root_paste_keeps_the_restore_base_suggestion() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			RESTORE_BASE_PAYLOAD,
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert_eq!(
+			plan.restore_hint().map(|s| &s.base),
+			Some(&RestoreBase::Strip {
+				segment: "sub".into()
+			})
+		);
+		assert!(!plan.adjust_paths);
+		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
+	}
+
+	#[test]
+	fn adjusting_paths_replans_with_the_suggestion_and_as_is_undoes_it() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(tmp.path()).unwrap().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			RESTORE_BASE_PAYLOAD,
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.set_adjust_paths(true).unwrap();
+		assert_eq!(item_paths(&plan), ["a.ts"]);
+		assert_eq!(plan.items[0].dest_path, dest.join("a.ts"));
+		// Apply plans from the same route as the preview did.
+		assert!(plan.target_route().unwrap().1.adjust_paths);
+		// The hint stays so the choice can be undone.
+		assert!(plan.restore_hint().is_some());
+		plan.set_adjust_paths(false).unwrap();
+		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
+		assert!(!plan.adjust_paths);
+		assert!(!plan.target_route().unwrap().1.adjust_paths);
+	}
+
+	#[test]
+	fn an_add_suggestion_nests_everything_under_the_existing_folder() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		fs::create_dir_all(ws.join("app")).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: app\n// FILE: src/a.ts\nx\n",
+			&ws,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert_eq!(
+			plan.restore_hint().map(|s| &s.base),
+			Some(&RestoreBase::Add {
+				prefix: "app".into()
+			})
+		);
+		plan.set_adjust_paths(true).unwrap();
+		assert_eq!(item_paths(&plan), ["app/src/a.ts"]);
+	}
+
+	#[test]
+	fn prefix_rows_hide_the_heuristic_suggestion() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		fs::create_dir_all(ws.join("src/a")).unwrap();
+		fs::create_dir_all(ws.join("src/b")).unwrap();
+		let text = "// FILE: a/x.ts\nx\n// FILE: b/y.ts\ny\n";
+		// The fixture is one the core heuristic does answer.
+		let paths = ["a/x.ts".to_string(), "b/y.ts".to_string()];
+		assert!(matches!(
+			snip_core::restore::suggest_restore_base(
+				&ws.to_string_lossy(),
+				&paths,
+				&snip_core::restore::FsProbe,
+				None,
+			),
+			Some(RestoreBaseSuggestion {
+				base: RestoreBase::Add { .. },
+				..
+			})
+		));
+		let mut plan =
+			PastePreviewPlan::build_from_clipboard_text(text, &ws, &[], 1)
+				.unwrap();
+		plan.set_keep_relative("a").unwrap();
+		plan.set_keep_relative("b").unwrap();
+		assert!(plan.restore_hint().is_none());
+		let err = plan.choose_adjust_paths(true).unwrap_err();
+		assert_eq!(err.key, "paste_adjust_unavailable");
+	}
+
+	#[test]
+	fn a_commit_payload_has_no_restore_hint() {
+		let tmp = tempfile::tempdir().unwrap();
+		let path = tmp.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_modifying_a(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert!(plan.whole_commit);
+		assert!(plan.restore_hint().is_none());
+		assert!(plan.choose_adjust_paths(true).is_err());
+	}
+
 	#[test]
 	fn change_tree_groups_by_root_and_directory_in_display_order() {
 		let dir = tempfile::tempdir().unwrap();
@@ -3417,10 +3625,10 @@ pub(crate) mod tests {
 			.admit_ui(None, Some(&shell), None)
 			.unwrap();
 		lock_pending(&pool)
-			.enqueue(PasteRequest::Remap {
+			.enqueue(PasteRequest::Remap(Remap::Prefix {
 				prefix: "a".into(),
 				keep: true,
-			})
+			}))
 			.unwrap();
 		let work = PastePending::start(&pool, Some(&shell), CancelToken::new())
 			.unwrap()

@@ -3,8 +3,32 @@
 use super::*;
 use crate::paste::{commit_header_id, PasteCounts, RowControl};
 
+/// The restore-base hint's sentence, worded from the suggestion's data in
+/// the interface language. Never `RestoreBaseSuggestion::label`: that is
+/// core's English, written for the CLI.
+fn restore_hint_text(
+	hint: &snip_core::restore::RestoreBaseSuggestion,
+	loc: crate::i18n::Locale,
+) -> String {
+	match &hint.base {
+		snip_core::restore::RestoreBase::Strip { segment } => {
+			tf("paste_adjust_strip", loc, &[segment])
+		}
+		snip_core::restore::RestoreBase::Add { prefix } => {
+			tf("paste_adjust_add", loc, &[prefix])
+		}
+	}
+}
+
 impl WorkbenchModel {
 	// ───────────────────────── paste ─────────────────────────
+
+	/// The hint row's text for the open paste plan, if the row is shown.
+	#[cfg(test)]
+	pub(crate) fn paste_hint_text(&self) -> Option<String> {
+		let hint = self.paste.plan()?.restore_hint()?;
+		Some(restore_hint_text(hint, self.locale))
+	}
 
 	pub(super) fn disambiguate_candidate_labels(
 		candidates: &[PathBuf],
@@ -735,6 +759,69 @@ impl WorkbenchModel {
 				.children(probe(log, "paste-mappings"))
 		});
 
+		// The restore-base hint: a non-modal row, never applied unasked.
+		let restore_hint = plan.restore_hint().map(|hint| {
+			let text = restore_hint_text(hint, loc);
+			let adjusted = plan.adjust_paths;
+			let pick = |id: &'static str, label: &str, on: bool, tab: isize| {
+				button(
+					id,
+					label.to_string(),
+					if adjusted == on {
+						Btn::Primary
+					} else {
+						Btn::Default
+					},
+					!applying,
+					tab,
+				)
+				.debug_selector(|| id.to_string())
+				.when(!applying, |b| {
+					b.on_click(cx.listener(move |this, _, _, cx| {
+						// The choice already in force needs no re-plan.
+						let current = this
+							.paste
+							.plan()
+							.is_some_and(|p| p.adjust_paths == on);
+						if !current {
+							this.choose_paste_adjust(on, cx);
+						}
+					}))
+				})
+				.children(probe(log, id))
+			};
+			div()
+				.id("paste-restore-base")
+				.debug_selector(|| "paste-restore-base".into())
+				.relative()
+				.flex()
+				.flex_row()
+				.flex_wrap()
+				.items_center()
+				.flex_shrink_0()
+				.gap_x(px(6.))
+				.gap_y(px(4.))
+				.mx(px(8.))
+				.my(px(6.))
+				.px(px(8.))
+				.py(px(5.))
+				.rounded(px(4.))
+				.border_1()
+				.border_color(rgb(pal().divider))
+				.bg(rgb(pal().panel_bg))
+				.text_size(px(SMALL_TEXT))
+				.child(
+					clip_text(text.clone())
+						.id("paste-restore-base-text")
+						.flex_1()
+						.min_w(px(180.))
+						.tooltip(tip(text)),
+				)
+				.child(pick("paste-adjust", t("paste_adjust", loc), true, 52))
+				.child(pick("paste-as-is", t("paste_as_is", loc), false, 53))
+				.children(probe(log, "paste-restore-base"))
+		});
+
 		let is_diff = self.paste.detail().is_some_and(|p| p.is_diff);
 		let side = self.reader.diff_mode == DiffMode::SideBySide;
 
@@ -782,6 +869,7 @@ impl WorkbenchModel {
 						.child(err.render(loc)),
 				)
 			})
+			.children(restore_hint)
 			// Mappings and rows share one scroll region: it takes its content
 			// height up to 60% of the panel and shrinks first when the window
 			// is small, so the action bar above stays pinned and every row is

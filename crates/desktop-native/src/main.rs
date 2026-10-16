@@ -5104,13 +5104,13 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+	fn show_landed_plan(&mut self, remap: Option<paste::Remap>) {
 		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
 		let items_count = plan.items.len();
-		if let Some((prefix, keep)) = remap {
-			let dest = prefix_target(plan, &prefix, keep);
-			let keep_note = if keep { " keep=primary" } else { "" };
+		if let Some(paste::Remap::Prefix { prefix, keep }) = &remap {
+			let dest = prefix_target(plan, prefix, *keep);
+			let keep_note = if *keep { " keep=primary" } else { "" };
 			app_log!(
 				"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
 				prefix,
@@ -5118,6 +5118,8 @@ impl WorkbenchModel {
 				dest,
 				items_count
 			);
+		} else if let Some(paste::Remap::AdjustPaths(on)) = &remap {
+			app_log!("[APP:PASTE_ADJUSTED: on={} items={}]", on, items_count);
 		} else {
 			for choice in &plan.prefix_choices {
 				for (idx, path) in choice.candidates.iter().enumerate() {
@@ -5135,6 +5137,21 @@ impl WorkbenchModel {
 				plan.shown(&plan.destination),
 				plan.mapping_ready()
 			);
+			if let Some(hint) = plan.restore_hint() {
+				let (kind, value) = match &hint.base {
+					snip_core::restore::RestoreBase::Strip { segment } => {
+						("strip", segment)
+					}
+					snip_core::restore::RestoreBase::Add { prefix } => {
+						("add", prefix)
+					}
+				};
+				app_log!(
+					"[APP:PASTE_RESTORE_BASE: kind={} value={}]",
+					kind,
+					value
+				);
+			}
 		}
 		self.set_status("status_paste_preview", [items_count.to_string()]);
 		if self.paste.collapse_log(&mut self.bottom_visible) {
@@ -5220,6 +5237,17 @@ impl WorkbenchModel {
 		self.rebuild_paste_plan(prefix.to_string(), None, cx);
 	}
 
+	/// The restore-base hint's [Adjust paths] (`true`) or [Use as-is]. The
+	/// choice re-plans like a prefix row does, and the focus comes back to
+	/// the panel once the new plan lands, so the next Enter applies it.
+	pub fn choose_paste_adjust(&mut self, on: bool, cx: &mut Context<Self>) {
+		if self.refuse_while_applying("mapping", cx) || !self.accepting_work() {
+			return;
+		}
+		let r = self.paste.adjust_paths(on, self.preview.as_ref());
+		self.queue_remapped(r, cx);
+	}
+
 	pub fn choose_paste_prefix(
 		&mut self,
 		prefix: &str,
@@ -5252,7 +5280,16 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
+		let r = self.paste.remap(prefix, destination, self.preview.as_ref());
+		self.queue_remapped(r, cx);
+	}
+
+	fn queue_remapped(
+		&mut self,
+		remapped: paste::preview::Remapped,
+		cx: &mut Context<Self>,
+	) {
+		match remapped {
 			paste::preview::Remapped::NoPlan => {}
 			paste::preview::Remapped::Invalid(err) => {
 				self.set_status_msg(err);
@@ -15184,25 +15221,34 @@ mod tests {
 			             cx: &mut VisualTestContext| {
 				model.read_with(cx, |m, _| {
 					let plan = m.paste.plan().unwrap();
-					plan.items
-						.iter()
-						.map(|i| i.path.clone())
-						.collect::<Vec<_>>()
+					(
+						plan.items
+							.iter()
+							.map(|i| i.path.clone())
+							.collect::<Vec<_>>(),
+						plan.adjust_paths,
+					)
 				})
 			};
 			assert!(
 				cx.debug_bounds("paste-restore-base").is_some(),
 				"no restore-base hint row"
 			);
-			assert_eq!(paths(&model, cx), vec!["sub/a.ts".to_string()]);
+			assert_eq!(
+				paths(&model, cx),
+				(vec!["sub/a.ts".to_string()], false)
+			);
 
 			click(cx, "paste-adjust");
 			settle(cx);
-			assert_eq!(paths(&model, cx), vec!["a.ts".to_string()]);
+			assert_eq!(paths(&model, cx), (vec!["a.ts".to_string()], true));
 
 			click(cx, "paste-as-is");
 			settle(cx);
-			assert_eq!(paths(&model, cx), vec!["sub/a.ts".to_string()]);
+			assert_eq!(
+				paths(&model, cx),
+				(vec!["sub/a.ts".to_string()], false)
+			);
 
 			click(cx, "paste-adjust");
 			settle(cx);
@@ -15211,6 +15257,39 @@ mod tests {
 			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(fs::read_to_string(sub.join("a.ts")).unwrap(), "x");
 			assert!(!sub.join("sub").exists());
+		}
+
+		/// The hint is worded from the suggestion's data in the interface
+		/// language: core's English `label` never reaches a zh-TW screen.
+		#[gpui::test]
+		fn restore_base_hint_is_worded_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_PAYLOAD);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			let zh = model.read_with(cx, |m, _| {
+				assert_eq!(m.locale, crate::i18n::Locale::ZhTw);
+				m.paste_hint_text().expect("a hint row")
+			});
+			assert!(zh.contains("sub/"), "{zh}");
+			assert!(zh.contains('路'), "{zh}");
+			assert!(!zh.contains("remove the leading"), "{zh}");
+
+			model.update(cx, |m, cx| m.toggle_locale(cx));
+			settle(cx);
+			let en = model.read_with(cx, |m, _| {
+				assert_eq!(m.locale, crate::i18n::Locale::En);
+				m.paste_hint_text().expect("a hint row")
+			});
+			assert!(en.contains("sub/"), "{en}");
+			assert!(en.contains("extra"), "{en}");
+			assert!(!en.contains('路'), "{en}");
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
 		}
 
 		/// The worker's suggestion is shown too, adjusting re-plans on the

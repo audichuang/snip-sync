@@ -205,7 +205,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
 兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是右鍵複製、貼上預覽的逐檔勾選與時間軸),以及下列例外:
-1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`,都由 `pastetarget::import_mapping` 建成。
+1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 在剪貼簿帶 `clipcode-root`(因此沒有 prefix 列)而且有建議時,顯示非 modal 的提示列,附［調整路徑］與［照原樣］,預設照原樣,［調整路徑］等同 `--adjust-paths`(`PasteRoute.adjust_paths`,本機與遠端 worker 一致);有 prefix 列時維持逐 prefix 選擇(D4),不顯示提示列。兩者最後都是同一個 `ImportMapping`,都由 `pastetarget::import_mapping` 建成。
 2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
 
 舊的整體引擎 `copy::collect_copy_files` 與 `gitsrc::collect_payload` 已降級為測試 oracle,產品程式碼不再呼叫。`restore::plan_restore` 仍是 `plan_import_with` 內部每筆 entry 的規劃器(contract fixture 測的就是它),`restore::execute_restore_plan` 仍是檔案貼上的執行器。
