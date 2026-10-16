@@ -553,13 +553,24 @@ fn first_segments<'a>(multi: &[&'a str]) -> BTreeSet<&'a str> {
 		.collect()
 }
 
+/// Whether a `clipcode-root` value can name a folder: one path segment that
+/// is not `.`, `..` (a TS copy that resolved no root writes `..`), blank or
+/// inside `.git`; a separator rules out absolute paths and `..` segments. Anything else would become an `Add` prefix that
+/// the destination can never hold, or a probe of `<root>/..`, which is always
+/// a directory.
+fn is_folder_name(name: &str) -> bool {
+	!name.trim_matches(['.', ' ']).is_empty()
+		&& !name.contains(['/', '\\'])
+		&& !has_git_segment(name)
+}
+
 fn suggest_from_source_root(
 	primary_root: &str,
 	rels: &[&str],
 	probe: &dyn DirProbe,
 	source_root: &str,
 ) -> Option<RestoreBaseSuggestion> {
-	if rels.is_empty() {
+	if rels.is_empty() || !is_folder_name(source_root) {
 		return None;
 	}
 	let target_name = base_name_of(primary_root);
@@ -1380,6 +1391,70 @@ mod tests {
 			None
 		)
 		.is_none());
+	}
+
+	#[test]
+	fn restore_base_ignores_a_clipcode_root_that_is_not_a_folder_name() {
+		// `clipcode-root` should be a folder's basename. A TS copy that
+		// resolved no root writes `..`, and a hand-edited payload can carry
+		// anything: none of these names a folder the paths could belong to,
+		// yet every probe below says the joined path is a directory (as
+		// `/work/..` always is), so only the name itself can refuse them.
+		let degenerate = [
+			".",
+			"..",
+			" ",
+			"a/b",
+			"a\\b",
+			"../x",
+			"x/..",
+			"/abs",
+			"/",
+			"C:/x",
+			"C:\\x",
+			"\\\\server\\share",
+			".git",
+			"sub/.git",
+			".GIT.",
+		];
+		let paths = ["src/a.ts", "lib/b.ts"];
+		for root in degenerate {
+			let joined = format!("/work/{root}");
+			let p = probe(&[joined.as_str(), "/work"], &[root, "src"]);
+			assert!(
+				suggest("/work", &paths, &p, Some(root)).is_none(),
+				"clipcode-root {root:?} must not produce a suggestion"
+			);
+			assert!(
+				suggest("/work", &paths[..1], &p, Some(root)).is_none(),
+				"clipcode-root {root:?} must not produce a suggestion for one file"
+			);
+		}
+		// A strip would also be a suggestion about a folder that is not named.
+		let p = probe(&[], &[]);
+		assert!(suggest(
+			"/work/inv-svc-console",
+			&["inv-svc-console/src/a.ts", "inv-svc-console/lib/b.ts"],
+			&p,
+			Some(".."),
+		)
+		.is_none());
+		// An ordinary name still works next to them.
+		let p = probe(&["/work/inv-svc-console"], &[REPO]);
+		assert_eq!(
+			suggest("/work", &paths, &p, Some(REPO)).unwrap().base,
+			add(REPO)
+		);
+		// A name that merely contains dots or spaces is a real folder name.
+		for root in ["a.b", "my repo", "..x", "x..", "v1.2"] {
+			let joined = format!("/work/{root}");
+			let p = probe(&[joined.as_str()], &[root]);
+			assert_eq!(
+				suggest("/work", &paths, &p, Some(root)).unwrap().base,
+				add(root),
+				"{root:?} is a legal folder name"
+			);
+		}
 	}
 
 	#[test]
