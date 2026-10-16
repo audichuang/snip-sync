@@ -2206,9 +2206,16 @@ impl WorkbenchModel {
 				if model.details_generation != generation {
 					return;
 				}
+				// The details land where their commit is selected: on the
+				// view, or on the selection a file read holds aside. A
+				// commit nothing selects any more (a file took the
+				// selection) has nowhere to land (L8 of `invariants`).
+				let Some(view) = model.view_of_selected_commit(&id) else {
+					return;
+				};
 				// A failed read leaves the row's own fields on screen.
 				// Details are keyed by the row id (merged log: with repo).
-				model.commit_view.commit_details = res.ok().map(|mut d| {
+				view.commit_details = res.ok().map(|mut d| {
 					app_log!(
 						"[APP:COMMIT_DETAILS: {} branches={}]",
 						&d.sha[..7.min(d.sha.len())],
@@ -2220,6 +2227,27 @@ impl WorkbenchModel {
 				cx.notify();
 			});
 		});
+	}
+
+	/// The commit view a read about the selected commit `id` fills: the live
+	/// one, or the one a file read holds aside while it is open. `None` when
+	/// no selection is of that commit.
+	fn view_of_selected_commit(&mut self, id: &str) -> Option<&mut CommitView> {
+		if self.selected_commit.as_deref() == Some(id) {
+			return Some(&mut self.commit_view);
+		}
+		let held = self.held_selection.as_mut()?;
+		(held.commit.as_deref() == Some(id)).then_some(&mut held.view)
+	}
+
+	/// The commit view a read about the multi-selection fills, as
+	/// [`Self::view_of_selected_commit`]. `None` when nothing is multi-selected.
+	fn view_of_multi_selection(&mut self) -> Option<&mut CommitView> {
+		if !self.log_selected.is_empty() {
+			return Some(&mut self.commit_view);
+		}
+		let held = self.held_selection.as_mut()?;
+		(!held.log_selected.is_empty()).then_some(&mut held.view)
 	}
 
 	/// A new selection starts with its commit list collapsed.
@@ -2288,8 +2316,13 @@ impl WorkbenchModel {
 				if model.details_generation != generation {
 					return;
 				}
+				// A multi-selection nothing holds any more has no list to
+				// fill (L6 of `invariants`).
+				let Some(view) = model.view_of_multi_selection() else {
+					return;
+				};
 				app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
-				model.commit_view.selection_details = res;
+				view.selection_details = res;
 				cx.notify();
 			});
 		});
