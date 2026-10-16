@@ -74,8 +74,11 @@ pub(crate) fn with_log_tab<R>(tab: Option<u32>, f: impl FnOnce() -> R) -> R {
 	out
 }
 
-/// A `[APP:…]` line printed by a background tab carries ` ws_tab=<id>`
-/// inside its brackets; lines of the shown tab and of the root are left
+/// A `[APP:…]` line printed by a background tab carries `ws_tab=<id>` as
+/// the first field after `KIND: ` (`[APP:KIND: ws_tab=<id> <fields>]`, and
+/// `[APP:KIND: ws_tab=<id>]` for a line without fields). One rule for every
+/// line: what a line ends in (a folder named `... ws_tab=2`, a free-text id)
+/// never passes for the tag. Lines of the shown tab and of the root are left
 /// byte for byte as a one-tab script expects them.
 pub(crate) fn tag_line(line: String) -> String {
 	let Some(tab) = LOG_TAB.with(Cell::get) else {
@@ -88,36 +91,27 @@ pub(crate) fn tag_line(line: String) -> String {
 }
 
 fn tag_with(line: String, tab: u32) -> String {
-	if !line.starts_with("[APP:") || !line.ends_with(']') {
+	let Some(rest) = line.strip_prefix("[APP:") else {
+		return line;
+	};
+	if !line.ends_with(']') {
 		return line;
 	}
-	// A line that ends in an id keeps `id=` as its last field, whatever the
-	// id says: the tag is a field before it.
-	if let Some(at) = id_field_at(&line) {
-		return format!("{}ws_tab={tab} {}", &line[..at], &line[at..]);
+	let kind_len = rest
+		.find(|c: char| {
+			!(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+		})
+		.unwrap_or(rest.len());
+	if kind_len == 0 {
+		return line;
 	}
-	let body = &line[..line.len() - 1];
-	if body.contains(": ") {
-		format!("{body} ws_tab={tab}]")
-	} else {
-		format!("{body}: ws_tab={tab}]")
-	}
-}
-
-/// Where the `id=` field of a probe line starts: right after `[APP:<kind>: `
-/// or after the fixed fields, which have no ` id=` in them (a `by=` is
-/// written without spaces, `ui::probe_line`).
-fn id_field_at(line: &str) -> Option<usize> {
-	let rest = line.strip_prefix("[APP:")?;
-	let (kind, fields) = rest.split_once(": ")?;
-	if !crate::ui::probe_line::ID_LAST_KINDS.contains(&kind) {
-		return None;
-	}
-	let start = line.len() - fields.len();
-	if fields.starts_with("id=") {
-		Some(start)
-	} else {
-		fields.find(" id=").map(|at| start + at + 1)
+	let (kind, after) = rest.split_at(kind_len);
+	match after {
+		"]" => format!("[APP:{kind}: ws_tab={tab}]"),
+		_ => match after.strip_prefix(": ") {
+			Some(fields) => format!("[APP:{kind}: ws_tab={tab} {fields}"),
+			None => line,
+		},
 	}
 }
 

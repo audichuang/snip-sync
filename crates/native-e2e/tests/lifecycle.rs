@@ -1866,13 +1866,13 @@ fn opening_a_workspace_during_a_write_uses_a_new_tab() {
 		lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(10));
 	let done_line = done.last().unwrap();
 	assert!(
-		done_line.contains(" ws_tab=1]"),
+		done_line.contains("[APP:PASTE_DONE: ws_tab=1 "),
 		"the write finished in the background tab: {done_line}"
 	);
 	assert!(
 		done.iter().chain(&opened).all(|l| {
 			!(l.contains("ws_tab=1")
-				&& (l.contains("[APP:WORKSPACE: state=")
+				&& (l.contains("[APP:WORKSPACE: ws_tab=1 state=")
 					|| l.contains("phase=draining")))
 		}),
 		"the writing tab changed during its write: {opened:?} {done:?}"

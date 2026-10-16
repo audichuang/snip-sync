@@ -6,21 +6,9 @@
 //! An id can hold any character a repository, branch or file name can, so
 //! `id=` is the last field of every such line and the id runs to the closing
 //! `]`: `[APP:<KIND>: <fixed fields> id=<id>]`. A background tab's
-//! `ws_tab=<n>` is put in front of `id=` by [`crate::tabs::tag_line`], never
-//! behind it. See `docs/real-ui-operator-protocol.md`, section 3.
-
-/// The kinds of line that end in an id: the background tab's tag goes in
-/// front of it for these ([`crate::tabs::tag_line`]).
-pub(crate) const ID_LAST_KINDS: [&str; 8] = [
-	"CTRL_BOUNDS",
-	"CTRL_GONE",
-	"CTRL_DUPLICATE",
-	"CTRL_COVERED",
-	"TEXT_FIT",
-	"TEXT_FIT_DRIFT",
-	"TEXT_FIT_STYLE_DRIFT",
-	"TEXT_FIT_GONE",
-];
+//! `ws_tab=<n>` is the first field, right after `KIND: `
+//! ([`crate::tabs::tag_line`]), so nothing is ever appended behind the id. See
+//! `docs/real-ui-operator-protocol.md`, section 3.
 
 /// `[APP:CTRL_BOUNDS: x=<n> y=<n> w=<n> h=<n> id=<id>]`
 pub(crate) fn bounds(id: &str, v: [i32; 4]) -> String {

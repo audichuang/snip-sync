@@ -102,7 +102,7 @@ pub fn lookup_bounds(
 	bounds.get(first).copied()
 }
 
-// The `[APP:<KIND>: <fixed fields> [ws_tab=<n> ]id=<id>]` lines carry an id that
+// The `[APP:<KIND>: [ws_tab=<n> ]<fixed fields> id=<id>]` lines carry an id that
 // can hold any character a repository, branch or file name can: spaces, `=`,
 // `:`, `]`, even a field's own name (`x=`, `by=`, `ws_tab=2`). So `id=` is the
 // last field of its line and the id is everything after it up to the closing
@@ -230,8 +230,8 @@ mod tests {
 	use super::*;
 	use std::collections::HashMap;
 
-	/// The tail a background tab's line gets: the tag is a field before
-	/// `id=`, which is the last field of the line.
+	/// What a background tab's line gets right after `KIND: `: the tag is
+	/// the first field, so `id=` stays the last field of the line.
 	const TAGS: [&str; 2] = ["", "ws_tab=2 "];
 
 	/// Ids a repository, a branch or a file can give, whole: spaces, `=`, `:`,

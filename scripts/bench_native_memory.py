@@ -516,32 +516,35 @@ THREE_TABS = 3
 # Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
 APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
-# The `[APP:<KIND>: <fixed fields> [ws_tab=<n> ]id=<id>]` lines carry an id that can hold any character
+# The `[APP:<KIND>: [ws_tab=<n> ]<fixed fields> id=<id>]` lines carry an id that can hold any character
 # a repository, branch or file name can: spaces, `=`, `:`, `]`, even a field's own name (`x=`, `by=`,
 # `ws_tab=2`). So `id=` is the last field of its line and the id is everything after it up to the
 # closing `]`; every other field comes before it and has no space in its value, so no reader cuts an
 # id at a space or a `=`, and none reads anything from the end of the line. A background tab's
-# `ws_tab=<n>` is a field before `id=`. `crates/native-e2e/src/lib.rs` reads the same lines by the
+# `ws_tab=<n>` is the first field of EVERY line it prints, right after `KIND: `, never at the end
+# (a folder can be named `x ws_tab=2`). `crates/native-e2e/src/lib.rs` reads the same lines by the
 # same rule; scripts/real_ui_round.py and scripts/check_native_ime.py use these patterns instead of
 # their own (docs/real-ui-operator-protocol.md, section 3).
 APP_TAB = r"(?:ws_tab=\d+ )?"
 BOUNDS_RE = re.compile(
-    rf"\[APP:CTRL_BOUNDS: x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
+    rf"\[APP:CTRL_BOUNDS: {APP_TAB}x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+) id=(?P<id>.*)\]\s*$"
 )
 CTRL_GONE_RE = re.compile(rf"\[APP:CTRL_GONE: {APP_TAB}id=(?P<id>.*)\]\s*$")
-# The covering control is written without a space, `]`, `%` or line break (`%20`, `%5D`, `%25`, `%0A`, `%0D`).
-CTRL_COVERED_RE = re.compile(rf"\[APP:CTRL_COVERED: by=(?P<by>\S*) {APP_TAB}id=(?P<id>.*)\]\s*$")
+# The covering control is written without a space, `]`, `%` or line break (`%20`, `%5D`, `%25`, `%0A`, `%0D`)
+# and `crates/desktop-native/src/ui/probe_line.rs` leaves any other character as it is, so `by` ends at
+# the first space (the Rust reader cuts at ' ' too), whatever else it holds: a Tab, a no-break space, U+3000.
+CTRL_COVERED_RE = re.compile(rf"\[APP:CTRL_COVERED: {APP_TAB}by=(?P<by>[^ ]*) id=(?P<id>.*)\]\s*$")
 TEXT_FIT_RE = re.compile(
-    r"\[APP:TEXT_FIT: rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
+    rf"\[APP:TEXT_FIT: {APP_TAB}rule=(?P<rule>\S+) natural=(?P<natural>-?\d+) floor=(?P<floor>-?\d+) "
     r"fit=(?P<fit>-|-?\d+) drawn=(?P<drawn>-?\d+) visible=(?P<visible>-?\d+) clipped=(?P<clipped>[01]) "
-    rf"cut=(?P<cut>[01]) shown=(?P<shown>\d+)/(?P<total>\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
+    r"cut=(?P<cut>[01]) shown=(?P<shown>\d+)/(?P<total>\d+) id=(?P<id>.*)\]\s*$"
 )
 TEXT_FIT_DRIFT_RE = re.compile(
-    rf"\[APP:TEXT_FIT_DRIFT: fit=(?P<fit>-?\d+) drawn=(?P<drawn>-?\d+) {APP_TAB}id=(?P<id>.*)\]\s*$"
+    rf"\[APP:TEXT_FIT_DRIFT: {APP_TAB}fit=(?P<fit>-?\d+) drawn=(?P<drawn>-?\d+) id=(?P<id>.*)\]\s*$"
 )
 # A family can have spaces ("JetBrains Mono/13/400"), so the styles run to the next field.
 TEXT_FIT_STYLE_DRIFT_RE = re.compile(
-    rf"\[APP:TEXT_FIT_STYLE_DRIFT: measured=(?P<measured>.+?) drawn=(?P<drawn>.+?) {APP_TAB}id=(?P<id>.*)\]\s*$"
+    rf"\[APP:TEXT_FIT_STYLE_DRIFT: {APP_TAB}measured=(?P<measured>.+?) drawn=(?P<drawn>.+?) id=(?P<id>.*)\]\s*$"
 )
 TEXT_FIT_GONE_RE = re.compile(rf"\[APP:TEXT_FIT_GONE: {APP_TAB}id=(?P<id>.*)\]\s*$")
 
@@ -569,7 +572,7 @@ def control_event_id(line: str) -> str | None:
     return m["id"] if m else None
 
 
-REPO_SELECT_RE = re.compile(r"\[APP:REPO_SELECTING: (?P<idx>\d+) \((?P<name>[^)]+)\)")
+REPO_SELECT_RE = re.compile(rf"\[APP:REPO_SELECTING: {APP_TAB}(?P<idx>\d+) \((?P<name>[^)]+)\)")
 FILE_HEADER_RE = re.compile(
     rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*([^\r\n]+)\r?\n"
 )
@@ -2215,31 +2218,27 @@ def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
 
 
 TAB_ACTIVE_RE = re.compile(r"\[APP:WS_TAB_ACTIVE: id=(\d+) ")
-TAB_TAG_RE = re.compile(r" ws_tab=(\d+)\]$")
-ID_LAST_KIND_RE = re.compile(
-    r"\[APP:(?:CTRL_BOUNDS|CTRL_GONE|CTRL_DUPLICATE|CTRL_COVERED|TEXT_FIT|TEXT_FIT_DRIFT|TEXT_FIT_STYLE_DRIFT|TEXT_FIT_GONE): "
-)
-FIELD_TAB_RE = re.compile(r"(?:^| )ws_tab=(\d+) $")
+# A background tab's tag is the first field after `KIND: `, on every line it prints.
+TAB_TAG_RE = re.compile(r"^\[APP:([A-Z0-9_]+): ws_tab=(\d+)(?: (.*))?\]$", re.DOTALL)
 
 
 def line_tab(line: str) -> int | None:
-    """The background workspace tab that printed `line`, None for the shown tab and the root.
+    """The background workspace tab that printed `line`, None for the shown tab and the root."""
+    tag = TAB_TAG_RE.match(line)
+    return int(tag[2]) if tag else None
 
-    A line that ends in a free-text id has `ws_tab=<n>` as a field before `id=`, which is the
-    last field (an id can itself end in ` ws_tab=2`); any other line has it before its `]`."""
-    kind = ID_LAST_KIND_RE.match(line)
-    if kind:
-        rest = line[kind.end():]
-        at = 0 if rest.startswith("id=") else rest.find(" id=") + 1
-        tag = FIELD_TAB_RE.search(rest[:at]) if at > 0 else None
-        return int(tag[1]) if tag else None
-    tag = TAB_TAG_RE.search(line)
-    return int(tag[1]) if tag else None
+
+def untagged(line: str) -> str:
+    """`line` as the shown tab prints it: without the background tab's `ws_tab=<n>` field."""
+    tag = TAB_TAG_RE.match(line)
+    if not tag:
+        return line
+    return f"[APP:{tag[1]}: {tag[3]}]" if tag[3] is not None else f"[APP:{tag[1]}]"
 
 
 def open_repo_name(lines: list[str]) -> str | None:
     """Basename of the repo the shown workspace tab last selected, or None after its
-    workspace changed. A background tab tags its lines with ` ws_tab=<id>`; the shown
+    workspace changed. A background tab tags its lines with `ws_tab=<id>` after `KIND: `; the shown
     tab's are untagged, so each line belongs to the tab `WS_TAB_ACTIVE` last named."""
     shown: int | None = None
     selected: dict[int | None, str | None] = {}
@@ -2250,10 +2249,11 @@ def open_repo_name(lines: list[str]) -> str | None:
             continue
         tag = line_tab(line)
         tab = tag if tag is not None else shown
-        if "[APP:WORKSPACE: state=" in line:
+        body = untagged(line)
+        if "[APP:WORKSPACE: state=" in body:
             selected[tab] = None
-        elif "[APP:REPO_SELECTING:" in line:
-            selected[tab] = parse_repo_select(line)[1]
+        elif "[APP:REPO_SELECTING:" in body:
+            selected[tab] = parse_repo_select(body)[1]
     return selected.get(shown)
 
 

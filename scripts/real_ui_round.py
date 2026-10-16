@@ -717,8 +717,8 @@ def parse_latest_viewport(lines: List[str]) -> Tuple[int, int]:
 
 
 # `TEXT_FIT` is the app's check of one text's box against the rule of its role
-# (docs/adr/0005-one-fit-rule-table.md). A line of a background tab has `ws_tab=<id>` as a field
-# before `id=`, which is the last field.
+# (docs/adr/0005-one-fit-rule-table.md). A line of a background tab has `ws_tab=<id>` as its first
+# field, right after `KIND: `; `id=` is the last field.
 RE_TEXT_FIT = TEXT_FIT_RE
 RE_TEXT_FIT_DRIFT = TEXT_FIT_DRIFT_RE
 # A box drawn in another family, size or weight than the one its floor and counts
