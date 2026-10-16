@@ -191,6 +191,231 @@ impl std::fmt::Display for CanonicalRootId {
 	}
 }
 
+/// A paste folder that may not exist yet: its nearest existing ancestor
+/// (canonical) and the names below it still to be made. A folder that
+/// exists has an empty tail and is exactly its `CanonicalRootId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlacedRoot {
+	anchor: CanonicalRootId,
+	tail: Vec<String>,
+}
+
+/// Why a paste folder cannot be used as a destination.
+#[derive(Debug, thiserror::Error)]
+pub enum DestinationError {
+	#[error("'{}' is not a folder", .path.display())]
+	NotADirectory { path: PathBuf },
+	#[error("'{}' is outside the workspace", .path.display())]
+	OutsideBound { path: PathBuf },
+	#[error("'{name}' cannot be a folder name here")]
+	InvalidName { name: String },
+	#[error(transparent)]
+	Io(#[from] io::Error),
+}
+
+impl DestinationError {
+	/// What a front end words: the variant survives into `PasteError::reason()`.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::NotADirectory { path } => Reason::NotRegularFile {
+				path: path.display().to_string(),
+			},
+			Self::OutsideBound { path } => Reason::OutsideRoot {
+				path: path.display().to_string(),
+			},
+			Self::InvalidName { name } => {
+				Reason::UnsafePath { path: name.clone() }
+			}
+			Self::Io(e) => io_reason(e, ""),
+		}
+	}
+}
+
+/// Wraps the error as the payload of an `io::Error` (NotADirectory keeps the
+/// kind of that name, OutsideBound is PermissionDenied, InvalidName is
+/// InvalidInput; `Io(e)` is `e` itself), so `PasteError::Destination` keeps
+/// its shape and `PasteError::reason()` can still downcast it.
+impl From<DestinationError> for io::Error {
+	fn from(err: DestinationError) -> Self {
+		let kind = match &err {
+			DestinationError::NotADirectory { .. } => {
+				io::ErrorKind::NotADirectory
+			}
+			DestinationError::OutsideBound { .. } => {
+				io::ErrorKind::PermissionDenied
+			}
+			DestinationError::InvalidName { .. } => io::ErrorKind::InvalidInput,
+			DestinationError::Io(_) => {
+				let DestinationError::Io(e) = err else {
+					unreachable!()
+				};
+				return e;
+			}
+		};
+		io::Error::new(kind, err)
+	}
+}
+
+impl From<CanonicalRootId> for PlacedRoot {
+	fn from(anchor: CanonicalRootId) -> Self {
+		Self {
+			anchor,
+			tail: Vec::new(),
+		}
+	}
+}
+
+impl PlacedRoot {
+	/// Reads `path` (absolute) and finds the folder it names: the deepest
+	/// ancestor that exists as the anchor, the names below it as the tail.
+	/// Writes nothing. `bound` is a folder the anchor must lie in, symlinks
+	/// resolved; a name below the anchor is made there, so it cannot leave.
+	///
+	/// A name that is not made yet must be a plain, ordinary folder name:
+	/// no `..`, `.git`, character Windows or a path separator refuses,
+	/// trailing dot or space, or Windows reserved name; and nothing is made
+	/// inside a Git directory. A `..` in the part that exists is resolved by
+	/// the OS, as `CanonicalRootId::new` always did.
+	pub fn resolve(
+		bound: Option<&Path>,
+		path: &Path,
+	) -> Result<Self, DestinationError> {
+		if !path.is_absolute() {
+			return Err(DestinationError::InvalidName {
+				name: path.display().to_string(),
+			});
+		}
+		let mut cur = path;
+		let mut tail: Vec<String> = Vec::new();
+		let anchor = loop {
+			match fs::symlink_metadata(cur) {
+				Ok(meta) if meta.is_dir() => break CanonicalRootId::new(cur)?,
+				Ok(meta) if meta.file_type().is_symlink() => {
+					if fs::metadata(cur).is_ok_and(|m| m.is_dir()) {
+						break CanonicalRootId::new(cur)?;
+					}
+					return Err(DestinationError::NotADirectory {
+						path: cur.to_path_buf(),
+					});
+				}
+				Ok(_) => {
+					return Err(DestinationError::NotADirectory {
+						path: cur.to_path_buf(),
+					})
+				}
+				Err(e)
+					if matches!(
+						e.kind(),
+						io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+					) =>
+				{
+					match cur.components().next_back() {
+						Some(std::path::Component::Normal(name)) => {
+							let Some(name) = name.to_str() else {
+								return Err(DestinationError::InvalidName {
+									name: name.to_string_lossy().into_owned(),
+								});
+							};
+							tail.push(name.to_string());
+						}
+						Some(std::path::Component::CurDir) => {}
+						Some(other) => {
+							return Err(DestinationError::InvalidName {
+								name: other
+									.as_os_str()
+									.to_string_lossy()
+									.into_owned(),
+							})
+						}
+						None => return Err(DestinationError::Io(e)),
+					}
+					match cur.parent() {
+						Some(parent) => cur = parent,
+						None => return Err(DestinationError::Io(e)),
+					}
+				}
+				Err(e) => return Err(DestinationError::Io(e)),
+			}
+		};
+		tail.reverse();
+		for name in &tail {
+			let plain = sanitize_relative_path(name).as_deref()
+				== Some(name.as_str())
+				&& !name.contains('/')
+				&& !paths::has_git_segment(name)
+				&& !paths::is_unfit_new_folder_name(name);
+			if !plain {
+				return Err(DestinationError::InvalidName {
+					name: name.clone(),
+				});
+			}
+		}
+		if let Some(bound) = bound {
+			let bound_real = dunce::canonicalize(bound)?;
+			if !paths::is_contained(anchor.path(), &bound_real) {
+				return Err(DestinationError::OutsideBound {
+					path: anchor.path().to_path_buf(),
+				});
+			}
+		}
+		let placed = Self { anchor, tail };
+		if !placed.tail.is_empty() && paths::lands_in_git_dir(&placed.path()) {
+			return Err(DestinationError::InvalidName {
+				name: placed.tail[0].clone(),
+			});
+		}
+		Ok(placed)
+	}
+
+	/// The nearest existing ancestor.
+	pub fn anchor(&self) -> &CanonicalRootId {
+		&self.anchor
+	}
+
+	/// The names below the anchor that are not made yet, shallow to deep.
+	pub fn tail(&self) -> &[String] {
+		&self.tail
+	}
+
+	/// The tail joined with `/`; empty when the folder exists.
+	pub fn tail_rel(&self) -> String {
+		self.tail.join("/")
+	}
+
+	/// The folder itself, lexically: the anchor with the tail below it.
+	pub fn path(&self) -> PathBuf {
+		let mut path = self.anchor.path().to_path_buf();
+		path.extend(&self.tail);
+		path
+	}
+
+	/// anchor/t1, anchor/t1/t2, ... (shallow to deep); empty when it exists.
+	/// Built with `PathBuf::push` per name, never by joining strings: the
+	/// keys must compare equal to `missing_dirs`, which come from
+	/// `op.absolute_path.parent()` (Windows separators included).
+	pub fn new_chain(&self) -> Vec<PathBuf> {
+		let mut path = self.anchor.path().to_path_buf();
+		self.tail
+			.iter()
+			.map(|name| {
+				path.push(name);
+				path.clone()
+			})
+			.collect()
+	}
+
+	/// Heap storage owned by this value; the enclosing owner counts the
+	/// inline struct once.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.tail.iter().fold(
+			self.anchor.retained_heap_bytes().saturating_add(
+				self.tail.capacity() * std::mem::size_of::<String>(),
+			),
+			|bytes, name| bytes.saturating_add(name.capacity()),
+		)
+	}
+}
+
 /// Where a file was selected from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceKind {
