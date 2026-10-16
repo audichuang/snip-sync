@@ -102,6 +102,26 @@ pub fn lookup_bounds(
 	bounds.get(first).copied()
 }
 
+/// Parses a `[APP:CTRL_BOUNDS: id=<id> x=<n> y=<n> w=<n> h=<n>]` line into
+/// the control id and its `[x, y, w, h]`.
+pub fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
+	let rest = line.split("[APP:CTRL_BOUNDS: id=").nth(1)?;
+	let (id, nums) = rest.rsplit_once(" x=")?;
+	let mut vals = nums.trim_end_matches(']').split(' ');
+	let x = vals.next()?.parse().ok()?;
+	let mut v = [x, 0, 0, 0];
+	for slot in &mut v[1..] {
+		*slot = vals.next()?.split('=').nth(1)?.parse().ok()?;
+	}
+	Some((id.to_string(), v))
+}
+
+/// Parses a `[APP:CTRL_GONE: id=<id>]` line.
+pub fn parse_gone(line: &str) -> Option<String> {
+	let rest = line.split("[APP:CTRL_GONE: id=").nth(1)?;
+	Some(rest.strip_suffix(']')?.to_string())
+}
+
 /// Parses a duplicate probe line `[APP:CTRL_DUPLICATE: id=...]`.
 pub fn parse_duplicate(line: &str) -> Option<String> {
 	let rest = line.split("[APP:CTRL_DUPLICATE: id=").nth(1)?;
@@ -205,6 +225,107 @@ mod tests {
 			Some("text-fit:row:ab12:date")
 		);
 		assert_eq!(parse_text_fit_gone(line), None);
+	}
+
+	/// Ids a repository or a branch can give: spaces, `=`, `:`, a `]`, and
+	/// words the line's own fields use. A line is read from its end, where
+	/// its fixed fields are, so none of them can move the id's end.
+	const ODD_IDS: [&str; 6] = [
+		"row:my repo:ab12cd3",
+		"row:a=b:c d:ab12cd3",
+		"row:odd ] name:ab12cd3",
+		"row:x x=1 y=2 w=3 h=4:ab12cd3",
+		"row:a rule=whole by=b fit=1 drawn=2:ab12cd3",
+		"row: lead and trail :ab12cd3",
+	];
+
+	/// The tail a background tab's line gets inside its brackets.
+	const TAGS: [&str; 2] = ["", " ws_tab=2"];
+
+	fn tagged(line: &str, tag: &str) -> String {
+		format!("{}{tag}]", line.strip_suffix(']').unwrap())
+	}
+
+	#[test]
+	fn any_character_in_an_id_is_read_back() {
+		for id in ODD_IDS {
+			for tag in TAGS {
+				let fit = tagged(&format!("[APP:TEXT_FIT: id=text-fit:{id}:subject rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79]"), tag);
+				assert_eq!(
+					parse_text_fit(&fit),
+					Some((format!("text-fit:{id}:subject"), true)),
+					"{fit}"
+				);
+				assert_eq!(
+					parse_text_fit_clipped(&fit),
+					Some(format!("text-fit:{id}:subject")),
+					"{fit}"
+				);
+				let drift = tagged(&format!("[APP:TEXT_FIT_DRIFT: id=text-fit:{id}:date fit=126 drawn=120]"), tag);
+				assert_eq!(
+					parse_text_fit_drift(&drift),
+					Some(format!("text-fit:{id}:date")),
+					"{drift}"
+				);
+				let style = tagged(&format!("[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:{id}:author measured=JetBrains Mono/13/400 drawn=Inter/13/600]"), tag);
+				assert_eq!(
+					parse_text_fit_drift(&style),
+					Some(format!("text-fit:{id}:author")),
+					"{style}"
+				);
+				let gone = tagged(
+					&format!("[APP:TEXT_FIT_GONE: id=text-fit:{id}:date]"),
+					tag,
+				);
+				assert_eq!(
+					parse_text_fit_gone(&gone),
+					Some(format!("text-fit:{id}:date")),
+					"{gone}"
+				);
+				let bounds = tagged(&format!("[APP:CTRL_BOUNDS: id=commit-row:{id} x=12 y=-3 w=100 h=20]"), tag);
+				assert_eq!(
+					parse_bounds(&bounds),
+					Some((format!("commit-row:{id}"), [12, -3, 100, 20])),
+					"{bounds}"
+				);
+				let ctrl_gone = tagged(
+					&format!("[APP:CTRL_GONE: id=commit-row:{id}]"),
+					tag,
+				);
+				assert_eq!(
+					parse_gone(&ctrl_gone),
+					Some(format!("commit-row:{id}")),
+					"{ctrl_gone}"
+				);
+				let dup = tagged(
+					&format!("[APP:CTRL_DUPLICATE: id=commit-row:{id}]"),
+					tag,
+				);
+				assert_eq!(
+					parse_duplicate(&dup),
+					Some(format!("commit-row:{id}")),
+					"{dup}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn a_covered_pair_splits_at_the_last_by() {
+		for tag in TAGS {
+			let line = tagged(
+				"[APP:CTRL_COVERED: id=commit-row:my repo:ab12cd3 by=btn-log-refresh]",
+				tag,
+			);
+			assert_eq!(
+				parse_covered(&line),
+				Some((
+					"commit-row:my repo:ab12cd3".to_string(),
+					"btn-log-refresh".to_string()
+				)),
+				"{line}"
+			);
+		}
 	}
 
 	#[test]

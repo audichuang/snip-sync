@@ -25,8 +25,8 @@ use snip_core::clip;
 use snip_core::commits;
 
 use snip_native_e2e::{
-	native_bin, parse_covered, parse_duplicate, parse_text_fit,
-	parse_text_fit_drift, parse_text_fit_gone, scaled,
+	native_bin, parse_bounds, parse_covered, parse_duplicate, parse_gone,
+	parse_text_fit, parse_text_fit_drift, parse_text_fit_gone, scaled,
 };
 
 fn clipboard_matching(what: &str, matches: impl FnMut(&str) -> bool) -> String {
@@ -69,23 +69,6 @@ type Viewport = Arc<Mutex<(i32, i32)>>;
 /// How long a confirmed paste write is held back in E2E mode, so the test
 /// can prove the confirmation controls are locked while it runs.
 const APPLY_DELAY_MS: u64 = 2500;
-
-fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
-	let rest = line.split("[APP:CTRL_BOUNDS: id=").nth(1)?;
-	let (id, nums) = rest.rsplit_once(" x=")?;
-	let mut vals = nums.trim_end_matches(']').split(' ');
-	let x = vals.next()?.parse().ok()?;
-	let mut v = [x, 0, 0, 0];
-	for slot in &mut v[1..] {
-		*slot = vals.next()?.split('=').nth(1)?.parse().ok()?;
-	}
-	Some((id.to_string(), v))
-}
-
-fn parse_gone(line: &str) -> Option<String> {
-	let rest = line.split("[APP:CTRL_GONE: id=").nth(1)?;
-	Some(rest.strip_suffix(']')?.to_string())
-}
 
 fn parse_viewport(line: &str) -> Option<(i32, i32)> {
 	let rest = line.split("[APP:VIEWPORT: ").nth(1)?;

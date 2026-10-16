@@ -46,6 +46,23 @@ class Bitmap:
         return self._lit.get(xy, (0, 0, 0))
 
 
+class TestBoundsOfOddIds(unittest.TestCase):
+    """An id runs to the line's fixed fields, whatever characters it holds."""
+
+    def test_bounds_and_gone_of_every_odd_id(self) -> None:
+        for control in (
+            "commit-row:my repo:ab12cd3",
+            "commit-row:a=b:c d:ab12cd3",
+            "commit-row:odd ] name:ab12cd3",
+            "commit-row:x x=1 y=2 w=3 h=4:ab12cd3",
+        ):
+            with self.subTest(id=control):
+                lines = [f"[APP:CTRL_BOUNDS: id={control} x=7 y=-8 w=90 h=12]"]
+                self.assertEqual(ime.parse_bounds(lines), {control: (7, -8, 90, 12)})
+                lines.append(f"[APP:CTRL_GONE: id={control}]")
+                self.assertEqual(ime.parse_bounds(lines), {})
+
+
 class TestImeGate(unittest.TestCase):
     def test_private_bus_starts_with_long_evidence_path_and_cleans_its_socket(self):
         missing = ime.missing_tools(("dbus-daemon", "dbus-send"))

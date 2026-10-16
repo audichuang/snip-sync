@@ -194,6 +194,26 @@ class TestBoundsAndGone(unittest.TestCase):
         self.assertNotIn("ref:refs/tags/v0.1.0", bounds)
 
 
+class TestBoundsOfOddIds(unittest.TestCase):
+    """An id runs to the line's fixed fields, whatever characters it holds."""
+
+    IDS = [
+        "commit-row:my repo:ab12cd3",
+        "commit-row:a=b:c d:ab12cd3",
+        "commit-row:odd ] name:ab12cd3",
+        "commit-row:x x=1 y=2 w=3 h=4:ab12cd3",
+        "commit-row: lead and trail :ab12cd3",
+    ]
+
+    def test_bounds_and_gone_of_every_odd_id(self) -> None:
+        for control in self.IDS:
+            with self.subTest(id=control):
+                lines = [f"[APP:CTRL_BOUNDS: id={control} x=7 y=-8 w=90 h=12]"]
+                self.assertEqual(parse_bounds(lines), {control: (7, -8, 90, 12)})
+                lines.append(f"[APP:CTRL_GONE: id={control}]")
+                self.assertEqual(parse_bounds(lines), {})
+
+
 class TestParseXwininfo(unittest.TestCase):
     def test_parse_valid_xwininfo(self) -> None:
         sample = """

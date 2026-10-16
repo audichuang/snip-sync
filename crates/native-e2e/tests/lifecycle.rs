@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use snip_native_e2e::{native_bin, scaled};
+use snip_native_e2e::{native_bin, parse_bounds, parse_gone, scaled};
 
 type Bounds = Arc<Mutex<std::collections::HashMap<String, [i32; 4]>>>;
 type Viewport = Arc<Mutex<(i32, i32)>>;
@@ -216,23 +216,6 @@ fn snapshot(pid: u32, start: &str) {
 		"[LIFECYCLE-TEST] pid={pid} starttime={start} alive={} children={kids:?}",
 		same_proc(pid, start)
 	);
-}
-
-fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
-	let rest = line.split("[APP:CTRL_BOUNDS: id=").nth(1)?;
-	let (id, nums) = rest.rsplit_once(" x=")?;
-	let mut vals = nums.trim_end_matches(']').split(' ');
-	let x = vals.next()?.parse().ok()?;
-	let mut v = [x, 0, 0, 0];
-	for slot in &mut v[1..] {
-		*slot = vals.next()?.split('=').nth(1)?.parse().ok()?;
-	}
-	Some((id.to_string(), v))
-}
-
-fn parse_gone(line: &str) -> Option<String> {
-	let rest = line.split("[APP:CTRL_GONE: id=").nth(1)?;
-	Some(rest.strip_suffix(']')?.to_string())
 }
 
 fn parse_viewport(line: &str) -> Option<(i32, i32)> {

@@ -264,6 +264,88 @@ class TestTextFit(unittest.TestCase):
             self.assertIn("chip-user", bad.stderr)
 
 
+# Ids a repository or a branch can give: spaces, `=`, `:`, a `]`, and words the
+# line's own fields use. A line is read from its end, where its fixed fields
+# are, so none of them can move the id's end.
+ODD_ROW_KEYS = [
+    "my repo:ab12cd3",
+    "a=b:c d:ab12cd3",
+    "odd ] name:ab12cd3",
+    "x x=1 y=2 w=3 h=4:ab12cd3",
+    "a rule=whole fit=1 drawn=2:ab12cd3",
+    " lead and trail :ab12cd3",
+]
+
+
+class TestIdsWithAnyCharacter(unittest.TestCase):
+    def test_a_text_fit_line_of_every_odd_id_is_read(self):
+        for key in ODD_ROW_KEYS:
+            tid = f"text-fit:row:{key}:subject"
+            for tag in ("", " ws_tab=2"):
+                with self.subTest(id=tid, tag=tag):
+                    line = fit_line(tid)[:-1] + tag + "]"
+                    entries, drift = rur.parse_text_fit([line])
+                    self.assertEqual(list(entries), [tid])
+                    self.assertEqual(drift, [])
+
+    def test_a_clipped_or_short_text_of_an_odd_id_fails_the_check(self):
+        for key in ODD_ROW_KEYS:
+            tid = f"text-fit:row:{key}:subject"
+            with self.subTest(id=tid):
+                header = fit_line("text-fit:log-header:ref-hint", rule="kv6", fit="-", shown="8/8")
+                entries, drift = rur.parse_text_fit(
+                    [header, fit_line(tid, clipped=1, shown="1/20", visible=60)]
+                )
+                problems = rur.text_fit_problems(entries, drift)
+                self.assertTrue(any("clipped" in p and tid in p for p in problems), problems)
+                self.assertTrue(any("rule" in p and tid in p for p in problems), problems)
+
+    def test_drifts_and_gone_lines_of_an_odd_id_are_read(self):
+        for key in ODD_ROW_KEYS:
+            tid = f"text-fit:row:{key}:author"
+            with self.subTest(id=tid):
+                width = [fit_line(tid), f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]"]
+                self.assertEqual(rur.parse_text_fit(width)[1], [tid])
+                style = [
+                    fit_line(tid),
+                    f"[APP:TEXT_FIT_STYLE_DRIFT: id={tid} measured=JetBrains Mono/13/400 drawn=Inter/13/600]",
+                ]
+                self.assertEqual(rur.parse_text_fit(style)[1], [tid])
+                gone = [*width, f"[APP:TEXT_FIT_GONE: id={tid}]"]
+                entries, drift = rur.parse_text_fit(gone)
+                self.assertEqual((list(entries), drift), ([], []))
+
+    def test_the_subcommand_check_fails_on_the_row_of_a_repo_with_a_space(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "app.log"
+            log.write_text(
+                "\n".join(
+                    [
+                        fit_line("text-fit:log-header:ref-hint", rule="kv6", fit="-", shown="8/8"),
+                        fit_line("text-fit:row:my repo:ab12cd3:subject", clipped=1, shown="1/20", visible=60),
+                    ]
+                )
+                + "\n"
+            )
+            out = subprocess.run(
+                [sys.executable, os.path.join(SCRIPTS_DIR, "real_ui_round.py"), "text-fit", str(log), "--check"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(out.returncode, 1, out.stdout)
+            self.assertIn("my repo", out.stderr)
+
+    def test_control_bounds_and_gone_of_an_odd_id_are_read(self):
+        for key in ODD_ROW_KEYS:
+            cid = f"commit-row:{key}"
+            with self.subTest(id=cid):
+                lines = [f"[APP:CTRL_BOUNDS: id={cid} x=10 y=20 w=80 h=30]"]
+                match = rur.parse_control_bounds_from_lines(lines, cid)
+                self.assertEqual((match.control_id, match.x, match.w), (cid, 10.0, 80.0))
+                gone = [*lines, f"[APP:CTRL_GONE: id={cid}]"]
+                with self.assertRaisesRegex(ValueError, "missing-control"):
+                    rur.parse_control_bounds_from_lines(gone, cid)
+
+
 class TestAppWindowTitle(unittest.TestCase):
     def test_bare_title_matches(self):
         self.assertTrue(rur.is_app_window_title("snip-sync"))
