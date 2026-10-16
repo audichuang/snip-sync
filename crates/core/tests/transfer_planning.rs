@@ -8239,12 +8239,188 @@ fn test_matches_preview_compares_the_symlinks_the_preview_recorded() {
 		.insert(key, dunce::canonicalize(dst.path().join("real2")).unwrap());
 	assert!(!moved.matches_preview(&preview));
 
-	// Fewer symlinks than the preview saw is fine; so is a preview from an
-	// older master that recorded none.
+	// A symlink the preview saw that is gone now is a change too: the plan
+	// made again would write where the preview did not show. Only a preview
+	// from an older master that recorded none is not compared.
 	let mut fewer = preview.clone();
 	fewer.symlinked_dirs.as_mut().unwrap().clear();
-	assert!(fewer.matches_preview(&preview));
+	assert!(!fewer.matches_preview(&preview));
 	let mut old_preview = preview.clone();
 	old_preview.symlinked_dirs = None;
 	assert!(extra.matches_preview(&old_preview));
+}
+
+/// A canonical folder that is not a repository, for the destinations the
+/// tests below replace after a preview.
+#[cfg(unix)]
+fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dunce::canonicalize(dir.path()).unwrap();
+	(dir, path)
+}
+
+/// `dir` moved aside and a symlink to `to` put in its place.
+#[cfg(unix)]
+fn swap_for_symlink(dir: &Path, to: &Path) {
+	let mut aside = dir.as_os_str().to_owned();
+	aside.push(".moved");
+	fs::rename(dir, &aside).unwrap();
+	std::os::unix::fs::symlink(to, dir).unwrap();
+}
+
+#[cfg(unix)]
+fn assert_stale_and_untouched(
+	res: Result<snip_core::restore::RestoreExecutionResult, TransferError>,
+	what: &str,
+) {
+	match res {
+		Err(TransferError::StaleDestination { .. }) => {}
+		other => panic!("{what}: expected a stale destination, got {other:?}"),
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_symlink_replaced_by_a_folder_is_not_the_preview_when_planned_again() {
+	let (_tmp, ws) = canonical_tmp();
+	fs::create_dir(ws.join("real")).unwrap();
+	std::os::unix::fs::symlink("real", ws.join("link")).unwrap();
+	let text = "// file: link/a.txt\na\n";
+	let preview = plan_one(&ws, text).destination_freshness().clone();
+	assert_eq!(preview.symlinked_dirs.as_ref().map(|m| m.len()), Some(1));
+
+	// The race: the worker has checked the old snapshot, and the symlink is
+	// replaced by a plain folder before it plans again.
+	fs::remove_file(ws.join("link")).unwrap();
+	fs::create_dir(ws.join("link")).unwrap();
+	let again = plan_one(&ws, text);
+	assert!(
+		!again.destination_freshness().matches_preview(&preview),
+		"a plan made again over a plain folder is not the symlinked preview"
+	);
+	assert!(
+		preview.revalidate().is_err(),
+		"the old snapshot says stale by itself"
+	);
+}
+
+/// A destination root that is replaced after the preview by a symlink to
+/// another folder carries every write somewhere the preview did not show,
+/// whatever the plan wrote there: a new file, an overwrite or a delete.
+#[cfg(unix)]
+#[test]
+fn test_a_destination_root_replaced_by_a_symlink_is_stale_for_every_op() {
+	type Prepare = fn(&Path, &Path);
+	let cases: [(&str, &str, Prepare); 3] = [
+		("create", "// file: new.txt\nnew\n", |_, _| {}),
+		("overwrite", "// file: a.txt\nnew\n", |selected, ext| {
+			fs::write(selected.join("a.txt"), "old\n").unwrap();
+			write_like(ext, "a.txt", "old\n", &selected.join("a.txt"));
+		}),
+		("delete", "// file: [DELETED] a.txt\n", |selected, ext| {
+			fs::write(selected.join("a.txt"), "old\n").unwrap();
+			write_like(ext, "a.txt", "old\n", &selected.join("a.txt"));
+		}),
+	];
+	for (what, text, prepare) in cases {
+		let (_tmp, ws) = canonical_tmp();
+		let selected = ws.join("selected");
+		let ext = ws.join("ext");
+		fs::create_dir_all(&selected).unwrap();
+		fs::create_dir_all(&ext).unwrap();
+		prepare(&selected, &ext);
+		let plan = plan_one(&selected, text);
+		swap_for_symlink(&selected, &ext);
+
+		assert_stale_and_untouched(plan.apply(&overwrite()), what);
+		assert!(!ext.join("new.txt").exists(), "{what}");
+		if what != "create" {
+			assert_eq!(
+				fs::read_to_string(ext.join("a.txt")).unwrap(),
+				"old\n",
+				"{what}"
+			);
+		}
+	}
+}
+
+/// The same for a folder above the root: the root's own path still names the
+/// folder, but it no longer is the one the preview showed.
+#[cfg(unix)]
+#[test]
+fn test_an_ancestor_of_the_destination_root_replaced_is_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	let selected = ws.join("a/b/selected");
+	let ext = ws.join("ext");
+	fs::create_dir_all(&selected).unwrap();
+	fs::create_dir_all(ext.join("b/selected")).unwrap();
+	let plan = plan_one(&selected, "// file: new.txt\nnew\n");
+	swap_for_symlink(&ws.join("a"), &ext);
+
+	assert_stale_and_untouched(plan.apply(&overwrite()), "ancestor");
+	assert!(!ext.join("b/selected/new.txt").exists());
+}
+
+/// A root another prefix is routed to, beside the primary one.
+#[cfg(unix)]
+#[test]
+fn test_a_prefix_root_replaced_by_a_symlink_is_stale() {
+	let (_tmp, ws) = canonical_tmp();
+	let primary = ws.join("primary");
+	let other = ws.join("other");
+	let ext = ws.join("ext");
+	for d in [&primary, &other, &ext] {
+		fs::create_dir_all(d).unwrap();
+	}
+	let mut mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(&primary).unwrap());
+	mapping.map_prefix("p", CanonicalRootId::new(&other).unwrap());
+	let plan = plan_import(
+		"// file: p/x.txt\nx\n// file: y.txt\ny\n",
+		"// file: $FILE_PATH",
+		&[primary.clone(), other.clone()],
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan.create_operations().len(), 2);
+	swap_for_symlink(&other, &ext);
+
+	assert_stale_and_untouched(plan.apply(&overwrite()), "prefix root");
+	assert!(!ext.join("x.txt").exists());
+	assert!(!primary.join("y.txt").exists(), "all or none");
+}
+
+/// A root nested in another: the inner one is replaced, then the outer.
+#[cfg(unix)]
+#[test]
+fn test_a_nested_root_replaced_is_stale_whichever_one_it_is() {
+	for replaced in ["dest/sub", "dest"] {
+		let (_tmp, ws) = canonical_tmp();
+		let dest = ws.join("dest");
+		let sub = dest.join("sub");
+		let ext = ws.join("ext");
+		fs::create_dir_all(&sub).unwrap();
+		fs::create_dir_all(ext.join("sub")).unwrap();
+		let mut mapping =
+			ImportMapping::with_primary(CanonicalRootId::new(&dest).unwrap());
+		mapping.map_prefix("p", CanonicalRootId::new(&sub).unwrap());
+		let plan = plan_import(
+			"// file: p/x.txt\nx\n// file: y.txt\ny\n",
+			"// file: $FILE_PATH",
+			&[dest.clone(), sub.clone()],
+			&mapping,
+		)
+		.unwrap();
+		let target = ws.join(replaced);
+		if replaced == "dest" {
+			swap_for_symlink(&target, &ext);
+		} else {
+			fs::create_dir_all(&ext).unwrap();
+			swap_for_symlink(&target, &ext.join("sub"));
+		}
+
+		assert_stale_and_untouched(plan.apply(&overwrite()), replaced);
+		assert!(!ext.join("sub/x.txt").exists(), "{replaced}");
+		assert!(!ext.join("y.txt").exists(), "{replaced}");
+	}
 }

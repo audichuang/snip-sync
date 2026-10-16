@@ -1995,3 +1995,142 @@ fn an_older_masters_snapshot_without_the_new_fields_still_applies() {
 		.unwrap();
 	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
 }
+
+/// `dir` moved aside and a symlink to `to` put in its place.
+#[cfg(unix)]
+fn swap_for_symlink(dir: &Path, to: &Path) {
+	let mut aside = dir.as_os_str().to_owned();
+	aside.push(".moved");
+	fs::rename(dir, &aside).unwrap();
+	std::os::unix::fs::symlink(to, dir).unwrap();
+}
+
+/// A destination folder replaced after the preview by a symlink to another
+/// folder is stale on a worker, for a new file, an overwrite and a delete:
+/// the write would land where the preview did not show.
+#[cfg(unix)]
+#[test]
+fn a_destination_replaced_by_a_symlink_after_a_remote_preview_is_stale_on_a_worker(
+) {
+	let _serial = serial();
+	for what in ["create", "overwrite", "delete"] {
+		let tmp = tempfile::tempdir().unwrap();
+		// The replacement lies outside the workspace: the worker's own
+		// planning refuses it, so only the check of the preview's snapshot
+		// can answer stale.
+		let outer = dunce::canonicalize(tmp.path()).unwrap();
+		let ws = outer.join("ws");
+		fs::create_dir_all(&ws).unwrap();
+		let selected = ws.join("selected");
+		let ext = outer.join("ext");
+		fs::create_dir_all(&selected).unwrap();
+		fs::create_dir_all(&ext).unwrap();
+		let text = match what {
+			"create" => entry("new.txt", "new"),
+			"overwrite" => entry("a.txt", "new"),
+			_ => "// File: [DELETED] a.txt\n".to_string(),
+		};
+		if what != "create" {
+			fs::write(selected.join("a.txt"), "old\n").unwrap();
+			fs::write(ext.join("a.txt"), "old\n").unwrap();
+			let mtime = fs::metadata(selected.join("a.txt"))
+				.unwrap()
+				.modified()
+				.unwrap();
+			fs::File::options()
+				.write(true)
+				.open(ext.join("a.txt"))
+				.unwrap()
+				.set_modified(mtime)
+				.unwrap();
+		}
+		let w = worker(None);
+		let (client, id) = open(&w, &ws);
+		let mapping = PasteMapping::default();
+		let planned = client
+			.import_plan(&id, "selected", &text, &mapping, None)
+			.unwrap();
+		swap_for_symlink(&selected, &ext);
+		let code = refused(client.import_apply(
+			&id,
+			"selected",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		));
+		assert_eq!(code, ErrorCode::Stale, "{what}");
+		assert!(!ext.join("new.txt").exists(), "{what}");
+		if what != "create" {
+			assert_eq!(
+				fs::read_to_string(ext.join("a.txt")).unwrap(),
+				"old\n",
+				"{what}"
+			);
+		}
+	}
+}
+
+/// The same for a folder above the destination and for a folder a prefix is
+/// routed to.
+#[cfg(unix)]
+#[test]
+fn an_ancestor_or_prefix_folder_replaced_after_a_remote_preview_is_stale_on_a_worker(
+) {
+	let _serial = serial();
+	for what in ["ancestor", "prefix"] {
+		let tmp = tempfile::tempdir().unwrap();
+		// The replacement lies outside the workspace: the worker's own
+		// planning refuses it, so only the check of the preview's snapshot
+		// can answer stale.
+		let outer = dunce::canonicalize(tmp.path()).unwrap();
+		let ws = outer.join("ws");
+		fs::create_dir_all(&ws).unwrap();
+		let ext = outer.join("ext");
+		fs::create_dir_all(ext.join("b/selected")).unwrap();
+		fs::create_dir_all(ws.join("a/b/selected")).unwrap();
+		fs::create_dir_all(ws.join("other")).unwrap();
+		fs::create_dir_all(ws.join("primary")).unwrap();
+		let (dest, text, mapping) = if what == "ancestor" {
+			(
+				"a/b/selected",
+				entry("new.txt", "new"),
+				PasteMapping::default(),
+			)
+		} else {
+			let mapping = PasteMapping {
+				prefixes: vec![("p".into(), "other".into())],
+				..Default::default()
+			};
+			(
+				"primary",
+				[entry("p/x.txt", "x"), entry("y.txt", "y")].concat(),
+				mapping,
+			)
+		};
+		let w = worker(None);
+		let (client, id) = open(&w, &ws);
+		let planned = client
+			.import_plan(&id, dest, &text, &mapping, None)
+			.unwrap();
+		if what == "ancestor" {
+			swap_for_symlink(&ws.join("a"), &ext);
+		} else {
+			swap_for_symlink(&ws.join("other"), &ext);
+		}
+		let code = refused(client.import_apply(
+			&id,
+			dest,
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		));
+		assert_eq!(code, ErrorCode::Stale, "{what}");
+		assert!(!ext.join("b/selected/new.txt").exists(), "{what}");
+		assert!(!ext.join("x.txt").exists(), "{what}");
+		assert!(!ws.join("primary/y.txt").exists(), "{what}");
+	}
+}
