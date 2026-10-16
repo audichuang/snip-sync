@@ -135,9 +135,15 @@ pub fn parse_text_fit_clipped(line: &str) -> Option<String> {
 }
 
 /// Parses a `[APP:TEXT_FIT_DRIFT: id=<id> fit=<n> drawn=<n>]` line: the box
-/// drawn is not the width the solver gave.
+/// drawn is not the width the solver gave. A
+/// `[APP:TEXT_FIT_STYLE_DRIFT: id=<id> measured=<style> drawn=<style>]` line
+/// counts as well: the box is drawn in another family, size or weight than
+/// the one its floor and counts were measured in.
 pub fn parse_text_fit_drift(line: &str) -> Option<String> {
-	let rest = line.split("[APP:TEXT_FIT_DRIFT: id=").nth(1)?;
+	let rest = line
+		.split("[APP:TEXT_FIT_DRIFT: id=")
+		.nth(1)
+		.or_else(|| line.split("[APP:TEXT_FIT_STYLE_DRIFT: id=").nth(1))?;
 	let (id, _) = rest.split_once(' ')?;
 	Some(id.to_string())
 }
@@ -185,6 +191,12 @@ mod tests {
 		);
 		assert_eq!(parse_text_fit_drift(line), None);
 		assert_eq!(parse_text_fit(drift), None);
+		let style = "[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:row:ab12:author measured=Inter/13/400 drawn=Inter/13/600]";
+		assert_eq!(
+			parse_text_fit_drift(style).as_deref(),
+			Some("text-fit:row:ab12:author")
+		);
+		assert_eq!(parse_text_fit(style), None);
 		assert_eq!(
 			parse_text_fit_gone(
 				"[APP:TEXT_FIT_GONE: id=text-fit:row:ab12:date]"

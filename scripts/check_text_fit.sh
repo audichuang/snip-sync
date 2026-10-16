@@ -18,6 +18,13 @@ set -euo pipefail
 #       `.flex_grow()`, `.min_w_0()`, `.flex_shrink(`, `clip_text(` and
 #       `fill_text(`, and no exemption helps: the widths in such a row are the
 #       solver's;
+#   L6  between the same markers: `.font_weight(`, `.font_family(`,
+#       `.text_size(`, `.font_style(`, `.italic(` and `.text_xs/sm/lg/xl(`.
+#       A text's family, size and weight come from `FitRole::style_for` (a
+#       viewer's own text through `FitCell::own`), pinned on the box by
+#       `FitCell::render`; the floor and the probe measure that style, so a
+#       weight put on after the render is measured in one style and drawn in
+#       another;
 #   L5  each of the four markers `log_row`, `branch_pane_row`,
 #       `branch_menu_row` and `log_filter_chips` exactly once, each closed by
 #       a `FIT-ROW-END`, so deleting a marker does not get a row out of L4.
@@ -110,6 +117,9 @@ while IFS= read -r file; do
 		[[ -n "$in_region" ]] || continue
 		if [[ "$line_content" =~ \.flex_1\(\)|\.flex_grow\(\)|\.min_w_0\(\)|\.flex_shrink\(|clip_text\(|fill_text\( ]]; then
 			reject "a width the solver does not know, in row ${in_region}" "A row between FIT-ROW-BEGIN and FIT-ROW-END takes its widths from fit_row: no flex_1, flex_grow, min_w_0, flex_shrink(..), clip_text or fill_text, and nothing exempts them."
+		fi
+		if [[ "$line_content" =~ \.font_weight\(|\.font_family\(|\.text_size\(|\.font_style\(|\.italic\(|\.text_(xs|sm|lg|xl)\( ]]; then
+			reject "a text style the role does not know, in row ${in_region}" "A text's family, size and weight come from FitRole::style_for, pinned by FitCell::render (the viewer's own text: FitCell::own): the floor and TEXT_FIT measure that style, so one put on after the render is drawn in another."
 		fi
 	done <"$file"
 	if [[ -n "$in_region" ]]; then

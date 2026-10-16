@@ -10,7 +10,8 @@
 use std::fmt;
 
 use gpui::{
-	canvas, div, prelude::*, px, AnyElement, Div, SharedString, Window,
+	canvas, div, prelude::*, px, AnyElement, Div, FontWeight, SharedString,
+	Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -42,6 +43,35 @@ pub(crate) enum FitRole {
 	PaneRepo,
 	MenuRefName,
 	MenuRepo,
+}
+
+/// The one description of how a text is drawn: its family, size and weight.
+/// A role has a style ([`FitRole::style`]) and a cell is drawn in it
+/// ([`FitCell::render`] pins all three on its box), the floors and the
+/// `TEXT_FIT` probe measure in it, and nothing else decides: a weight put on
+/// a cell after it is rendered is a [`TextFit::style_drift`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FitStyle {
+	pub family: &'static str,
+	pub size: f32,
+	pub weight: FontWeight,
+}
+
+impl FitStyle {
+	/// The regular weight, which is what everything but the viewer's own
+	/// name is drawn in.
+	pub(crate) const fn regular(family: &'static str, size: f32) -> Self {
+		Self {
+			family,
+			size,
+			weight: FontWeight::NORMAL,
+		}
+	}
+
+	/// The text system's width of `s` in this style.
+	pub(crate) fn width(self, window: &Window, s: &str) -> f32 {
+		text_width_in(window, self.family, self.size, self.weight, s)
+	}
 }
 
 /// How much of a text must stay in sight (graphemes, not pixels).
@@ -194,18 +224,33 @@ impl FitRole {
 		}
 	}
 
-	/// The font family and size the text is drawn in.
-	pub(crate) fn font(self) -> (&'static str, f32) {
+	/// The style the text is drawn in, for everything but the viewer's own
+	/// name.
+	pub(crate) fn style(self) -> FitStyle {
+		self.style_for(false)
+	}
+
+	/// The style of a text that may be the viewer's own: the author's name
+	/// of their own commits is semibold, and its floor, its box and the
+	/// probe all follow.
+	pub(crate) fn style_for(self, own: bool) -> FitStyle {
 		match self {
-			FitRole::Hash => (CODE_FONT, SMALL_TEXT),
+			FitRole::Hash => FitStyle::regular(CODE_FONT, SMALL_TEXT),
 			FitRole::BranchLabel
 			| FitRole::TagLabel
 			| FitRole::RefMore
 			| FitRole::Collapsed
 			| FitRole::PaneRepo
-			| FitRole::MenuRepo => (UI_FONT, SMALL_TEXT),
+			| FitRole::MenuRepo => FitStyle::regular(UI_FONT, SMALL_TEXT),
+			FitRole::Author => FitStyle {
+				weight: if own {
+					FontWeight::SEMIBOLD
+				} else {
+					FontWeight::NORMAL
+				},
+				..FitStyle::regular(UI_FONT, UI_TEXT)
+			},
 			FitRole::Subject
-			| FitRole::Author
 			| FitRole::Date
 			| FitRole::ChipRepo
 			| FitRole::ChipBranch
@@ -215,7 +260,7 @@ impl FitRole {
 			| FitRole::RefHint
 			| FitRole::PaneGroup
 			| FitRole::PaneRefName
-			| FitRole::MenuRefName => (UI_FONT, UI_TEXT),
+			| FitRole::MenuRefName => FitStyle::regular(UI_FONT, UI_TEXT),
 		}
 	}
 
@@ -589,18 +634,21 @@ fn pay_gap<P>(fit: &mut RowFit<P>, i: usize) -> bool {
 
 // ───────────────────────── drawing and the probe ─────────────────────────
 
-/// Width of `s` shaped in `family` at `size`, from the text system (shaped
-/// lines are cached per frame, so a redraw does not reshape).
+/// Width of `s` shaped in `family` at `size` and `weight`, from the text
+/// system (shaped lines are cached per frame, so a redraw does not reshape).
 pub(crate) fn text_width_in(
 	window: &Window,
 	family: &str,
-	s: &str,
 	size: f32,
+	weight: FontWeight,
+	s: &str,
 ) -> f32 {
 	let s = s.replace(['\n', '\r'], " ");
+	let mut font = gpui::font(family.to_string());
+	font.weight = weight;
 	let run = gpui::TextRun {
 		len: s.len(),
-		font: gpui::font(family.to_string()),
+		font,
 		color: gpui::black(),
 		background_color: None,
 		underline: None,
@@ -614,13 +662,30 @@ pub(crate) fn text_width_in(
 	)
 }
 
-/// `measure` for a role: its font and size from the text system.
+/// `measure` for a role: its style from the text system.
 pub(crate) fn role_measure<'a>(
 	window: &'a Window,
 	role: FitRole,
 ) -> impl Fn(&str) -> f32 + 'a {
-	let (family, size) = role.font();
-	move |s: &str| text_width_in(window, family, s, size)
+	style_measure(window, role.style())
+}
+
+/// `measure` for a role whose text may be the viewer's own (see
+/// [`FitRole::style_for`]).
+pub(crate) fn role_measure_for<'a>(
+	window: &'a Window,
+	role: FitRole,
+	own: bool,
+) -> impl Fn(&str) -> f32 + 'a {
+	style_measure(window, role.style_for(own))
+}
+
+/// `measure` in `style`.
+pub(crate) fn style_measure<'a>(
+	window: &'a Window,
+	style: FitStyle,
+) -> impl Fn(&str) -> f32 + 'a {
+	move |s: &str| style.width(window, s)
 }
 
 /// Where a `TEXT_FIT` belongs: the scope is the id of the probe of the thing
@@ -651,6 +716,11 @@ impl fmt::Display for FitId {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextFit {
 	pub role: FitRole,
+	/// The style the floor and the counts were measured in: the cell's own.
+	pub(crate) style: FitStyle,
+	/// What gpui draws it in when that is not the cell's style (a weight or
+	/// a size put on the box after it was rendered), as `family/size/weight`.
+	pub style_drift: Option<String>,
 	pub text: SharedString,
 	/// The key's graphemes of a `KeyValue` text, else 0.
 	pub key_graphemes: usize,
@@ -678,6 +748,7 @@ impl TextFit {
 	/// A text the solver dropped: nothing drawn.
 	fn dropped(
 		role: FitRole,
+		style: FitStyle,
 		text: SharedString,
 		key_end: usize,
 		natural: f32,
@@ -686,6 +757,8 @@ impl TextFit {
 		let total = grapheme_count(&text);
 		Self {
 			role,
+			style,
+			style_drift: None,
 			key_graphemes: key_graphemes(role, &text, key_end),
 			text,
 			natural,
@@ -705,6 +778,12 @@ impl TextFit {
 	/// something between the solver and the screen changed it.
 	pub fn drifts(&self) -> bool {
 		self.fit.is_some_and(|fit| (self.drawn - fit).abs() > 1.)
+	}
+
+	/// The box is drawn in another style than the one its floor and counts
+	/// were measured in: what the probe says is not what is on screen.
+	pub fn style_drifts(&self) -> bool {
+		self.style_drift.is_some()
 	}
 
 	/// The log line, for the id.
@@ -734,6 +813,18 @@ impl TextFit {
 			self.drawn
 		)
 	}
+
+	pub(super) fn style_drift_line(&self, id: &str) -> String {
+		format!(
+			"[APP:TEXT_FIT_STYLE_DRIFT: id={id} measured={} drawn={}]",
+			style_text(self.style.family, self.style.size, self.style.weight),
+			self.style_drift.as_deref().unwrap_or("-")
+		)
+	}
+}
+
+fn style_text(family: &str, size: f32, weight: FontWeight) -> String {
+	format!("{family}/{size}/{}", weight.0)
 }
 
 fn key_graphemes(role: FitRole, text: &str, key_end: usize) -> usize {
@@ -767,6 +858,7 @@ pub(crate) struct FitCell {
 	pad: f32,
 	frame: f32,
 	width: FitWidth,
+	own: bool,
 }
 
 impl FitCell {
@@ -781,7 +873,16 @@ impl FitCell {
 			pad: 0.,
 			frame: 0.,
 			width: FitWidth::Flex,
+			own: false,
 		}
+	}
+
+	/// The text is the viewer's own: it is drawn, floored and probed in the
+	/// role's own style ([`FitRole::style_for`]), never by a weight added to
+	/// the box afterwards.
+	pub(crate) fn own(mut self, own: bool) -> Self {
+		self.own = own;
+		self
 	}
 
 	/// Where a `KeyValue` text's key ends (a byte index of the text).
@@ -862,9 +963,10 @@ impl FitCell {
 			pad,
 			frame: border,
 			width,
+			own,
 		} = self;
 		let role = id.role;
-		let (family, size) = role.font();
+		let style = role.style_for(own);
 		// No `overflow_hidden` here: gpui clips to the box without its
 		// padding, and the probe reads the clip of the ancestors, not the
 		// cell's own. The text clips itself, and the solver gives a box
@@ -874,8 +976,9 @@ impl FitCell {
 			.flex()
 			.flex_row()
 			.items_center()
-			.font_family(family)
-			.text_size(px(size));
+			.font_family(style.family)
+			.text_size(px(style.size))
+			.font_weight(style.weight);
 		root = match width {
 			FitWidth::Solved { fit } => root.w(px(fit)).flex_shrink_0(),
 			FitWidth::Flex => root.min_w_0(),
@@ -905,7 +1008,7 @@ impl FitCell {
 		}
 		if let Some(probes) = probes {
 			let frame = probes.0.clone();
-			let measure = role_measure(window, role);
+			let measure = style_measure(window, style);
 			let natural = natural_px(role, &text, &measure);
 			let floor = floor_px(role, &text, key_end, &measure);
 			let fit = match width {
@@ -934,10 +1037,42 @@ impl FitCell {
 							k.text == text
 								&& (k.visible - visible_w).abs() < 0.01
 						});
+						// What gpui draws it in: the style the box inherits
+						// at this point, whoever set it.
+						let painted = window.text_style();
+						let painted_size = f32::from(
+							painted.font_size.to_pixels(window.rem_size()),
+						);
+						let style_drift =
+							((painted.font_family.as_ref() != style.family)
+								|| (painted_size - style.size).abs() > 0.01
+								|| painted.font_weight != style.weight)
+								.then(|| {
+									style_text(
+										painted.font_family.as_ref(),
+										painted_size,
+										painted.font_weight,
+									)
+								});
 						let (shown, total) = match known {
-							Some(k) => (k.shown, k.total),
-							None => {
-								let measure = role_measure(window, role);
+							Some(k)
+								if k.style == style
+									&& k.style_drift == style_drift =>
+							{
+								(k.shown, k.total)
+							}
+							_ => {
+								// Counted in what is on screen, so a drift
+								// cannot hide behind a kind measure.
+								let measure = |s: &str| {
+									text_width_in(
+										window,
+										painted.font_family.as_ref(),
+										painted_size,
+										painted.font_weight,
+										s,
+									)
+								};
 								shown_graphemes(
 									role, &text, visible_w, &measure,
 								)
@@ -948,6 +1083,8 @@ impl FitCell {
 							&id,
 							TextFit {
 								role,
+								style,
+								style_drift,
 								key_graphemes: key_graphemes(
 									role, &text, key_end,
 								),
@@ -986,6 +1123,7 @@ impl FitCell {
 pub(crate) fn record_dropped(
 	probes: &Option<Probes>,
 	id: FitId,
+	style: FitStyle,
 	text: &str,
 	natural: f32,
 	floor: f32,
@@ -993,7 +1131,14 @@ pub(crate) fn record_dropped(
 	let Some(probes) = probes else { return };
 	probes.0.borrow_mut().record_fit(
 		&id.to_string(),
-		TextFit::dropped(id.role, text.to_string().into(), 0, natural, floor),
+		TextFit::dropped(
+			id.role,
+			style,
+			text.to_string().into(),
+			0,
+			natural,
+			floor,
+		),
 	);
 }
 
@@ -1129,12 +1274,33 @@ mod tests {
 			assert_eq!(role.rule(), rule, "{role:?}");
 			assert_eq!(role.presence(), presence, "{role:?}");
 			assert!(keys.insert(key), "{key} is two roles' key");
-			let (font, size) = role.font();
-			assert!(!font.is_empty() && size > 0.);
+			let style = role.style();
+			assert!(!style.family.is_empty() && style.size > 0.);
+			assert_eq!(style.weight, FontWeight::NORMAL, "{role:?}");
+			// Only an author's name has an own style; no other role's text
+			// can be the viewer's own.
+			let own = role.style_for(true);
+			if role == FitRole::Author {
+				assert_eq!(own.weight, FontWeight::SEMIBOLD);
+				assert_eq!((own.family, own.size), (style.family, style.size));
+			} else {
+				assert_eq!(own, style, "{role:?}");
+			}
 			// A rule names itself as the probe prints it, and reads back.
 			assert_eq!(FitRule::parse(&rule.name()), Some(rule));
 		}
-		assert_eq!(FitRole::Hash.font(), (CODE_FONT, SMALL_TEXT));
+		assert_eq!(
+			FitRole::Hash.style(),
+			FitStyle::regular(CODE_FONT, SMALL_TEXT)
+		);
+		assert_eq!(
+			FitRole::Subject.style(),
+			FitStyle::regular(UI_FONT, UI_TEXT)
+		);
+		assert_eq!(
+			FitRole::BranchLabel.style(),
+			FitStyle::regular(UI_FONT, SMALL_TEXT)
+		);
 		assert_eq!(FitRole::BranchLabel.chrome(), 17.);
 		assert_eq!(FitRole::ChipUser.chrome(), 27.);
 		// The More chip's padding (4 + 4), the gap and the 10px icon.
@@ -1590,5 +1756,115 @@ mod render_tests {
 		assert!(f.x.abs() < 0.5, "{f:?}");
 		assert!((f.drawn - 60.).abs() < 0.5, "{f:?}");
 		assert!(!f.clipped && !f.drifts(), "{f:?}");
+	}
+
+	/// How a test box dresses the cell it holds.
+	#[derive(Clone, Copy)]
+	enum Dress {
+		/// An ancestor that sets a weight and a size of its own.
+		Ancestor,
+		/// A weight put on the box after `render`: the way the viewer's own
+		/// author used to be drawn.
+		AfterRender,
+		/// The cell told it is the viewer's own.
+		Own,
+		/// Nothing.
+		Plain,
+	}
+
+	struct Dressed {
+		probes: Option<Probes>,
+		dress: Dress,
+	}
+
+	impl Render for Dressed {
+		fn render(
+			&mut self,
+			window: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			let cell = FitCell::new(
+				FitId::new("t", FitRole::Author),
+				"Alexandra Konstantinopoulou",
+			)
+			.fixed_width(80.);
+			let cell = match self.dress {
+				Dress::Own => cell.own(true),
+				_ => cell,
+			};
+			let drawn = cell.render(&self.probes, window);
+			let drawn = match self.dress {
+				Dress::AfterRender => drawn.font_weight(FontWeight::SEMIBOLD),
+				_ => drawn,
+			};
+			let holder = div().w(px(200.));
+			let holder = match self.dress {
+				Dress::Ancestor => {
+					holder.font_weight(FontWeight::BOLD).text_size(px(30.))
+				}
+				_ => holder,
+			};
+			div()
+				.size_full()
+				.child(holder.child(drawn))
+				.children(probe_frame_end(&self.probes))
+		}
+	}
+
+	fn dressed(cx: &mut TestAppContext, dress: Dress) -> TextFit {
+		let probes = Probes::for_test();
+		let shared = probes.clone();
+		let (_, cx) = cx.add_window_view(|_, _| Dressed {
+			probes: Some(probes),
+			dress,
+		});
+		cx.run_until_parked();
+		shared
+			.text_fit("text-fit:t:author")
+			.expect("the text was recorded")
+	}
+
+	/// A cell pins its role's weight and size on its box: nothing an
+	/// ancestor sets reaches the text, so the floor measured in the role's
+	/// style is the text's.
+	#[gpui::test]
+	fn a_cell_is_drawn_in_its_roles_style_whatever_an_ancestor_sets(
+		cx: &mut TestAppContext,
+	) {
+		for dress in [Dress::Plain, Dress::Ancestor] {
+			let f = dressed(cx, dress);
+			assert!(!f.style_drifts(), "{f:?}");
+			assert_eq!(f.style, FitRole::Author.style());
+		}
+	}
+
+	/// The viewer's own name is drawn in the weight the cell was told, and
+	/// the probe measures and counts in that weight.
+	#[gpui::test]
+	fn an_own_cell_is_drawn_and_probed_in_semibold(cx: &mut TestAppContext) {
+		let f = dressed(cx, Dress::Own);
+		assert!(!f.style_drifts(), "{f:?}");
+		assert_eq!(f.style.weight, FontWeight::SEMIBOLD);
+		assert_eq!(f.style, FitRole::Author.style_for(true));
+	}
+
+	/// A weight added to the box after `render` is no longer a silent
+	/// mismatch between what is measured and what is drawn: the probe reads
+	/// what gpui draws and says so.
+	#[gpui::test]
+	fn a_weight_put_on_the_box_after_render_is_a_style_drift(
+		cx: &mut TestAppContext,
+	) {
+		let f = dressed(cx, Dress::AfterRender);
+		assert!(f.style_drifts(), "{f:?}");
+		assert!(
+			f.style_drift
+				.as_deref()
+				.is_some_and(|d| d.ends_with("/600")),
+			"{f:?}"
+		);
+		assert!(f
+			.style_drift_line("text-fit:t:author")
+			.starts_with("[APP:TEXT_FIT_STYLE_DRIFT: id=text-fit:t:author"));
 	}
 }

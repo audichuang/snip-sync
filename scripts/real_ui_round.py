@@ -715,6 +715,9 @@ RE_TEXT_FIT = re.compile(
     r"\s+drawn=(-?\d+)\s+visible=(-?\d+)\s+clipped=([01])\s+cut=([01])\s+shown=(\d+)/(\d+)(?:\s+ws_tab=\d+)?\]$"
 )
 RE_TEXT_FIT_DRIFT = re.compile(r"^\[APP:TEXT_FIT_DRIFT:\s+id=(\S+)\s+fit=(-?\d+)\s+drawn=(-?\d+)(?:\s+ws_tab=\d+)?\]$")
+# A box drawn in another family, size or weight than the one its floor and counts
+# were measured in: the same kind of problem as a width that drifted.
+RE_TEXT_FIT_STYLE_DRIFT = re.compile(r"^\[APP:TEXT_FIT_STYLE_DRIFT:\s+id=(\S+)\s+measured=(\S+)\s+drawn=(\S+)(?:\s+ws_tab=\d+)?\]$")
 RE_TEXT_FIT_GONE = re.compile(r"^\[APP:TEXT_FIT_GONE:\s+id=(\S+?)(?:\s+ws_tab=\d+)?\]$")
 RE_TEXT_FIT_RULE = re.compile(r"^(whole|readable(\d+)|kv(\d+))$")
 
@@ -769,7 +772,7 @@ def parse_text_fit(lines: List[str]) -> Tuple[Dict[str, TextFitEntry], List[str]
             if tid in drift:
                 drift.remove(tid)
             continue
-        m = RE_TEXT_FIT_DRIFT.match(line)
+        m = RE_TEXT_FIT_DRIFT.match(line) or RE_TEXT_FIT_STYLE_DRIFT.match(line)
         if m:
             if m.group(1) not in drift:
                 drift.append(m.group(1))

@@ -1,8 +1,8 @@
 //! Git Log chrome: filter chips, dropdown menus and the branches pane.
 
 use super::fit::{
-	fit_row, floor_px, natural_px, record_dropped, role_measure, text_width_in,
-	Claim, FitCell, FitId, FitRole, Part, RowFit, CHIP_CHROME_W, FIT_MARGIN,
+	fit_row, floor_px, natural_px, record_dropped, role_measure, Claim,
+	FitCell, FitId, FitRole, FitStyle, Part, RowFit, CHIP_CHROME_W, FIT_MARGIN,
 	MORE_ICON_W,
 };
 use super::*;
@@ -968,7 +968,7 @@ pub(super) fn short_ref(name: &str) -> &str {
 /// Width of `s` laid out in the UI font at `size`, from the text system
 /// (shaped lines are cached per frame, so a redraw does not reshape).
 pub(crate) fn text_width(window: &Window, s: &str, size: f32) -> f32 {
-	text_width_in(window, UI_FONT, s, size)
+	FitStyle::regular(UI_FONT, size).width(window, s)
 }
 
 /// [`log_date_in`] in the viewer's time zone, now.
@@ -2327,6 +2327,7 @@ impl WorkbenchModel {
 					record_dropped(
 						probes,
 						FitId::new(scope.clone(), FitRole::PaneRepo),
+						FitRole::PaneRepo.style(),
 						r,
 						repo_natural,
 						repo_natural,
@@ -2478,6 +2479,7 @@ impl WorkbenchModel {
 					record_dropped(
 						probes,
 						FitId::new(scope.clone(), FitRole::MenuRepo),
+						FitRole::MenuRepo.style(),
 						r,
 						repo_natural,
 						repo_natural,
@@ -2999,7 +3001,7 @@ mod row_fit_tests {
 	/// 0.6em per character, as the test text system measures; `wide` text
 	/// (a CJK font) 1.0em, the ellipsis always 0.6.
 	fn measure(role: FitRole, wide: bool) -> impl Fn(&str) -> f32 {
-		let size = role.font().1;
+		let size = role.style().size;
 		move |s: &str| {
 			s.chars()
 				.map(|c| {

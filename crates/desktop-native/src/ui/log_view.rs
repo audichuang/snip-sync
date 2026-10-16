@@ -1,8 +1,8 @@
 //! Git Log list, commit details and changed files.
 
 use super::fit::{
-	floor_px, natural_px, record_dropped, role_measure, FitCell, FitId,
-	FitRole, ELLIPSIS, FIT_MARGIN,
+	floor_px, natural_px, record_dropped, role_measure, role_measure_for,
+	FitCell, FitId, FitRole, ELLIPSIS, FIT_MARGIN,
 };
 use super::log::row_policy::*;
 use super::*;
@@ -625,6 +625,18 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Whether the commit is the viewer's own: its author's name is drawn
+	/// in the viewer's weight (see [`FitRole::style_for`]), so the author
+	/// column is floored in it too.
+	pub(super) fn is_own_commit(
+		&self,
+		c: &snip_core::browser::CommitSummary,
+	) -> bool {
+		self.git_user_email
+			.as_deref()
+			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email))
+	}
+
 	/// The worst row of each kind the list's columns are decided from
 	/// (see [`fit_list`]), kept while nothing it reads changes.
 	pub(super) fn log_list_fit_parts(
@@ -652,6 +664,8 @@ impl WorkbenchModel {
 		for (ix, c) in rows.iter().enumerate() {
 			c.sha.hash(&mut h);
 			c.author_name.hash(&mut h);
+			// Its weight: the viewer's email arrives after the first rows.
+			self.is_own_commit(c).hash(&mut h);
 			self.collapsed_merges.contains(&c.sha).hash(&mut h);
 			if let Some(r) =
 				self.graph_layout.as_ref().and_then(|l| l.rows.get(ix))
@@ -674,12 +688,14 @@ impl WorkbenchModel {
 			.map(|c| subject(&format!("{}{ELLIPSIS}", c.repeat(6))))
 			.fold(0., f32::max)
 			+ FIT_MARGIN;
-		let author = ui(FitRole::Author);
 		let mut seen = HashSet::new();
 		let mut author_floor: Option<f32> = None;
 		for c in &rows {
-			if seen.insert(c.author_name.as_str()) {
-				let f = floor_px(FitRole::Author, &c.author_name, 0, &author);
+			// Each name in the weight it is drawn in.
+			let own = self.is_own_commit(c);
+			if seen.insert((c.author_name.as_str(), own)) {
+				let measure = role_measure_for(window, FitRole::Author, own);
+				let f = floor_px(FitRole::Author, &c.author_name, 0, &measure);
 				author_floor = Some(author_floor.map_or(f, |a| a.max(f)));
 			}
 		}
@@ -786,10 +802,7 @@ impl WorkbenchModel {
 			.unwrap_or_default();
 		let label_parts: Vec<LabelPart> =
 			data.iter().map(|d| label_part(window, d)).collect();
-		let mine = self
-			.git_user_email
-			.as_deref()
-			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
+		let mine = self.is_own_commit(c);
 		let measure = |role| role_measure(window, role);
 		let collapsed_text =
 			collapsed.then(|| tf("collapsed_n", loc, &[&hidden_n]));
@@ -828,10 +841,13 @@ impl WorkbenchModel {
 		// A cell the solver dropped: only the probe hears of it.
 		let dropped = |role: FitRole, text: &str| {
 			if probes.is_some() {
-				let m = measure(role);
+				// Only the author's text can be the viewer's own.
+				let own = mine && role == FitRole::Author;
+				let m = role_measure_for(window, role, own);
 				record_dropped(
 					probes,
 					fid(role),
+					role.style_for(own),
 					text,
 					natural_px(role, text, &m),
 					floor_px(role, text, 0, &m),
@@ -916,10 +932,10 @@ impl WorkbenchModel {
 			cells.push(
 				FitCell::new(fid(FitRole::Author), c.author_name.clone())
 					.selector(format!("log-author:{ix}"))
+					.own(mine)
 					.solved(&fit, LogCell::Author)
 					.render(probes, window)
 					.ml(px(CELL_GAP))
-					.when(mine, |d| d.font_weight(FontWeight::SEMIBOLD))
 					.id(SharedString::from(format!("author:{key}")))
 					.tip(format!("{} <{}>", c.author_name, c.author_email))
 					.into_any_element(),

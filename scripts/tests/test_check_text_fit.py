@@ -115,6 +115,23 @@ class CheckTextFit(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("solver", r.stderr)
 
+    def test_a_text_style_put_on_a_fitted_row_is_rejected(self):
+        for token in [
+            ".font_weight(FontWeight::SEMIBOLD)", ".font_family(F)", ".text_size(px(9.))",
+            ".font_style(S)", ".italic()", ".text_xs()", ".text_sm()",
+        ]:
+            with self.subTest(token=token):
+                inner = f"    d{token};\n"
+                extra = {"ui/rows.rs": markers(NAMES[:1], inner) + markers(NAMES[1:])}
+                r = run_check("fn f() {}\n", with_markers=False, extra=extra)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("style", r.stderr)
+
+    def test_a_text_style_outside_a_fitted_row_is_fine(self):
+        self.assertEqual(
+            run_check("fn f() { d.font_weight(FontWeight::SEMIBOLD).text_size(px(9.)); }\n").returncode, 0
+        )
+
     def test_an_exemption_does_not_help_inside_a_fitted_row(self):
         inner = "    d.flex_1(); // FIT-EXEMPT: no\n"
         extra = {"ui/rows.rs": markers(NAMES[:1], inner) + markers(NAMES[1:])}

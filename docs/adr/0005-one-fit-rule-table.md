@@ -43,6 +43,10 @@ Log 工具視窗裡一段文字和別的文字搶寬度時（commit 列的 subje
 
 `[APP:TEXT_FIT: id=text-fit:<scope>:<role> rule= natural= floor= fit= drawn= visible= clipped= cut= shown=/]` 在內容改變時印一行。`visible` 是盒子與 `window.content_mask()`（所有祖先裁切框的交集）的橫向交集，所以 `drift`（`TEXT_FIT_DRIFT`：畫出來的盒子與求解器給的寬度差超過 1px，代表有一層繞過了求解器）與 `clipped`（祖先裁掉了它）是兩件事。`#[gpui::test]` 與 native-e2e smoke 斷言兩者都沒有，`scripts/real_ui_round.py text-fit --check` 在真實 UI 的日誌上做同一件事。
 
+## 量測與繪製用同一個文字樣式
+
+字型家族、字級、字重只在一處定義：`FitRole::style_for(own)`（`FitStyle`）。`FitCell::render` 把它的三個值都釘在盒子上（所以祖先設的字重、字級不會漏進文字），下限（`floor_px`）、自然寬、清單層的作者欄下限與 `TEXT_FIT` 的 `shown` 都用同一個樣式量。唯一不是 `Regular` 的是自己的作者名稱（`Author` 且 `own`，semibold）：`FitCell::own(true)` 帶著它，清單層算作者欄下限時每個作者名也依它是不是自己的來量（快取鍵含這一點，`git_user_email` 在第一批列之後才到）。畫完後探針再從 `window.text_style()` 讀 gpui 實際用的樣式，不同就印 `[APP:TEXT_FIT_STYLE_DRIFT: id= measured= drawn=]`（`style_drift`；`shown` 以實際繪製的樣式計，不被量測樣式掩蓋），與寬度的 drift 一樣在 `#[gpui::test]`、native-e2e 與 `real_ui_round.py text-fit --check` 都算失敗。真實字型矩陣的 fixture 有一列是使用者本人、名稱是 56 個 W，並用獨立的 semibold 整形數字檢查作者欄在 1080 寬、預設窗格時仍留得下 3 個 grapheme。
+
 重畫只有一個機制（`refresh_if_stale`）：這一幀依據的寬和量到的寬不同時排一次重畫，每個新寬度最多 3 次（`Window::refresh` 在繪製中是 no-op，所以排在這一幀結束之後）。面板寬、清單寬、篩選 chip 列都走它。
 
 ## Consequences
@@ -51,5 +55,5 @@ Log 工具視窗裡一段文字和別的文字搶寬度時（commit 列的 subje
 - 設計取捨：使用者定案「≥1080 寬一定要有標籤」。收合的 merge 列在 1080、hash 開時，subject 的 6 字下限、完整日期、整段的「已收合 N」與標籤組的下限空間上不可能同時成立（清單 574，英文「+3 collapsed nodes」自然寬約 130），所以讓「已收合 N」讓位：標籤組排在它前面（清單層與列層都是），清單層的作者欄下限也排在它前面（它只是 gutter 裡 `+` 的說明，不該比一整欄還重要，也不該讓一列合併把每一列的作者欄都擠掉）。收合與展開的開關 `collapse:<key>` 在 gutter 裡，不受影響，消失的只是旁邊的說明文字。代價是 1080 hash 開時，帶 ref 的收合 merge 列沒有「已收合 N」；沒有 ref 的收合列照常顯示。
 - 繁中與英文的標籤有無仍可能不同，因為日期的寬度不同。這是刻意的，所以沒有「標籤出現與否和語系無關」這條規則。
 - 規程只判規則，不判像素：T36、B43 的通過線是 `text-fit --check` 與規則，不再寫 574、160、64 這類實作常數。
-- `scripts/check_text_fit.sh` 擋下重新加權重的做法（`flex_shrink = Some(..)`、已退役的常數與函式名稱）、Log 檔案裡沒有 `FIT-EXEMPT: <理由>` 的 `clip_text`／`fill_text`／`.text_ellipsis()`／`.line_clamp(`，以及 `FIT-ROW-BEGIN`／`FIT-ROW-END` 之間的 `.flex_1()`、`.flex_grow()`、`.min_w_0()`、`.flex_shrink(`；四個區段標記（`log_row`、`branch_pane_row`、`branch_menu_row`、`log_filter_chips`）各要恰好出現一次，刪掉標記也躲不掉。哪些行算測試碼只有一份判定（`scripts/lib/test_code.sh`）。
+- `scripts/check_text_fit.sh` 擋下重新加權重的做法（`flex_shrink = Some(..)`、已退役的常數與函式名稱）、Log 檔案裡沒有 `FIT-EXEMPT: <理由>` 的 `clip_text`／`fill_text`／`.text_ellipsis()`／`.line_clamp(`，以及 `FIT-ROW-BEGIN`／`FIT-ROW-END` 之間的 `.flex_1()`、`.flex_grow()`、`.min_w_0()`、`.flex_shrink(`，和 `.font_weight(`、`.font_family(`、`.text_size(`、`.font_style(`、`.italic(`、`.text_xs/sm/lg/xl(`（樣式只來自 `FitRole::style_for`，在 render 之後再加就是量一個樣式、畫另一個）；四個區段標記（`log_row`、`branch_pane_row`、`branch_menu_row`、`log_filter_chips`）各要恰好出現一次，刪掉標記也躲不掉。哪些行算測試碼只有一份判定（`scripts/lib/test_code.sh`）。
 - 範圍外：詳情窗格的檔名（以 `FIT-EXEMPT` 標記）、其他下拉選單、垂直方向「半列可見」的裁切（#197）。

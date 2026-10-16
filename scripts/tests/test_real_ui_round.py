@@ -195,6 +195,16 @@ class TestTextFit(unittest.TestCase):
         entries, drift = rur.parse_text_fit(lines + [fit_line(tid)])
         self.assertEqual(drift, [])
 
+    def test_a_style_drift_counts_like_a_width_drift(self):
+        tid = "text-fit:row:a:author"
+        lines = [
+            fit_line(tid),
+            f"[APP:TEXT_FIT_STYLE_DRIFT: id={tid} measured=Inter/13/400 drawn=Inter/13/600]",
+        ]
+        self.assertEqual(rur.parse_text_fit(lines)[1], [tid])
+        # The next line of the text, without a drift line, clears it.
+        self.assertEqual(rur.parse_text_fit(lines + [fit_line(tid)])[1], [])
+
     def test_check_fails_on_drift_clipping_and_a_broken_rule(self):
         ok = rur.parse_text_fit([fit_line("text-fit:row:a:subject")])
         self.assertEqual(rur.text_fit_problems(*ok), [])

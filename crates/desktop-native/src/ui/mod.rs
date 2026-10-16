@@ -287,6 +287,9 @@ impl ProbeFrame {
 			if fit.drifts() {
 				app_log!("{}", fit.drift_line(id));
 			}
+			if fit.style_drifts() {
+				app_log!("{}", fit.style_drift_line(id));
+			}
 			self.fits_logged.insert(id.to_string(), line);
 		}
 		self.fits_seen.insert(id.to_string(), fit);
@@ -440,7 +443,7 @@ impl Probes {
 	pub(crate) fn text_fit_drift(&self) -> Vec<String> {
 		self.text_fits()
 			.into_iter()
-			.filter(|(_, f)| f.drifts())
+			.filter(|(_, f)| f.drifts() || f.style_drifts())
 			.map(|(id, _)| id)
 			.collect()
 	}
@@ -2245,6 +2248,8 @@ mod tests {
 	fn a_fit() -> fit::TextFit {
 		fit::TextFit {
 			role: fit::FitRole::Subject,
+			style: fit::FitRole::Subject.style(),
+			style_drift: None,
 			text: "x".into(),
 			key_graphemes: 0,
 			natural: 10.,

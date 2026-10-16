@@ -15676,7 +15676,7 @@ mod tests {
 								total: f.total,
 								key_graphemes: f.key_graphemes,
 								clipped: f.clipped,
-								drifts: f.drifts(),
+								drifts: f.drifts() || f.style_drifts(),
 								text: f.text.to_string(),
 								id,
 							}
