@@ -2,12 +2,17 @@
 //!
 //! A folder that does not exist yet has no identity of its own: it is *the
 //! folder `anchor/t1/t2`* where `anchor` is the nearest folder that exists.
-//! That folder is the filesystem's own, so it is compared as it is (its
-//! canonical path, as written) and never folded; only the names below it,
-//! which the filesystem has not seen yet, fold case, and only when the
-//! anchor's filesystem does. Two folders under two existing folders are two
-//! folders however alike the paths read: `Α/new` and `α/new` are one folder
-//! only if `Α` and `α` are.
+//! That folder is the filesystem's own, so it is told by the object the
+//! filesystem has (its device and inode, on Windows its file index; see
+//! [`DirKey`]), never by how its path is spelled, and never folded: a
+//! canonical path keeps the spelling the caller used for every segment that
+//! is not a symlink, so `R/Sub` and `R/sub` are one folder on a filesystem
+//! that folds case (and `/private/x` and `/System/Volumes/Data/private/x`
+//! are one on macOS), yet two canonical paths. Only the names below the
+//! anchor, which the filesystem has not seen yet, fold case, and only when
+//! the anchor's filesystem does. Two folders under two existing folders are
+//! two folders however alike the paths read: `Α/new` and `α/new` are one
+//! folder only if `Α` and `α` are (the same object).
 //!
 //! [`FolderId`] is the only type that decides this, and its fields are
 //! private to this module: a caller cannot build one from a lowercased whole
@@ -20,15 +25,39 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::fscase::fs_is_case_insensitive;
 use crate::restore;
+
+/// Which existing folder: the filesystem's object, not a spelling of it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DirKey {
+	/// The folder's own device and inode (Windows: volume and file index).
+	Object(Arc<same_file::Handle>),
+	/// Only when the folder cannot be opened: its canonical path.
+	Path(PathBuf),
+}
+
+impl DirKey {
+	/// What the filesystem says `path` is. A folder that exists but cannot
+	/// be opened is told by its canonical path, which is all there is.
+	pub(crate) fn of(path: &Path) -> Self {
+		match same_file::Handle::from_path(path) {
+			Ok(handle) => Self::Object(Arc::new(handle)),
+			Err(_) => Self::Path(
+				dunce::canonicalize(path)
+					.unwrap_or_else(|_| path.to_path_buf()),
+			),
+		}
+	}
+}
 
 /// A folder to be made, by the exact identity of the folder it is made in
 /// and the (folded) names below that.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FolderId {
-	anchor: PathBuf,
+	anchor: DirKey,
 	/// Whether the anchor's filesystem folds case; decides `tail`. Equal
 	/// anchors always carry the same value.
 	folds: bool,
@@ -36,7 +65,7 @@ pub(crate) struct FolderId {
 }
 
 impl FolderId {
-	fn at(anchor: PathBuf, folds: bool) -> Self {
+	fn at(anchor: DirKey, folds: bool) -> Self {
 		Self {
 			anchor,
 			folds,
@@ -63,7 +92,7 @@ impl FolderId {
 /// An existing folder as the filesystem has it.
 #[derive(Clone)]
 struct Anchor {
-	canonical: PathBuf,
+	key: DirKey,
 	folds: bool,
 }
 
@@ -74,8 +103,13 @@ struct Anchor {
 pub(crate) struct NewFolderNames {
 	/// Whether the filesystem under each destination root folds case.
 	root_folds: HashMap<PathBuf, bool>,
-	/// Existing folder, as spelled, to its anchor. One `canonicalize` each.
+	/// Which existing folder a path is.
+	identify: Box<dyn Fn(&Path) -> DirKey>,
+	/// Existing folder, as spelled, to its anchor. One lookup each.
 	anchors: HashMap<PathBuf, Anchor>,
+	/// Whether names below a folder fold, by folder: the answer for the
+	/// first spelling met decides, so one folder never has two.
+	folds: HashMap<DirKey, bool>,
 	/// The first spelling asked for, per folder.
 	spelled: HashMap<FolderId, PathBuf>,
 	/// The folders the user named (a placed folder's tail).
@@ -84,9 +118,19 @@ pub(crate) struct NewFolderNames {
 
 impl NewFolderNames {
 	pub(crate) fn new(root_folds: HashMap<PathBuf, bool>) -> Self {
+		Self::with_identity(root_folds, Box::new(DirKey::of))
+	}
+
+	/// [`Self::new`] with another way to tell which folder a path is.
+	pub(crate) fn with_identity(
+		root_folds: HashMap<PathBuf, bool>,
+		identify: Box<dyn Fn(&Path) -> DirKey>,
+	) -> Self {
 		Self {
 			root_folds,
+			identify,
 			anchors: HashMap::new(),
+			folds: HashMap::new(),
 			spelled: HashMap::new(),
 			named: HashSet::new(),
 		}
@@ -109,12 +153,18 @@ impl NewFolderNames {
 		if let Some(anchor) = self.anchors.get(existing) {
 			return anchor.clone();
 		}
-		let canonical = dunce::canonicalize(existing)
-			.unwrap_or_else(|_| existing.to_path_buf());
-		let anchor = Anchor {
-			folds: self.folds_at(&canonical),
-			canonical,
+		let key = (self.identify)(existing);
+		let folds = match self.folds.get(&key) {
+			Some(&folds) => folds,
+			None => {
+				let canonical = dunce::canonicalize(existing)
+					.unwrap_or_else(|_| existing.to_path_buf());
+				let folds = self.folds_at(&canonical);
+				self.folds.insert(key.clone(), folds);
+				folds
+			}
 		};
+		let anchor = Anchor { key, folds };
 		self.anchors.insert(existing.to_path_buf(), anchor.clone());
 		anchor
 	}
@@ -128,7 +178,7 @@ impl NewFolderNames {
 		tail: &[String],
 	) -> Vec<PathBuf> {
 		let a = self.anchor(anchor);
-		let mut id = FolderId::at(a.canonical, a.folds);
+		let mut id = FolderId::at(a.key, a.folds);
 		let mut cur = anchor.to_path_buf();
 		let mut chain = Vec::with_capacity(tail.len());
 		for name in tail {
@@ -174,7 +224,7 @@ impl NewFolderNames {
 			missing.push(name.as_os_str());
 		}
 		let a = self.anchor(&base);
-		let mut id = FolderId::at(a.canonical, a.folds);
+		let mut id = FolderId::at(a.key, a.folds);
 		let mut ids = Vec::with_capacity(missing.len());
 		let mut names_one = false;
 		for name in &missing {
@@ -230,7 +280,7 @@ impl NewFolderNames {
 				cur = parent;
 			}
 			let a = self.anchor(cur);
-			let mut id = FolderId::at(a.canonical, a.folds);
+			let mut id = FolderId::at(a.key, a.folds);
 			for name in names.into_iter().rev() {
 				id = id.child(name);
 			}
@@ -238,15 +288,13 @@ impl NewFolderNames {
 				requested.insert(dir.clone());
 			}
 		}
-		// The invariant: a named folder, spelled as named, that a create
-		// needs is requested. A gap here would make it with no consent.
+		// A named folder, spelled as named, that a create needs is
+		// requested whatever the identity above made of it. (A folder that
+		// appeared between resolving and planning moves its tail's anchor,
+		// so the two can differ: asking is the safe side, and the plan is
+		// found stale when it is applied.)
 		for dir in named_paths {
 			if missing.contains(dir) {
-				debug_assert!(
-					requested.contains(dir),
-					"named folder {} is not requested",
-					dir.display()
-				);
 				requested.insert(dir.clone());
 			}
 		}
@@ -312,5 +360,73 @@ mod tests {
 		let got = n.requested(&missing, &[]);
 		assert_eq!(got, [PathBuf::from("/ws/NEW")].into());
 		assert_eq!(chain, [PathBuf::from("/ws/new")]);
+	}
+
+	/// Names that spell one existing folder two ways: `/ws/Sub` and
+	/// `/ws/sub` are one object, as on a filesystem that folds case (a
+	/// canonical path keeps whichever spelling it was given).
+	fn same_object(spellings: &'static [&'static str]) -> NewFolderNames {
+		let roots = spellings.iter().map(|r| (PathBuf::from(r), true));
+		NewFolderNames::with_identity(
+			roots.collect(),
+			Box::new(move |path| {
+				let one = spellings.iter().any(|s| Path::new(s) == path);
+				DirKey::Path(if one {
+					PathBuf::from(spellings[0])
+				} else {
+					path.to_path_buf()
+				})
+			}),
+		)
+	}
+
+	/// The folder the user named under one spelling of an existing folder is
+	/// named when a path reaches it through another spelling of that folder.
+	#[test]
+	fn one_existing_folder_spelled_two_ways_is_one_anchor() {
+		let mut n = same_object(&["/ws/Sub", "/ws/sub"]);
+		let chain = n.name_chain(Path::new("/ws/Sub"), &tail(&["new"]));
+		let missing: HashSet<PathBuf> = [PathBuf::from("/ws/sub/new")].into();
+		assert_eq!(n.requested(&missing, &chain), missing);
+		// By identity alone, without the spelling to fall back on.
+		assert_eq!(n.requested(&missing, &[]), missing);
+	}
+
+	/// The same two spellings do not make a folder under a third one the
+	/// named folder.
+	#[test]
+	fn another_existing_folder_is_another_anchor() {
+		let mut n = same_object(&["/ws/Sub", "/ws/sub"]);
+		n.name_chain(Path::new("/ws/Sub"), &tail(&["new"]));
+		let missing: HashSet<PathBuf> = [PathBuf::from("/ws/other/new")].into();
+		assert_eq!(n.requested(&missing, &[]), HashSet::new());
+	}
+
+	/// A folder of the tail that appears between resolving and planning
+	/// moves the anchor of what is still missing. That is not a reason to
+	/// panic: the folder named is asked about, and the plan is stale when
+	/// applied.
+	#[test]
+	fn a_tail_folder_made_in_between_is_still_requested() {
+		let mut n = names(true, &["/ws"]);
+		let chain = n.name_chain(Path::new("/ws"), &tail(&["a", "b"]));
+		let missing: HashSet<PathBuf> = [PathBuf::from("/ws/a/b")].into();
+		assert_eq!(n.requested(&missing, &chain), missing);
+	}
+
+	/// Real folders: two spellings of one folder get one identity, two
+	/// folders get two. Case is whatever the filesystem here does.
+	#[test]
+	fn the_filesystem_object_decides_which_folder() {
+		let tmp = tempfile::tempdir().unwrap();
+		let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+		fs::create_dir(&a).unwrap();
+		fs::create_dir(&b).unwrap();
+		assert_eq!(DirKey::of(&a), DirKey::of(&tmp.path().join("./a")));
+		assert_ne!(DirKey::of(&a), DirKey::of(&b));
+		assert_eq!(
+			DirKey::of(&tmp.path().join("missing")),
+			DirKey::Path(tmp.path().join("missing"))
+		);
 	}
 }

@@ -8742,6 +8742,45 @@ fn test_apply_without_consent_makes_nothing() {
 	assert!(!ws.join("new").exists());
 }
 
+/// A1b: one existing folder reached by two spellings is one folder. On
+/// macOS `/System/Volumes/Data/private/...` and `/private/...` are one
+/// folder (a firmlink), yet two canonical paths: the folder the user named
+/// under it, reached by a payload that goes through the other spelling,
+/// still asks for consent. macOS only: it is the one place a test can make
+/// two spellings of a folder without a mount.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_named_folder_reached_through_another_spelling_of_its_anchor_is_asked_for(
+) {
+	use std::os::unix::fs::MetadataExt;
+
+	let (_tmp, ws) = canonical_tmp();
+	let root = ws.join("R");
+	fs::create_dir_all(root.join("Sub")).unwrap();
+	let mut spelled = PathBuf::from("/System/Volumes/Data");
+	spelled.push(root.strip_prefix("/").unwrap());
+	let (a, b) = (
+		fs::metadata(&root).unwrap(),
+		fs::metadata(&spelled).expect("the data volume's firmlink is there"),
+	);
+	assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+
+	let mut mapping =
+		ImportMapping::with_primary(placed(&root.join("Sub").join("new")));
+	mapping.map_prefix("q", placed(&spelled));
+	let plan = plan_placed(&ws, "// file: q/Sub/new/b.txt\nB\n", &mapping);
+	assert_eq!(plan.new_dirs().incidental, Vec::<PathBuf>::new());
+	assert_eq!(plan.new_dirs().requested.len(), 1, "{:?}", plan.new_dirs());
+	let err = plan.apply(&RestoreSelection::default()).unwrap_err();
+	match &err {
+		TransferError::NewDirsNotConfirmed { dirs } => {
+			assert_eq!(dirs.len(), 1, "{dirs:?}")
+		}
+		other => panic!("expected NewDirsNotConfirmed, got {other:?}"),
+	}
+	assert!(!root.join("Sub/new").exists());
+}
+
 /// A2: with the agreement the folder is made and the file written.
 #[test]
 fn test_apply_with_consent_makes_the_folder_and_writes() {

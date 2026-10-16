@@ -1866,16 +1866,11 @@ impl TransferImportPlan {
 				dirs: unconfirmed,
 			});
 		}
+		// Only `new.requested` is made here, and the check above made sure
+		// each of them is agreed to. Whether a folder the user named is in
+		// `requested` at all is decided when planning (`foldernames`), by
+		// the identity of the folder; nothing at this point can tell.
 		let made = self.make_requested_dirs(&new.requested)?;
-		// The agreement covers every folder the user named that is made: a
-		// gap in how folders are told apart must end as a refusal above,
-		// never as a folder made with no consent.
-		debug_assert!(
-			made.iter()
-				.all(|dir| selection.confirmed_new_dirs.contains(dir)),
-			"made {made:?} without consent to {:?}",
-			selection.confirmed_new_dirs
-		);
 
 		let mut result = restore::execute_restore_plan_observed(
 			&self.restore_plan,
