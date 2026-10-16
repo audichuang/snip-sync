@@ -61,6 +61,8 @@ jobs:
               run: ./scripts/check_test_refresh.sh
             - name: Ban raw-text message paths in product code
               run: ./scripts/check_msg_raw.sh
+            - name: Ban width weights and unruled truncation in the log UI
+              run: ./scripts/check_text_fit.sh
 
     # clippy + rustdoc on all three OSes; audit once, on Linux.
     lint-rust:

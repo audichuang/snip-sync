@@ -1,5 +1,10 @@
 //! Git Log chrome: filter chips, dropdown menus and the branches pane.
 
+use super::fit::{
+	fit_row, floor_px, natural_px, record_dropped, role_measure, text_width_in,
+	Claim, FitCell, FitId, FitRole, Part, RowFit, CHIP_CHROME_W, FIT_MARGIN,
+	LABEL_ICON_GAP,
+};
 use super::*;
 
 // ───────────────────────── log helpers (IJ-2a) ─────────────────────────
@@ -28,164 +33,161 @@ impl LogMenu {
 	}
 }
 
-/// Measured layout widths for dynamic filter chip overflow.
+/// What the filter bar remembers between frames. Its chips are laid out by
+/// [`split_chips`] for the width of the container it measured last frame; the
+/// container's canvas draws one more frame when this one's width differs
+/// ([`refresh_if_stale`], at most 3 times for a new width).
 #[derive(Clone, Default)]
 pub struct LogFilterLayout {
+	/// The chips' container, as drawn (0 until the first frame).
 	pub container_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub repo_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub branch_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub user_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub date_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub more_w: std::rc::Rc<std::cell::Cell<f32>>,
+	/// The width the chips were split for in this frame.
+	pub used_w: std::rc::Rc<std::cell::Cell<f32>>,
+	/// Which chips the last frame drew on the bar (bit `i` is
+	/// `ALL_LOG_FILTER_MENUS[i]`).
 	pub last_mask: std::rc::Rc<std::cell::Cell<u8>>,
+	/// Redraws asked for since the container's width last changed.
 	pub refresh_count: std::rc::Rc<std::cell::Cell<u8>>,
-	/// The widest text an active chip draws (0 until first measured: the
-	/// 180px default). Active chips share the bar, so a long value is
-	/// truncated before it pushes another active chip into the overflow.
-	/// Inactive chips keep `CHIP_TEXT_MAX_W`.
-	pub text_cap: std::rc::Rc<std::cell::Cell<f32>>,
-	/// The active chips' natural text widths of the last frame: the cap for
-	/// any bar width follows from them, so the container canvas can tell
-	/// that a resize left the drawn cap stale.
-	pub cap_natural: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
-	/// Each chip's last drawn text and its measured width. A chip whose
-	/// text is unchanged keeps that width while hidden, so a text estimate
-	/// cannot reveal it again and again (estimates run a few px short or
-	/// long where the font falls back).
-	pub measured: std::rc::Rc<std::cell::RefCell<[(String, f32); 4]>>,
 }
 
 pub(crate) const ALL_LOG_FILTER_MENUS: [LogMenu; 4] =
 	[LogMenu::Repo, LogMenu::Branch, LogMenu::User, LogMenu::Date];
 pub(crate) const LOG_FILTER_GAP: f32 = 4.0;
-pub(crate) const CONSERVATIVE_CHIP_W_EMPTY: f32 = 75.0;
-pub(crate) const CONSERVATIVE_CHIP_W_ACTIVE: f32 = 180.0;
-pub(crate) const CONSERVATIVE_MORE_W: f32 = 42.0;
-/// The widest chip text, and the narrowest an active chip's text is
-/// truncated to before the split gives up on showing it.
+/// The widest chip text; a longer one is cut with an ellipsis.
 pub(crate) const CHIP_TEXT_MAX_W: f32 = 180.0;
-pub(crate) const CHIP_TEXT_MIN_W: f32 = 64.0;
-/// A chip's padding, gap and icon around its text (with 1px slack).
-pub(crate) const CHIP_CHROME_W: f32 = 28.0;
-/// Extra room per active chip, so a text measured a few px off (font
-/// fallback) does not push a chip into the overflow again.
-pub(crate) const CHIP_SLACK_W: f32 = 3.0;
+/// An overflow chip's padding (4 + 4), the gap before its icon, the icon;
+/// a hidden filter with a value adds a 5px dot and its gap in front of the
+/// icon, and a 1px border on each side.
+const MORE_PAD_W: f32 = 8.;
+const MORE_ICON_W: f32 = 10.;
+const MORE_DOT_W: f32 = 5. + 2.;
+const MORE_BORDER_W: f32 = 2.;
 
-/// The text cap that lets active chips with these natural text widths
-/// share `room` px: short values keep their width, long ones split what
-/// is left.
-pub(crate) fn chip_text_cap(natural: &[f32], room: f32) -> f32 {
-	let mut sorted: Vec<f32> =
-		natural.iter().map(|w| w.min(CHIP_TEXT_MAX_W)).collect();
-	sorted.sort_by(f32::total_cmp);
-	let mut left = room;
-	let mut count = sorted.len();
-	for w in sorted {
-		if w * count as f32 > left {
-			break;
-		}
-		left -= w;
-		count -= 1;
+/// The roles of the filter bar's chips, by menu.
+pub(super) fn chip_role(menu: LogMenu) -> FitRole {
+	match menu {
+		LogMenu::Repo => FitRole::ChipRepo,
+		LogMenu::Branch => FitRole::ChipBranch,
+		LogMenu::User => FitRole::ChipUser,
+		LogMenu::Date => FitRole::ChipDate,
+		LogMenu::More | LogMenu::FilterMore => FitRole::ChipMore,
 	}
-	if count == 0 {
-		return CHIP_TEXT_MAX_W;
-	}
-	(left / count as f32).clamp(CHIP_TEXT_MIN_W, CHIP_TEXT_MAX_W)
 }
 
-impl LogFilterLayout {
-	/// The active chips' text cap for a bar `avail` px wide.
-	pub(crate) fn text_cap_for(&self, avail: f32) -> f32 {
-		let natural = self.cap_natural.borrow();
-		if natural.is_empty() || avail <= 0.0 {
-			return CHIP_TEXT_MAX_W;
-		}
-		let chrome = LOG_FILTER_GAP + CHIP_CHROME_W + CHIP_SLACK_W;
-		chip_text_cap(
-			&natural,
-			avail - self.more_w.get() - natural.len() as f32 * chrome,
-		)
-	}
+/// The chips and the overflow chip, as the solver places them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChipPart {
+	Chip(LogMenu),
+	More,
+}
 
-	pub fn text_cap(&self) -> f32 {
-		match self.text_cap.get() {
-			c if c > 0.0 => c,
-			_ => CHIP_TEXT_MAX_W,
-		}
-	}
+/// What a filter chip asks of the split.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ChipInput {
+	pub natural: f32,
+	pub floor: f32,
+	pub valued: bool,
+}
 
-	pub fn chip_width_cell(
-		&self,
-		menu: LogMenu,
-	) -> &std::rc::Rc<std::cell::Cell<f32>> {
-		match menu {
-			LogMenu::Repo => &self.repo_w,
-			LogMenu::Branch => &self.branch_w,
-			LogMenu::User => &self.user_w,
-			LogMenu::Date => &self.date_w,
-			LogMenu::More | LogMenu::FilterMore => &self.more_w,
-		}
+/// Which chips stay on a bar `avail` px wide (a bit mask over
+/// `ALL_LOG_FILTER_MENUS`) and the width each gets. Chips that fit whole all
+/// stay. Else the overflow chip comes first, then every chip with a value at
+/// its floor, the shorter text first, so a short value is whole before a
+/// long one gets more; then the chips with a value grow, the shorter first;
+/// chips without a value come last, and are the first to go into the
+/// overflow chip. A hidden value marks the overflow chip with a dot; when
+/// nothing with a value is hidden it needs none, and the split is made again
+/// without.
+pub(super) fn split_chips(
+	chips: &[ChipInput; 4],
+	more: f32,
+	more_with_dot: f32,
+	avail: f32,
+) -> (u8, RowFit<ChipPart>) {
+	// Every part pays the gap before it, the first one too: widen the bar
+	// by one gap.
+	let avail = avail + LOG_FILTER_GAP;
+	let parts = |more_w: f32| -> Vec<Part<ChipPart>> {
+		chips
+			.iter()
+			.enumerate()
+			.map(|(i, c)| {
+				Part::new(
+					ChipPart::Chip(ALL_LOG_FILTER_MENUS[i]),
+					c.natural,
+					c.floor,
+					LOG_FILTER_GAP,
+				)
+			})
+			.chain(std::iter::once(Part::new(
+				ChipPart::More,
+				more_w,
+				more_w,
+				LOG_FILTER_GAP,
+			)))
+			.collect()
+	};
+	let chip = |i: usize| ChipPart::Chip(ALL_LOG_FILTER_MENUS[i]);
+	let whole: f32 = chips.iter().map(|c| c.natural + LOG_FILTER_GAP).sum();
+	if whole <= avail + 1e-3 {
+		let claims: Vec<Claim<ChipPart>> = (0..4)
+			.map(|i| Claim::Grow(chip(i), chips[i].natural))
+			.collect();
+		return (0b1111, fit_row(avail, &parts(more), &claims));
 	}
-
-	pub fn chip_effective_w(&self, menu: LogMenu, has_value: bool) -> f32 {
-		let measured = self.chip_width_cell(menu).get();
-		if measured > 0.0 {
-			measured
-		} else if has_value {
-			CONSERVATIVE_CHIP_W_ACTIVE
+	let pass = |more_w: f32| {
+		let mut valued: Vec<usize> =
+			(0..4).filter(|&i| chips[i].valued).collect();
+		valued.sort_by(|&a, &b| chips[a].natural.total_cmp(&chips[b].natural));
+		let mut claims = vec![Claim::Atomic(vec![ChipPart::More])];
+		claims.extend(valued.iter().map(|&i| Claim::Atomic(vec![chip(i)])));
+		claims.push(Claim::ShortestFirst(
+			valued.iter().map(|&i| chip(i)).collect(),
+		));
+		claims.extend(
+			(0..4)
+				.filter(|&i| !chips[i].valued)
+				.map(|i| Claim::Atomic(vec![chip(i)])),
+		);
+		let fit = fit_row(avail, &parts(more_w), &claims);
+		// Without room for the overflow chip nothing goes on the bar.
+		let mask = if fit.shown(ChipPart::More) {
+			(0..4)
+				.filter(|&i| fit.shown(chip(i)))
+				.fold(0u8, |m, i| m | (1 << i))
 		} else {
-			CONSERVATIVE_CHIP_W_EMPTY
-		}
-	}
-
-	pub fn more_effective_w(&self) -> f32 {
-		let measured = self.more_w.get();
-		if measured > 0.0 {
-			measured
-		} else {
-			CONSERVATIVE_MORE_W
-		}
-	}
-
-	/// Which chips stay on the bar, as a bit mask over
-	/// `ALL_LOG_FILTER_MENUS`. Inactive chips give way first, from the
-	/// end: an active chip keeps its clear button in sight as long as it
-	/// fits. The rest go to the overflow chip.
-	pub fn compute_split(&self, available_w: f32, has_values: [bool; 4]) -> u8 {
-		if available_w <= 0.0 {
-			return 0;
-		}
-		let w: [f32; 4] = std::array::from_fn(|i| {
-			self.chip_effective_w(ALL_LOG_FILTER_MENUS[i], has_values[i])
-		});
-		let needed = |mask: u8| {
-			let shown: Vec<usize> =
-				(0..4).filter(|i| mask & (1 << i) != 0).collect();
-			let mut sum: f32 = shown.iter().map(|&i| w[i]).sum();
-			let items = shown.len() + usize::from(mask != 0b1111);
-			sum += items.saturating_sub(1) as f32 * LOG_FILTER_GAP;
-			if mask != 0b1111 {
-				sum += self.more_effective_w();
-				// The overflow chip's dot and border mark a hidden value.
-				if (0..4).any(|i| mask & (1 << i) == 0 && has_values[i]) {
-					sum += 9.;
-				}
-			}
-			sum
+			0
 		};
-		let mut mask = 0b1111u8;
-		let order = (0..4usize)
-			.rev()
-			.filter(|&i| !has_values[i])
-			.chain((0..4usize).rev().filter(|&i| has_values[i]));
-		for i in order {
-			if needed(mask) <= available_w {
-				return mask;
-			}
-			mask &= !(1 << i);
-		}
-		0
+		(mask, fit)
+	};
+	let any_valued = chips.iter().any(|c| c.valued);
+	let (mask, fit) = pass(if any_valued { more_with_dot } else { more });
+	let hides_valued = (0..4).any(|i| mask & (1 << i) == 0 && chips[i].valued);
+	if any_valued && !hides_valued {
+		return pass(more);
 	}
+	(mask, fit)
+}
+
+/// The chips of `mask` and the rest, each in their usual order.
+pub(super) fn split_by_mask(mask: u8) -> (Vec<LogMenu>, Vec<LogMenu>) {
+	(0..4).fold((Vec::new(), Vec::new()), |(mut on, mut off), i| {
+		if mask & (1 << i) != 0 {
+			on.push(ALL_LOG_FILTER_MENUS[i])
+		} else {
+			off.push(ALL_LOG_FILTER_MENUS[i])
+		}
+		(on, off)
+	})
+}
+
+/// The filter bar of one frame: the split and the widths.
+pub(super) struct ChipFit {
+	pub mask: u8,
+	pub fit: RowFit<ChipPart>,
+	/// The overflow chip's width without and with the dot of a hidden value.
+	pub more: f32,
+	pub more_dot: f32,
 }
 
 /// What a log dropdown entry does when clicked.
@@ -533,141 +535,340 @@ pub(super) fn path_picker_matches(
 
 /// Rows per branches-pane group.
 pub(super) const MAX_BRANCH_ROWS: usize = 200;
-pub(super) const AUTHOR_W: f32 = 120.;
-pub(super) const DATE_W: f32 = 118.;
-/// The subject width a log row keeps while the gutter, author, date and ref
-/// labels are squeezed, where the window allows.
-pub(super) const MIN_SUBJECT_W: f32 = 160.;
-/// The least a subject keeps beside ref labels that would not fit otherwise;
-/// down to here the subject gives way before a label is cut (#195).
-pub(super) const MIN_SUBJECT_BESIDE_LABELS: f32 = 96.;
-/// The narrowest a ref-label group is squeezed to; below it the labels are
-/// dropped altogether.
-const MIN_LABELS_W: f32 = 80.;
-/// The narrowest a ref label is squeezed to: its icon and a few characters.
-/// Below it the label would show only its icon, which says nothing (#195).
-const LABEL_FLOOR_W: f32 = 14. + 3. + 30.;
-/// The narrowest the graph gutter is clipped to.
-const MIN_GUTTER_W: f32 = 72.;
 
-/// The narrowest the author and date cells are squeezed to (their text is
-/// clipped) once the graph gutter is at its floor.
-const MIN_AUTHOR_W: f32 = 72.;
-const MIN_DATE_W: f32 = 88.;
+/// The numbers of a Log row's layout. The least a text keeps is not here but
+/// in the rule table (`FitRole::rule`, ADR 0005); these are the fixed parts
+/// of a row and the widths a column grows to when there is room.
+pub(super) mod row_policy {
+	/// The row's right padding.
+	pub const ROW_PAD_R: f32 = 8.;
+	/// The gap before the subject and before the author, date and hash.
+	pub const CELL_GAP: f32 = 8.;
+	/// The gap between two ref labels.
+	pub const LABEL_GAP: f32 = 8.;
+	/// The gap before a collapsed chip and before the first ref label.
+	pub const SUBJECT_LABEL_GAP: f32 = 6.;
+	pub const HASH_W: f32 = 64.;
+	/// The narrowest the graph gutter is clipped to before the other
+	/// columns give way.
+	pub const MIN_GUTTER_W: f32 = 72.;
+	pub const AUTHOR_W: f32 = 120.;
+	pub const DATE_W: f32 = 118.;
+	/// The subject's comfortable width: columns grow past their floors
+	/// only once it has this much.
+	pub const SUBJECT_COMFORT_W: f32 = 160.;
+	/// A ref label is never wider than this.
+	pub const LABEL_MAX_W: f32 = 320.;
+}
+use row_policy::*;
+
+/// The list's width until it reports its own (the first frame).
+pub(super) const NOMINAL_LIST_W: f32 = 800.;
+
+/// What the list's columns are decided from, other than its width: the worst
+/// row of each kind ([`fit_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ListFitParts {
+	pub date_need: f32,
+	pub author_floor: Option<f32>,
+	pub subject_floor_bound: f32,
+	pub collapsed: Option<f32>,
+	pub labels: Vec<LabelPart>,
+}
+
+impl ListFitParts {
+	pub(super) fn input(
+		&self,
+		list_w: f32,
+		hash: bool,
+		gutter: f32,
+	) -> ListFitInput {
+		ListFitInput {
+			list_w,
+			hash,
+			gutter,
+			date_need: self.date_need,
+			author_floor: self.author_floor,
+			subject_floor_bound: self.subject_floor_bound,
+			collapsed: self.collapsed,
+			labels: self.labels.clone(),
+		}
+	}
+}
+
+/// What the Log keeps between frames to place its rows.
+#[derive(Default)]
+pub struct LogFit {
+	/// The log panel's width: the side panes and the search box read it.
+	pub(super) panel: StaleWidth,
+	/// The list's width, which its columns are decided from.
+	pub(super) list: StaleWidth,
+	/// [`ListFitParts`] for a fingerprint of everything they read.
+	pub(super) cache:
+		std::cell::RefCell<Option<(u64, std::rc::Rc<ListFitParts>)>>,
+}
+
+/// The cells of a Log row the solver places, left to right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum LogCell {
+	Gutter,
+	Subject,
+	Collapsed,
+	BranchLabel,
+	TagLabel,
+	RefMore,
+	Author,
+	Date,
+	Hash,
+}
+
+impl LogCell {
+	/// The graph gutter is not text: it has no role.
+	pub(super) fn role(self) -> Option<FitRole> {
+		match self {
+			LogCell::Gutter => None,
+			LogCell::Subject => Some(FitRole::Subject),
+			LogCell::Collapsed => Some(FitRole::Collapsed),
+			LogCell::BranchLabel => Some(FitRole::BranchLabel),
+			LogCell::TagLabel => Some(FitRole::TagLabel),
+			LogCell::RefMore => Some(FitRole::RefMore),
+			LogCell::Author => Some(FitRole::Author),
+			LogCell::Date => Some(FitRole::Date),
+			LogCell::Hash => Some(FitRole::Hash),
+		}
+	}
+
+	const ALL: [LogCell; 9] = [
+		LogCell::Gutter,
+		LogCell::Subject,
+		LogCell::Collapsed,
+		LogCell::BranchLabel,
+		LogCell::TagLabel,
+		LogCell::RefMore,
+		LogCell::Author,
+		LogCell::Date,
+		LogCell::Hash,
+	];
+}
+
+/// One ref label (or the `+N`) of a row, with the widths it may have.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LabelPart {
+	pub cell: LogCell,
+	pub natural: f32,
+	pub floor: f32,
+}
 
 /// The widths one list decides for all its rows, so columns line up from row
-/// to row.
+/// to row. `None` is a column left out of every row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ListCols {
 	pub gutter: f32,
-	pub author: f32,
-	pub date: f32,
+	pub author: Option<f32>,
+	pub date: Option<f32>,
 }
 
-/// How a log row divides its width: the graph gutter, the ref labels and
-/// what is left for the subject.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct RowWidths {
+/// What the list's columns depend on beyond its width: the worst row of each
+/// kind (see [`fit_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ListFitInput {
+	pub list_w: f32,
+	pub hash: bool,
+	/// The graph gutter's natural width.
 	pub gutter: f32,
-	pub labels: f32,
-	pub subject: f32,
+	/// The widest date string of the locale, whole.
+	pub date_need: f32,
+	/// The most any author name needs at its readable floor; `None` with
+	/// no row.
+	pub author_floor: Option<f32>,
+	/// A subject's floor, for the widest letters ("漢" or "W").
+	pub subject_floor_bound: f32,
+	/// The widest collapsed chip.
+	pub collapsed: Option<f32>,
+	/// The ref labels of the row whose floors add up to the most.
+	pub labels: Vec<LabelPart>,
 }
 
-/// What a `list_w` wide row leaves for the gutter, labels and subject after
-/// 8px right padding, the 8px gaps between the cells and the optional hash.
-fn row_base(list_w: f32, show_hash: bool) -> f32 {
-	let gaps = if show_hash { 4. } else { 3. } * 8.;
-	let hash_w = if show_hash { 64. } else { 0. };
-	list_w - 8. - gaps - hash_w
+/// What a row asks of the solver beyond the list's columns.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RowFitInput {
+	pub hash: bool,
+	pub subject_natural: f32,
+	pub subject_floor: f32,
+	pub collapsed: Option<f32>,
+	pub labels: Vec<LabelPart>,
 }
 
-/// The graph gutter, author and date widths of every row in a `list_w` wide
-/// list, decided once per list. Pieces give way to the subject in this
-/// order: the gutter is clipped (only as far as a squeezed label group, when
-/// there are labels, and the subject need), then no further than
-/// [`MIN_GUTTER_W`]; below that the author and then the date cell shrink
-/// (one order for every shortfall) until the subject reaches
-/// [`MIN_SUBJECT_W`]. On a very narrow list the subject takes what is left.
-///
-/// `labels_w` is the widest ref-label group any row of the list has (0 for
-/// none, see [`ref_labels_width`]). Beside a short subject the group gets
-/// room only as far as it needs it (down to [`MIN_SUBJECT_BESIDE_LABELS`]
-/// for the subject): the author column gives way first, then the date, and
-/// for the labels the date never goes below `date_need`, the width of the
-/// longest date string of the current locale ([`date_need_w`]), so a list
-/// whose labels already fit keeps its columns (#216). The subject's shortfall
-/// uses the same routine (author first, then the date); only when even author
-/// at [`MIN_AUTHOR_W`] and date at that floor cannot reach the subject minimum
-/// does the date yield last, down to [`MIN_DATE_W`].
-///
-/// [`MIN_SUBJECT_W`] is not guaranteed on
-/// lists under about 520px with the hash column on (a 900 window with the
-/// hash shown leaves the subject about 97px).
-pub(super) fn list_cols(
-	list_w: f32,
-	gutter_w: f32,
-	labels_w: f32,
-	date_need: f32,
-	show_hash: bool,
-) -> ListCols {
-	let has_labels = labels_w > 0.;
-	let base = row_base(list_w, show_hash);
-	// The 6px before the labels only exists with labels.
-	let labels = if has_labels { MIN_LABELS_W + 6. } else { 0. };
-	let room = base - AUTHOR_W - DATE_W - MIN_SUBJECT_W - labels;
-	let gutter = gutter_w.min(room.max(MIN_GUTTER_W));
-	// What the subject still lacks with the gutter placed.
-	let lack = (MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
-	// A short subject beside the labels: the room the whole group needs,
-	// taken from the author, then from the date down to what it needs. Where
-	// even all of that would leave the group under MIN_LABELS_W it is
-	// dropped anyway, so nothing is squeezed for it.
-	let date_floor = date_need.clamp(MIN_DATE_W, DATE_W);
-	let label_give = (AUTHOR_W - MIN_AUTHOR_W) + (DATE_W - date_floor);
-	let have = base - gutter - AUTHOR_W - DATE_W;
-	let label_lack = if has_labels
-		&& have + label_give >= MIN_SUBJECT_BESIDE_LABELS + 6. + MIN_LABELS_W
-	{
-		(MIN_SUBJECT_BESIDE_LABELS + 6. + labels_w - have).clamp(0., label_give)
-	} else {
-		0.
-	};
-	// One give-way order for both shortfalls: the author first, then the
-	// date. The labels' share stops at `date_floor`; only the subject's own
-	// minimum may push the date on to MIN_DATE_W.
-	let total = lack.max(label_lack);
-	let author_cut = total.min(AUTHOR_W - MIN_AUTHOR_W);
-	let date_cut = (total - author_cut).min(DATE_W - MIN_DATE_W);
-	ListCols {
-		gutter,
-		author: AUTHOR_W - author_cut,
-		date: DATE_W - date_cut,
-	}
-}
-
-/// The laid-out width of a row's ref labels, as [`ref_label_elements`] draws
-/// them (`measure` gives a name's text width): each label its icon allowance
-/// and text (at most 320), 8px between labels, then the `+N` badge.
-pub(super) fn ref_labels_width(
-	refs: &[snip_core::graph::RefInfo],
-	current_branch: Option<&str>,
-	measure: &dyn Fn(&str) -> f32,
-) -> f32 {
-	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	let mut width = 0.;
-	for (n, l) in graph_view::kind_labels(&shown, current_branch)
-		.into_iter()
+fn label_parts(labels: &[LabelPart]) -> Vec<Part<LogCell>> {
+	labels
+		.iter()
 		.enumerate()
-	{
-		if n > 0 {
-			width += 8.;
-		}
-		width += (17. + measure(&l.text)).min(320.);
+		.map(|(n, l)| {
+			let gap = if n == 0 { SUBJECT_LABEL_GAP } else { LABEL_GAP };
+			Part::new(l.cell, l.natural, l.floor, gap)
+		})
+		.collect()
+}
+
+/// Every cell a row can have as a part, those without text at width 0.
+fn all_parts(present: Vec<Part<LogCell>>) -> Vec<Part<LogCell>> {
+	LogCell::ALL
+		.into_iter()
+		.map(|cell| {
+			present
+				.iter()
+				.find(|p| p.id == cell)
+				.copied()
+				.unwrap_or(Part::new(cell, 0., 0., 0.))
+		})
+		.collect()
+}
+
+/// The graph gutter, author and date widths of every row of a list, decided
+/// once from the worst row of each kind. One order for every shortfall (ADR
+/// 0005): the date is whole before anything else (or the column is gone, on
+/// a list under about 250px); the subject gets its readable floor; a
+/// collapsed chip and the ref labels' floors come before the author column,
+/// so the author goes first and then, when even the labels' floors do not
+/// fit, the labels are dropped as a group; then the labels grow, the subject
+/// to its comfortable width, the author, the date and the gutter, and the
+/// subject takes the rest.
+pub(super) fn fit_list(i: &ListFitInput) -> ListCols {
+	let avail = i.list_w - ROW_PAD_R;
+	let date = Part::new(
+		LogCell::Date,
+		i.date_need.max(DATE_W),
+		i.date_need,
+		CELL_GAP,
+	);
+	let mut present = vec![
+		Part::new(LogCell::Gutter, i.gutter, 0., 0.),
+		Part::new(
+			LogCell::Subject,
+			i.list_w.max(i.subject_floor_bound),
+			i.subject_floor_bound,
+			CELL_GAP,
+		),
+		date,
+	];
+	if i.hash {
+		present.push(Part::new(LogCell::Hash, HASH_W, HASH_W, CELL_GAP));
 	}
-	if hidden > 0 {
-		width += 8. + measure(&format!("+{hidden}"));
+	if let Some(w) = i.collapsed {
+		present.push(Part::new(LogCell::Collapsed, w, w, SUBJECT_LABEL_GAP));
 	}
-	width
+	present.extend(label_parts(&i.labels));
+	if let Some(floor) = i.author_floor {
+		present.push(Part::new(
+			LogCell::Author,
+			AUTHOR_W.max(floor),
+			floor,
+			CELL_GAP,
+		));
+	}
+	let label_cells: Vec<LogCell> = i.labels.iter().map(|l| l.cell).collect();
+	let kinds: Vec<LogCell> = label_cells
+		.iter()
+		.copied()
+		.filter(|c| *c != LogCell::RefMore)
+		.collect();
+	let mut claims = Vec::new();
+	if i.hash {
+		claims.push(Claim::Atomic(vec![LogCell::Hash]));
+	}
+	claims.push(Claim::Atomic(vec![LogCell::Date]));
+	claims.push(Claim::Grow(LogCell::Gutter, i.gutter.min(MIN_GUTTER_W)));
+	claims.push(Claim::Grow(LogCell::Subject, i.subject_floor_bound));
+	if i.collapsed.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
+	}
+	if !label_cells.is_empty() {
+		claims.push(Claim::Atomic(label_cells));
+	}
+	if i.author_floor.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Author]));
+	}
+	if !kinds.is_empty() {
+		claims.push(Claim::ShortestFirst(kinds));
+	}
+	claims.push(Claim::Grow(LogCell::Subject, SUBJECT_COMFORT_W));
+	if i.author_floor.is_some() {
+		claims.push(Claim::Grow(LogCell::Author, AUTHOR_W));
+	}
+	claims.push(Claim::Grow(LogCell::Date, DATE_W));
+	claims.push(Claim::Grow(LogCell::Gutter, i.gutter));
+	claims.push(Claim::Rest(LogCell::Subject));
+	let fit = fit_row(avail, &all_parts(present), &claims);
+	ListCols {
+		gutter: fit.width(LogCell::Gutter),
+		author: (i.author_floor.is_some() && fit.shown(LogCell::Author))
+			.then(|| fit.width(LogCell::Author)),
+		date: fit.shown(LogCell::Date).then(|| fit.width(LogCell::Date)),
+	}
+}
+
+/// How one row of a `list_w` wide list divides its width, in the list's
+/// columns. The columns come first, the same in every row; then the subject's
+/// floor, the collapsed chip, the ref labels (all or none), the shorter label
+/// whole before the longer, and the subject takes what is left. A list that
+/// had room for its worst row's floors has it for every row's.
+pub(super) fn fit_log_row(
+	list_w: f32,
+	cols: &ListCols,
+	row: &RowFitInput,
+) -> RowFit<LogCell> {
+	let avail = list_w - ROW_PAD_R;
+	let mut present = vec![
+		Part::new(LogCell::Gutter, cols.gutter, cols.gutter, 0.),
+		Part::new(
+			LogCell::Subject,
+			row.subject_natural,
+			row.subject_floor,
+			CELL_GAP,
+		),
+	];
+	if let Some(w) = cols.date {
+		present.push(Part::new(LogCell::Date, w, w, CELL_GAP));
+	}
+	if let Some(w) = cols.author {
+		present.push(Part::new(LogCell::Author, w, w, CELL_GAP));
+	}
+	if row.hash {
+		present.push(Part::new(LogCell::Hash, HASH_W, HASH_W, CELL_GAP));
+	}
+	if let Some(w) = row.collapsed {
+		present.push(Part::new(LogCell::Collapsed, w, w, SUBJECT_LABEL_GAP));
+	}
+	present.extend(label_parts(&row.labels));
+	let label_cells: Vec<LogCell> = row.labels.iter().map(|l| l.cell).collect();
+	let kinds: Vec<LogCell> = label_cells
+		.iter()
+		.copied()
+		.filter(|c| *c != LogCell::RefMore)
+		.collect();
+	let mut claims = Vec::new();
+	if row.hash {
+		claims.push(Claim::Atomic(vec![LogCell::Hash]));
+	}
+	if cols.date.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Date]));
+	}
+	claims.push(Claim::Atomic(vec![LogCell::Gutter]));
+	if cols.author.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Author]));
+	}
+	claims.push(Claim::Grow(LogCell::Subject, row.subject_floor));
+	if row.collapsed.is_some() {
+		claims.push(Claim::Atomic(vec![LogCell::Collapsed]));
+	}
+	if !label_cells.is_empty() {
+		claims.push(Claim::Atomic(label_cells));
+	}
+	if !kinds.is_empty() {
+		claims.push(Claim::ShortestFirst(kinds));
+	}
+	claims.push(Claim::Rest(LogCell::Subject));
+	fit_row(avail, &all_parts(present), &claims)
 }
 
 /// The width the date cell needs for the longest date string of `loc`
@@ -692,40 +893,53 @@ pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
 	.fold(0., f32::max)
 }
 
-/// Divides a `list_w` wide row laid out with `cols`. A subject keeps only
-/// its own text width, up to [`MIN_SUBJECT_W`]. When the ref labels
-/// (`labels_w`, 0 for none) do not fit beside it, the subject gives way to
-/// them down to [`MIN_SUBJECT_BESIDE_LABELS`] before a label is cut; the
-/// labels shrink to [`MIN_LABELS_W`] and are dropped below that. With room
-/// to spare nothing changes.
-pub(super) fn row_widths(
-	list_w: f32,
-	cols: ListCols,
-	labels_w: f32,
-	subject_w: f32,
-	show_hash: bool,
-) -> RowWidths {
-	let gutter = cols.gutter;
-	let avail = row_base(list_w, show_hash) - cols.author - cols.date - gutter;
-	let mut labels = labels_w;
-	// A short subject reserves only its own text.
-	if labels > 0. && avail - labels - 6. < subject_w.min(MIN_SUBJECT_W) {
-		// The subject gives way down to its floor before a label is cut;
-		// below MIN_LABELS_W the labels go.
-		let room = avail - 6. - subject_w.min(MIN_SUBJECT_BESIDE_LABELS);
-		labels = if room >= labels_w.min(MIN_LABELS_W) {
-			room.min(labels_w)
-		} else {
-			0.
-		};
-	}
-	let with_labels = if labels > 0. { labels + 6. } else { 0. };
-	RowWidths {
-		gutter,
-		labels,
-		subject: (avail - with_labels).max(0.),
-	}
+/// A ref row of the Branches menu: its name and repo, the indent of its
+/// depth, whether it is the active filter and the panel's width.
+pub(super) struct MenuRow {
+	pub name: String,
+	pub label: String,
+	pub depth: usize,
+	pub repo: Option<String>,
+	pub checked: bool,
+	pub panel_w: f32,
 }
+
+/// A menu panel is between these wide; its border (1+1) and padding (4+4)
+/// are around the rows, an item's own padding (8+8), check box (14) and the
+/// gap after it (6) around its text, and a nested row is indented 14px a
+/// level.
+const MENU_MIN_W: f32 = 200.;
+const MENU_MAX_W: f32 = 360.;
+const MENU_PANEL_CHROME: f32 = 10.;
+const MENU_ITEM_CHROME: f32 = 16. + 14. + 6.;
+const MENU_INDENT_W: f32 = 14.;
+
+/// One ref row of the branches pane.
+pub(super) struct PaneRow {
+	pub id: String,
+	pub label: String,
+	pub glyph: AnyElement,
+	pub indent: f32,
+	pub target: Option<String>,
+	pub active: bool,
+	pub repo: Option<String>,
+}
+
+/// The two texts of a pane or menu row that share its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RefRowCell {
+	Name,
+	Suffix,
+}
+
+/// Around a pane row's text: the pane's right border, a row's margin on both
+/// sides and its right padding, the glyph, the gap before the name and
+/// before the repo.
+const PANE_BORDER_W: f32 = 1.;
+const PANE_ROW_MARGIN: f32 = 4.;
+const PANE_ROW_PAD_R: f32 = 6.;
+const PANE_GLYPH_W: f32 = 14.;
+const REF_ROW_GAP: f32 = 6.;
 
 /// `refs/heads/main` → `main`, `refs/remotes/origin/x` → `origin/x`.
 pub(super) fn short_ref(name: &str) -> &str {
@@ -738,21 +952,7 @@ pub(super) fn short_ref(name: &str) -> &str {
 /// Width of `s` laid out in the UI font at `size`, from the text system
 /// (shaped lines are cached per frame, so a redraw does not reshape).
 pub(crate) fn text_width(window: &Window, s: &str, size: f32) -> f32 {
-	let s = s.replace(['\n', '\r'], " ");
-	let run = gpui::TextRun {
-		len: s.len(),
-		font: gpui::font(UI_FONT),
-		color: gpui::black(),
-		background_color: None,
-		underline: None,
-		strikethrough: None,
-	};
-	f32::from(
-		window
-			.text_system()
-			.shape_line(s.into(), px(size), &[run], None)
-			.width,
-	)
+	text_width_in(window, UI_FONT, s, size)
 }
 
 /// [`log_date_in`] in the viewer's time zone, now.
@@ -837,37 +1037,27 @@ pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
 	icon_tinted(label_icon_kind(l), 14., l.color)
 }
 
-/// A muted suffix after a name (a ref's repository, or `×N` repositories):
-/// it shrinks first, so the name keeps its width as long as it fits (#194).
-pub(super) fn yielding_suffix(text: impl Into<SharedString>) -> Div {
-	let mut d = clip_text(text)
-		.ml(px(6.))
-		.text_size(px(SMALL_TEXT))
-		.text_color(rgb(pal().text_muted));
-	// Flex shrink is weighted by the item's own width; this weight makes
-	// the suffix absorb the overflow before the name loses a pixel.
-	d.style().flex_shrink = Some(1000.);
-	d
+/// One ref label (or the `+N` badge) of a row, as data: the solver gives it
+/// a width and the row draws it.
+#[derive(Clone, Debug)]
+pub(super) struct RefDatum {
+	pub cell: LogCell,
+	pub text: String,
+	/// The label's icon and colour; `None` for the `+N`.
+	pub label: Option<graph_view::RefLabel>,
+	pub tooltip: String,
 }
 
 /// A row's ref labels, after the subject: one label for its branches and one
 /// for its tags, each with its icon, and the names of at most two badges
-/// per label, the rest folded into `+N`. Also returns their laid-out width
-/// (`measure` gives a name's text width).
-pub(super) fn ref_label_elements(
-	ix: usize,
+/// per label, the rest folded into `+N`.
+pub(super) fn ref_label_data(
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
-	row: &str,
-	measure: &dyn Fn(&str) -> f32,
-) -> (Vec<AnyElement>, f32) {
+) -> Vec<RefDatum> {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	let width = ref_labels_width(refs, current_branch, measure);
-	let mut out: Vec<AnyElement> = Vec::new();
-	for (n, l) in graph_view::kind_labels(&shown, current_branch)
-		.into_iter()
-		.enumerate()
-	{
+	let mut out = Vec::new();
+	for l in graph_view::kind_labels(&shown, current_branch) {
 		let tooltip = shown
 			.iter()
 			.filter(|b| {
@@ -880,32 +1070,16 @@ pub(super) fn ref_label_elements(
 			.map(|i| graph_view::format_ref_badge(i).0)
 			.collect::<Vec<_>>()
 			.join("\n");
-		let selector = format!("log-ref-label:{ix}:{n}");
-		let mut el = div()
-			.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
-			.debug_selector(move || selector)
-			.flex()
-			.items_center()
-			.gap(px(3.))
-			.max_w(px(320.))
-			// Squeezed by the labels container, the text ellipsizes, but the
-			// label keeps its icon and a few characters (never a bare icon).
-			.min_w(px((17. + measure(&l.text)).min(LABEL_FLOOR_W)))
-			.overflow_hidden()
-			.tip(tooltip)
-			.child(label_icon(&l))
-			.child(
-				clip_text(l.text.clone())
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text)),
-			);
-		// A squeezed group gives the most to the later labels first; each
-		// keeps LABEL_FLOOR_W, so the first (best-ranked) one takes the rest
-		// (#195).
-		if n > 0 {
-			el.style().flex_shrink = Some(1000.);
-		}
-		out.push(el.into_any_element());
+		out.push(RefDatum {
+			cell: if l.tag {
+				LogCell::TagLabel
+			} else {
+				LogCell::BranchLabel
+			},
+			text: l.text.clone(),
+			label: Some(l),
+			tooltip,
+		});
 	}
 	if hidden > 0 {
 		let all = refs
@@ -913,18 +1087,27 @@ pub(super) fn ref_label_elements(
 			.map(|i| graph_view::format_ref_badge(i).0)
 			.collect::<Vec<_>>()
 			.join("\n");
-		out.push(
-			div()
-				.id(SharedString::from(format!("ref-more:{row}")))
-				.flex_shrink_0()
-				.text_size(px(SMALL_TEXT))
-				.text_color(rgb(pal().log_ref_text))
-				.tip(all)
-				.child(format!("+{hidden}"))
-				.into_any_element(),
-		);
+		out.push(RefDatum {
+			cell: LogCell::RefMore,
+			text: format!("+{hidden}"),
+			label: None,
+			tooltip: all,
+		});
 	}
-	(out, width)
+	out
+}
+
+/// What the solver needs of a ref label: it is never wider than
+/// [`LABEL_MAX_W`] (the text beyond is cut with an ellipsis).
+pub(super) fn label_part(window: &Window, d: &RefDatum) -> LabelPart {
+	let role = d.cell.role().expect("a label cell has a role");
+	let measure = role_measure(window, role);
+	let natural = natural_px(role, &d.text, &measure).min(LABEL_MAX_W);
+	LabelPart {
+		cell: d.cell,
+		natural,
+		floor: floor_px(role, &d.text, 0, &measure).min(natural),
+	}
 }
 
 impl WorkbenchModel {
@@ -932,12 +1115,75 @@ impl WorkbenchModel {
 
 	// ───────────────────────── log (IJ-2a) ─────────────────────────
 
+	/// The chip's text, and where its key ends.
+	fn log_chip_text(label: &str, value: &Option<String>) -> (String, usize) {
+		match value {
+			Some(v) => (format!("{label}: {v}"), label.len() + 2),
+			None => (label.to_string(), 0),
+		}
+	}
+
+	/// Which chips stay on the bar, at what width: [`split_chips`] for the
+	/// width the bar's container had last frame. Prints the chips'
+	/// `LOG_CHIPS` line when the split changed.
+	pub(super) fn log_chip_fit(&self, window: &Window) -> ChipFit {
+		let loc = self.locale;
+		let layout = &self.log_filter_layout;
+		let inputs: [ChipInput; 4] = std::array::from_fn(|i| {
+			let menu = ALL_LOG_FILTER_MENUS[i];
+			let (label, value) = self.log_menu_value(menu, loc);
+			let role = chip_role(menu);
+			let m = role_measure(window, role);
+			let (text, key_end) = Self::log_chip_text(&label, &value);
+			let natural =
+				CHIP_CHROME_W + m(&text).min(CHIP_TEXT_MAX_W) + FIT_MARGIN;
+			let valued = value.is_some();
+			ChipInput {
+				natural,
+				floor: if valued {
+					floor_px(role, &text, key_end, &m).min(natural)
+				} else {
+					natural
+				},
+				valued,
+			}
+		});
+		let more = MORE_PAD_W
+			+ LABEL_ICON_GAP
+			+ role_measure(window, FitRole::ChipMore)(t("log_chip_more", loc))
+			+ MORE_ICON_W
+			+ FIT_MARGIN;
+		let more_dot = more + MORE_DOT_W + MORE_BORDER_W;
+		let avail = self.log_chips_available_width();
+		layout.used_w.set(avail);
+		let (mask, fit) = split_chips(&inputs, more, more_dot, avail);
+		if layout.last_mask.replace(mask) != mask {
+			let w: Vec<String> = ALL_LOG_FILTER_MENUS
+				.iter()
+				.map(|m| format!("{:.0}", fit.width(ChipPart::Chip(*m))))
+				.collect();
+			app_log!(
+				"[APP:LOG_CHIPS: avail={avail:.0} widths={} more={:.0} shown={mask:04b}]",
+				w.join(","),
+				fit.width(ChipPart::More)
+			);
+		}
+		ChipFit {
+			mask,
+			fit,
+			more,
+			more_dot,
+		}
+	}
+
 	/// Filter chip of the log's filter bar: `Name▾`, or `Name: value ✕`.
 	pub(super) fn log_chip(
 		&self,
 		menu: LogMenu,
 		label: &str,
 		value: Option<String>,
+		chips: &ChipFit,
+		window: &Window,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
@@ -949,101 +1195,63 @@ impl WorkbenchModel {
 		};
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
-		let selector = id.clone();
 		let open = self.overlays.log_menu() == Some(menu);
 		let active = value.is_some();
-		let text_cap = match active {
-			true => self.log_filter_layout.text_cap(),
-			false => CHIP_TEXT_MAX_W,
+		let (text, key_end) = Self::log_chip_text(label, &value);
+		let trailing = if active {
+			div()
+				.id(SharedString::from(clear_id.clone()))
+				.relative()
+				.flex()
+				.rounded(px(3.))
+				.hover(|s| s.bg(rgb(pal().divider)))
+				.tip(t("log_clear_filter", self.locale))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					cx.stop_propagation();
+					this.clear_log_chip(menu, cx);
+				}))
+				.child(icon(Icon::Close, 12.))
+				.children(probe(log, clear_id))
+				.into_any_element()
+		} else {
+			icon(Icon::ChevronDown, 12.).into_any_element()
 		};
-		// The drawn width depends on the text and on its cap.
-		let text = match &value {
-			Some(v) => format!("{label}: {v}\u{0}{text_cap:.0}"),
-			None => format!("{label}\u{0}{text_cap:.0}"),
-		};
-		div()
+		// FIT-ROW-BEGIN log_filter_chips
+		FitCell::new(FitId::new(id.clone(), chip_role(menu)), text)
+			.key_end(key_end)
+			.selector(id.clone())
+			.pad(6.)
+			.trailing(trailing)
+			.solved(&chips.fit, ChipPart::Chip(menu))
+			.render(&self.probes, window)
 			.id(SharedString::from(id.clone()))
-			.debug_selector(move || selector)
-			.relative()
-			.flex_shrink_0()
 			.h(px(24.))
-			.px(px(6.))
-			.flex()
-			.items_center()
-			.gap(px(3.))
 			.rounded(px(4.))
 			.cursor_pointer()
-			.text_size(px(UI_TEXT))
+			.text_color(rgb(pal().text))
 			.when(open, |d| d.bg(rgb(pal().hover_bg)))
 			.hover(|s| s.bg(rgb(pal().hover_bg)))
 			.on_click(cx.listener(move |this, _, window, cx| {
 				this.toggle_log_menu(menu, TriggerId::LogChip(menu), window, cx)
 			}))
-			.child(
-				div()
-					.max_w(px(text_cap))
-					.overflow_hidden()
-					.line_clamp(1)
-					.text_ellipsis()
-					.text_color(rgb(pal().text))
-					.child(match &value {
-						Some(v) => format!("{label}: {v}"),
-						None => label.to_string(),
-					}),
-			)
-			.child(if active {
-				div()
-					.id(SharedString::from(clear_id.clone()))
-					.relative()
-					.flex()
-					.rounded(px(3.))
-					.hover(|s| s.bg(rgb(pal().divider)))
-					.tip(t("log_clear_filter", self.locale))
-					.on_click(cx.listener(move |this, _, _, cx| {
-						cx.stop_propagation();
-						this.clear_log_chip(menu, cx);
-					}))
-					.child(icon(Icon::Close, 12.))
-					.children(probe(log, clear_id))
-					.into_any_element()
-			} else {
-				icon(Icon::ChevronDown, 12.).into_any_element()
-			})
-			// A drawn chip reports its real width; text estimates are off by
-			// a few pixels where the font falls back (CJK on Linux).
-			.child({
-				let cell = self.log_filter_layout.chip_width_cell(menu).clone();
-				let measured = self.log_filter_layout.measured.clone();
-				let slot = ALL_LOG_FILTER_MENUS.iter().position(|m| *m == menu);
-				canvas(
-					move |b, _, _| {
-						let w = f32::from(b.size.width);
-						cell.set(w);
-						if let Some(i) = slot {
-							measured.borrow_mut()[i] = (text, w);
-						}
-					},
-					|_, _, _, _| {},
-				)
-				.absolute()
-				.size_full()
-			})
 			.child(self.overlay_trigger_slot(TriggerId::LogChip(menu)))
-			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
+			.when(open, |d| d.child(self.log_menu_panel(menu, window, cx)))
 			.children(probe(log, id))
 			.into_any_element()
+		// FIT-ROW-END
 	}
 
 	/// Overflow chip collecting filters that do not fit in a narrow window.
 	pub(super) fn log_chip_more(
 		&self,
 		hidden_menus: Vec<LogMenu>,
+		chips: &ChipFit,
+		window: &Window,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
 		let id = "log-filter-more".to_string();
-		let selector = id.clone();
 		let active = hidden_menus
 			.iter()
 			.any(|m| self.log_menu_value(*m, loc).1.is_some());
@@ -1053,92 +1261,56 @@ impl WorkbenchModel {
 			_ => None,
 		};
 		let open = open_menu.is_some();
-		div()
-			.id(SharedString::from(id.clone()))
-			.debug_selector(move || selector)
-			.relative()
-			.flex_shrink_0()
-			.h(px(24.))
-			.px(px(4.))
+		// It is drawn whole even where the split found no room for it.
+		let width = if chips.fit.shown(ChipPart::More) {
+			chips.fit.width(ChipPart::More)
+		} else if active {
+			chips.more_dot
+		} else {
+			chips.more
+		};
+		let trailing = div()
 			.flex()
 			.items_center()
 			.gap(px(2.))
-			.rounded(px(4.))
-			.cursor_pointer()
-			.text_size(px(UI_TEXT))
-			.when(open, |d| d.bg(rgb(pal().hover_bg)))
-			.when(active, |d| d.border_1().border_color(rgb(pal().focus_ring)))
-			.hover(|s| s.bg(rgb(pal().hover_bg)))
-			.on_click(cx.listener(move |this, _, window, cx| {
-				// The sub-menu it opened last is closed by it too.
-				this.toggle_log_menu(
-					LogMenu::FilterMore,
-					TriggerId::LogFilterMore,
-					window,
-					cx,
-				)
-			}))
-			.child(
-				div()
-					.text_color(rgb(pal().text))
-					.child(t("log_chip_more", loc)),
-			)
 			.when(active, |d| {
 				d.child(
 					div().size(px(5.)).rounded_full().bg(rgb(pal().focus_ring)),
 				)
 			})
-			.child(icon(Icon::ChevronDown, 10.))
-			.child(self.overlay_trigger_slot(TriggerId::LogFilterMore))
-			.when_some(open_menu, |d, m| d.child(self.log_menu_panel(m, cx)))
-			.children(probe(log, id))
-			.into_any_element()
-	}
-
-	/// Sets each chip's width for the split: the width it was drawn at with
-	/// this same text, else an estimate from the text laid out as `log_chip`
-	/// and `log_chip_more` draw it. A hidden chip cannot be measured after
-	/// layout, and its text can change while hidden (a filter picked from
-	/// the overflow chip).
-	pub(super) fn measure_log_chips(&self, window: &Window) {
-		let loc = self.locale;
-		let layout = &self.log_filter_layout;
-		let texts: Vec<(String, bool)> = ALL_LOG_FILTER_MENUS
-			.into_iter()
-			.map(|menu| {
-				let (label, value) = self.log_menu_value(menu, loc);
-				match value {
-					Some(v) => (format!("{label}: {v}"), true),
-					None => (label, false),
-				}
-			})
-			.collect();
-		// Padding 4+4, gap 2, 10px icon, 1px slack. Without the active dot:
-		// `compute_split_count` adds it when a hidden chip has a value.
-		let more =
-			8. + text_width(window, t("log_chip_more", loc), UI_TEXT) + 13.;
-		*layout.cap_natural.borrow_mut() = texts
-			.iter()
-			.filter(|(_, active)| *active)
-			.map(|(text, _)| text_width(window, text, UI_TEXT))
-			.collect();
-		layout.more_w.set(more);
-		let cap = layout.text_cap_for(self.log_chips_available_width());
-		layout.text_cap.set(cap);
-		let measured = layout.measured.borrow();
-		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
-			let cap = if texts[i].1 { cap } else { CHIP_TEXT_MAX_W };
-			let key = format!("{}\u{0}{cap:.0}", texts[i].0);
-			let w = match &measured[i] {
-				(drawn, w) if *drawn == key && *w > 0. => *w,
-				// Padding 6+6, label (capped), gap 3, 12px icon, 1px slack.
-				_ => {
-					CHIP_CHROME_W
-						+ text_width(window, &texts[i].0, UI_TEXT).min(cap)
-				}
-			};
-			layout.chip_width_cell(menu).set(w);
-		}
+			.child(icon(Icon::ChevronDown, MORE_ICON_W));
+		FitCell::new(
+			FitId::new("log-filter-more", FitRole::ChipMore),
+			t("log_chip_more", loc),
+		)
+		.selector(id.clone())
+		.pad(4.)
+		.trailing(trailing)
+		.fixed_width(width)
+		.render(&self.probes, window)
+		.id(SharedString::from(id.clone()))
+		.h(px(24.))
+		.rounded(px(4.))
+		.cursor_pointer()
+		.text_color(rgb(pal().text))
+		.when(open, |d| d.bg(rgb(pal().hover_bg)))
+		.when(active, |d| d.border_1().border_color(rgb(pal().focus_ring)))
+		.hover(|s| s.bg(rgb(pal().hover_bg)))
+		.on_click(cx.listener(move |this, _, window, cx| {
+			// The sub-menu it opened last is closed by it too.
+			this.toggle_log_menu(
+				LogMenu::FilterMore,
+				TriggerId::LogFilterMore,
+				window,
+				cx,
+			)
+		}))
+		.child(self.overlay_trigger_slot(TriggerId::LogFilterMore))
+		.when_some(open_menu, |d, m| {
+			d.child(self.log_menu_panel(m, window, cx))
+		})
+		.children(probe(log, id))
+		.into_any_element()
 	}
 
 	pub(super) fn log_branch_value(&self) -> Option<String> {
@@ -1265,6 +1437,7 @@ impl WorkbenchModel {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn log_filter_split_has_values(&self, loc: Locale) -> [bool; 4] {
 		[
 			self.log_scope_value().is_some(),
@@ -1274,36 +1447,10 @@ impl WorkbenchModel {
 		]
 	}
 
-	/// Splits filter chips into those on the bar and those in the overflow
-	/// chip, in their usual order.
+	/// The filter chips on the bar and those in the overflow chip, in their
+	/// usual order, as the last frame split them.
 	pub(crate) fn log_filter_split(&self) -> (Vec<LogMenu>, Vec<LogMenu>) {
-		let available_w = self.log_chips_available_width();
-		let has_values = self.log_filter_split_has_values(self.locale);
-		let mask = self
-			.log_filter_layout
-			.compute_split(available_w, has_values);
-		let layout = &self.log_filter_layout;
-		if layout.last_mask.replace(mask) != mask {
-			let w: Vec<String> = ALL_LOG_FILTER_MENUS
-				.iter()
-				.map(|m| format!("{:.0}", layout.chip_width_cell(*m).get()))
-				.collect();
-			app_log!(
-				"[APP:LOG_CHIPS: avail={available_w:.0} widths={} more={:.0} shown={mask:04b}]",
-				w.join(","),
-				layout.more_w.get()
-			);
-		}
-		(0..4)
-			.map(|i| (ALL_LOG_FILTER_MENUS[i], mask & (1 << i) != 0))
-			.fold((Vec::new(), Vec::new()), |(mut on, mut off), (m, shown)| {
-				if shown {
-					on.push(m)
-				} else {
-					off.push(m)
-				}
-				(on, off)
-			})
+		split_by_mask(self.log_filter_layout.last_mask.get())
 	}
 
 	pub(super) fn clear_log_chip(
@@ -1333,6 +1480,7 @@ impl WorkbenchModel {
 	pub(super) fn log_menu_panel(
 		&self,
 		menu: LogMenu,
+		window: &Window,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let loc = self.locale;
@@ -1365,11 +1513,14 @@ impl WorkbenchModel {
 						.w(px(14.))
 						.when(checked, |d| d.child(icon(Icon::Checked, 14.))),
 				)
+				// FIT-EXEMPT: a filter menu's item label shares its row with a 14px check box only
 				.child(fill_text(label))
 				.children(probe(log, id))
 				.into_any_element()
 		};
 		let mut items: Vec<AnyElement> = Vec::new();
+		// The Branches menu is as wide as its rows need.
+		let mut branch_w: Option<f32> = None;
 		match menu {
 			// One chip for both: the filter field, the repositories (a row
 			// keeps only its repository, the checkbox adds or drops it),
@@ -1481,6 +1632,7 @@ impl WorkbenchModel {
 										.rounded(px(2.))
 										.bg(graph_view::palette_rgb(ix)),
 								)
+								// FIT-EXEMPT: a repository row of the filter menu shares its row with a check box only
 								.child(fill_text(repo.name.clone()))
 								.children(probe(log, id))
 								.into_any_element(),
@@ -1571,7 +1723,7 @@ impl WorkbenchModel {
 					&self.log_branch_menu_open,
 					loc,
 				);
-				let refs = head
+				let refs: Vec<BranchRow> = head
 					.then(|| BranchRow::Ref {
 						name: "HEAD".into(),
 						label: "HEAD".into(),
@@ -1580,7 +1732,17 @@ impl WorkbenchModel {
 					})
 					.into_iter()
 					.chain(rows)
-					.take(MAX_LOG_MENU_ITEMS);
+					.take(MAX_LOG_MENU_ITEMS)
+					.collect();
+				// The panel is as wide as its widest row, between 200 and
+				// 360px: the width the rows then share is known.
+				let widest = refs
+					.iter()
+					.map(|r| self.branch_menu_natural(window, r))
+					.fold(0., f32::max);
+				branch_w = Some(
+					(widest + MENU_PANEL_CHROME).clamp(MENU_MIN_W, MENU_MAX_W),
+				);
 				for row in refs {
 					match row {
 						BranchRow::Group {
@@ -1622,6 +1784,7 @@ impl WorkbenchModel {
 										},
 									))
 									.child(div().flex_shrink_0().w(px(14.)))
+									// FIT-EXEMPT: a branch menu group's label shares its row with fixed icons only
 									.child(fill_text(label))
 									.child(icon(
 										if collapsed {
@@ -1643,39 +1806,18 @@ impl WorkbenchModel {
 						} => {
 							let checked = self.active_ref_filter.as_deref()
 								== Some(&name);
-							let target = name.clone();
-							items.push(
-								div()
-									.pl(px(depth as f32 * 14.))
-									.flex()
-									.items_center()
-									.child(item(
-										format!("log-branch:{name}"),
-										label,
-										checked,
-										Box::new(move |this, cx| {
-											this.close_log_menus(
-												CloseWhy::Picked,
-												cx,
-											);
-											this.filter_by_ref(
-												Some(target.clone()),
-												cx,
-											)
-										}),
-										cx,
-									))
-									.when_some(repo, |d, r| {
-										let selector =
-											format!("menu-repo:{name}");
-										d.child(
-											yielding_suffix(r).debug_selector(
-												move || selector,
-											),
-										)
-									})
-									.into_any_element(),
-							);
+							items.push(self.branch_menu_row(
+								window,
+								MenuRow {
+									name,
+									label,
+									depth,
+									repo,
+									checked,
+									panel_w: branch_w.unwrap_or(MENU_MIN_W),
+								},
+								cx,
+							));
 						}
 					}
 				}
@@ -1878,8 +2020,9 @@ impl WorkbenchModel {
 		}
 		let panel = self
 			.overlay_panel(OverlayKind::LogMenu(menu), cx)
-			.min_w(px(200.))
-			.max_w(px(360.))
+			.min_w(px(MENU_MIN_W))
+			.max_w(px(MENU_MAX_W))
+			.when_some(branch_w, |d, w| d.w(px(w)))
 			.max_h(px(if menu == LogMenu::Repo { 480. } else { 320. }))
 			.overflow_y_scroll()
 			.flex()
@@ -2071,14 +2214,303 @@ impl WorkbenchModel {
 					14.,
 				))
 			})
+			// FIT-EXEMPT: a path picker row's name shares its row with fixed icons only
 			.child(fill_text(pick.name))
 			.children(probe(log, id))
 			.into_any_element()
 	}
 
+	/// One ref row of the branches pane: the glyph, the name, and the repo
+	/// the ref belongs to when it is not the same in all of them. The name
+	/// gets its floor first and then its whole text; the repo only comes
+	/// whole, after the name is whole, or not at all (#194).
+	pub(super) fn branch_pane_row(
+		&self,
+		window: &Window,
+		row: PaneRow,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let PaneRow {
+			id,
+			label,
+			glyph,
+			indent,
+			target,
+			active,
+			repo,
+		} = row;
+		let probes = &self.probes;
+		let name_key = id.trim_start_matches("ref:").to_string();
+		let name_m = role_measure(window, FitRole::PaneRefName);
+		let repo_m = role_measure(window, FitRole::PaneRepo);
+		// The row's width less its margins, padding, glyph and the gap
+		// before the name.
+		let avail = self.log_branches_w()
+			- PANE_BORDER_W
+			- 2. * PANE_ROW_MARGIN
+			- indent - PANE_ROW_PAD_R
+			- PANE_GLYPH_W
+			- REF_ROW_GAP;
+		let name_natural = natural_px(FitRole::PaneRefName, &label, &name_m);
+		let name_floor = floor_px(FitRole::PaneRefName, &label, 0, &name_m);
+		let repo_natural = repo
+			.as_deref()
+			.map_or(0., |r| natural_px(FitRole::PaneRepo, r, &repo_m));
+		let fit = fit_row(
+			avail,
+			&[
+				Part::new(RefRowCell::Name, name_natural, name_floor, 0.),
+				Part::new(
+					RefRowCell::Suffix,
+					repo_natural,
+					repo_natural,
+					REF_ROW_GAP,
+				),
+			],
+			&[
+				Claim::Grow(RefRowCell::Name, name_floor),
+				Claim::Grow(RefRowCell::Name, name_natural),
+				Claim::Atomic(if repo.is_some() {
+					vec![RefRowCell::Suffix]
+				} else {
+					vec![]
+				}),
+			],
+		);
+		let scope = format!("ref:{name_key}");
+		let tip = match &repo {
+			Some(r) => format!("{label} ({r})"),
+			None => label.clone(),
+		};
+		// FIT-ROW-BEGIN branch_pane_row
+		let name = FitCell::new(
+			FitId::new(scope.clone(), FitRole::PaneRefName),
+			label,
+		)
+		.selector(format!("ref-name:{name_key}"))
+		.solved(&fit, RefRowCell::Name)
+		.render(probes, window)
+		.ml(px(REF_ROW_GAP))
+		.text_color(rgb(pal().text));
+		let suffix = repo.as_deref().map(|r| {
+			if fit.shown(RefRowCell::Suffix) {
+				Some(
+					FitCell::new(
+						FitId::new(scope.clone(), FitRole::PaneRepo),
+						r.to_string(),
+					)
+					.selector(format!("ref-repo:{name_key}"))
+					.solved(&fit, RefRowCell::Suffix)
+					.render(probes, window)
+					.ml(px(REF_ROW_GAP))
+					.text_color(rgb(pal().text_muted)),
+				)
+			} else {
+				if probes.is_some() {
+					record_dropped(
+						probes,
+						FitId::new(scope.clone(), FitRole::PaneRepo),
+						r,
+						repo_natural,
+						repo_natural,
+					);
+				}
+				None
+			}
+		});
+		div()
+			.id(SharedString::from(id.clone()))
+			.debug_selector(|| id.clone())
+			.relative()
+			.flex_shrink_0()
+			.h(px(24.))
+			.mx(px(PANE_ROW_MARGIN))
+			.pl(px(indent))
+			.pr(px(PANE_ROW_PAD_R))
+			.flex()
+			.items_center()
+			.rounded(px(4.))
+			.cursor_pointer()
+			.when(active, |d| d.bg(rgb(pal().selection_inactive_bg)))
+			.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.tip(tip)
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.filter_by_ref(target.clone(), cx)
+			}))
+			.child(div().flex_shrink_0().w(px(PANE_GLYPH_W)).child(glyph))
+			.child(name)
+			.children(suffix.flatten())
+			.children(probe(&self.probes, id))
+			.into_any_element()
+		// FIT-ROW-END
+	}
+
+	/// What a row of the Branches menu needs to be whole, with its padding,
+	/// check box and indent (the panel's own padding and border not counted).
+	pub(super) fn branch_menu_natural(
+		&self,
+		window: &Window,
+		row: &BranchRow,
+	) -> f32 {
+		match row {
+			BranchRow::Group { label, .. } => {
+				// Padding, the 14px before the label, the gap, the chevron.
+				MENU_ITEM_CHROME
+					+ text_width(window, label, UI_TEXT)
+					+ REF_ROW_GAP + 12.
+			}
+			BranchRow::Ref {
+				label, depth, repo, ..
+			} => {
+				let name = natural_px(
+					FitRole::MenuRefName,
+					label,
+					&role_measure(window, FitRole::MenuRefName),
+				);
+				let suffix = repo.as_deref().map_or(0., |r| {
+					REF_ROW_GAP
+						+ natural_px(
+							FitRole::MenuRepo,
+							r,
+							&role_measure(window, FitRole::MenuRepo),
+						)
+				});
+				MENU_ITEM_CHROME + *depth as f32 * MENU_INDENT_W + name + suffix
+			}
+		}
+	}
+
+	/// One ref row of the Branches menu: a check box, the name and the repo
+	/// of the ref, in the panel's width. The name gets its floor first and
+	/// then its whole text; the repo comes whole after it or not at all.
+	pub(super) fn branch_menu_row(
+		&self,
+		window: &Window,
+		row: MenuRow,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let MenuRow {
+			name,
+			label,
+			depth,
+			repo,
+			checked,
+			panel_w,
+		} = row;
+		let probes = &self.probes;
+		let indent = depth as f32 * MENU_INDENT_W;
+		let name_m = role_measure(window, FitRole::MenuRefName);
+		let repo_m = role_measure(window, FitRole::MenuRepo);
+		// What the panel's content leaves after the indent, the item's
+		// padding, the check box and its gap.
+		let avail = panel_w - MENU_PANEL_CHROME - indent - MENU_ITEM_CHROME;
+		let name_natural = natural_px(FitRole::MenuRefName, &label, &name_m);
+		let name_floor = floor_px(FitRole::MenuRefName, &label, 0, &name_m);
+		let repo_natural = repo
+			.as_deref()
+			.map_or(0., |r| natural_px(FitRole::MenuRepo, r, &repo_m));
+		let fit = fit_row(
+			avail,
+			&[
+				Part::new(RefRowCell::Name, name_natural, name_floor, 0.),
+				Part::new(
+					RefRowCell::Suffix,
+					repo_natural,
+					repo_natural,
+					REF_ROW_GAP,
+				),
+			],
+			&[
+				Claim::Grow(RefRowCell::Name, name_floor),
+				Claim::Grow(RefRowCell::Name, name_natural),
+				Claim::Atomic(if repo.is_some() {
+					vec![RefRowCell::Suffix]
+				} else {
+					vec![]
+				}),
+			],
+		);
+		let scope = format!("log-branch:{name}");
+		let id = format!("log-branch:{name}");
+		let selector = id.clone();
+		let target = name.clone();
+		// FIT-ROW-BEGIN branch_menu_row
+		let text = FitCell::new(
+			FitId::new(scope.clone(), FitRole::MenuRefName),
+			label,
+		)
+		.selector(format!("menu-name:{name}"))
+		.solved(&fit, RefRowCell::Name)
+		.render(probes, window)
+		.ml(px(REF_ROW_GAP));
+		let suffix = repo.as_deref().and_then(|r| {
+			if fit.shown(RefRowCell::Suffix) {
+				Some(
+					FitCell::new(
+						FitId::new(scope.clone(), FitRole::MenuRepo),
+						r.to_string(),
+					)
+					.selector(format!("menu-repo:{name}"))
+					.solved(&fit, RefRowCell::Suffix)
+					.render(probes, window)
+					.ml(px(REF_ROW_GAP))
+					.text_color(rgb(pal().text_muted)),
+				)
+			} else {
+				if probes.is_some() {
+					record_dropped(
+						probes,
+						FitId::new(scope.clone(), FitRole::MenuRepo),
+						r,
+						repo_natural,
+						repo_natural,
+					);
+				}
+				None
+			}
+		});
+		div()
+			.pl(px(indent))
+			.flex()
+			.items_center()
+			.child(
+				div()
+					.id(SharedString::from(id.clone()))
+					.debug_selector(move || selector)
+					.relative()
+					.w(px(panel_w - MENU_PANEL_CHROME - indent))
+					.h(px(24.))
+					.px(px(8.))
+					.flex()
+					.items_center()
+					.rounded(px(4.))
+					.cursor_pointer()
+					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.close_log_menus(CloseWhy::Picked, cx);
+						this.filter_by_ref(Some(target.clone()), cx)
+					}))
+					.child(
+						div().flex_shrink_0().w(px(14.)).when(checked, |d| {
+							d.child(icon(Icon::Checked, 14.))
+						}),
+					)
+					.child(text)
+					.children(suffix)
+					.children(probe(&self.probes, id)),
+			)
+			.into_any_element()
+		// FIT-ROW-END
+	}
+
 	/// IntelliJ's branches pane: search, HEAD, collapsible Local / Remote /
 	/// Tags groups (no counts).
-	pub(super) fn render_branches(&self, cx: &mut Context<Self>) -> AnyElement {
+	pub(super) fn render_branches(
+		&self,
+		window: &Window,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
 		let needle = self
@@ -2097,47 +2529,19 @@ impl WorkbenchModel {
 		             active: bool,
 		             repo: Option<String>,
 		             cx: &mut Context<Self>| {
-			let name_key = id.trim_start_matches("ref:").to_string();
-			div()
-				.id(SharedString::from(id.clone()))
-				.debug_selector(|| id.clone())
-				.relative()
-				.flex_shrink_0()
-				.h(px(24.))
-				.mx(px(4.))
-				.pl(px(indent))
-				.pr(px(6.))
-				.flex()
-				.items_center()
-				.gap(px(6.))
-				.rounded(px(4.))
-				.cursor_pointer()
-				.when(active, |d| d.bg(rgb(pal().selection_inactive_bg)))
-				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tip(match &repo {
-					Some(r) => format!("{label} ({r})"),
-					None => label.clone(),
-				})
-				.on_click(cx.listener(move |this, _, _, cx| {
-					this.filter_by_ref(target.clone(), cx)
-				}))
-				.child(glyph)
-				.child(
-					clip_text(label)
-						.text_color(rgb(pal().text))
-						.debug_selector({
-							let s = format!("ref-name:{name_key}");
-							move || s
-						}),
-				)
-				.when_some(repo.clone(), |d, r| {
-					d.child(yielding_suffix(r).debug_selector({
-						let s = format!("ref-repo:{name_key}");
-						move || s
-					}))
-				})
-				.children(probe(log, id))
-				.into_any_element()
+			self.branch_pane_row(
+				window,
+				PaneRow {
+					id,
+					label,
+					glyph,
+					indent,
+					target,
+					active,
+					repo,
+				},
+				cx,
+			)
 		};
 		if (self.head_sha.is_some() || self.log_is_merged())
 			&& needle.is_empty()
@@ -2206,7 +2610,15 @@ impl WorkbenchModel {
 							.when(depth > 0, |d| {
 								d.child(icon(Icon::Folder, 14.))
 							})
-							.child(clip_text(label).text_color(rgb(pal().text)))
+							.child(
+								FitCell::new(
+									FitId::new(gid.clone(), FitRole::PaneGroup),
+									label,
+								)
+								.flex()
+								.render(&self.probes, window)
+								.text_color(rgb(pal().text)),
+							)
 							.children(probe(log, gid))
 							.into_any_element(),
 					);
@@ -2379,357 +2791,121 @@ impl WorkbenchModel {
 }
 
 #[cfg(test)]
-mod row_width_tests {
-	use super::*;
-
-	// A 24-lane gutter (the widest) and the widest combined label.
-	const WIDE_GUTTER: f32 = 24. * 16. + 8.;
-
-	// The widest zh-TW date ("2026/10/15 09:00") at 1080 measures ~110px.
-	const DATE_NEED: f32 = 110.;
-
-	fn cols(list_w: f32, gutter_w: f32, labels: bool, hash: bool) -> ListCols {
-		let labels_w = if labels { 180. } else { 0. };
-		list_cols(list_w, gutter_w, labels_w, DATE_NEED, hash)
-	}
-
-	#[test]
-	fn roomy_rows_are_unchanged() {
-		let c = cols(1200., 40., true, false);
-		assert_eq!(
-			c,
-			ListCols {
-				gutter: 40.,
-				author: AUTHOR_W,
-				date: DATE_W
-			}
-		);
-		let w = row_widths(1200., c, 100., 400., false);
-		assert_eq!(w.gutter, 40.);
-		assert_eq!(w.labels, 100.);
-		assert_eq!(w.subject, 1200. - 8. - 24. - 40. - 238. - 106.);
-		let c = cols(1200., 40., false, true);
-		let w = row_widths(1200., c, 0., 400., true);
-		assert_eq!(w.subject, 1200. - 8. - 32. - 40. - 238. - 64.);
-	}
-
-	#[test]
-	fn multi_repo_graph_keeps_a_subject() {
-		// 574 and 433 are the lists a 1080 and a 900 window leave (measured
-		// in the in-process tests `wide_multi_repo_log_keeps_a_subject_at_*`).
-		for list_w in [433., 480., 574., 720., 900.] {
-			for show_hash in [false, true] {
-				// Known limit (see `list_cols`): the hash column costs 72px,
-				// and a list this narrow with it is below what any squeeze
-				// can save (433px with hash leaves a 97px subject).
-				if show_hash && list_w < 520. {
-					continue;
-				}
-				for has_labels in [false, true] {
-					let c = cols(list_w, WIDE_GUTTER, has_labels, show_hash);
-					for subject_w in [40., 400.] {
-						for labels_w in [0., 60., 337.] {
-							let w = row_widths(
-								list_w, c, labels_w, subject_w, show_hash,
-							);
-							let with_labels =
-								if w.labels > 0. { w.labels + 6. } else { 0. };
-							assert!(
-								w.subject >= subject_w.min(MIN_SUBJECT_BESIDE_LABELS),
-								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
-							);
-							assert!(
-								w.subject + with_labels >= MIN_SUBJECT_W,
-								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
-							);
-							assert!(
-								w.labels == 0. || w.labels >= labels_w.min(MIN_LABELS_W),
-								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
-							);
-							assert!(
-								c.gutter <= WIDE_GUTTER && w.labels <= labels_w
-							);
-						}
-					}
-				}
-			}
-		}
-	}
-
-	#[test]
-	fn a_1080_window_keeps_ref_labels_and_a_subject() {
-		// 574px is the list a 1080 window leaves, hash off, long labels.
-		let c = cols(574., WIDE_GUTTER, true, false);
-		let w = row_widths(574., c, 337., 400., false);
-		assert!(w.labels >= MIN_LABELS_W, "{c:?} {w:?}");
-		assert!(w.subject >= MIN_SUBJECT_BESIDE_LABELS, "{c:?} {w:?}");
-	}
-
-	#[test]
-	fn a_narrow_list_squeezes_author_then_date_after_the_gutter() {
-		// 433px (a 900 window): the gutter is at its floor, the date and the
-		// author cells give the subject its minimum.
-		let c = cols(433., WIDE_GUTTER, true, false);
-		assert_eq!(c.gutter, MIN_GUTTER_W);
-		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
-		assert!(c.author >= MIN_AUTHOR_W);
-		// The author goes first, to its floor, then the date.
-		assert_eq!(c.author, MIN_AUTHOR_W);
-		let w = row_widths(433., c, 337., 400., false);
-		assert_eq!(w.labels, 0.);
-		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
-		// Only the author gives way while it alone is enough.
-		let c = cols(FLOOR_W - 10., WIDE_GUTTER, false, false);
-		assert_eq!(c.date, DATE_W);
-		assert!(c.author < AUTHOR_W);
-	}
-
-	// Below this list width the gutter floor plus full author and date
-	// leave less than MIN_SUBJECT_W.
-	const FLOOR_W: f32 =
-		8. + 24. + AUTHOR_W + DATE_W + MIN_GUTTER_W + MIN_SUBJECT_W;
-
-	#[test]
-	fn below_the_squeeze_the_subject_takes_the_rest() {
-		let c = cols(300., WIDE_GUTTER, true, false);
-		assert_eq!(
-			(c.gutter, c.author, c.date),
-			(MIN_GUTTER_W, MIN_AUTHOR_W, MIN_DATE_W)
-		);
-		let w = row_widths(300., c, 337., 400., false);
-		assert_eq!(w.labels, 0.);
-		assert_eq!(w.subject, 300. - 8. - 24. - 72. - 72. - 88.);
-	}
-
-	#[test]
-	fn a_list_without_labels_keeps_more_gutter() {
-		let with = cols(574., WIDE_GUTTER, true, false);
-		let without = cols(574., WIDE_GUTTER, false, false);
-		assert!(without.gutter > with.gutter);
-		assert_eq!(without.gutter, 574. - 8. - 24. - 238. - MIN_SUBJECT_W);
-	}
-
-	#[test]
-	fn every_row_of_a_list_shares_one_set_of_columns() {
-		// Labels take room from the subject, never from the gutter.
-		let c = cols(574., WIDE_GUTTER, true, false);
-		let (none, dropped) = (
-			row_widths(560., c, 0., 400., false),
-			row_widths(560., c, 337., 400., false),
-		);
-		assert_eq!(dropped.gutter, none.gutter);
-		assert_eq!(dropped.subject + dropped.labels + 6., none.subject);
-	}
-
-	#[test]
-	fn labels_shrink_before_the_gutter() {
-		let c = cols(800., 120., true, false);
-		assert_eq!(c.gutter, 120.);
-		let w = row_widths(800., c, 337., 400., false);
-		assert!(w.labels < 337. && w.labels >= 80.);
-		assert_eq!(w.subject, MIN_SUBJECT_BESIDE_LABELS);
-	}
-
-	#[test]
-	fn tiny_windows_never_go_negative() {
-		let c = cols(100., WIDE_GUTTER, true, true);
-		let w = row_widths(100., c, 337., 400., true);
-		assert!(w.subject >= 0. && w.labels == 0.);
-	}
-
-	#[test]
-	fn a_short_subject_leaves_its_room_to_the_labels() {
-		let c = cols(574., 40., true, false);
-		let w = row_widths(574., c, 200., 30., false);
-		assert_eq!(w.labels, 200.);
-	}
-
-	#[test]
-	fn author_then_date_give_way_so_a_short_tag_is_not_cut() {
-		// #216: main, origin/main and a tag beside "empty replay" at 1080
-		// (the list is 574px; gutters from the real graph and its floor).
-		for (gutter, labels_w) in
-			[(40., 176.), (56., 190.), (MIN_GUTTER_W, 176.)]
-		{
-			let c = list_cols(574., gutter, labels_w, DATE_NEED, false);
-			let w = row_widths(574., c, labels_w, 75., false);
-			assert_eq!(w.labels, labels_w, "{gutter}: {c:?} {w:?}");
-			// The date keeps what its string needs.
-			assert!(c.date >= DATE_NEED, "{gutter}: {c:?}");
-		}
-	}
-
-	#[test]
-	fn labels_that_fit_cost_no_column_width() {
-		// Only "main" (~60px): nothing gives way, date and author stay full.
-		for date_need in [DATE_NEED, 97.] {
-			let c = list_cols(574., 56., 60., date_need, false);
-			assert_eq!((c.author, c.date), (AUTHOR_W, DATE_W), "{c:?}");
-		}
-	}
-
-	#[test]
-	fn the_date_is_kept_whole_at_1080_for_every_label_group() {
-		// zh-TW dates ("2026/3/7 09:00" ~97px, "2026/10/15 09:00" ~110px).
-		for need in [97., 110.] {
-			for labels_w in [0., 60., 120., 176., 190., 337.] {
-				for gutter in [40., 56., MIN_GUTTER_W] {
-					let c = list_cols(574., gutter, labels_w, need, false);
-					assert!(
-						c.date >= need,
-						"{need} {labels_w} {gutter}: {c:?}"
-					);
-				}
-			}
-		}
-	}
-
-	#[test]
-	fn every_shortfall_gives_way_author_first_and_keeps_the_date() {
-		// #216: the subject's shortfall and the labels' take the columns in
-		// one order across list widths, hash on/off, label groups and gutters,
-		// wherever the date floor is reachable.
-		let mut checked = 0;
-		for need in [97., 110.] {
-			for list_w in [600., 574., 540., 500., 480., 450.] {
-				for hash in [false, true] {
-					for labels_w in [0., 50., 120., 190.] {
-						for gutter in [40., 56., 72.] {
-							let c =
-								list_cols(list_w, gutter, labels_w, need, hash);
-							let base = row_base(list_w, hash);
-							// Subject need with the gutter at its real width.
-							let lack = (MIN_SUBJECT_W
-								- (base - c.gutter - AUTHOR_W - DATE_W))
-								.max(0.);
-							let give = (AUTHOR_W - MIN_AUTHOR_W)
-								+ (DATE_W - need.clamp(MIN_DATE_W, DATE_W));
-							if lack > give {
-								continue; // floor unreachable: fallback case
-							}
-							checked += 1;
-							let tag = format!(
-								"{need} {list_w} {hash} {labels_w} {gutter}: {c:?}"
-							);
-							assert!(c.date >= need, "{tag}");
-							assert!(c.author >= MIN_AUTHOR_W, "{tag}");
-							// The date is cut only once the author is at its floor.
-							assert!(
-								c.date == DATE_W || c.author == MIN_AUTHOR_W,
-								"{tag}"
-							);
-						}
-					}
-				}
-			}
-		}
-		assert!(checked > 100, "{checked}");
-	}
-
-	#[test]
-	fn the_author_gives_way_before_the_date() {
-		let c = list_cols(574., 40., 176., DATE_NEED, false);
-		assert!(c.author < AUTHOR_W && c.date == DATE_W, "{c:?}");
-	}
-
-	#[test]
-	fn a_ref_group_is_measured_as_it_is_drawn() {
-		use snip_core::graph::{RefInfo, RefKind};
-		let r = |raw: &str, display: &str, kind| RefInfo {
-			raw_name: raw.into(),
-			display_name: display.into(),
-			kind,
-		};
-		let refs = vec![
-			r("refs/heads/main", "main", RefKind::Branch),
-			r(
-				"refs/remotes/origin/main",
-				"origin/main",
-				RefKind::RemoteBranch {
-					remote: "origin".into(),
-					name: "main".into(),
-				},
-			),
-			r("refs/tags/v0.3.0", "v0.3.0", RefKind::Tag),
-		];
-		let m = |s: &str| s.chars().count() as f32 * 7.;
-		// "main, origin/main" and "v0.3.0", each with its 17px allowance.
-		let w = ref_labels_width(&refs, Some("main"), &m);
-		assert_eq!(w, (17. + 17. * 7.) + 8. + (17. + 6. * 7.));
-		assert_eq!(ref_labels_width(&[], None, &m), 0.);
-		// The date need is the widest string of the locale.
-		let d = date_need_w(Locale::ZhTw, &m);
-		assert_eq!(d, "2026/12/28 23:59".chars().count() as f32 * 7.);
-	}
-
-	#[test]
-	fn the_subject_gives_way_to_whole_labels_down_to_its_floor() {
-		let c = cols(574., WIDE_GUTTER, true, false);
-		let w = row_widths(574., c, 108., 400., false);
-		assert_eq!(w.labels, 108.);
-		assert!(w.subject >= MIN_SUBJECT_BESIDE_LABELS);
-	}
-}
-
-#[cfg(test)]
 mod filter_split_tests {
 	use super::*;
 
-	fn layout(widths: [f32; 4], more: f32) -> LogFilterLayout {
-		let l = LogFilterLayout::default();
-		for (m, w) in ALL_LOG_FILTER_MENUS.iter().zip(widths) {
-			l.chip_width_cell(*m).set(w);
+	fn chip(natural: f32, floor: f32, valued: bool) -> ChipInput {
+		ChipInput {
+			natural,
+			floor,
+			valued,
 		}
-		l.more_w.set(more);
-		l
 	}
 
-	/// All chips stay when they fit; inactive chips give way before an
-	/// active one, from the end; the overflow chip's dot counts only for
-	/// a hidden value.
+	const MORE: f32 = 46.;
+	const DOT: f32 = 9.;
+
+	fn split(chips: [ChipInput; 4], avail: f32) -> u8 {
+		split_chips(&chips, MORE, MORE + DOT, avail).0
+	}
+
+	/// All chips stay when they fit whole; chips without a value give way
+	/// before one with a value, from the end; the overflow chip's dot counts
+	/// only for a hidden value.
 	#[test]
-	fn inactive_chips_give_way_first() {
-		let l = layout([100., 50., 110., 55.], 46.);
-		let all = 100. + 50. + 110. + 55. + 3. * LOG_FILTER_GAP;
-		assert_eq!(l.compute_split(all, [true, false, true, false]), 0b1111);
-		// Repo and User are active: Date, then Branch go first.
-		let two = 100. + 110. + 46. + 2. * LOG_FILTER_GAP;
-		assert_eq!(l.compute_split(two, [true, false, true, false]), 0b0101);
-		assert_eq!(
-			l.compute_split(two + 30., [true, false, true, false]),
-			0b0101
+	fn chips_without_a_value_give_way_first() {
+		let chips = [
+			chip(100., 60., true),
+			chip(50., 50., false),
+			chip(110., 60., true),
+			chip(55., 55., false),
+		];
+		let g = LOG_FILTER_GAP;
+		let all = 100. + 50. + 110. + 55. + 3. * g;
+		assert_eq!(split(chips, all), 0b1111);
+		// Repo and User have a value: Date, then Branch go first.
+		let two = 100. + 110. + MORE + 2. * g;
+		assert_eq!(split(chips, two), 0b0101);
+		assert_eq!(split(chips, two + 30.), 0b0101);
+		let three = 100. + 50. + 110. + MORE + 3. * g;
+		assert_eq!(split(chips, three), 0b0111);
+		// Too narrow for both values whole: the two floors and the overflow
+		// chip, with its dot, still fit, then a value is cut before one goes.
+		let floors = 60. + 60. + MORE + DOT + 2. * g;
+		let (mask, fit) = split_chips(&chips, MORE, MORE + DOT, floors);
+		assert_eq!(mask, 0b0101);
+		assert!(fit.width(ChipPart::Chip(LogMenu::Repo)) >= 60.);
+		// Without room for the second floor it goes to the overflow chip.
+		assert_eq!(split(chips, floors - 1.), 0b0001);
+		// Nothing has a value: the front chips stay.
+		let plain = [
+			chip(100., 100., false),
+			chip(50., 50., false),
+			chip(110., 110., false),
+			chip(55., 55., false),
+		];
+		assert_eq!(split(plain, 100. + 50. + MORE + 2. * g), 0b0011);
+	}
+
+	/// The overflow chip needs no dot when nothing with a value is hidden:
+	/// the split is made again without it, and keeps the room.
+	#[test]
+	fn the_dot_is_only_for_a_hidden_value() {
+		let chips = [
+			chip(100., 60., true),
+			chip(50., 50., false),
+			chip(110., 110., false),
+			chip(55., 55., false),
+		];
+		let g = LOG_FILTER_GAP;
+		// Repo plus the overflow chip, no dot: fits in 100 + 46 + g, not with
+		// the dot's 9 more: the split without the dot still shows the value.
+		let (mask, fit) =
+			split_chips(&chips, MORE, MORE + DOT, 100. + MORE + g);
+		assert_eq!(mask, 0b0001);
+		assert_eq!(fit.width(ChipPart::More), MORE);
+	}
+
+	/// A short value is whole before a longer one is given more (#205): the
+	/// shorter active chip stays whole while the longer one is cut.
+	#[test]
+	fn the_shorter_value_is_whole_before_the_longer_gets_more() {
+		let chips = [
+			chip(300., 90., true),
+			chip(120., 70., true),
+			chip(40., 40., false),
+			chip(40., 40., false),
+		];
+		let g = LOG_FILTER_GAP;
+		// Room for the floors, the overflow chip and 40px more.
+		let avail = 90. + 70. + MORE + DOT + 2. * g + 40.;
+		let (mask, fit) = split_chips(&chips, MORE, MORE + DOT, avail);
+		assert_eq!(mask & 0b11, 0b11);
+		let (repo, branch) = (
+			fit.width(ChipPart::Chip(LogMenu::Repo)),
+			fit.width(ChipPart::Chip(LogMenu::Branch)),
 		);
-		let three = 100. + 50. + 110. + 46. + 3. * LOG_FILTER_GAP;
-		assert_eq!(l.compute_split(three, [true, false, true, false]), 0b0111);
-		// Too narrow for both active chips: the later one hides, and the
-		// overflow chip needs room for its dot.
-		let one = 100. + 46. + 9. + LOG_FILTER_GAP;
-		assert_eq!(l.compute_split(one, [true, false, true, false]), 0b0001);
-		assert_eq!(l.compute_split(one - 1., [true, false, true, false]), 0);
-		// Nothing active: plain prefix order.
-		let prefix = 100. + 50. + 46. + 2. * LOG_FILTER_GAP;
-		assert_eq!(l.compute_split(prefix, [false; 4]), 0b0011);
+		// Nothing with a value is hidden, so the overflow chip has no dot and
+		// there are 49px to give: the shorter value (120) takes them first,
+		// 70 + 49, and the longer stays at its floor.
+		assert_eq!((repo, branch), (90., 119.));
+		// With 10px more the shorter one is whole (120) and the longer one
+		// gets the 9px that are left.
+		let (_, fit) = split_chips(&chips, MORE, MORE + DOT, avail + 10.);
+		assert_eq!(fit.width(ChipPart::Chip(LogMenu::Branch)), 120.);
+		assert_eq!(fit.width(ChipPart::Chip(LogMenu::Repo)), 99.);
 	}
-}
 
-#[cfg(test)]
-mod chip_text_cap_tests {
-	use super::*;
-
-	/// Values that fit keep their width; long ones share what is left;
-	/// the cap never goes below the floor or above the old 180.
 	#[test]
-	fn long_values_share_the_room_short_ones_keep_theirs() {
-		// Everything fits: no cap below the old 180.
-		assert_eq!(chip_text_cap(&[117., 87.], 400.), CHIP_TEXT_MAX_W);
-		// Neither fits twice over: both get half.
-		assert_eq!(chip_text_cap(&[117., 87.], 140.), 70.);
-		// The short one keeps its 87; the long one gets the rest.
-		assert_eq!(chip_text_cap(&[117., 87.], 200.), 113.);
-		assert_eq!(chip_text_cap(&[200., 200.], 300.), 150.);
-		assert_eq!(chip_text_cap(&[200., 200.], 20.), CHIP_TEXT_MIN_W);
-		assert_eq!(chip_text_cap(&[300.], 1000.), CHIP_TEXT_MAX_W);
-		assert_eq!(chip_text_cap(&[], 100.), CHIP_TEXT_MAX_W);
+	fn no_room_for_the_overflow_chip_puts_nothing_on_the_bar() {
+		let chips = [
+			chip(100., 60., true),
+			chip(50., 50., false),
+			chip(110., 60., true),
+			chip(55., 55., false),
+		];
+		assert_eq!(split(chips, MORE + DOT - 1.), 0);
+		assert_eq!(split(chips, 0.), 0);
 	}
 }
 
@@ -2801,44 +2977,404 @@ mod repo_label_tests {
 #[cfg(test)]
 mod row_fit_tests {
 	use super::*;
+	use crate::ui::fit::{ELLIPSIS, FIT_MARGIN};
 
-	/// The policy over every shape of a log row (#228). While the list's
-	/// columns and each row's widths come from two functions and a flex
-	/// layout, this is checked on the first of them: `list_cols`. A date is
-	/// whole (`date_need` wide) or the column is absent, and it is absent
-	/// only on a list narrower than 250px.
-	#[test]
-	fn log_row_policy_holds_for_every_shape() {
-		let mut bad = Vec::new();
-		for list_w in (300..=1400).step_by(10) {
-			let list_w = list_w as f32;
+	/// 0.6em per character, as the test text system measures; `wide` text
+	/// (a CJK font) 1.0em, the ellipsis always 0.6.
+	fn measure(role: FitRole, wide: bool) -> impl Fn(&str) -> f32 {
+		let size = role.font().1;
+		move |s: &str| {
+			s.chars()
+				.map(|c| {
+					if wide && !c.is_ascii() && c != '\u{2026}' {
+						1.0
+					} else {
+						0.6
+					}
+				})
+				.sum::<f32>()
+				* size
+		}
+	}
+
+	fn part(cell: LogCell, text: &str, wide: bool) -> LabelPart {
+		let role = cell.role().unwrap();
+		let m = measure(role, wide);
+		let natural = natural_px(role, text, &m).min(LABEL_MAX_W);
+		LabelPart {
+			cell,
+			natural,
+			floor: floor_px(role, text, 0, &m).min(natural),
+		}
+	}
+
+	const CJK_TAG: &str =
+		"\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}";
+	const CJK_SUBJECT: &str = "\u{4fee}\u{6b63}\u{9060}\u{7aef}\u{5de5}\u{4f5c}\u{5340}\u{5728}\u{6162}\u{901f}\u{9023}\u{7dda}\u{4e0b}\u{8b80}\u{53d6}";
+	const CJK_AUTHOR: &str = "\u{9673}\u{5927}\u{6587}\u{6e2c}\u{8a66}\u{4f5c}\u{8005}\u{540d}\u{7a31}";
+
+	/// The label groups a row can have: none, one branch, a branch and a tag
+	/// (the most: a row shows two badges, or one and `+N`), a CJK tag, a label
+	/// over the cap, one label and `+12`.
+	fn label_shapes() -> Vec<(&'static str, Vec<LabelPart>)> {
+		let long = "feature/".to_string() + &"x".repeat(40);
+		vec![
+			("none", vec![]),
+			("main", vec![part(LogCell::BranchLabel, "main", false)]),
+			(
+				"main+tag",
+				vec![
+					part(LogCell::BranchLabel, "main, origin/main", false),
+					part(LogCell::TagLabel, "v0.3.0", false),
+				],
+			),
+			(
+				"cjk tag",
+				vec![
+					part(LogCell::BranchLabel, "main, origin/main", false),
+					part(LogCell::TagLabel, CJK_TAG, true),
+				],
+			),
+			(
+				"over the cap",
+				vec![part(LogCell::BranchLabel, &long, false)],
+			),
+			// A row with three refs or more shows one badge and `+N`.
+			(
+				"one and more",
+				vec![
+					part(LogCell::TagLabel, CJK_TAG, true),
+					part(LogCell::RefMore, "+12", false),
+				],
+			),
+		]
+	}
+
+	#[derive(Clone)]
+	struct Shape {
+		list_w: f32,
+		hash: bool,
+		label: &'static str,
+		labels: Vec<LabelPart>,
+		subject: &'static str,
+		wide_subject: bool,
+		gutter: f32,
+		author: Option<&'static str>,
+		date_need: f32,
+	}
+
+	struct Solved {
+		cols: ListCols,
+		row: RowFit<LogCell>,
+		input: ListFitInput,
+	}
+
+	fn solve(s: &Shape) -> Solved {
+		let subject_m = measure(FitRole::Subject, s.wide_subject);
+		let bound_m = measure(FitRole::Subject, true);
+		let author_m = measure(FitRole::Author, true);
+		let input = ListFitInput {
+			list_w: s.list_w,
+			hash: s.hash,
+			gutter: s.gutter,
+			date_need: s.date_need,
+			author_floor: s
+				.author
+				.map(|a| floor_px(FitRole::Author, a, 0, &author_m)),
+			subject_floor_bound: bound_m(&format!(
+				"{}{ELLIPSIS}",
+				"\u{6f22}".repeat(6)
+			))
+			.max(bound_m(&format!("{}{ELLIPSIS}", "W".repeat(6))))
+				+ FIT_MARGIN,
+			collapsed: None,
+			labels: s.labels.clone(),
+		};
+		let cols = fit_list(&input);
+		let row = fit_log_row(
+			s.list_w,
+			&cols,
+			&RowFitInput {
+				hash: s.hash,
+				subject_natural: natural_px(
+					FitRole::Subject,
+					s.subject,
+					&subject_m,
+				),
+				subject_floor: floor_px(
+					FitRole::Subject,
+					s.subject,
+					0,
+					&subject_m,
+				),
+				collapsed: None,
+				labels: s.labels.clone(),
+			},
+		);
+		Solved { cols, row, input }
+	}
+
+	fn shapes(list_w: impl Iterator<Item = f32> + Clone) -> Vec<Shape> {
+		let mut out = Vec::new();
+		for list_w in list_w {
 			for hash in [false, true] {
-				for labels_w in [0., 60., 176., 337.] {
-					for gutter in [24., 40., 72., 392.] {
-						for date_need in [110., 124.8] {
-							let c = list_cols(
-								list_w, gutter, labels_w, date_need, hash,
-							);
-							if c.date < date_need - 0.5 {
-								bad.push(format!(
-									"list {list_w} hash={hash} labels={labels_w} gutter={gutter} need={date_need}: date {}",
-									c.date
-								));
+				for (label, labels) in label_shapes() {
+					for (subject, wide_subject) in [
+						("short", false),
+						("a subject long enough to want the whole row for itself and then some more words", false),
+						(CJK_SUBJECT, true),
+					] {
+						for gutter in [24., 40., 72., 392.] {
+							for author in [None, Some("t"), Some(CJK_AUTHOR)] {
+								for date_need in [110., 124.8] {
+									out.push(Shape {
+										list_w,
+										hash,
+										label,
+										labels: labels.clone(),
+										subject,
+										wide_subject,
+										gutter,
+										author,
+										date_need,
+									});
+								}
 							}
 						}
 					}
 				}
 			}
 		}
-		// The 433px list a 900 window leaves, hash off, labels, 110px dates:
-		// the date is squeezed to 97px, a time cut off.
-		let c = list_cols(433., 392., 176., 110., false);
+		out
+	}
+
+	fn tag(s: &Shape) -> String {
+		format!(
+			"list {} hash={} labels={} subject={:?} gutter={} author={:?} need={}",
+			s.list_w, s.hash, s.label, s.subject, s.gutter, s.author, s.date_need
+		)
+	}
+
+	/// The width a shown cell takes with its gap before it.
+	fn used(r: &RowFit<LogCell>, labels: &[LabelPart]) -> f32 {
+		let mut total = 0.;
+		for cell in LogCell::ALL {
+			if !r.shown(cell) {
+				continue;
+			}
+			let gap = match cell {
+				LogCell::Gutter => 0.,
+				LogCell::Subject
+				| LogCell::Author
+				| LogCell::Date
+				| LogCell::Hash => CELL_GAP,
+				LogCell::Collapsed => SUBJECT_LABEL_GAP,
+				LogCell::BranchLabel | LogCell::TagLabel | LogCell::RefMore => {
+					if labels.first().map(|l| l.cell) == Some(cell) {
+						SUBJECT_LABEL_GAP
+					} else {
+						LABEL_GAP
+					}
+				}
+			};
+			total += r.width(cell) + gap;
+		}
+		total
+	}
+
+	/// P-1: the one policy, over every shape (#228). The date is whole or
+	/// the column is gone (only on a list under 250px); the subject keeps its
+	/// readable floor from 433px; the label group is all shown or all
+	/// dropped, each at its floor at least, the shorter whole before the
+	/// longer; the author column is absent or at its floor at least; nothing
+	/// is wider than the row.
+	#[test]
+	fn log_row_policy_holds_for_every_shape() {
+		let mut bad = Vec::new();
+		let mut checked = 0;
+		for s in shapes((300..=1400).step_by(20).map(|w| w as f32)) {
+			checked += 1;
+			let Solved { cols, row, input } = solve(&s);
+			let t = tag(&s);
+			match cols.date {
+				Some(w) => {
+					if w < s.date_need - 0.01
+						|| w > s.date_need.max(DATE_W) + 0.01
+					{
+						bad.push(format!(
+							"{t}: date {w} for need {}",
+							s.date_need
+						));
+					}
+				}
+				None => {
+					if s.list_w >= 250. {
+						bad.push(format!("{t}: no date column"));
+					}
+				}
+			}
+			if s.list_w >= 433.
+				&& row.width(LogCell::Subject)
+					< row.floor(LogCell::Subject) - 0.01
+			{
+				bad.push(format!(
+					"{t}: subject {} < floor {}",
+					row.width(LogCell::Subject),
+					row.floor(LogCell::Subject)
+				));
+			}
+			let cells: Vec<LogCell> = s.labels.iter().map(|l| l.cell).collect();
+			let shown: Vec<bool> =
+				cells.iter().map(|c| row.shown(*c)).collect();
+			if shown.iter().any(|x| *x != shown[0]) {
+				bad.push(format!("{t}: the label group is split: {shown:?}"));
+			}
+			for l in &s.labels {
+				if row.shown(l.cell) && row.width(l.cell) < l.floor - 0.01 {
+					bad.push(format!(
+						"{t}: {:?} {} < floor {}",
+						l.cell,
+						row.width(l.cell),
+						l.floor
+					));
+				}
+			}
+			let kinds: Vec<&LabelPart> = s
+				.labels
+				.iter()
+				.filter(|l| l.cell != LogCell::RefMore)
+				.collect();
+			if let [a, b] = kinds[..] {
+				if row.shown(a.cell) {
+					let (short, long) = if a.natural <= b.natural {
+						(a, b)
+					} else {
+						(b, a)
+					};
+					if row.width(short.cell)
+						< short.natural.min(row.width(long.cell)) - 0.01
+					{
+						bad.push(format!(
+							"{t}: the shorter label is cut before the longer"
+						));
+					}
+				}
+			}
+			if let Some(w) = cols.author {
+				if w < input.author_floor.unwrap() - 0.01 {
+					bad.push(format!("{t}: author {w} under its floor"));
+				}
+			}
+			let u = used(&row, &s.labels);
+			if u > s.list_w - ROW_PAD_R + 0.01 {
+				bad.push(format!("{t}: {u} wide in a {} row", s.list_w));
+			}
+		}
+		assert!(checked > 5000, "{checked}");
 		assert!(
 			bad.is_empty(),
-			"{} shapes cut the date (433px, labels, need 110: date {}):\n{}",
+			"{} violations in {checked} shapes:\n{}",
 			bad.len(),
-			c.date,
-			bad.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
+			bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
 		);
+	}
+
+	/// P-2: every row of a list shares its columns, and a label group no
+	/// bigger than the worst row's fits wherever the worst group fits.
+	#[test]
+	fn every_row_shares_the_list_columns() {
+		let cost = |g: &[LabelPart]| -> f32 {
+			g.iter().map(|l| l.floor + CELL_GAP).sum()
+		};
+		let mut checked = 0;
+		for s in shapes([433., 574., 760., 1100.].into_iter()) {
+			let Solved { cols, row, .. } = solve(&s);
+			let t = tag(&s);
+			assert_eq!(row.width(LogCell::Gutter), cols.gutter, "{t}");
+			assert_eq!(
+				cols.author.is_some(),
+				s.author.is_some() && cols.author.is_some()
+			);
+			if let Some(w) = cols.author {
+				assert_eq!(row.width(LogCell::Author), w, "{t}");
+			} else {
+				assert!(!row.shown(LogCell::Author), "{t}");
+			}
+			if let Some(w) = cols.date {
+				assert_eq!(row.width(LogCell::Date), w, "{t}");
+			}
+			let Some(first) = s.labels.first() else {
+				continue;
+			};
+			if !row.shown(first.cell) {
+				continue;
+			}
+			for (name, other) in label_shapes() {
+				if other.is_empty() || cost(&other) > cost(&s.labels) {
+					continue;
+				}
+				let subject_m = measure(FitRole::Subject, s.wide_subject);
+				let other_row = fit_log_row(
+					s.list_w,
+					&cols,
+					&RowFitInput {
+						hash: s.hash,
+						subject_natural: natural_px(
+							FitRole::Subject,
+							s.subject,
+							&subject_m,
+						),
+						subject_floor: floor_px(
+							FitRole::Subject,
+							s.subject,
+							0,
+							&subject_m,
+						),
+						collapsed: None,
+						labels: other.clone(),
+					},
+				);
+				for l in &other {
+					assert!(
+						other_row.shown(l.cell),
+						"{t}: the smaller group {name} lost {:?} in a list that had room for the worst",
+						l.cell
+					);
+				}
+			}
+			checked += 1;
+		}
+		assert!(checked > 100, "{checked}");
+	}
+
+	/// P-3: from a 1080 window on (a 574px list), the labels are there,
+	/// hash column on or off.
+	#[test]
+	fn labels_stay_from_the_1080_list() {
+		let mut bad = Vec::new();
+		for s in shapes([574., 600., 700., 900., 1200.].into_iter()) {
+			if s.labels.is_empty() {
+				continue;
+			}
+			let Solved { row, .. } = solve(&s);
+			for l in &s.labels {
+				if !row.shown(l.cell) {
+					bad.push(format!("{}: {:?} dropped", tag(&s), l.cell));
+				}
+			}
+		}
+		assert!(
+			bad.is_empty(),
+			"{} violations:\n{}",
+			bad.len(),
+			bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+		);
+	}
+
+	#[test]
+	fn the_date_need_is_the_widest_string_of_the_locale() {
+		let m = |s: &str| s.chars().count() as f32 * 7.;
+		let d = date_need_w(Locale::ZhTw, &m);
+		assert_eq!(d, "2026/12/28 23:59".chars().count() as f32 * 7.);
 	}
 }

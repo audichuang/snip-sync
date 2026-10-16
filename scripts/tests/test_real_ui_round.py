@@ -142,6 +142,118 @@ class TestLogParsing(unittest.TestCase):
             rur.parse_latest_viewport(lines)
 
 
+def fit_line(tid: str, rule: str = "readable6", natural: int = 100, floor: int = 50, fit: str = "100",
+             drawn: int = 100, visible: int = 100, clipped: int = 0, cut: int = 0, shown: str = "10/10") -> str:
+    return (
+        f"[APP:TEXT_FIT: id={tid} rule={rule} natural={natural} floor={floor} fit={fit} drawn={drawn} "
+        f"visible={visible} clipped={clipped} cut={cut} shown={shown}]"
+    )
+
+
+class TestTextFit(unittest.TestCase):
+    def test_latest_line_of_each_text_wins_and_gone_removes_it(self):
+        lines = [
+            fit_line("text-fit:row:a:subject", fit="80", drawn=80, visible=80, shown="9/10"),
+            fit_line("text-fit:row:a:subject"),
+            fit_line("text-fit:row:a:date", rule="whole", shown="16/16"),
+            "[APP:TEXT_FIT_GONE: id=text-fit:row:a:date]",
+        ]
+        entries, drift = rur.parse_text_fit(lines)
+        self.assertEqual(list(entries), ["text-fit:row:a:subject"])
+        self.assertEqual(entries["text-fit:row:a:subject"].fit, 100)
+        self.assertEqual(drift, [])
+
+    def test_flex_has_no_fit_and_a_branch_name_has_slashes(self):
+        lines = [
+            fit_line("text-fit:log-header:ref-hint", rule="kv6", fit="-", shown="8/8"),
+            fit_line("text-fit:ref:refs/heads/feature/x:pane-name", shown="8/8"),
+        ]
+        entries, _ = rur.parse_text_fit(lines)
+        self.assertIsNone(entries["text-fit:log-header:ref-hint"].fit)
+        self.assertIn("text-fit:ref:refs/heads/feature/x:pane-name", entries)
+
+    def test_a_background_tab_line_is_read(self):
+        line = fit_line("text-fit:row:a:subject")[:-1] + " ws_tab=2]"
+        entries, _ = rur.parse_text_fit([line])
+        self.assertIn("text-fit:row:a:subject", entries)
+
+    def test_drift_counts_only_after_the_last_viewport(self):
+        tid = "text-fit:row:a:subject"
+        lines = [
+            fit_line(tid, drawn=90),
+            f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]",
+            "[APP:VIEWPORT: 1800x1440]",
+        ]
+        self.assertEqual(rur.parse_text_fit(lines)[1], [])
+        lines.insert(2, "[APP:VIEWPORT: 900x600]")
+        lines += [
+            fit_line(tid, drawn=90),
+            f"[APP:TEXT_FIT_DRIFT: id={tid} fit=100 drawn=90]",
+        ]
+        self.assertEqual(rur.parse_text_fit(lines)[1], [tid])
+        # A later line without a DRIFT clears it.
+        entries, drift = rur.parse_text_fit(lines + [fit_line(tid)])
+        self.assertEqual(drift, [])
+
+    def test_check_fails_on_drift_clipping_and_a_broken_rule(self):
+        ok = rur.parse_text_fit([fit_line("text-fit:row:a:subject")])
+        self.assertEqual(rur.text_fit_problems(*ok), [])
+        entries, _ = rur.parse_text_fit([fit_line("text-fit:row:a:subject", clipped=1, visible=60)])
+        self.assertTrue(any("clipped" in p for p in rur.text_fit_problems(entries, [])))
+        self.assertTrue(any("drift" in p for p in rur.text_fit_problems(ok[0], ["text-fit:row:a:subject"])))
+        # readable6 with 5 of 10 graphemes: the rule is broken.
+        entries, _ = rur.parse_text_fit([fit_line("text-fit:row:a:subject", shown="5/10")])
+        self.assertTrue(any("rule" in p for p in rur.text_fit_problems(entries, [])))
+        # But 3 of 3 is whole.
+        entries, _ = rur.parse_text_fit([fit_line("text-fit:row:a:subject", shown="3/3")])
+        self.assertEqual(rur.text_fit_problems(entries, []), [])
+
+    def test_rules_by_kind(self):
+        def holds(rule: str, shown: str) -> bool:
+            entries, _ = rur.parse_text_fit([fit_line("text-fit:row:a:x", rule=rule, shown=shown)])
+            return rur.text_fit_rule_holds(entries["text-fit:row:a:x"])
+
+        self.assertTrue(holds("whole", "16/16"))
+        self.assertFalse(holds("whole", "11/16"))
+        self.assertTrue(holds("readable3", "3/9"))
+        self.assertFalse(holds("readable3", "2/9"))
+        self.assertTrue(holds("kv4", "4/30"))
+        self.assertFalse(holds("kv4", "3/30"))
+        self.assertTrue(holds("kv4", "2/2"))
+
+    def test_a_dropped_text_has_nothing_to_check(self):
+        dropped = fit_line("text-fit:row:a:branch", fit="0", drawn=0, visible=0, cut=1, shown="0/17")
+        entries, drift = rur.parse_text_fit([dropped])
+        self.assertEqual(rur.text_fit_problems(entries, drift), [])
+
+    def test_the_subcommand_prints_filters_and_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "app.log"
+            log.write_text(
+                "\n".join(
+                    [
+                        fit_line("text-fit:row:a:subject"),
+                        fit_line("text-fit:log-filter-user:chip-user", rule="kv4", shown="2/20"),
+                    ]
+                )
+                + "\n"
+            )
+            out = subprocess.run(
+                [sys.executable, os.path.join(SCRIPTS_DIR, "real_ui_round.py"), "text-fit", str(log),
+                 "--prefix", "text-fit:row:", "--check"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("text-fit:row:a:subject", out.stdout)
+            self.assertNotIn("chip-user", out.stdout)
+            bad = subprocess.run(
+                [sys.executable, os.path.join(SCRIPTS_DIR, "real_ui_round.py"), "text-fit", str(log), "--check"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(bad.returncode, 1)
+            self.assertIn("chip-user", bad.stderr)
+
+
 class TestAppWindowTitle(unittest.TestCase):
     def test_bare_title_matches(self):
         self.assertTrue(rur.is_app_window_title("snip-sync"))

@@ -707,6 +707,136 @@ def parse_latest_viewport(lines: List[str]) -> Tuple[int, int]:
     raise ValueError("No [APP:VIEWPORT: ...] line found in log")
 
 
+# `TEXT_FIT` is the app's check of one text's box against the rule of its role
+# (docs/adr/0005-one-fit-rule-table.md). A line of a background tab ends with
+# ` ws_tab=<id>` inside its brackets.
+RE_TEXT_FIT = re.compile(
+    r"^\[APP:TEXT_FIT:\s+id=(\S+)\s+rule=(\S+)\s+natural=(-?\d+)\s+floor=(-?\d+)\s+fit=(-|-?\d+)"
+    r"\s+drawn=(-?\d+)\s+visible=(-?\d+)\s+clipped=([01])\s+cut=([01])\s+shown=(\d+)/(\d+)(?:\s+ws_tab=\d+)?\]$"
+)
+RE_TEXT_FIT_DRIFT = re.compile(r"^\[APP:TEXT_FIT_DRIFT:\s+id=(\S+)\s+fit=(-?\d+)\s+drawn=(-?\d+)(?:\s+ws_tab=\d+)?\]$")
+RE_TEXT_FIT_GONE = re.compile(r"^\[APP:TEXT_FIT_GONE:\s+id=(\S+?)(?:\s+ws_tab=\d+)?\]$")
+RE_TEXT_FIT_RULE = re.compile(r"^(whole|readable(\d+)|kv(\d+))$")
+
+
+@dataclasses.dataclass
+class TextFitEntry:
+    id: str
+    rule: str
+    natural: int
+    floor: int
+    fit: Optional[int]  # None for a text that flexes
+    drawn: int
+    visible: int
+    clipped: bool
+    cut: bool
+    shown: int
+    total: int
+    line_number: int
+
+
+def parse_text_fit(lines: List[str]) -> Tuple[Dict[str, TextFitEntry], List[str]]:
+    """The latest `TEXT_FIT` of every text still drawn, and the texts whose box
+    differs from the width the solver gave since the last viewport line.
+
+    A `TEXT_FIT_GONE` takes a text out; a new `TEXT_FIT` line for it replaces
+    the old one and clears its drift (the app prints `TEXT_FIT_DRIFT` right
+    after the line that has it)."""
+    latest: Dict[str, TextFitEntry] = {}
+    drift: List[str] = []
+    for n, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if RE_VIEWPORT.match(line):
+            drift = []
+            continue
+        m = RE_TEXT_FIT.match(line)
+        if m:
+            tid = m.group(1)
+            latest[tid] = TextFitEntry(
+                id=tid,
+                rule=m.group(2),
+                natural=int(m.group(3)),
+                floor=int(m.group(4)),
+                fit=None if m.group(5) == "-" else int(m.group(5)),
+                drawn=int(m.group(6)),
+                visible=int(m.group(7)),
+                clipped=m.group(8) == "1",
+                cut=m.group(9) == "1",
+                shown=int(m.group(10)),
+                total=int(m.group(11)),
+                line_number=n,
+            )
+            if tid in drift:
+                drift.remove(tid)
+            continue
+        m = RE_TEXT_FIT_DRIFT.match(line)
+        if m:
+            if m.group(1) not in drift:
+                drift.append(m.group(1))
+            continue
+        m = RE_TEXT_FIT_GONE.match(line)
+        if m:
+            latest.pop(m.group(1), None)
+            if m.group(1) in drift:
+                drift.remove(m.group(1))
+    return latest, drift
+
+
+def text_fit_rule_holds(entry: TextFitEntry) -> bool:
+    """Whether what shows of a text satisfies its rule. `kv<n>` cannot know the
+    key's length here, so it checks only that `n` graphemes show."""
+    m = RE_TEXT_FIT_RULE.match(entry.rule)
+    if not m:
+        return False
+    if entry.rule == "whole":
+        return entry.shown == entry.total
+    n = int(m.group(2) or m.group(3))
+    return entry.shown >= min(n, entry.total)
+
+
+def text_fit_problems(entries: Dict[str, TextFitEntry], drift: List[str]) -> List[str]:
+    """What `text-fit --check` fails on: a drift since the last viewport line,
+    a clipped text, a text that shows less than its rule keeps. A dropped text
+    (`fit=0`) is not drawn and has nothing to check."""
+    problems = [f"drift {tid}" for tid in drift]
+    for e in entries.values():
+        if e.fit == 0:
+            continue
+        if e.clipped:
+            problems.append(f"clipped {e.id} (drawn={e.drawn} visible={e.visible})")
+        if not text_fit_rule_holds(e):
+            problems.append(f"rule {e.id}: {e.rule} but shows {e.shown}/{e.total} (fit={e.fit})")
+    return problems
+
+
+def cmd_text_fit(args: argparse.Namespace) -> int:
+    log_file = Path(args.log)
+    if not log_file.is_file():
+        print(f"ERROR: Log file not found at {log_file}", file=sys.stderr)
+        return 1
+    lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    entries, drift = parse_text_fit(lines)
+    shown = {k: v for k, v in entries.items() if k.startswith(args.prefix)} if args.prefix else entries
+    for e in sorted(shown.values(), key=lambda e: e.id):
+        fit = "-" if e.fit is None else str(e.fit)
+        print(
+            f"{e.id} rule={e.rule} natural={e.natural} floor={e.floor} fit={fit} drawn={e.drawn} "
+            f"visible={e.visible} clipped={int(e.clipped)} cut={int(e.cut)} shown={e.shown}/{e.total}"
+        )
+    for tid in drift:
+        if not args.prefix or tid.startswith(args.prefix):
+            print(f"DRIFT {tid}")
+    if not args.check:
+        return 0
+    problems = text_fit_problems(shown, [d for d in drift if not args.prefix or d.startswith(args.prefix)])
+    for p in problems:
+        print(f"FAIL: {p}", file=sys.stderr)
+    if not shown:
+        print("FAIL: no TEXT_FIT line matches", file=sys.stderr)
+        return 1
+    return 1 if problems else 0
+
+
 def calculate_point_coordinates(
     bounds: ControlBoundsMatch,
     viewport_physical: Tuple[int, int],
@@ -1752,6 +1882,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also move the pointer to the control's centre and stay there (tooltips); never clicks",
     )
 
+    # text-fit
+    p_fit = subparsers.add_parser(
+        "text-fit",
+        help="Print the latest TEXT_FIT of every text in an app log; --check fails on drift, clipping or a broken rule",
+    )
+    p_fit.add_argument("log", help="The app's log file")
+    p_fit.add_argument("--prefix", default="", help="Only ids that start with this (e.g. text-fit:row:)")
+    p_fit.add_argument("--check", action="store_true", help="Exit 1 on drift since the last VIEWPORT, clipped=1, or shown below the rule")
+
     # title
     p_title = subparsers.add_parser("title", help="Print the exact title of the round's main window")
     p_title.add_argument("--run", help="Run directory path")
@@ -1790,6 +1929,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_resize(args)
     elif args.subcommand == "point":
         return cmd_point(args)
+    elif args.subcommand == "text-fit":
+        return cmd_text_fit(args)
     elif args.subcommand == "title":
         return cmd_title(args)
     elif args.subcommand == "finish":

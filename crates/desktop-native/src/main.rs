@@ -872,6 +872,7 @@ pub struct WorkbenchModel {
 	/// The log panel's width at the last layout.
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
 	pub log_filter_layout: ui::LogFilterLayout,
+	pub log_fit: ui::LogFit,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
 	/// The changed-files pane groups by directory (else a flat list).
@@ -1405,6 +1406,7 @@ impl WorkbenchModel {
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
 			log_filter_layout: Default::default(),
+			log_fit: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
@@ -12192,8 +12194,6 @@ mod tests {
 			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
 			let mut last_chip = None;
 			for _ in 0..10 {
-				// ALLOWED-TEST-REFRESH: test harness needs redraw frames for search field width re-measurement before clicking branch chip
-				cx.update(|window, _| window.refresh());
 				settle(cx);
 				let pos = cx
 					.debug_bounds("log-filter-branch")
@@ -12353,65 +12353,6 @@ mod tests {
 					m.status.key,
 				);
 			});
-		}
-
-		/// The log list width and, per laid-out row, the widths of its graph
-		/// gutter and subject cell.
-		struct LogMeasure {
-			list_w: f32,
-			rows: Vec<(f32, f32)>,
-		}
-
-		/// Six repositories with three feature branches of long names each,
-		/// so the graph is wide and rows carry ref labels; shown in a
-		/// `w` x 752 window.
-		fn measure_wide_log(cx: &mut TestAppContext, w: f32) -> LogMeasure {
-			let ws = tempfile::tempdir().unwrap();
-			for i in 0..6 {
-				let r = repo(ws.path(), &format!("repo{i}"), &[]);
-				for b in 0..3 {
-					let name = format!("feature/a-rather-long-branch-{i}-{b}");
-					git(&r, &["checkout", "-q", "-b", &name, "main"]);
-					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
-					git(&r, &["add", "."]);
-					git(
-						&r,
-						&["commit", "-q", "-m", &format!("commit {i} {b}")],
-					);
-				}
-				git(&r, &["checkout", "-q", "main"]);
-			}
-			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
-			settle(cx);
-			// The list reads its own width from the previous frame.
-			for _ in 0..2 {
-				// ALLOWED-TEST-REFRESH: test harness needs a redraw after resize so log list reads its width from previous frame
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
-			let (n, list_w) = model.read_with(cx, |m, _| {
-				let bounds = m.log_scroll.0.borrow().base_handle.bounds();
-				(m.display_commits().len(), f32::from(bounds.size.width))
-			});
-			assert!(n > 10, "log did not load: {n} commits");
-			let mut rows = Vec::new();
-			for ix in 0..n {
-				// `debug_bounds` wants a 'static selector; a test may leak.
-				let key = |what: &str| -> &'static str {
-					Box::leak(format!("log-{what}:{ix}").into_boxed_str())
-				};
-				if let (Some(g), Some(s)) = (
-					cx.debug_bounds(key("gutter")),
-					cx.debug_bounds(key("subject-room")),
-				) {
-					rows.push((
-						f32::from(g.size.width),
-						f32::from(s.size.width),
-					));
-				}
-			}
-			LogMeasure { list_w, rows }
 		}
 
 		/// Writes a file over the preview limit and commits it in `r`.
@@ -13653,37 +13594,94 @@ mod tests {
 			});
 		}
 
-		/// Every row shares one gutter, and the subject of each row keeps at
-		/// least `min` wide.
-		fn assert_log_layout(m: &LogMeasure, min: f32) {
-			assert!(!m.rows.is_empty(), "no rows were laid out");
-			for (gutter, subject) in &m.rows {
-				assert_eq!(*gutter, m.rows[0].0, "{:?}", m.rows);
-				assert!(
-					*subject >= min,
-					"list {}: subject {subject} < {min}: {:?}",
-					m.list_w,
-					m.rows
-				);
+		/// Six repositories with three feature branches of long names each,
+		/// so the graph is wide and rows carry ref labels; shown in a
+		/// `w` x 752 window and resized from the default one, with no input
+		/// after the resize. What breaks the one policy on its rows.
+		fn wide_log_violations(cx: &mut TestAppContext, w: f32) -> Vec<String> {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..6 {
+				let r = repo(ws.path(), &format!("repo{i}"), &[]);
+				for b in 0..3 {
+					let name = format!("feature/a-rather-long-branch-{i}-{b}");
+					git(&r, &["checkout", "-q", "-b", &name, "main"]);
+					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
+					git(&r, &["add", "."]);
+					git(
+						&r,
+						&["commit", "-q", "-m", &format!("commit {i} {b}")],
+					);
+				}
+				git(&r, &["checkout", "-q", "main"]);
 			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			enable_probes(&model, cx);
+			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+			settle(cx);
+			let n = model.read_with(cx, |m, _| m.display_commits().len());
+			assert!(n > 10, "log did not load: {n} commits");
+			let mut bad = Vec::new();
+			let mut gutters = Vec::new();
+			let mut drawn = 0;
+			for ix in 0..n {
+				if bounds_of(cx, format!("log-row:{ix}")).is_none() {
+					continue;
+				}
+				drawn += 1;
+				bad.extend(
+					row_policy_violations(&model, cx, ix, 0.)
+						.into_iter()
+						.map(|v| format!("{w}: row {ix}: {v}")),
+				);
+				if let Some(g) = seen_cell(&model, cx, ix, RowCell::Gutter) {
+					gutters.push(g.w);
+				}
+				// From a 1080 window on, a row with refs has its labels.
+				let has_refs = model.read_with(cx, |m, _| {
+					m.graph_layout
+						.as_ref()
+						.is_some_and(|l| !l.rows[ix].refs.is_empty())
+				});
+				if w >= 1080.
+					&& has_refs && seen_cell(&model, cx, ix, RowCell::Label(0))
+					.is_none()
+				{
+					bad.push(format!("{w}: row {ix} lost its labels"));
+				}
+			}
+			assert!(drawn > 0, "no rows were laid out");
+			if gutters.iter().any(|g| (*g - gutters[0]).abs() > 0.01) {
+				bad.push(format!("{w}: the gutters differ: {gutters:?}"));
+			}
+			bad
 		}
 
+		/// At 1080 the list is ~574px: every row keeps its subject's floor
+		/// and a whole date, and a row with refs has its labels.
 		#[gpui::test]
 		fn wide_multi_repo_log_keeps_a_subject_at_1080(
 			cx: &mut TestAppContext,
 		) {
-			let m = measure_wide_log(cx, 1080.);
-			// ui::log::MIN_SUBJECT_W
-			assert_log_layout(&m, 160.);
+			let bad = wide_log_violations(cx, 1080.);
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
 		}
 
-		/// At 900 the list is ~430px: the gutter sits at its floor and the
-		/// date and author cells shrink, so the subject still gets its
-		/// minimum with the labels dropped.
+		/// At 900 the list is ~430px: the gutter sits at its floor, the
+		/// date stays whole and the author column or the labels give way.
 		#[gpui::test]
 		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
-			let m = measure_wide_log(cx, 900.);
-			assert_log_layout(&m, 160.);
+			let bad = wide_log_violations(cx, 900.);
+			assert!(
+				bad.is_empty(),
+				"{} violations:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
 		}
 
 		/// `git` with both dates fixed, so one repository's commits sort
@@ -13789,88 +13787,49 @@ mod tests {
 		}
 
 		/// On a 1160 window the list is 654px: both labels fit whole beside
-		/// a subject of about 96px.
+		/// the subject and the columns.
 		#[gpui::test]
 		fn head_row_labels_stay_whole_at_1160(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1160., 720.);
-			settle_until(cx, "the log rows", |cx| {
-				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
-			});
-			settle(cx);
+			let (model, cx) = open_log_window(cx, ws.path(), 1160., false);
 			let texts = head_label_texts(&model, cx);
 			assert_eq!(texts, ["main, origin/main", "v0.3.0"]);
-			for n in 0..2 {
-				// The label's natural width, capped as `ref_label_elements` caps it.
-				let natural = cx
-					.update(|w, _| {
-						17. + crate::ui::text_width(
-							w,
-							&texts[n],
-							crate::theme::SMALL_TEXT,
-						)
-					})
-					.min(320.);
-				let selector = ["log-ref-label:0:0", "log-ref-label:0:1"][n];
-				let width =
-					cx.debug_bounds(selector).expect("label").size.width;
+			for (n, text) in texts.iter().enumerate() {
+				let label =
+					seen_cell(&model, cx, 0, RowCell::Label(n)).expect("label");
 				assert!(
-					f32::from(width) >= natural - 1.0,
-					"label {n} {:?} cut: {width:?} < {natural}",
-					texts[n]
+					label.visible >= label.natural - 1.0,
+					"label {n} {text:?} cut: {label:?}"
 				);
 			}
-			let subject = cx.debug_bounds("log-subject:0").expect("subject");
-			// ui::log::MIN_SUBJECT_BESIDE_LABELS
-			assert!(
-				f32::from(subject.size.width) >= 96. - 1.0,
-				"subject {:?}",
-				subject.size.width
-			);
-			// ui::log::MIN_SUBJECT_W: the subject gave way to keep the labels whole.
-			assert!(
-				f32::from(subject.size.width) < 160.,
-				"subject {:?}",
-				subject.size.width
-			);
+			let subject =
+				seen_cell(&model, cx, 0, RowCell::Subject).expect("subject");
+			assert!(subject.visible >= subject.floor - 1., "{subject:?}");
 		}
 
-		/// On a 1080 window the list is 574px. The labels cannot both fit whole
-		/// beside the subject there, so the branch label is ellipsized and the
-		/// tag keeps its icon and a few characters, never a bare icon (#195).
+		/// On a 1080 window the list is 574px. The labels keep their
+		/// rule's floor (the label kind: 6 characters), the subject keeps
+		/// its own, and the HEAD row has its labels (#195).
 		#[gpui::test]
 		fn head_row_labels_stay_readable_at_1080(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
-			settle_until(cx, "the log rows", |cx| {
-				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
-			});
-			settle(cx);
-			assert_eq!(
-				head_label_texts(&model, cx),
-				["main, origin/main", "v0.3.0"]
-			);
-			for selector in ["log-ref-label:0:0", "log-ref-label:0:1"] {
-				let width =
-					cx.debug_bounds(selector).expect("label").size.width;
-				// Icon (14px), its gap (3px) and 30px of text: ui::log::LABEL_FLOOR_W.
-				assert!(
-					f32::from(width) >= 47. - 1.0,
-					"{selector} shows only its icon: {width:?}"
+			for hash in [false, true] {
+				let (model, cx) = open_log_window(cx, ws.path(), 1080., hash);
+				assert_eq!(
+					head_label_texts(&model, cx),
+					["main, origin/main", "v0.3.0"]
 				);
+				let bad = row_policy_violations(&model, cx, 0, 1080.);
+				assert!(bad.is_empty(), "hash={hash}: {bad:?}");
+				for n in 0..2 {
+					let label = seen_cell(&model, cx, 0, RowCell::Label(n))
+						.expect("label");
+					assert!(label.rule_holds(), "hash={hash}: {label:?}");
+					assert!(label.visible >= label.floor - 1., "{label:?}");
+				}
 			}
-			// About 94px here: a little under MIN_SUBJECT_BESIDE_LABELS, which
-			// the labels' floors cannot all be fitted beside at this width.
-			let subject = cx.debug_bounds("log-subject:0").expect("subject");
-			assert!(
-				f32::from(subject.size.width) >= 92.,
-				"subject {:?}",
-				subject.size.width
-			);
 		}
 
 		// ───────── #228: one fit rule for the log's texts (S0 helpers) ─────────
@@ -14000,49 +13959,48 @@ mod tests {
 			Hash,
 		}
 
-		/// How much of a text a rule keeps in sight.
-		#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-		enum Rule {
-			Whole,
-			Readable(usize),
-		}
-
-		impl RowCell {
-			fn rule(self) -> Rule {
-				match self {
-					RowCell::Subject | RowCell::Label(_) => Rule::Readable(6),
-					RowCell::Author => Rule::Readable(3),
-					RowCell::Gutter
-					| RowCell::Collapsed
-					| RowCell::Date
-					| RowCell::Hash => Rule::Whole,
-				}
-			}
-		}
-
-		/// One drawn cell of a row, as `debug_bounds` and the text system
-		/// give it.
+		/// One drawn cell of a row: what `TEXT_FIT` (the graph gutter, which
+		/// is no text: its `debug_bounds`) saw of it.
 		#[derive(Clone, Debug)]
 		struct SeenCell {
 			cell: RowCell,
+			role: Option<crate::ui::FitRole>,
 			text: String,
-			/// The cell's box.
+			/// Where the box starts, and how wide it was drawn.
 			x: f32,
 			w: f32,
-			/// The part of the box no ancestor clips away.
-			vis_l: f32,
-			vis_r: f32,
-			/// What the text needs, whole, with its icon (labels: 17).
+			/// How much of the box no ancestor clips away.
+			visible: f32,
+			/// What the text needs whole, and what its rule keeps at least.
 			natural: f32,
-			/// The icon and gap before the text (labels: 17).
-			chrome: f32,
-			code: bool,
-			size: f32,
+			floor: f32,
+			/// The width the solver gave.
+			fit: Option<f32>,
+			shown: usize,
+			total: usize,
+			key_graphemes: usize,
 		}
 
 		impl SeenCell {
-			fn visible(&self) -> f32 {
-				(self.vis_r - self.vis_l).max(0.)
+			/// What is in sight: from the box's left to the visible width.
+			fn vis_l(&self) -> f32 {
+				self.x
+			}
+
+			fn vis_r(&self) -> f32 {
+				self.x + self.visible
+			}
+
+			fn rule_holds(&self) -> bool {
+				match self.role {
+					Some(role) => crate::ui::rule_holds(
+						role.rule(),
+						self.shown,
+						self.total,
+						self.key_graphemes,
+					),
+					None => true,
+				}
 			}
 		}
 
@@ -14054,153 +14012,85 @@ mod tests {
 			cx.debug_bounds(s)
 		}
 
-		fn row_label_texts(
+		/// The `TEXT_FIT` of the text of row `ix` in `role`.
+		fn row_text_fit(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
 			ix: usize,
-		) -> Vec<String> {
+			role: crate::ui::FitRole,
+		) -> Option<crate::ui::TextFit> {
 			model.read_with(cx, |m, _| {
-				let row = &m.graph_layout.as_ref().unwrap().rows[ix];
-				let cur = m.log_current_branch(&m.display_commits()[ix].sha);
-				let (shown, _) =
-					crate::graph_view::visible_refs(&row.refs, cur.as_deref());
-				crate::graph_view::kind_labels(&shown, cur.as_deref())
-					.into_iter()
-					.map(|l| l.text)
-					.collect()
+				let key = m.log_row_key(m.display_commits()[ix]);
+				m.probes
+					.as_ref()
+					.expect("probes are on")
+					.text_fit(&format!("text-fit:row:{key}:{}", role.key()))
 			})
 		}
 
-		/// Where row `ix` drew `cell`, `None` where it drew none.
+		/// Where row `ix` drew `cell`, `None` where it drew none (a dropped
+		/// text has a `TEXT_FIT` of width 0, but is not drawn).
 		fn seen_cell(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
 			ix: usize,
 			cell: RowCell,
 		) -> Option<SeenCell> {
-			use crate::theme::{SMALL_TEXT, UI_TEXT};
-			let (sha, subject, author, date_iso, loc, hidden) = model
-				.read_with(cx, |m, _| {
-					let c = m.display_commits()[ix];
-					(
-						c.sha.clone(),
-						c.subject.clone(),
-						c.author_name.clone(),
-						c.author_date.clone(),
-						m.locale,
-						crate::history::side_only(&m.commits, &c.sha).len(),
-					)
-				});
-			let (selector, text, code, size, chrome) = match cell {
-				RowCell::Gutter => (
-					format!("log-gutter:{ix}"),
-					String::new(),
-					false,
-					UI_TEXT,
-					0.,
-				),
-				RowCell::Subject => {
-					(format!("log-subject:{ix}"), subject, false, UI_TEXT, 0.)
+			use crate::ui::FitRole;
+			let role = match cell {
+				RowCell::Gutter => {
+					let b = bounds_of(cx, format!("log-gutter:{ix}"))?;
+					return Some(SeenCell {
+						cell,
+						role: None,
+						text: String::new(),
+						x: f32::from(b.left()),
+						w: f32::from(b.size.width),
+						visible: f32::from(b.size.width),
+						natural: f32::from(b.size.width),
+						floor: f32::from(b.size.width),
+						fit: Some(f32::from(b.size.width)),
+						shown: 0,
+						total: 0,
+						key_graphemes: 0,
+					});
 				}
-				RowCell::Collapsed => (
-					format!("log-collapsed:{ix}"),
-					crate::i18n::tf("collapsed_n", loc, &[&hidden]),
-					false,
-					SMALL_TEXT,
-					0.,
-				),
+				RowCell::Subject => FitRole::Subject,
+				RowCell::Collapsed => FitRole::Collapsed,
+				RowCell::Author => FitRole::Author,
+				RowCell::Date => FitRole::Date,
+				RowCell::Hash => FitRole::Hash,
+				// The first label is the branches' if the row has one.
 				RowCell::Label(n) => {
-					let texts = row_label_texts(model, cx, ix);
-					(
-						format!("log-ref-label:{ix}:{n}"),
-						texts.get(n)?.clone(),
-						false,
-						SMALL_TEXT,
-						17.,
-					)
+					let mut present = Vec::new();
+					for r in [FitRole::BranchLabel, FitRole::TagLabel] {
+						if row_text_fit(model, cx, ix, r)
+							.is_some_and(|f| f.fit != Some(0.))
+						{
+							present.push(r);
+						}
+					}
+					*present.get(n)?
 				}
-				RowCell::Author => {
-					(format!("log-author:{ix}"), author, false, UI_TEXT, 0.)
-				}
-				RowCell::Date => (
-					format!("log-date:{ix}"),
-					crate::ui::log_date(&date_iso, loc),
-					false,
-					UI_TEXT,
-					0.,
-				),
-				RowCell::Hash => (
-					format!("log-sha:{ix}"),
-					sha[..7].to_string(),
-					true,
-					SMALL_TEXT,
-					0.,
-				),
 			};
-			let b = bounds_of(cx, selector)?;
-			let mut visible = b;
-			let parents: &[String] = &match cell {
-				RowCell::Subject | RowCell::Collapsed => {
-					vec![format!("log-subject-room:{ix}")]
-				}
-				RowCell::Label(_) => vec![
-					format!("log-labels:{ix}"),
-					format!("log-subject-room:{ix}"),
-				],
-				_ => vec![],
-			};
-			for parent in parents {
-				visible = visible.intersect(&bounds_of(cx, parent.clone())?);
+			let f = row_text_fit(model, cx, ix, role)?;
+			if f.fit == Some(0.) {
+				return None;
 			}
-			let natural = chrome + text_w(cx, &text, code, size);
 			Some(SeenCell {
 				cell,
-				text,
-				x: f32::from(b.left()),
-				w: f32::from(b.size.width),
-				vis_l: f32::from(visible.left()),
-				vis_r: f32::from(visible.right()),
-				natural,
-				chrome,
-				code,
-				size,
+				role: Some(role),
+				text: f.text.to_string(),
+				x: f.x,
+				w: f.drawn,
+				visible: f.visible,
+				natural: f.natural,
+				floor: f.floor,
+				fit: f.fit,
+				shown: f.shown,
+				total: f.total,
+				key_graphemes: f.key_graphemes,
 			})
-		}
-
-		/// (graphemes in sight, graphemes in all): the most a visible width
-		/// shows before gpui's ellipsis, which truncates char by char with
-		/// the "…" counted.
-		fn shown_graphemes(
-			cx: &mut VisualTestContext,
-			s: &SeenCell,
-		) -> (usize, usize) {
-			use unicode_segmentation::UnicodeSegmentation;
-			let gs: Vec<&str> = s.text.graphemes(true).collect();
-			let total = gs.len();
-			let visible = s.visible();
-			if s.natural <= visible + 0.5 {
-				return (total, total);
-			}
-			let mut shown = 0;
-			for k in 1..=total {
-				let prefix = gs[..k].concat() + "\u{2026}";
-				if s.chrome + text_w(cx, &prefix, s.code, s.size) + 1.
-					<= visible
-				{
-					shown = k;
-				} else {
-					break;
-				}
-			}
-			(shown, total)
-		}
-
-		/// Whether what is in sight satisfies the rule.
-		fn rule_holds(rule: Rule, shown: usize, total: usize) -> bool {
-			match rule {
-				Rule::Whole => shown == total,
-				Rule::Readable(n) => shown >= n.min(total),
-			}
 		}
 
 		/// The row's cells that were drawn, in row order.
@@ -14227,12 +14117,15 @@ mod tests {
 			out
 		}
 
+		/// A row's cells as (cell, drawn?, x, w), to compare two windows.
+		type RowShape = Vec<(RowCell, bool, f32, f32)>;
+
 		/// (cell, drawn?, x, w) of row `ix`, to compare two windows.
 		fn log_row_shape(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
 			ix: usize,
-		) -> Vec<(RowCell, bool, f32, f32)> {
+		) -> RowShape {
 			[
 				RowCell::Gutter,
 				RowCell::Subject,
@@ -14267,41 +14160,38 @@ mod tests {
 				(f32::from(row.left()), f32::from(row.right()));
 			// A1: what is in sight never overlaps, and stays in the row.
 			for (i, a) in cells.iter().enumerate() {
-				if a.visible() <= 0.5 {
+				if a.visible <= 0.5 {
 					continue;
 				}
-				if a.vis_l < row_l - 0.5 || a.vis_r > row_r + 0.5 {
+				if a.vis_l() < row_l - 0.5 || a.vis_r() > row_r + 0.5 {
 					bad.push(format!("A1 {:?} leaves the row: {a:?}", a.cell));
 				}
 				for b in &cells[i + 1..] {
-					if b.visible() <= 0.5 {
+					if b.visible <= 0.5 {
 						continue;
 					}
-					if a.vis_l < b.vis_r - 0.5 && b.vis_l < a.vis_r - 0.5 {
+					if a.vis_l() < b.vis_r() - 0.5
+						&& b.vis_l() < a.vis_r() - 0.5
+					{
 						bad.push(format!(
 							"A1 {:?} [{:.1},{:.1}] overlaps {:?} [{:.1},{:.1}]",
-							a.cell, a.vis_l, a.vis_r, b.cell, b.vis_l, b.vis_r
+							a.cell,
+							a.vis_l(),
+							a.vis_r(),
+							b.cell,
+							b.vis_l(),
+							b.vis_r()
 						));
 					}
 				}
 			}
 			let cell = |c: RowCell| cells.iter().find(|s| s.cell == c);
-			// A2: the subject keeps its readable floor (6 characters, the
-			// ellipsis and 1px, the width gpui needs to show them).
+			// A2: the subject keeps its readable floor.
 			if let Some(s) = cell(RowCell::Subject) {
-				let floor = text_w(
-					cx,
-					&format!(
-						"{}\u{2026}",
-						s.text.chars().take(6).collect::<String>()
-					),
-					false,
-					s.size,
-				) + 1.;
-				if s.visible() < floor.min(s.natural) - 1. {
+				if s.visible < s.floor - 1. {
 					bad.push(format!(
-						"A2 subject {:.1} < floor {floor:.1}: {s:?}",
-						s.visible()
+						"A2 subject {:.1} < floor {:.1}: {s:?}",
+						s.visible, s.floor
 					));
 				}
 			}
@@ -14314,25 +14204,32 @@ mod tests {
 				} else {
 					(b, a)
 				};
-				let want = short.natural.min(long.visible()) - 1.;
-				if short.visible() < want {
+				let want = short.natural.min(long.visible) - 1.;
+				if short.visible < want {
 					bad.push(format!(
 						"A3 label {:?} {:.1} < min({:.1}, other {:.1}) - 1",
-						short.text,
-						short.visible(),
-						short.natural,
-						long.visible()
+						short.text, short.visible, short.natural, long.visible
 					));
+				}
+			}
+			// A4: no drift from the solver, and no ancestor clips a text.
+			for s in &cells {
+				if s.role.is_none() {
+					continue;
+				}
+				if s.fit.is_some_and(|fit| (s.w - fit).abs() > 1.) {
+					bad.push(format!("A4 {:?} drifts: {s:?}", s.cell));
+				}
+				if s.visible < s.w - 0.5 {
+					bad.push(format!("A4 {:?} is clipped: {s:?}", s.cell));
 				}
 			}
 			// A5: a date is whole, or absent.
 			if let Some(d) = cell(RowCell::Date) {
-				if d.visible() < d.natural - 1. {
+				if d.visible < d.natural - 1. {
 					bad.push(format!(
 						"A5 date {:?} {:.1} < {:.1} - 1",
-						d.text,
-						d.visible(),
-						d.natural
+						d.text, d.visible, d.natural
 					));
 				}
 			}
@@ -14445,7 +14342,7 @@ mod tests {
 						None => bad.push(format!(
 							"{w} hash={hash}: no collapsed chip"
 						)),
-						Some(c) if c.visible() < c.natural - 1. => {
+						Some(c) if c.visible < c.natural - 1. => {
 							bad.push(format!("{w} hash={hash}: chip cut {c:?}"))
 						}
 						Some(_) => {}
@@ -14471,7 +14368,7 @@ mod tests {
 			hash: bool,
 			from: f32,
 			to: f32,
-		) -> (Vec<(RowCell, bool, f32, f32)>, [u8; 2], u8) {
+		) -> (RowShape, [u8; 2], u8) {
 			let (model, cx) = open_log_window(cx, ws, from, hash);
 			let has = model
 				.read_with(cx, |m, _| m.log_filter_split_has_values(m.locale));
@@ -14514,8 +14411,10 @@ mod tests {
 		}
 
 		/// A window widened from 1080 to 1600 draws its rows as a fresh
-		/// 1600 window does, with no input in between. The filter bar does
-		/// not redraw it: its split stays and it asks for no refresh.
+		/// 1600 window does, with no input in between. No filter chip is
+		/// active, so the bar's split stays and its redraws are not what
+		/// settles the rows: once the frames settle, it has none left to ask
+		/// for (`refresh_count` is back to 0).
 		#[gpui::test]
 		fn log_rows_follow_a_widening_without_input(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
@@ -14553,6 +14452,147 @@ mod tests {
 					&fresh,
 				);
 			}
+		}
+
+		/// G6: the probe reports each fitted text of the HEAD row, the solver's
+		/// width is the drawn one, a dropped group has width 0, and an idle
+		/// frame prints nothing.
+		#[gpui::test]
+		fn text_fit_probe_reports_each_fitted_text_once(
+			cx: &mut TestAppContext,
+		) {
+			use crate::ui::FitRole;
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels_dated(ws.path());
+			{
+				let (model, cx) = open_log_window(cx, ws.path(), 1080., false);
+				for role in [
+					FitRole::Subject,
+					FitRole::BranchLabel,
+					FitRole::TagLabel,
+					FitRole::Author,
+					FitRole::Date,
+				] {
+					let f = row_text_fit(&model, cx, 0, role)
+						.unwrap_or_else(|| panic!("{role:?} has no TEXT_FIT"));
+					let fit = f.fit.unwrap_or(0.);
+					assert!(fit > 0., "{role:?}: {f:?}");
+					assert!((f.drawn - fit).abs() <= 1., "{role:?}: {f:?}");
+					assert!(!f.clipped, "{role:?}: {f:?}");
+				}
+				let (drift, clipped) = model.read_with(cx, |m, _| {
+					let p = m.probes.as_ref().unwrap();
+					(p.text_fit_drift(), p.text_fit_clipped())
+				});
+				assert!(drift.is_empty(), "drift: {drift:?}");
+				assert!(clipped.is_empty(), "clipped: {clipped:?}");
+			}
+			// With the hash column on, a 900 window has no room for the
+			// labels: the dropped group is reported with width 0.
+			let (model, cx) = open_log_window(cx, ws.path(), 900., true);
+			for role in [FitRole::BranchLabel, FitRole::TagLabel] {
+				let f = row_text_fit(&model, cx, 0, role)
+					.unwrap_or_else(|| panic!("{role:?} has no TEXT_FIT"));
+				assert_eq!(f.fit, Some(0.), "{role:?}: {f:?}");
+				assert!(f.cut && f.shown == 0, "{role:?}: {f:?}");
+			}
+			// Two more frames print no TEXT_FIT line: nothing changed.
+			crate::test_log::take();
+			for _ in 0..2 {
+				model.update(cx, |_, cx| cx.notify());
+				settle(cx);
+			}
+			let lines: Vec<String> = crate::test_log::take()
+				.into_iter()
+				.filter(|l| l.contains("[APP:TEXT_FIT"))
+				.collect();
+			assert!(lines.is_empty(), "an idle frame printed {lines:?}");
+		}
+
+		/// What the whole window's `TEXT_FIT`s say at `w`x`h`: ids whose box
+		/// is not the solver's width, and ids an ancestor clips.
+		fn fit_defects(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> (Vec<String>, Vec<String>) {
+			model.read_with(cx, |m, _| {
+				let p = m.probes.as_ref().expect("probes are on");
+				(p.text_fit_drift(), p.text_fit_clipped())
+			})
+		}
+
+		/// Two repositories with refs and a long author, in every window size
+		/// the native smoke drives, with the real text system where there is
+		/// one: no text of the window is drawn in a width the solver did not
+		/// give it, and no ancestor clips one.
+		#[gpui::test]
+		fn no_text_drifts_or_is_clipped_at_the_smoke_viewports(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			real_text_fixture(ws.path());
+			let r = repo(ws.path(), "second-repository-with-a-long-name", &[]);
+			git(
+				&r,
+				&["branch", "feature/a-rather-long-branch-name-for-labels"],
+			);
+			let mut bad = Vec::new();
+			for real in [false, true] {
+				for (w, h) in [
+					(700., 632.),
+					(900., 600.),
+					(1080., 720.),
+					(1280., 860.),
+					(1600., 900.),
+				] {
+					for hash in [false, true] {
+						let opened = if real {
+							open_real_text(cx, ws.path().to_path_buf(), w, h)
+						} else {
+							let (model, vcx) = open_sized(
+								cx,
+								ws.path().to_path_buf(),
+								None,
+								w,
+								h,
+							);
+							enable_probes(&model, vcx);
+							Some((model, vcx))
+						};
+						let Some((model, cx)) = opened else { continue };
+						settle_until(cx, "the log rows", |cx| {
+							model.read_with(cx, |m, _| {
+								m.display_commits().len() >= 5
+							})
+						});
+						settle(cx);
+						if hash {
+							click_probed(&model, cx, "btn-log-more");
+							click_probed(&model, cx, "log-more:hash");
+							click_probed(&model, cx, "btn-log-more");
+							click_probed(&model, cx, "log-more:details");
+						}
+						settle(cx);
+						let (drift, clipped) = fit_defects(&model, cx);
+						for id in drift {
+							bad.push(format!(
+								"{w}x{h} real={real} hash={hash}: drift {id}"
+							));
+						}
+						for id in clipped {
+							bad.push(format!(
+								"{w}x{h} real={real} hash={hash}: clipped {id}"
+							));
+						}
+					}
+				}
+			}
+			assert!(
+				bad.is_empty(),
+				"{} defects:\n{}",
+				bad.len(),
+				bad.join("\n")
+			);
 		}
 
 		/// Two repositories, the first with branches of 4, 6 .. 40 characters
@@ -14675,7 +14715,7 @@ mod tests {
 					for v in ref_row_violations(
 						cx,
 						b,
-						None,
+						Some(format!("menu-name:refs/heads/{b}")),
 						format!("menu-repo:refs/heads/{b}"),
 					) {
 						bad.push(format!("{w}: {v}"));
@@ -14797,11 +14837,11 @@ mod tests {
 					for b in &on_bar[i + 1..] {
 						let (short, long) =
 							if a.0 <= b.0 { (a, b) } else { (b, a) };
-						// `long` is cut while `short` is cut too.
-						if long.1 < long.0 - 2. && short.1 < short.0 - 2. {
+						// `short` is cut while `long` has more than its floor.
+						if short.1 < short.0 - 2. && long.1 > long.2 + 1. {
 							bad.push(format!(
-								"{w}: the shorter value is cut ({:.1} of {:.1}) beside a longer cut one ({:.1} of {:.1})",
-								short.1, short.0, long.1, long.0
+								"{w}: the shorter value is cut ({:.1} of {:.1}) while a longer one has {:.1} of {:.1}, its floor {:.1}",
+								short.1, short.0, long.1, long.0, long.2
 							));
 						}
 					}
@@ -14913,17 +14953,26 @@ mod tests {
 				settle(cx);
 				for ix in 0..4 {
 					for s in row_cells(&model, cx, ix) {
-						if s.text.is_empty() {
-							continue;
-						}
-						let (shown, total) = shown_graphemes(cx, &s);
-						if !rule_holds(s.cell.rule(), shown, total) {
+						let Some(role) = s.role else { continue };
+						if !s.rule_holds() {
 							bad.push(format!(
-								"{w} hash={hash} en={english} row {ix} {:?} {:?}: {shown}/{total} in {:.1}px breaks {:?}",
+								"{w} hash={hash} en={english} row {ix} {:?} {:?}: {}/{} in {:.1}px breaks {:?}",
 								s.cell,
 								s.text,
-								s.visible(),
-								s.cell.rule()
+								s.shown,
+								s.total,
+								s.visible,
+								role.rule()
+							));
+						}
+						// A4: the solver's width is the drawn one, and no
+						// ancestor clips the text.
+						if s.fit.is_some_and(|fit| (s.w - fit).abs() > 1.)
+							|| s.visible < s.w - 0.5
+						{
+							bad.push(format!(
+								"{w} hash={hash} en={english} row {ix} {:?} drifts or is clipped: {s:?}",
+								s.cell
 							));
 						}
 					}
@@ -14940,7 +14989,8 @@ mod tests {
 		/// The test platform measures with `NoopTextSystem` (every char 0.6em),
 		/// so CJK is undercounted and truncation never shows (#224).
 		/// `use_real_text_system` swaps in the OS text system (CoreText on
-		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md).
+		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md),
+		/// and `open_real_text` registers the embedded fonts as the app does.
 		/// Windows is skipped: building DirectWrite without a window was not
 		/// attempted. Without an installed CJK font the CJK check fails.
 		#[gpui::test]
@@ -14948,26 +14998,16 @@ mod tests {
 			cx: &mut TestAppContext,
 		) {
 			const TAG: &str = "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}";
-			let size = crate::theme::SMALL_TEXT;
-			if !cx.use_real_text_system() {
-				assert!(
-					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
-						|| cfg!(windows),
-					"no real text system on this OS"
-				);
-				return;
-			}
 			let ws = tempfile::tempdir().unwrap();
 			head_with_labels(ws.path());
 			let r = ws.path().join("solo");
 			git(&r, &["tag", "-d", "v0.3.0"]);
 			git(&r, &["tag", TAG]);
-			let (model, cx) =
-				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
-			let cjk = cx.update(|w, _| crate::ui::text_width(w, TAG, size));
-			// What NoopTextSystem reports: 0.6em per char.
-			let noop = TAG.chars().count() as f32 * 0.6 * size;
-			assert!(cjk > noop * 1.3, "cjk {cjk} vs noop {noop}");
+			let Some((model, cx)) =
+				open_real_text(cx, ws.path().to_path_buf(), 1080., 720.)
+			else {
+				return;
+			};
 			settle_until(cx, "the log rows", |cx| {
 				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
 			});
@@ -14976,17 +15016,13 @@ mod tests {
 				head_label_texts(&model, cx),
 				["main, origin/main", TAG]
 			);
-			let tag = cx.debug_bounds("log-ref-label:0:1").expect("tag label");
-			let natural =
-				cx.update(|w, _| 17. + crate::ui::text_width(w, TAG, size));
-			// The CJK tag is wider than the list leaves it, so it is
-			// ellipsized at 1080, yet keeps the icon and a few characters.
-			assert!(
-				f32::from(tag.size.width) >= 47. - 1.0,
-				"tag {:?}",
-				tag.size.width
-			);
-			assert!(f32::from(tag.size.width) < natural, "tag not cut");
+			// Whatever width the list leaves the CJK tag, the rule holds:
+			// six of its characters at least, or all of it.
+			let tag = seen_cell(&model, cx, 0, RowCell::Label(1)).expect("tag");
+			assert!(tag.rule_holds(), "{tag:?}");
+			assert!(tag.visible >= tag.floor - 1., "{tag:?}");
+			let bad = row_policy_violations(&model, cx, 0, 1080.);
+			assert!(bad.is_empty(), "{bad:?}");
 		}
 
 		/// A merge lists the files changed against any parent. Those the
@@ -16480,7 +16516,7 @@ mod tests {
 		}
 
 		/// The branch name keeps its width before the repo count gives way
-		/// (#194): the `×N` suffix shrinks to nothing first.
+		/// (#194): the `×N` suffix is dropped first, whole or not at all.
 		#[gpui::test]
 		fn branch_name_keeps_its_width_before_the_repo_count(
 			cx: &mut TestAppContext,
@@ -16538,14 +16574,13 @@ mod tests {
 				.expect("the long name is rendered")
 				.size
 				.width;
+			// The suffix is whole or gone: it is not drawn at all.
 			let long_suffix = cx
 				.debug_bounds(repo_sel)
-				.expect("the long branch's suffix is rendered")
-				.size
-				.width;
+				.map_or(0., |b| f32::from(b.size.width));
 			assert!(
-				f32::from(long_suffix) <= 1.0,
-				"the suffix shrinks to nothing first: {long_suffix:?}"
+				long_suffix <= 1.0,
+				"the suffix gives way first: {long_suffix:?}"
 			);
 			assert!(
 				f32::from(long_name) > natural,
@@ -19516,16 +19551,19 @@ mod tests {
 
 			cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(632.)));
 			settle(cx);
-			let (drawn, wanted) = model.read_with(cx, |m, _| {
+			let (drawn, split_for, measured) = model.read_with(cx, |m, _| {
 				let layout = &m.log_filter_layout;
-				let has = m.log_filter_split_has_values(m.locale);
 				(
 					layout.last_mask.get(),
-					layout.compute_split(layout.container_w.get(), has),
+					layout.used_w.get(),
+					layout.container_w.get(),
 				)
 			});
-			assert_ne!(wanted, 0b1111, "700 wide must not fit every chip");
-			assert_eq!(drawn, wanted, "the drawn split follows the new width");
+			assert_ne!(drawn, 0b1111, "700 wide must not fit every chip");
+			assert!(
+				(split_for - measured).abs() < 0.5,
+				"the drawn split is for the bar's new width: {split_for} vs {measured}"
+			);
 		}
 
 		/// At the default 1080x720 window with the details pane open, an
@@ -19587,11 +19625,11 @@ mod tests {
 			}
 		}
 
-		/// The drawn text cap follows a resize that keeps the split mask: the
-		/// bar widened, so the truncated values get their room back with no
-		/// input (#205).
+		/// The chips follow a resize that keeps the split mask: the bar
+		/// widened, so the cut values get their room back with no input
+		/// (#205).
 		#[gpui::test]
-		fn log_chip_text_cap_follows_a_resize_that_keeps_the_mask(
+		fn log_chips_follow_a_resize_that_keeps_the_mask(
 			cx: &mut TestAppContext,
 		) {
 			let ws = tempfile::tempdir().unwrap();
@@ -19625,27 +19663,39 @@ mod tests {
 			for _ in 0..5 {
 				settle(cx);
 			}
-			let before =
-				model.read_with(cx, |m, _| m.log_filter_layout.text_cap());
+			let chip_w = |cx: &mut VisualTestContext, id: &'static str| {
+				cx.debug_bounds(id)
+					.map(|b| f32::from(b.size.width))
+					.unwrap_or(0.)
+			};
+			let mut before = [
+				chip_w(cx, "log-filter-repo"),
+				chip_w(cx, "log-filter-branch"),
+			];
 			for w in [1110., 1140.] {
 				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
 				for _ in 0..5 {
 					settle(cx);
 				}
-				let (drawn, wanted, mask) = model.read_with(cx, |m, _| {
-					let l = &m.log_filter_layout;
-					(
-						l.text_cap(),
-						l.text_cap_for(l.container_w.get()),
-						l.last_mask.get(),
-					)
-				});
+				let (split_for, measured, mask) =
+					model.read_with(cx, |m, _| {
+						let l = &m.log_filter_layout;
+						(l.used_w.get(), l.container_w.get(), l.last_mask.get())
+					});
 				assert_eq!(mask & 0b11, 0b11, "both chips stay on the bar");
 				assert!(
-					(drawn - wanted).abs() < 0.5,
-					"at {w}: drawn cap {drawn} follows the bar ({wanted})"
+					(split_for - measured).abs() < 0.5,
+					"at {w}: the chips were split for {split_for}, the bar is {measured}"
 				);
-				assert!(drawn >= before, "a wider bar never shrinks the cap");
+				let now = [
+					chip_w(cx, "log-filter-repo"),
+					chip_w(cx, "log-filter-branch"),
+				];
+				assert!(
+					now[0] >= before[0] - 0.5 && now[1] >= before[1] - 0.5,
+					"a wider bar never shrinks a chip: {before:?} -> {now:?}"
+				);
+				before = now;
 			}
 		}
 

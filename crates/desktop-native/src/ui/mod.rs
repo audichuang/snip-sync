@@ -88,10 +88,12 @@ pub(crate) use changes::{
 	change_rows, commit_file_rows, natural_cmp, ChangeItemRow, ChangeLayout,
 	UNREADABLE,
 };
+#[cfg(test)]
+pub(crate) use fit::{rule_holds, FitRole, TextFit};
 use log::*;
 #[cfg(test)]
 pub(crate) use log::{log_date, text_width};
-pub use log::{LogFilterLayout, LogMenu};
+pub use log::{LogFilterLayout, LogFit, LogMenu};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -237,6 +239,12 @@ pub struct ProbeFrame {
 	seen: HashMap<String, [i32; 4]>,
 	seen_order: Vec<(String, [i32; 4])>,
 	probed_this_frame: HashSet<String>,
+	/// `TEXT_FIT` of the last two frames, like `shown` and `seen`.
+	fits_shown: HashMap<String, fit::TextFit>,
+	fits_seen: HashMap<String, fit::TextFit>,
+	/// The line each id last printed, so a line is printed when it changes;
+	/// dropped with the id when it is gone.
+	fits_logged: HashMap<String, String>,
 }
 
 impl ProbeFrame {
@@ -259,6 +267,46 @@ impl ProbeFrame {
 		} else {
 			false
 		}
+	}
+
+	/// What the last frames saw of the text `id`, if they drew it.
+	pub(crate) fn known_fit(&self, id: &str) -> Option<fit::TextFit> {
+		self.fits_seen
+			.get(id)
+			.or_else(|| self.fits_shown.get(id))
+			.cloned()
+	}
+
+	/// Records a text drawn this frame (`TEXT_FIT`). Prints its line when it
+	/// differs from the last one printed for the id, and a DRIFT line when
+	/// the box differs from the width the solver gave it.
+	pub(crate) fn record_fit(&mut self, id: &str, fit: fit::TextFit) {
+		let line = fit.line(id);
+		if self.fits_logged.get(id) != Some(&line) {
+			app_log!("{}", line);
+			if fit.drifts() {
+				app_log!("{}", fit.drift_line(id));
+			}
+			self.fits_logged.insert(id.to_string(), line);
+		}
+		self.fits_seen.insert(id.to_string(), fit);
+	}
+
+	/// Closes the frame's `TEXT_FIT`s; returns the ids drawn last frame but
+	/// not this one.
+	pub(crate) fn end_text_fits(&mut self) -> Vec<String> {
+		let mut gone: Vec<String> = self
+			.fits_shown
+			.keys()
+			.filter(|k| !self.fits_seen.contains_key(*k))
+			.cloned()
+			.collect();
+		gone.sort();
+		for id in &gone {
+			self.fits_logged.remove(id);
+		}
+		self.fits_shown = std::mem::take(&mut self.fits_seen);
+		gone
 	}
 
 	/// Test only: records a control drawn this frame; true when new or moved.
@@ -320,7 +368,11 @@ impl ProbeFrame {
 
 	#[cfg(test)]
 	fn tracked(&self) -> usize {
-		self.shown.len() + self.seen.len()
+		self.shown.len()
+			+ self.seen.len()
+			+ self.fits_shown.len()
+			+ self.fits_seen.len()
+			+ self.fits_logged.len()
 	}
 }
 
@@ -360,6 +412,47 @@ impl Probes {
 		viewport_w: f32,
 	) -> (Vec<String>, Vec<(String, String)>) {
 		self.0.borrow_mut().end_frame_with_audit(viewport_w)
+	}
+
+	/// Test only: what the probe saw of the text `id` (a `text-fit:...` id).
+	#[cfg(test)]
+	pub(crate) fn text_fit(&self, id: &str) -> Option<fit::TextFit> {
+		self.0.borrow().known_fit(id)
+	}
+
+	/// Test only: every text drawn in the latest frame, by id.
+	#[cfg(test)]
+	pub(crate) fn text_fits(&self) -> Vec<(String, fit::TextFit)> {
+		let f = self.0.borrow();
+		let latest = if f.fits_seen.is_empty() {
+			&f.fits_shown
+		} else {
+			&f.fits_seen
+		};
+		let mut all: Vec<_> =
+			latest.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+		all.sort_by(|a, b| a.0.cmp(&b.0));
+		all
+	}
+
+	/// Test only: the ids whose box differs from the width the solver gave.
+	#[cfg(test)]
+	pub(crate) fn text_fit_drift(&self) -> Vec<String> {
+		self.text_fits()
+			.into_iter()
+			.filter(|(_, f)| f.drifts())
+			.map(|(id, _)| id)
+			.collect()
+	}
+
+	/// Test only: the ids of the latest frame an ancestor clips.
+	#[cfg(test)]
+	pub(crate) fn text_fit_clipped(&self) -> Vec<String> {
+		self.text_fits()
+			.into_iter()
+			.filter(|(_, f)| f.clipped)
+			.map(|(id, _)| id)
+			.collect()
 	}
 
 	pub fn from_env() -> Option<Self> {
@@ -438,6 +531,9 @@ pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 					for id in gone {
 						app_log!("[APP:CTRL_GONE: id={}]", id);
 					}
+					for id in frame.borrow_mut().end_text_fits() {
+						app_log!("[APP:TEXT_FIT_GONE: id={}]", id);
+					}
 					for (id, by) in covered {
 						app_log!("[APP:CTRL_COVERED: id={} by={}]", id, by);
 					}
@@ -450,6 +546,77 @@ pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 		.with_priority(usize::MAX)
 		.into_any_element(),
 	)
+}
+
+/// Asks for another frame when this one was laid out with a width that is
+/// not the one the window measured, at most three times for each new width
+/// (`budget` counts them; the caller resets it when the width changes).
+/// `Window::refresh` does nothing while a frame is drawing, so the call waits
+/// for the end of the frame.
+pub(crate) fn refresh_if_stale(
+	stale: bool,
+	budget: &Rc<std::cell::Cell<u8>>,
+	window: &mut Window,
+	cx: &mut App,
+) {
+	if !stale {
+		budget.set(0);
+		return;
+	}
+	let used = budget.get();
+	if used >= 3 {
+		return;
+	}
+	budget.set(used + 1);
+	let handle = window.window_handle();
+	cx.defer(move |cx| {
+		let _ = handle.update(cx, |_, w, _| w.refresh());
+	});
+}
+
+/// A width a frame was laid out with, against the width it was drawn at: the
+/// layout reads last frame's measurement, so a window that was resized draws
+/// one frame with the old width. When the two differ the canvas asks for
+/// another frame ([`refresh_if_stale`]).
+#[derive(Clone, Default)]
+pub(crate) struct StaleWidth {
+	used: Rc<std::cell::Cell<f32>>,
+	measured: Rc<std::cell::Cell<f32>>,
+	budget: Rc<std::cell::Cell<u8>>,
+}
+
+impl StaleWidth {
+	/// The width this frame is laid out with.
+	pub(crate) fn used(&self, w: f32) {
+		self.used.set(w);
+	}
+
+	/// A canvas the size of its (relative) parent, to measure it with.
+	pub(crate) fn canvas(&self) -> impl IntoElement {
+		let (used, measured, budget) = (
+			self.used.clone(),
+			self.measured.clone(),
+			self.budget.clone(),
+		);
+		canvas(
+			move |b, window, cx| {
+				let w = f32::from(b.size.width);
+				// A new width is new input: allow fresh refreshes.
+				if (measured.replace(w) - w).abs() > 0.5 {
+					budget.set(0);
+				}
+				refresh_if_stale(
+					(w - used.get()).abs() > 0.5,
+					&budget,
+					window,
+					cx,
+				);
+			},
+			|_, _, _, _| {},
+		)
+		.absolute()
+		.size_full()
+	}
 }
 
 // ───────────────────────── small building blocks ─────────────────────────
@@ -1888,7 +2055,6 @@ impl Render for WorkbenchModel {
 									.child(center),
 							)
 							.when(self.bottom_visible, |d| {
-								self.measure_log_chips(window);
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(
 										self.render_log(bottom_h, window, cx),
@@ -2042,6 +2208,67 @@ mod tests {
 			f.end_frame();
 			assert!(f.tracked() <= 3, "bookkeeping grew to {}", f.tracked());
 		}
+	}
+
+	fn a_fit() -> fit::TextFit {
+		fit::TextFit {
+			role: fit::FitRole::Subject,
+			text: "x".into(),
+			key_graphemes: 0,
+			natural: 10.,
+			floor: 5.,
+			fit: Some(10.),
+			x: 0.,
+			drawn: 10.,
+			visible: 10.,
+			clipped: false,
+			cut: false,
+			shown: 1,
+			total: 1,
+		}
+	}
+
+	#[test]
+	fn text_fit_bookkeeping_is_bounded_by_one_frame() {
+		let mut f = ProbeFrame::default();
+		for frame in 0..1000 {
+			for row in 0..3 {
+				f.record_fit(
+					&format!("text-fit:row:{frame}/{row}:subject"),
+					a_fit(),
+				);
+			}
+			let gone = f.end_text_fits();
+			let want: Vec<String> = if frame == 0 {
+				vec![]
+			} else {
+				(0..3)
+					.map(|row| {
+						format!("text-fit:row:{}/{row}:subject", frame - 1)
+					})
+					.collect()
+			};
+			assert_eq!(gone, want);
+			assert!(f.tracked() <= 6, "bookkeeping grew to {}", f.tracked());
+		}
+	}
+
+	#[test]
+	fn a_text_fit_prints_only_when_it_changes() {
+		let mut f = ProbeFrame::default();
+		let id = "text-fit:row:a:subject";
+		f.record_fit(id, a_fit());
+		let line = f.fits_logged.get(id).cloned().unwrap();
+		assert!(line.contains("rule=readable6") && line.contains("fit=10"));
+		f.end_text_fits();
+		// The same text again: the line stays the one printed.
+		f.record_fit(id, a_fit());
+		assert_eq!(f.fits_logged.get(id), Some(&line));
+		let mut cut = a_fit();
+		cut.drawn = 7.;
+		assert!(cut.drifts());
+		f.record_fit(id, cut);
+		assert_ne!(f.fits_logged.get(id), Some(&line));
 	}
 
 	#[test]

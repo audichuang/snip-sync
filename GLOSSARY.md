@@ -24,6 +24,10 @@ _Avoid_: popover、popup、dropdown（泛指時）、menu（單獨使用，易�
 屬於某個窗格的一塊介面：閱讀器的搜尋／跳行列、Project 窗格的加入 repo 輸入框。開浮層不會關它，分頁切走時它留著，它開著時 tooltip 照常顯示。
 _Avoid_: 工具列、bar（泛指時）
 
+**可辨識下限**（readable floor）:
+一段文字至少要看得到的 grapheme 數，由 `FitRole::rule()` 決定（subject 與 ref 標籤 6、作者 3、chip 的鍵加值 4 個字；日期整段）。空間不夠時，文字被截到這個下限為止，再不夠就整個 chip、整欄或整組標籤退出，不再截。
+_Avoid_: 最小寬度、幾 px
+
 ## 貼上
 
 **貼上目標**（paste target）:

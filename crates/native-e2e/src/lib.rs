@@ -118,10 +118,82 @@ pub fn parse_covered(line: &str) -> Option<(String, String)> {
 	))
 }
 
+/// Parses a `TEXT_FIT` line `[APP:TEXT_FIT: id=<id> ... clipped=<0|1> ...]`:
+/// the id of the text and whether an ancestor clips it.
+pub fn parse_text_fit(line: &str) -> Option<(String, bool)> {
+	let rest = line.split("[APP:TEXT_FIT: id=").nth(1)?;
+	let (id, rest) = rest.split_once(' ')?;
+	let clipped = rest.split(" clipped=").nth(1)?.starts_with('1');
+	Some((id.to_string(), clipped))
+}
+
+/// The id of a `TEXT_FIT` line that has `clipped=1`: an ancestor cuts the
+/// text's box.
+pub fn parse_text_fit_clipped(line: &str) -> Option<String> {
+	let (id, clipped) = parse_text_fit(line)?;
+	clipped.then_some(id)
+}
+
+/// Parses a `[APP:TEXT_FIT_DRIFT: id=<id> fit=<n> drawn=<n>]` line: the box
+/// drawn is not the width the solver gave.
+pub fn parse_text_fit_drift(line: &str) -> Option<String> {
+	let rest = line.split("[APP:TEXT_FIT_DRIFT: id=").nth(1)?;
+	let (id, _) = rest.split_once(' ')?;
+	Some(id.to_string())
+}
+
+/// Parses a `[APP:TEXT_FIT_GONE: id=<id>]` line: the text is not drawn any
+/// more.
+pub fn parse_text_fit_gone(line: &str) -> Option<String> {
+	let rest = line.split("[APP:TEXT_FIT_GONE: id=").nth(1)?;
+	Some(rest.trim_end().strip_suffix(']')?.to_string())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use std::collections::HashMap;
+
+	#[test]
+	fn text_fit_lines_are_parsed() {
+		let line = "[APP:TEXT_FIT: id=text-fit:row:ab12:subject rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79]";
+		assert_eq!(
+			parse_text_fit(line),
+			Some(("text-fit:row:ab12:subject".to_string(), true))
+		);
+		assert_eq!(
+			parse_text_fit_clipped(line).as_deref(),
+			Some("text-fit:row:ab12:subject")
+		);
+		let whole = line.replace("clipped=1", "clipped=0");
+		assert_eq!(parse_text_fit_clipped(&whole), None);
+		assert_eq!(
+			parse_text_fit(&whole),
+			Some(("text-fit:row:ab12:subject".to_string(), false))
+		);
+		// A branch name is part of an id, with its slashes.
+		let pane = "[APP:TEXT_FIT: id=text-fit:ref:refs/heads/feature/x:pane-name rule=readable6 natural=9 floor=9 fit=9 drawn=9 visible=9 clipped=0 cut=0 shown=1/1]";
+		assert_eq!(
+			parse_text_fit(pane).unwrap().0,
+			"text-fit:ref:refs/heads/feature/x:pane-name"
+		);
+		let drift =
+			"[APP:TEXT_FIT_DRIFT: id=text-fit:row:ab12:date fit=126 drawn=120]";
+		assert_eq!(
+			parse_text_fit_drift(drift).as_deref(),
+			Some("text-fit:row:ab12:date")
+		);
+		assert_eq!(parse_text_fit_drift(line), None);
+		assert_eq!(parse_text_fit(drift), None);
+		assert_eq!(
+			parse_text_fit_gone(
+				"[APP:TEXT_FIT_GONE: id=text-fit:row:ab12:date]"
+			)
+			.as_deref(),
+			Some("text-fit:row:ab12:date")
+		);
+		assert_eq!(parse_text_fit_gone(line), None);
+	}
 
 	#[test]
 	fn clipboard_wait_retries_unavailable_and_stale_values() {

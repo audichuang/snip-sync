@@ -3,12 +3,18 @@
 //! shares a row's width ([`fit_row`]) and the `TEXT_FIT` probe that checks
 //! what was drawn against it.
 //!
-//! This half is pure: it needs no GPUI, only a `measure` function from text
-//! to width.
-// Until the Log rows use it (S2).
-#![cfg_attr(not(test), allow(dead_code))]
+//! The first half is pure: it needs no GPUI, only a `measure` function from
+//! text to width. The second draws a text in its box ([`FitCell`]) and
+//! reports it to the probe.
 
+use std::fmt;
+
+use gpui::{
+	canvas, div, prelude::*, px, AnyElement, Div, SharedString, Window,
+};
 use unicode_segmentation::UnicodeSegmentation;
+
+use super::Probes;
 
 use crate::theme::{CODE_FONT, SMALL_TEXT, UI_FONT, UI_TEXT};
 
@@ -49,8 +55,11 @@ pub(crate) enum FitRule {
 	KeyValue(usize),
 }
 
-/// What a role does when there is not even room for its floor.
+/// What a role does when there is not even room for its floor. The table
+/// states it; the claims of the Log rows (`log.rs`) are written to match, and
+/// the tests read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Presence {
 	/// Never absent.
 	Always,
@@ -79,6 +88,7 @@ pub(crate) const FIT_MARGIN: f32 = 1.;
 pub(crate) const ELLIPSIS: &str = "\u{2026}";
 
 impl FitRole {
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) const ALL: [FitRole; 19] = [
 		FitRole::Subject,
 		FitRole::BranchLabel,
@@ -127,6 +137,7 @@ impl FitRole {
 	}
 
 	/// The role named by `key`.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn from_key(key: &str) -> Option<FitRole> {
 		FitRole::ALL.into_iter().find(|r| r.key() == key)
 	}
@@ -155,6 +166,7 @@ impl FitRole {
 	}
 
 	/// What happens when even the floor does not fit.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn presence(self) -> Presence {
 		match self {
 			FitRole::Subject => Presence::Always,
@@ -241,6 +253,7 @@ impl FitRule {
 	}
 
 	/// The rule `name` writes.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn parse(name: &str) -> Option<FitRule> {
 		if name == "whole" {
 			return Some(FitRule::Whole);
@@ -308,7 +321,7 @@ pub(crate) fn floor_px(
 
 /// How many graphemes of `text` a box `visible` wide shows, of how many it
 /// has: all of them when the whole text fits, else the most whose prefix and
-/// the ellipsis fit (the way gpui cuts, with [`FIT_MARGIN`]).
+/// the ellipsis fit (the way gpui cuts).
 pub(crate) fn shown_graphemes(
 	role: FitRole,
 	text: &str,
@@ -319,9 +332,12 @@ pub(crate) fn shown_graphemes(
 	if role.chrome() + measure(text) <= visible + 0.5 {
 		return (total, total);
 	}
+	// gpui's ellipsis keeps the prefix whose width and the ellipsis's stay
+	// under the box; the margin is the floor's, it is not asked of what is
+	// seen (a box snapped to a physical pixel can be 0.5px under it).
 	let fits = |k: usize| {
 		let kept = format!("{}{ELLIPSIS}", prefix_graphemes(text, k));
-		role.chrome() + measure(&kept) + FIT_MARGIN <= visible
+		role.chrome() + measure(&kept) <= visible + 0.01
 	};
 	// The most graphemes that fit; a longer prefix is never narrower.
 	let (mut lo, mut hi) = (0, total);
@@ -338,6 +354,7 @@ pub(crate) fn shown_graphemes(
 
 /// Whether `shown` of `total` graphemes satisfies `rule`; `key_graphemes` is a
 /// `KeyValue` text's key length.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rule_holds(
 	rule: FitRule,
 	shown: usize,
@@ -425,6 +442,7 @@ impl<P: Copy + Eq + std::fmt::Debug> RowFit<P> {
 		self.get(p).part.natural
 	}
 
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn floor(&self, p: P) -> f32 {
 		self.get(p).part.floor
 	}
@@ -435,11 +453,13 @@ impl<P: Copy + Eq + std::fmt::Debug> RowFit<P> {
 	}
 
 	/// Whether an [`Claim::Atomic`] group holding `p` was refused.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn dropped(&self, p: P) -> bool {
 		self.get(p).dropped
 	}
 
 	/// What was left after every claim.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn slack(&self) -> f32 {
 		self.slack
 	}
@@ -559,6 +579,402 @@ fn pay_gap<P>(fit: &mut RowFit<P>, i: usize) -> bool {
 	fit.slack -= gap;
 	fit.placed[i].shown = true;
 	true
+}
+
+// ───────────────────────── drawing and the probe ─────────────────────────
+
+/// Width of `s` shaped in `family` at `size`, from the text system (shaped
+/// lines are cached per frame, so a redraw does not reshape).
+pub(crate) fn text_width_in(
+	window: &Window,
+	family: &str,
+	s: &str,
+	size: f32,
+) -> f32 {
+	let s = s.replace(['\n', '\r'], " ");
+	let run = gpui::TextRun {
+		len: s.len(),
+		font: gpui::font(family.to_string()),
+		color: gpui::black(),
+		background_color: None,
+		underline: None,
+		strikethrough: None,
+	};
+	f32::from(
+		window
+			.text_system()
+			.shape_line(s.into(), px(size), &[run], None)
+			.width,
+	)
+}
+
+/// `measure` for a role: its font and size from the text system.
+pub(crate) fn role_measure<'a>(
+	window: &'a Window,
+	role: FitRole,
+) -> impl Fn(&str) -> f32 + 'a {
+	let (family, size) = role.font();
+	move |s: &str| text_width_in(window, family, s, size)
+}
+
+/// Where a `TEXT_FIT` belongs: the scope is the id of the probe of the thing
+/// that holds the text (`row:<key>`, `ref:<name>`, `log-filter-<key>`), the
+/// role says which text of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FitId {
+	pub scope: SharedString,
+	pub role: FitRole,
+}
+
+impl FitId {
+	pub(crate) fn new(scope: impl Into<SharedString>, role: FitRole) -> Self {
+		Self {
+			scope: scope.into(),
+			role,
+		}
+	}
+}
+
+impl fmt::Display for FitId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "text-fit:{}:{}", self.scope, self.role.key())
+	}
+}
+
+/// What the probe saw of one text, against what the solver gave it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextFit {
+	pub role: FitRole,
+	pub text: SharedString,
+	/// The key's graphemes of a `KeyValue` text, else 0.
+	pub key_graphemes: usize,
+	/// The whole text's width in its box, and the rule's floor.
+	pub natural: f32,
+	pub floor: f32,
+	/// The width the solver gave: `None` for a text that flexes (a header
+	/// hint), `Some(0.)` for one it dropped.
+	pub fit: Option<f32>,
+	/// Logical px: where the box starts, how wide it was drawn, and how
+	/// much of it no ancestor clips away.
+	pub x: f32,
+	pub drawn: f32,
+	pub visible: f32,
+	/// An ancestor clips part of the box.
+	pub clipped: bool,
+	/// The text shows an ellipsis of its own.
+	pub cut: bool,
+	/// Graphemes in sight, of how many (see [`shown_graphemes`]).
+	pub shown: usize,
+	pub total: usize,
+}
+
+impl TextFit {
+	/// A text the solver dropped: nothing drawn.
+	fn dropped(
+		role: FitRole,
+		text: SharedString,
+		key_end: usize,
+		natural: f32,
+		floor: f32,
+	) -> Self {
+		let total = grapheme_count(&text);
+		Self {
+			role,
+			key_graphemes: key_graphemes(role, &text, key_end),
+			text,
+			natural,
+			floor,
+			fit: Some(0.),
+			x: 0.,
+			drawn: 0.,
+			visible: 0.,
+			clipped: false,
+			cut: true,
+			shown: 0,
+			total,
+		}
+	}
+
+	/// The solver gave a width and the drawn box differs by more than 1px:
+	/// something between the solver and the screen changed it.
+	pub fn drifts(&self) -> bool {
+		self.fit.is_some_and(|fit| (self.drawn - fit).abs() > 1.)
+	}
+
+	/// The log line, for the id.
+	pub(super) fn line(&self, id: &str) -> String {
+		let fit = match self.fit {
+			Some(f) => format!("{:.0}", f),
+			None => "-".into(),
+		};
+		format!(
+			"[APP:TEXT_FIT: id={id} rule={} natural={:.0} floor={:.0} fit={fit} drawn={:.0} visible={:.0} clipped={} cut={} shown={}/{}]",
+			self.role.rule().name(),
+			self.natural,
+			self.floor,
+			self.drawn,
+			self.visible,
+			u8::from(self.clipped),
+			u8::from(self.cut),
+			self.shown,
+			self.total,
+		)
+	}
+
+	pub(super) fn drift_line(&self, id: &str) -> String {
+		format!(
+			"[APP:TEXT_FIT_DRIFT: id={id} fit={:.0} drawn={:.0}]",
+			self.fit.unwrap_or(0.),
+			self.drawn
+		)
+	}
+}
+
+fn key_graphemes(role: FitRole, text: &str, key_end: usize) -> usize {
+	match role.rule() {
+		FitRule::KeyValue(_) => {
+			grapheme_count(&text[..key_end.min(text.len())])
+		}
+		FitRule::Whole | FitRule::Readable(_) => 0,
+	}
+}
+
+/// How a cell is given its width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FitWidth {
+	/// The solver's width.
+	Solved { fit: f32 },
+	/// No width of its own: the box shrinks with its parent (a header hint
+	/// that gives way to the buttons beside it).
+	Flex,
+}
+
+/// One text that shares a row: the box with the role's font, ellipsis and
+/// the probe. Dropped texts are not drawn at all: call [`record_dropped`].
+pub(crate) struct FitCell {
+	id: FitId,
+	text: SharedString,
+	key_end: usize,
+	selector: Option<String>,
+	leading: Option<AnyElement>,
+	trailing: Option<AnyElement>,
+	pad: f32,
+	width: FitWidth,
+}
+
+impl FitCell {
+	pub(crate) fn new(id: FitId, text: impl Into<SharedString>) -> Self {
+		Self {
+			id,
+			text: text.into(),
+			key_end: 0,
+			selector: None,
+			leading: None,
+			trailing: None,
+			pad: 0.,
+			width: FitWidth::Flex,
+		}
+	}
+
+	/// Where a `KeyValue` text's key ends (a byte index of the text).
+	pub(crate) fn key_end(mut self, i: usize) -> Self {
+		self.key_end = i;
+		self
+	}
+
+	/// The debug selector of the box (`log-subject:{ix}` and its family).
+	pub(crate) fn selector(mut self, s: String) -> Self {
+		self.selector = Some(s);
+		self
+	}
+
+	/// An icon before the text (a label's glyph).
+	pub(crate) fn leading(mut self, e: impl IntoElement) -> Self {
+		self.leading = Some(e.into_any_element());
+		self
+	}
+
+	/// An icon after the text (a chip's clear button or arrow).
+	pub(crate) fn trailing(mut self, e: impl IntoElement) -> Self {
+		self.trailing = Some(e.into_any_element());
+		self
+	}
+
+	/// Padding left and right of the content (a chip's 6px).
+	pub(crate) fn pad(mut self, px: f32) -> Self {
+		self.pad = px;
+		self
+	}
+
+	/// The width the solver gave `p`.
+	pub(crate) fn solved<P: Copy + Eq + fmt::Debug>(
+		mut self,
+		fit: &RowFit<P>,
+		p: P,
+	) -> Self {
+		self.width = FitWidth::Solved { fit: fit.width(p) };
+		self
+	}
+
+	/// A width that is not the solver's: an overflow chip drawn where the
+	/// split found no room for it, a test's box.
+	pub(crate) fn fixed_width(mut self, fit: f32) -> Self {
+		self.width = FitWidth::Solved { fit };
+		self
+	}
+
+	/// No width of its own.
+	pub(crate) fn flex(mut self) -> Self {
+		self.width = FitWidth::Flex;
+		self
+	}
+
+	/// The box. A caller that needs a tooltip or a click adds `.id(..)` to
+	/// it; the probe is a canvas inside, so the box keeps its children.
+	pub(crate) fn render(
+		self,
+		probes: &Option<Probes>,
+		window: &Window,
+	) -> Div {
+		let Self {
+			id,
+			text,
+			key_end,
+			selector,
+			leading,
+			trailing,
+			pad,
+			width,
+		} = self;
+		let role = id.role;
+		let (family, size) = role.font();
+		// No `overflow_hidden` here: gpui clips to the box without its
+		// padding, and the probe reads the clip of the ancestors, not the
+		// cell's own. The text clips itself, and the solver gives a box
+		// that holds the icons and padding.
+		let mut root = div()
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.font_family(family)
+			.text_size(px(size));
+		root = match width {
+			FitWidth::Solved { fit } => root.w(px(fit)).flex_shrink_0(),
+			FitWidth::Flex => root.min_w_0(),
+		};
+		if pad > 0. {
+			root = root.px(px(pad));
+		}
+		if leading.is_some() || trailing.is_some() {
+			root = root.gap(px(LABEL_ICON_GAP));
+		}
+		if let Some(s) = selector {
+			root = root.debug_selector(move || s);
+		}
+		if let Some(e) = leading {
+			root = root.child(div().flex_shrink_0().child(e));
+		}
+		root = root.child(
+			div()
+				.min_w_0()
+				.overflow_hidden()
+				.line_clamp(1)
+				.text_ellipsis()
+				.child(text.clone()),
+		);
+		if let Some(e) = trailing {
+			root = root.child(div().flex_shrink_0().child(e));
+		}
+		if let Some(probes) = probes {
+			let frame = probes.0.clone();
+			let measure = role_measure(window, role);
+			let natural = natural_px(role, &text, &measure);
+			let floor = floor_px(role, &text, key_end, &measure);
+			let fit = match width {
+				FitWidth::Solved { fit } => Some(fit),
+				FitWidth::Flex => None,
+			};
+			let id = id.to_string();
+			root = root.child(
+				canvas(
+					move |b, window, _| {
+						// Across only: a row scrolled out of its list is not
+						// clipped in width.
+						let mask = window.content_mask().bounds;
+						let drawn = f32::from(b.size.width);
+						let visible_w =
+							(f32::from(b.right().min(mask.right()))
+								- f32::from(b.left().max(mask.left())))
+							.clamp(0., drawn);
+						// The shown count is read off the text system: do it
+						// only when what it depends on changed.
+						let known = frame.borrow().known_fit(&id).filter(|k| {
+							k.text == text
+								&& (k.visible - visible_w).abs() < 0.01
+						});
+						let (shown, total) = match known {
+							Some(k) => (k.shown, k.total),
+							None => {
+								let measure = role_measure(window, role);
+								shown_graphemes(
+									role, &text, visible_w, &measure,
+								)
+							}
+						};
+						let shorter = fit.unwrap_or(drawn).min(visible_w);
+						frame.borrow_mut().record_fit(
+							&id,
+							TextFit {
+								role,
+								key_graphemes: key_graphemes(
+									role, &text, key_end,
+								),
+								text: text.clone(),
+								natural,
+								floor,
+								fit,
+								x: f32::from(b.origin.x),
+								drawn,
+								visible: visible_w,
+								clipped: visible_w < drawn - 0.5,
+								cut: shorter < natural - 0.5,
+								shown,
+								total,
+							},
+						);
+					},
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.size_full(),
+			);
+		}
+		root
+	}
+}
+
+/// Records a text the solver dropped, so `TEXT_FIT` has a line for it
+/// (`fit=0`) and the matrix can tell a dropped group from a missing one.
+pub(crate) fn record_dropped(
+	probes: &Option<Probes>,
+	id: FitId,
+	text: &str,
+	natural: f32,
+	floor: f32,
+) {
+	let Some(probes) = probes else { return };
+	probes.0.borrow_mut().record_fit(
+		&id.to_string(),
+		TextFit::dropped(id.role, text.to_string().into(), 0, natural, floor),
+	);
+}
+
+/// The stretch of a row that is not text: it takes what the texts leave, so
+/// the fixed columns on the right stay on the right. The one `flex_1` a Log
+/// row may have (`check_text_fit.sh`).
+pub(crate) fn spacer() -> Div {
+	div().flex_1().min_w_0()
 }
 
 #[cfg(test)]
@@ -765,8 +1181,9 @@ mod tests {
 		assert_eq!(shown_graphemes(role, text, floor, &m), (6, 26));
 		assert!(rule_holds(role.rule(), 6, 26, 0));
 		assert!(!rule_holds(role.rule(), 5, 26, 0));
-		// A pixel less than the floor: five.
-		assert_eq!(shown_graphemes(role, text, floor - 1., &m), (5, 26));
+		// A hair under the floor's margin: still six; a char less: five.
+		assert_eq!(shown_graphemes(role, text, floor - 1., &m), (6, 26));
+		assert_eq!(shown_graphemes(role, text, floor - 1.5, &m), (5, 26));
 		// Nothing fits.
 		assert_eq!(shown_graphemes(role, text, 1., &m), (0, 26));
 		// A text shorter than the rule needs only shows itself.
@@ -970,5 +1387,60 @@ mod tests {
 		assert_eq!(fit.width(P::A), 0.);
 		assert!(!fit.shown(P::A));
 		assert!(fit.shown(P::B) && fit.width(P::B) == 20.);
+	}
+}
+
+#[cfg(test)]
+mod render_tests {
+	use super::*;
+	use crate::ui::probe_frame_end;
+	use gpui::{Context, Render, TestAppContext};
+
+	/// A 100px box in a 40px one: the ancestor clips it.
+	struct Clipped {
+		probes: Option<Probes>,
+	}
+
+	impl Render for Clipped {
+		fn render(
+			&mut self,
+			window: &mut Window,
+			_: &mut Context<Self>,
+		) -> impl IntoElement {
+			div()
+				.size_full()
+				.child(
+					div().w(px(40.)).overflow_hidden().child(
+						FitCell::new(
+							FitId::new("t", FitRole::Subject),
+							"abcdefghij",
+						)
+						.fixed_width(100.)
+						.render(&self.probes, window),
+					),
+				)
+				.children(probe_frame_end(&self.probes))
+		}
+	}
+
+	/// G7: an ancestor that clips a text is seen even where the text's box is
+	/// the width the solver gave (`drawn == fit`).
+	#[gpui::test]
+	fn text_fit_reports_an_ancestor_clip(cx: &mut TestAppContext) {
+		let probes = Probes::for_test();
+		let shared = probes.clone();
+		let (_, cx) = cx.add_window_view(|_, _| Clipped {
+			probes: Some(probes),
+		});
+		cx.run_until_parked();
+		let f = shared
+			.text_fit("text-fit:t:subject")
+			.expect("the text was recorded");
+		assert!((f.drawn - 100.).abs() < 0.5, "{f:?}");
+		assert!((f.visible - 40.).abs() < 0.5, "{f:?}");
+		assert!(f.clipped, "{f:?}");
+		assert!(!f.drifts(), "{f:?}");
+		assert_eq!(shared.text_fit_clipped(), ["text-fit:t:subject"]);
+		assert!(shared.text_fit_drift().is_empty());
 	}
 }
