@@ -424,7 +424,7 @@ impl WorkbenchModel {
 			.is_none()
 			.then(|| plan.items.get(plan.selected_item_idx))
 			.flatten();
-		let folder_detail = plan.cursor_dir.as_ref().map(|key| {
+		let folder_detail = plan.detail_dir().map(|key| {
 			let title = if key.path.is_empty() {
 				plan.shown(&key.root)
 			} else {

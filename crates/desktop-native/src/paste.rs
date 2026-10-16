@@ -1462,6 +1462,19 @@ struct RootGroup {
 	skipped: Vec<usize>,
 }
 
+/// The root a path lies in. With one root inside another (a prefix mapped to
+/// a folder of the destination) it is the inner one, where a write to that
+/// path would be shown too.
+fn innermost_root<'a>(
+	roots: &'a [PathBuf],
+	path: &Path,
+) -> Option<&'a PathBuf> {
+	roots
+		.iter()
+		.filter(|r| path.starts_with(r))
+		.max_by_key(|r| r.components().count())
+}
+
 /// Whether `path` lies inside folder `dir` (not merely shares its start).
 fn path_under(path: &str, dir: &str) -> bool {
 	path.strip_prefix(dir)
@@ -2551,9 +2564,7 @@ impl PastePreviewPlan {
 			)?;
 		}
 		for (op_idx, op) in plan.delete_operations.iter().enumerate() {
-			let dest_root = roots
-				.iter()
-				.find(|r| op.absolute_path.starts_with(r))
+			let dest_root = innermost_root(&roots, &op.absolute_path)
 				.cloned()
 				.unwrap_or_else(|| primary.clone());
 			let item = PasteItem {
@@ -3121,6 +3132,14 @@ impl PastePreviewPlan {
 			self.items[ix].selected = on;
 		}
 		Some(on)
+	}
+
+	/// The folder the detail pane describes: the cursor's folder, while its
+	/// row is shown. A remap clears the rows but keeps the cursor for the
+	/// next landing, and a folder with no rows has nothing to describe.
+	pub fn detail_dir(&self) -> Option<&DirKey> {
+		let key = self.cursor_dir.as_ref()?;
+		(!self.items.is_empty() && self.has_dir_row(key)).then_some(key)
 	}
 
 	/// Whether a folder or root row with this key is shown now.
@@ -4012,6 +4031,52 @@ pub(crate) mod tests {
 		.unwrap();
 		let roots = shape(&plan).iter().filter(|l| l.starts_with("R ")).count();
 		assert_eq!(roots, 1, "{:?}", shape(&plan));
+	}
+
+	/// A delete's path is resolved by the engine too: through the symlinked
+	/// destination it must still land under the one root, beside the writes.
+	#[cfg(unix)]
+	#[test]
+	fn a_delete_under_a_symlinked_destination_stays_in_its_root() {
+		let tmp = tempfile::tempdir().unwrap();
+		let real = tmp.path().join("real").join("web");
+		fs::create_dir_all(real.join("p")).unwrap();
+		fs::write(real.join("p").join("gone.txt"), "old\n").unwrap();
+		fs::create_dir(tmp.path().join("links")).unwrap();
+		let link = tmp.path().join("links").join("web");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: [DELETED] p/gone.txt\n// This file has been deleted in this change\n",
+			&link,
+			&[],
+			1,
+		)
+		.unwrap();
+		let gone = ix_of(&plan, "p/gone.txt");
+		assert!(plan.items[gone].is_delete(), "{:?}", plan.items[gone].op);
+		assert_eq!(
+			shape(&plan),
+			[
+				format!("R {} 2", root_label(&plan)),
+				"D p 2 d1".to_string(),
+				"F p/a.txt d2".to_string(),
+				"F p/gone.txt d2".to_string(),
+			]
+		);
+		assert_eq!(plan.counts().deletes, 1);
+	}
+
+	#[test]
+	fn a_delete_belongs_to_the_innermost_root() {
+		let roots: Vec<PathBuf> = ["/w/dest", "/w/dest/sub", "/w/other"]
+			.map(Into::into)
+			.into();
+		let of = |p: &str| innermost_root(&roots, Path::new(p));
+		assert_eq!(of("/w/dest/a.txt"), Some(&roots[0]));
+		assert_eq!(of("/w/dest/sub/a.txt"), Some(&roots[1]));
+		assert_eq!(of("/w/dest/subway/a.txt"), Some(&roots[0]));
+		assert_eq!(of("/w/other/x"), Some(&roots[2]));
+		assert_eq!(of("/elsewhere/x"), None);
 	}
 
 	#[test]

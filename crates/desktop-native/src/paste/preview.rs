@@ -893,6 +893,55 @@ mod tests {
 		);
 	}
 
+	/// Plans the writes again for `prefix` (kept under the destination) and
+	/// lands the result, as a click on its "keep" button does.
+	fn land_remap(s: &mut PastePreview, prefix: &str) {
+		let Remapped::Ready(request) = s.remap(prefix.into(), None, None)
+		else {
+			panic!("{prefix}: no remap to run");
+		};
+		s.enqueue(request).unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(1, cancel);
+		assert!(matches!(
+			s.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+	}
+
+	/// A remap resets the cursor to the first row. When a fold that survived
+	/// the remap hides that row, the cursor goes to the folder instead of
+	/// staying on a row nobody can see (and Space, the detail pane and a
+	/// diff read would act on it).
+	#[test]
+	fn a_remap_whose_first_row_is_folded_away_lands_on_its_folder() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(
+			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
+			dir.path(),
+			None,
+		);
+		land_remap(&mut s, "a");
+		land_remap(&mut s, "b");
+		let (first, other) =
+			(index_of(&s, "a/x/1.txt"), index_of(&s, "b/y/2.txt"));
+		assert_eq!(first, 0, "the remap's reset cursor is on the first row");
+		let ax = dir_key(&s, "a/x");
+		assert_eq!(s.select(other, None), Nav::Moved(other));
+		assert!(matches!(s.toggle_dir_fold(ax.clone(), None), Folded::Kept));
+
+		land_remap(&mut s, "a");
+		let plan = s.plan().unwrap();
+		assert!(plan.collapsed_dirs.contains(&ax), "the fold survived");
+		assert_eq!(plan.cursor(), PasteCursor::Dir(ax));
+		assert!(plan.detail_preview().is_none());
+		assert!(s.detail().is_none());
+	}
+
 	const SRC_TREE: &str = "// clipcode-root: src\n// FILE: src/app/a.ts\nA\n// FILE: src/app/b.ts\nB\n// FILE: src/lib/c.ts\nC\n";
 
 	fn dir_key(s: &PastePreview, path: &str) -> DirKey {
@@ -911,6 +960,29 @@ mod tests {
 			.iter()
 			.position(|i| i.path == path)
 			.unwrap()
+	}
+
+	/// A click carries the key its frame drew. When the plan has moved on, a
+	/// key that names no row now must not leave a fold (or a cursor) behind.
+	#[test]
+	fn folding_a_folder_that_is_not_shown_does_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = landed(SRC_TREE, dir.path(), None);
+		let before = s.plan().unwrap().cursor();
+		let ghost = dir_key(&s, "src/gone");
+		assert!(matches!(s.toggle_dir_fold(ghost, None), Folded::Ignored));
+		assert!(s.plan().unwrap().collapsed_dirs.is_empty());
+		assert_eq!(s.plan().unwrap().cursor(), before);
+
+		// `src/app` is no row while `src` is folded.
+		let (src, app) = (dir_key(&s, "src"), dir_key(&s, "src/app"));
+		assert!(matches!(
+			s.toggle_dir_fold(src.clone(), None),
+			Folded::Reselected(Nav::MovedDir)
+		));
+		assert!(matches!(s.toggle_dir_fold(app, None), Folded::Ignored));
+		assert_eq!(s.plan().unwrap().collapsed_dirs.len(), 1);
+		assert!(s.plan().unwrap().collapsed_dirs.contains(&src));
 	}
 
 	/// A folder fold grows the retained set (its key), so unlike a commit
