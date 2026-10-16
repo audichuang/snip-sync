@@ -4130,10 +4130,12 @@ pub fn plan_import_parsed_with(
 	for (entry_index, entry) in entries.into_iter().enumerate() {
 		cancelled_err(opts, "plan-import")?;
 		// Where the entry lands: the anchor, the names below it that a folder
-		// still to be made adds, and the path the route leaves for the file
-		// itself. The last is checked on its own before the tail joins it, so
-		// a path that names no file cannot become the folder it is under.
-		let (target_root, tail, rel_path) = if let Some(em) =
+		// still to be made adds, the path the route leaves below them, and,
+		// when the route puts a folder in front of that path (Add), the path
+		// the entry keeps for the file itself. What the entry keeps is
+		// checked on its own before anything is put in front of it, so a path
+		// that names no file cannot become the folder it is under.
+		let (target_root, tail, rel_path, own_path) = if let Some(em) =
 			mapping.entry_destinations.get(&entry.path)
 		{
 			let rel =
@@ -4142,6 +4144,7 @@ pub fn plan_import_parsed_with(
 				&em.root,
 				std::borrow::Cow::Borrowed(""),
 				std::borrow::Cow::Borrowed(rel),
+				None,
 			)
 		} else {
 			let normalized = paths::normalize_system_path(&entry.path);
@@ -4179,6 +4182,7 @@ pub fn plan_import_parsed_with(
 							&c.anchor,
 							std::borrow::Cow::Borrowed(c.tail.as_str()),
 							std::borrow::Cow::Owned(rel),
+							None,
 						),
 						None => {
 							skipped_operations.push(SkippedOperation {
@@ -4203,6 +4207,7 @@ pub fn plan_import_parsed_with(
 						primary.anchor(),
 						std::borrow::Cow::Owned(primary.tail_rel()),
 						std::borrow::Cow::Borrowed(entry.path.as_str()),
+						None,
 					)
 				} else {
 					skipped_operations.push(SkippedOperation {
@@ -4229,12 +4234,14 @@ pub fn plan_import_parsed_with(
 						dest.anchor(),
 						std::borrow::Cow::Owned(dest.tail_rel()),
 						std::borrow::Cow::Borrowed(rest),
+						None,
 					)
 				} else if let Some(ref primary) = mapping.primary_destination {
 					(
 						primary.anchor(),
 						std::borrow::Cow::Owned(primary.tail_rel()),
 						primary_relative(mapping, &entry.path),
+						Some(entry.path.as_str()),
 					)
 				} else {
 					skipped_operations.push(SkippedOperation {
@@ -4250,6 +4257,7 @@ pub fn plan_import_parsed_with(
 					primary.anchor(),
 					std::borrow::Cow::Owned(primary.tail_rel()),
 					primary_relative(mapping, &entry.path),
+					Some(entry.path.as_str()),
 				)
 			} else {
 				skipped_operations.push(SkippedOperation {
@@ -4270,6 +4278,19 @@ pub fn plan_import_parsed_with(
 				relative_path: None,
 				reason: SkipReason::UnresolvedPath,
 				detail: Some(restore::SkipDetail::ProtectedGitMetadata),
+			});
+			continue;
+		}
+
+		// What the entry keeps for the file itself, with nothing put in front
+		// of it: a name, no `..`. A folder put in front (Add) or a tail
+		// would otherwise make a path that names no file (`.`) the folder.
+		if sanitize_relative_path(own_path.unwrap_or(&rel_path)).is_none() {
+			skipped_operations.push(SkippedOperation {
+				raw_path: entry.path.clone(),
+				relative_path: None,
+				reason: SkipReason::UnresolvedPath,
+				detail: None,
 			});
 			continue;
 		}

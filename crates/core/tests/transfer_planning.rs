@@ -8929,7 +8929,10 @@ fn test_add_skips_a_path_without_a_file_name_beside_a_real_file() {
 		);
 		assert_eq!(
 			create_paths(&plan),
-			vec![(ws.join("new/src/a.txt"), "new/src/a.txt".to_string())],
+			vec![(
+				ws.join("new/src/a.txt"),
+				if exists { "src/a.txt" } else { "new/src/a.txt" }.to_string()
+			)],
 			"exists={exists}"
 		);
 		assert!(plan
