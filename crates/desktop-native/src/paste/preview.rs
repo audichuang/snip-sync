@@ -35,6 +35,11 @@ pub struct PastePreview {
 	/// The typed destination field, while it is open. Kept here so that
 	/// everything that ends or restarts the session closes it too.
 	dest_edit: Option<DestEdit>,
+	/// Why the last destination gesture of the bar (breadcrumb, chip, menu,
+	/// dialog) named a folder the workspace cannot take. The open plan was
+	/// left as it was; the bar says why until the destination moves or the
+	/// user types.
+	dest_refusal: Option<Msg>,
 }
 
 #[derive(Debug)]
@@ -134,6 +139,7 @@ impl PastePreview {
 			apply_delay,
 			folder: None,
 			dest_edit: None,
+			dest_refusal: None,
 		}
 	}
 
@@ -145,6 +151,22 @@ impl PastePreview {
 	/// Records the destination folder. Set after `clear`, which resets it.
 	pub fn set_folder(&mut self, folder: DestFolder) {
 		self.folder = Some(folder);
+		self.dest_refusal = None;
+	}
+
+	/// The refusal the destination bar still shows.
+	pub fn dest_refusal(&self) -> Option<&Msg> {
+		self.dest_refusal.as_ref()
+	}
+
+	pub fn set_dest_refusal(&mut self, refusal: Option<Msg>) {
+		self.dest_refusal = refusal;
+	}
+
+	/// Names the open plan's payload, so an answer that arrives later (the
+	/// OS folder dialog) can tell whether it is still the same paste.
+	pub fn payload_token(&self) -> Option<std::sync::Weak<str>> {
+		self.plan.as_ref().map(|p| p.payload_token())
 	}
 
 	/// The typed destination field, when it is open.
@@ -172,6 +194,7 @@ impl PastePreview {
 	fn forget_destination(&mut self) {
 		self.folder = None;
 		self.dest_edit = None;
+		self.dest_refusal = None;
 	}
 
 	pub fn plan(&self) -> Option<&PastePreviewPlan> {

@@ -1114,7 +1114,10 @@ impl WorkbenchModel {
 			.filter(|rel| !rel.is_empty());
 		let left_rel = self.paste_left_folder();
 
-		let status = if let Some(err) = editing.and_then(|e| e.error.as_ref()) {
+		let status = if let Some(err) = editing
+			.and_then(|e| e.error.as_ref())
+			.or_else(|| self.paste.dest_refusal())
+		{
 			Some((false, err.render(loc)))
 		} else if let Some(plan) = plan.filter(|_| !loading) {
 			if plan.executable() {

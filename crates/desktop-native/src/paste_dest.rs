@@ -123,8 +123,23 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		app_log!("[APP:PASTE_DEST_REFUSED: via={via} reason={}]", err.key);
-		self.set_status_msg(err);
+		self.set_status_msg(err.clone());
+		if self.paste.plan().is_some() {
+			// The bar says it too, beside the plan that stays as it was.
+			self.paste.set_dest_refusal(Some(err));
+			self.focus_paste_panel(cx);
+		}
 		cx.notify();
+	}
+
+	/// Hands the focus back to the panel, or to the typed field when it is
+	/// open: Enter must not reach the panel while a path is being typed.
+	fn focus_paste_panel(&mut self, cx: &mut Context<Self>) {
+		self.pending_focus = Some(if self.paste.dest_edit().is_some() {
+			self.paste_dest_input.read(cx).handle()
+		} else {
+			self.paste_focus.clone()
+		});
 	}
 
 	/// The destination as the log and the bar name it.
@@ -146,6 +161,11 @@ impl WorkbenchModel {
 		via: &'static str,
 		cx: &mut Context<Self>,
 	) {
+		// No plan, no panel: a result that arrives after the preview closed
+		// (the folder dialog) changes nothing.
+		if self.paste.plan().is_none() {
+			return;
+		}
 		if self.refuse_while_applying("destination", cx) {
 			return;
 		}
@@ -252,12 +272,25 @@ impl WorkbenchModel {
 			),
 		});
 		let tab = self.ws_tab;
+		// The dialog is asynchronous: the preview it was opened over may
+		// have been cancelled, or replaced by a new paste, by the time a
+		// folder comes back.
+		let session = self.paste.payload_token();
 		cx.spawn(async move |this, cx| {
 			crate::tabs::tagged(tab, async move {
 				if let Ok(Ok(Some(paths))) = picked.await {
 					if let Some(path) = paths.into_iter().next() {
 						let _ = this.update(cx, |this, cx| {
-							this.paste_dest_picked(path, cx)
+							let same =
+								match (&session, this.paste.payload_token()) {
+									(Some(was), Some(now)) => was.ptr_eq(&now),
+									_ => false,
+								};
+							if same {
+								this.paste_dest_picked(path, cx)
+							} else {
+								app_log!("[APP:PASTE_DEST_IGNORED: via=browse stale]");
+							}
 						});
 					}
 				}
@@ -279,6 +312,7 @@ impl WorkbenchModel {
 			return;
 		}
 		self.user_action();
+		self.paste.set_dest_refusal(None);
 		let rel = self
 			.paste
 			.folder()
@@ -326,8 +360,11 @@ impl WorkbenchModel {
 
 	/// Typing makes the last refusal stale.
 	pub(crate) fn paste_dest_changed(&mut self, cx: &mut Context<Self>) {
-		if self.paste.dest_edit().is_some_and(|e| e.error.is_some()) {
+		let stale = self.paste.dest_edit().is_some_and(|e| e.error.is_some())
+			|| self.paste.dest_refusal().is_some();
+		if stale {
 			self.paste.set_dest_edit_error(None);
+			self.paste.set_dest_refusal(None);
 			cx.notify();
 		}
 	}

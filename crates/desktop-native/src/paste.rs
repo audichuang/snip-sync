@@ -1471,6 +1471,12 @@ impl Drop for DetailReadCharge {
 }
 
 impl PastePreviewPlan {
+	/// A handle that stays equal to itself for as long as this payload is
+	/// the one previewed (a retarget keeps it, a new paste does not).
+	pub fn payload_token(&self) -> std::sync::Weak<str> {
+		Arc::downgrade(&self.raw_payload)
+	}
+
 	pub(crate) fn commit_diff_request(
 		&self,
 		idx: usize,

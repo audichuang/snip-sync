@@ -5111,10 +5111,17 @@ impl WorkbenchModel {
 		request: paste::PasteRequest,
 		cx: &mut Context<Self>,
 	) {
+		let retarget = matches!(request, paste::PasteRequest::Retarget { .. });
 		if let Err(err) = self.paste.enqueue(request) {
 			// A remap's plan is idle again, without its writes.
 			self.refresh_paste_candidates(cx);
-			self.set_status_msg(err);
+			if retarget {
+				// The disarmed shell stays open on the folder the user
+				// picked: it says why there is nothing to apply.
+				self.set_paste_error(err);
+			} else {
+				self.set_status_msg(err);
+			}
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
@@ -5150,7 +5157,7 @@ impl WorkbenchModel {
 		}
 		match landed {
 			Some(paste::preview::Landed::Shown { remap, retargeted }) => {
-				self.show_landed_plan(remap, retargeted);
+				self.show_landed_plan(remap, retargeted, cx);
 				let selected_idx =
 					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
 				self.load_paste_diff(selected_idx, cx);
@@ -5210,6 +5217,7 @@ impl WorkbenchModel {
 		&mut self,
 		remap: Option<(String, bool)>,
 		retargeted: bool,
+		cx: &mut Context<Self>,
 	) {
 		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
@@ -5265,7 +5273,14 @@ impl WorkbenchModel {
 		if self.paste.collapse_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
-		self.pending_focus = Some(self.paste_focus.clone());
+		// A plan landing under the open destination field (a prefix chosen
+		// with the pointer while typing) leaves the focus where the user
+		// is typing: the panel's Enter would apply into the old folder.
+		self.pending_focus = Some(if self.paste.dest_edit().is_some() {
+			self.paste_dest_input.read(cx).handle()
+		} else {
+			self.paste_focus.clone()
+		});
 	}
 
 	/// Keep full write/read diagnostics in status, but do not let a newly
@@ -5795,6 +5810,15 @@ impl WorkbenchModel {
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
 		self.user_action();
+		// A path typed but not yet confirmed would be pasted into the old
+		// folder. The button is locked while the field is open; Enter in
+		// the panel is refused here, whoever holds the focus.
+		if self.paste.dest_edit().is_some() {
+			app_log!("[APP:APPLY_IGNORED: editing]");
+			self.set_status("paste_dest_editing", []);
+			cx.notify();
+			return;
+		}
 		let apply = match self.paste.begin_apply() {
 			Ok(w) => w,
 			Err(paste::preview::ApplyRefused::Loading) => {
@@ -23534,7 +23558,12 @@ mod tests {
 				let (model, cx) = open_ready(cx, &ws);
 				open_editor(&model, cx);
 				cx.simulate_keystrokes("cmd-a");
-				cx.simulate_input("my dir");
+				// The key itself, through the keymap: `simulate_input` skips
+				// it, and without the field's `NoAction` binding the preview
+				// takes the space as its row toggle.
+				cx.simulate_input("my");
+				cx.simulate_keystrokes("space");
+				cx.simulate_input("dir");
 				assert_eq!(editor_text(&model, cx), "my dir");
 				assert!(model.read_with(cx, |m, _| {
 					m.paste.plan().unwrap().items.iter().all(|i| i.selected)
@@ -23542,6 +23571,106 @@ mod tests {
 				cx.simulate_keystrokes("enter");
 				landed(&model, cx);
 				assert_eq!(plan_destination(&model, cx), ws.join("my dir"));
+			}
+
+			/// A path typed but not yet confirmed must not be pasted into
+			/// the old folder, by any route to Apply: a plan that lands
+			/// while the field is open leaves the focus in the field, and a
+			/// panel that does hold the focus refuses Enter.
+			#[gpui::test]
+			fn enter_never_applies_while_the_destination_field_is_open(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: notes/x.txt\nN\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				click_probed(&model, cx, "paste-dest-edit");
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input("docs");
+				// A plan landing under the open field (the report: a prefix
+				// choice made with the pointer while typing).
+				click_probed(&model, cx, "paste-map-keep:notes");
+				landed(&model, cx);
+				assert!(editor_open(&model, cx));
+				assert!(
+					editor_focused(&model, cx),
+					"the field keeps the focus a landing plan would take"
+				);
+				assert!(!paste_focused(&model, cx));
+
+				// The panel holds the focus all the same (a click on a row):
+				// Enter is refused, the field stays.
+				click_probed(&model, cx, "paste-row:0:notes/x.txt");
+				settle(cx);
+				assert!(paste_focused(&model, cx));
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+				assert!(editor_open(&model, cx));
+				assert!(model.read_with(cx, |m, _| m.paste.is_open()
+					&& !m.paste_busy()));
+				assert!(!first.join("notes/x.txt").exists());
+				assert!(!ws.join("docs/notes/x.txt").exists());
+				assert!(!ws.join("notes/x.txt").exists());
+			}
+
+			/// A folder the bar's gestures cannot take is said on the bar,
+			/// beside the plan that stays as it was, until the destination
+			/// moves or the user types; the focus stays with the panel.
+			#[gpui::test]
+			fn a_refused_folder_is_said_on_the_bar_and_the_plan_stays(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				let first = model.read_with(cx, |m, _| m.repo_root().unwrap());
+				// Turns the probes on.
+				probed_point(&model, cx, "paste-dest-root");
+				model.update(cx, |m, cx| {
+					m.paste_into_rel("missing", "crumb", cx)
+				});
+				settle(cx);
+				let said = model.read_with(cx, |m, _| {
+					m.paste.dest_refusal().map(|e| e.key)
+				});
+				assert_eq!(said, Some("paste_err_destination"));
+				assert!(probed(&model, cx, "paste-dest-status"));
+				assert!(paste_focused(&model, cx));
+				assert_eq!(plan_destination(&model, cx), first);
+				assert!(executable(&model, cx));
+
+				// Moving the destination clears it.
+				click_probed(&model, cx, "paste-dest-root");
+				landed(&model, cx);
+				assert!(model
+					.read_with(cx, |m, _| m.paste.dest_refusal().is_none()));
+			}
+
+			/// A folder that comes back from the OS dialog after the preview
+			/// was cancelled leaves nothing behind.
+			#[gpui::test]
+			fn a_destination_after_the_preview_closed_changes_nothing(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, ws) = multi_repo_ws();
+				let (model, cx) = open_ready(cx, &ws);
+				preview(&model, cx, "// FILE: x.txt\nX\n");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(!model.read_with(cx, |m, _| m.paste.is_open()));
+				model.update(cx, |m, cx| {
+					m.paste_dest_picked(ws.join("docs"), cx)
+				});
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					assert!(m.paste.folder().is_none());
+					assert!(m.paste.dest_refusal().is_none());
+					assert!(!m.paste.is_open());
+				});
 			}
 
 			/// The workspace root of a remote workspace is a destination of

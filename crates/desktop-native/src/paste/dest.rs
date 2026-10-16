@@ -46,8 +46,9 @@ pub struct DestEdit {
 ///
 /// Compared by words first. A local path that does not start with the
 /// workspace by words (the workspace is spelled through a symlink, as macOS
-/// `/var` for `/private/var` is) is compared again as resolved paths, which
-/// is done once when the folder is set, never per frame. A remote tree path
+/// `/var` for `/private/var` is) is compared again as resolved paths, unless it
+/// is a plain ancestor of the workspace, which is outside however it is
+/// spelled and costs no system call. A remote tree path
 /// is virtual, so only the words count.
 pub fn folder_rel(
 	workspace_root: &Path,
@@ -58,6 +59,12 @@ pub fn folder_rel(
 		return crate::remote::remote_rel(workspace_root, path);
 	}
 	lexical_rel(workspace_root, path).or_else(|| {
+		// A folder above the workspace (an enclosing repo) is outside it
+		// however either is spelled: the bar asks this every frame, and
+		// that case must cost no system call.
+		if workspace_root.starts_with(path) {
+			return None;
+		}
 		let root = dunce::canonicalize(workspace_root).ok()?;
 		let path = dunce::canonicalize(path).ok()?;
 		lexical_rel(&root, &path)
