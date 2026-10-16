@@ -57,12 +57,11 @@ jobs:
                   components: rustfmt
             - name: Rust format
               run: cargo fmt --all -- --check
-            - name: Ban self-refresh in tests
-              run: ./scripts/check_test_refresh.sh
-            - name: Ban raw-text message paths in product code
-              run: ./scripts/check_msg_raw.sh
-            - name: Ban width weights and unruled truncation in the log UI
-              run: ./scripts/check_text_fit.sh
+            # Every scripts/check_*.sh: the bans on self-refresh in tests, raw-text
+            # message paths, width weights in the log UI and a bare u64 as a
+            # generation counter. A new lint is a new file, not a new step.
+            - name: Run the repo's lints
+              run: ./scripts/run_lints.sh
 
     # clippy + rustdoc on all three OSes; audit once, on Linux.
     lint-rust:
