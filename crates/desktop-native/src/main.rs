@@ -4083,7 +4083,13 @@ impl WorkbenchModel {
 
 		// A superseded read of the previously open repo is dropped when it
 		// lands; the queue reads that repo instead of leaving it loading.
-		let previous = self.repo_root();
+		// By index, not `repo_root()`: `select_repo` has pinned the new repo
+		// by now, and a pin that does not match the open entry reads as no
+		// open repo at all (R6 of `invariants`).
+		let previous = self
+			.selected_repo_idx
+			.and_then(|i| self.repos.get(i))
+			.map(|r| r.root.clone());
 		if previous.as_ref() != Some(&self.repos[idx].root) {
 			if let Some(prev) = previous.filter(|prev| {
 				self.change_repos.iter().any(|s| {
