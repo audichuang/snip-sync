@@ -4101,6 +4101,11 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
+		if self.selected_commit.is_none() {
+			// No selection is left, so the Log has no claim on the latest
+			// preview read (L6 of `invariants`).
+			self.preview_pending_from_log = false;
+		}
 		// The same commit stays selected while the repo is read again, so
 		// its details and its repository stay (the Log may be pinned to
 		// another repo than the one now open); the rest is read anew.
