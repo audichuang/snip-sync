@@ -287,7 +287,8 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 執行環境強化照舊:固定 argv 前綴 `-c core.fsmonitor= -c protocol.allow=never -c core.hooksPath=/dev/null`(Windows 為 `NUL`),注入 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`,清除 `GIT_DIR`、`GIT_WORK_TREE` 等變數。
 - **資源規則**:
   - 獨立名額池：遠端讀取使用 `gitrun` 獨立的 `GitPool::Served`（並行 1、佇列 4），不計入 worker 主人的 `Local` 名額池，遠端 master 的請求絕不排擠 worker 主人自己的 UI 操作，也不會卡住桌面版的工作區切換或結束（drain）。master 端亦對遠端 Git 呼叫限制最多 4 個並行請求。
-  - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。worker 每秒發送 `Pending` heartbeat 幀；master 斷線或取消請求時立即中止 worker 背景 job。
+  - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。協定 ≥2 時，**每個請求**（含 `OpenWorkspace`／`ListDir`／`Stat`／`Read` 這類 worker 自己回答的請求）在 worker 計算期間每秒發送一個 `Pending` heartbeat 幀；自己回答的請求也有 View 的期限（60 秒），不經 job 名額（不會收到 `Busy`）。協定 1 的 master 不認得 `Pending`，只收到回覆。master 斷線或取消請求時立即中止 worker 背景 job。
+  - master 的沉默上限：回覆的第一個位元組之前 5 秒（讓休眠或 NAT 逾時而斷掉的池中連線快速失敗），回覆開始之後（frame 中途、同一個回覆的兩個 frame 之間、heartbeat 之後）30 秒；整個呼叫另受絕對期限限制，收尾靠取消而不是靠上限。逾時訊息帶出已收到的位元組數與經過時間，並分出「沉默」（no data for）與「期限」（time limit passed）兩種結束方式；`GitError` 保留這段文字，不再一律寫成 90 秒。
 - **已知限制**:
   - tag 與參照極多（refs 輸出超過 `SERVED_MAX_STDOUT = 4 MiB`）的 repo，在遠端會顯示「遠端參照資料過大」（`remote_refs_too_large`）錯誤（本機可看）。
   - Refresh 時，開著的 Changes 列預覽若不屬於正在重新載入的 repo（或尚未讀完），預覽會清掉，回到該 repo 的預設畫面，不保留也不重讀；本機與遠端相同。專案樹開著的檔案照常重讀。

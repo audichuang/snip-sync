@@ -1349,21 +1349,16 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let job_cancel = cancel.clone();
 		let host = self.git_host();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(job_cancel),
-			async move {
-				let result = bg
-					.spawn(async move {
-						read_new_side(&host, &root, &source, &path, cancel)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					model.finish_expand(shown, only, result, cx)
-				});
-			},
-		);
+		self.spawn_owned(cx, Some(job_cancel), async move {
+			let result = bg
+				.spawn(async move {
+					read_new_side(&host, &root, &source, &path, cancel)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				model.finish_expand(shown, only, result, cx)
+			});
+		});
 		cx.notify();
 	}
 

@@ -3354,10 +3354,7 @@ pub(crate) mod tests {
 			.unwrap()
 			.unwrap();
 		let mut life = crate::lifecycle::Lifecycle::new(1);
-		let (id, held) = life.register(
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(token.clone()),
-		);
+		let (id, held) = life.register_read(Some(token.clone()));
 		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
 		token.cancel();
 		for n in 1..=100 {

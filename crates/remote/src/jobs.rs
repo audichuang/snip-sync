@@ -272,9 +272,7 @@ impl<'w, W: Write> Answer<'w, W> {
 	pub(crate) fn work_delay(&self) -> Option<Duration> {
 		// An irrefutable pattern: a new `Fault` stops this compiling until
 		// it decides what it means here.
-		self.fault
-			.as_ref()
-			.map(|crate::fault::Fault::Delay(d)| *d)
+		self.fault.as_ref().map(|crate::fault::Fault::Delay(d)| *d)
 	}
 }
 
@@ -358,6 +356,36 @@ pub(crate) fn write_response<W: Write>(
 		),
 		other => other,
 	}
+}
+
+/// Proof that a request is answered under [`run_inline`]: only this module
+/// makes one.
+pub(crate) struct Covered(());
+
+/// Answers a request `State::handle` serves. From protocol 2 on the work runs
+/// under heartbeats like any job, so a master hears from a live worker within
+/// a second; a protocol 1 master does not know `Pending` and gets the answer
+/// alone. Like a view, it has `deadline` and answers `Timeout` past it.
+pub(crate) fn run_inline<W: Write>(
+	answer: &mut Answer<'_, W>,
+	negotiated: u32,
+	deadline: Duration,
+	op: impl FnOnce(Covered) -> Response + Send,
+) -> io::Result<()> {
+	if negotiated < crate::proto::GIT_VIEWS_VERSION {
+		if let Some(d) = answer.work_delay() {
+			std::thread::sleep(d);
+		}
+		return answer.reply(&op(Covered(())));
+	}
+	run_job_with(
+		answer,
+		HEARTBEAT,
+		deadline,
+		CancelToken::new(),
+		DeadlineReply::Fail,
+		|_, _| op(Covered(())),
+	)
 }
 
 /// Runs `op` on a scoped thread; writes Pending every `HEARTBEAT` until it

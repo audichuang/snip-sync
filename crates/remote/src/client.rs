@@ -38,16 +38,32 @@ use crate::{ConnectFailureKind, RemoteError, StartReason, WaitEnd};
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-// Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a stalled
-// worker must fail a call in time. It bounds the SILENCE between bytes, not
-// a frame's whole transfer: a long job sends a heartbeat every second, and
-// a large reply may take longer than this to arrive whole on a slow link
-// as long as it keeps moving. Once a reply has started arriving mid-frame,
-// its silence may run to MID_FRAME_IDLE_FACTOR times this bound, still
-// inside the call's absolute deadline (#191).
+// The silence a call tolerates, between bytes, never a frame's whole
+// transfer: a large reply may take longer than this to arrive whole on a
+// slow link as long as it keeps moving. One rule, by where the call is
+// (#191, [`silence_budget`]):
+// - Before the first byte of its reply: this bound. A connection that went
+//   dead while pooled (a sleep, a NAT timeout, no RST) fails fast.
+// - Once the reply has started, anywhere (inside a frame, between the
+//   frames of one reply, after a heartbeat): REPLY_IDLE_FACTOR times it.
+//   From then on a pause says only that the link or the process froze: a
+//   worker of protocol 2 and up sends a heartbeat every second while its
+//   work runs, whatever the work is, so a live worker is never this quiet.
+// The call's absolute deadline bounds both. A close or quit does not wait
+// for either: it ends a call by its cancel token.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// How much longer than the idle bound a reply already arriving may pause.
-const MID_FRAME_IDLE_FACTOR: u32 = 6;
+/// How much longer than the idle bound a reply that has started may pause.
+const REPLY_IDLE_FACTOR: u32 = 6;
+
+/// The silence a call tolerates: `idle` until the first byte of its reply,
+/// [`REPLY_IDLE_FACTOR`] times that once the reply has started (#191).
+fn silence_budget(idle: Duration, reply_started: bool) -> Duration {
+	if reply_started {
+		idle.saturating_mul(REPLY_IDLE_FACTOR)
+	} else {
+		idle
+	}
+}
 /// How often a wait re-checks its deadline, its cancel token and the
 /// stream's last-byte clock.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -240,10 +256,13 @@ pub(crate) trait FrameIo {
 	) -> Result<Option<Response>, RemoteError>;
 
 	/// The next frame while bytes keep arriving: `idle` bounds the SILENCE
-	/// between bytes, not the arrival of a whole frame — a large reply may
-	/// take longer than that to cross a slow link. The wait also ends at
-	/// the absolute `deadline` or on `cancel`. The default has no byte
-	/// clock and simply reads the next frame (tests feed memory streams).
+	/// before the call's reply starts, not the arrival of a whole frame — a
+	/// large reply may take longer than that to cross a slow link. Once the
+	/// reply has started, a pause anywhere in it may run to
+	/// [`REPLY_IDLE_FACTOR`] times `idle` ([`silence_budget`]). The wait also
+	/// ends at the absolute `deadline` or on `cancel`. The default has no
+	/// byte clock and simply reads the next frame (tests feed memory
+	/// streams).
 	fn recv_idle(
 		&mut self,
 		idle: Duration,
@@ -252,6 +271,13 @@ pub(crate) trait FrameIo {
 	) -> Result<Option<Response>, RemoteError> {
 		let _ = (deadline, cancel);
 		self.recv(idle)
+	}
+
+	/// The error for a call past its absolute deadline. A stream with a
+	/// byte clock says how much arrived and for how long; the default has
+	/// none.
+	fn overdue(&self) -> RemoteError {
+		RemoteError::TimedOut
 	}
 }
 
@@ -353,12 +379,10 @@ pub struct Connection {
 	/// it pulled. Shared with the read thread; a wait ends when the stream
 	/// goes silent past [`IO_TIMEOUT`].
 	last_byte: Arc<StreamClock>,
-	/// When the current call started, and the stream's byte count and
-	/// whole-frame count at that point: the call's reply is what arrives
-	/// past them (#191).
+	/// When the current call started, and the stream's byte count at that
+	/// point: the call's reply is what arrives past it (#191).
 	call_started: Instant,
 	call_base: u64,
-	frame_base: u64,
 }
 
 impl Connection {
@@ -430,7 +454,6 @@ impl Connection {
 			last_byte,
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
@@ -590,7 +613,6 @@ impl Connection {
 		let mut frames = 0;
 		self.call_started = Instant::now();
 		self.call_base = self.last_byte.received();
-		self.frame_base = self.call_base;
 		self.in_flight.store(true, Ordering::SeqCst);
 		let res = self.send_guarded(request, cancel, deadline).and_then(|()| {
 			self.last_byte.restart();
@@ -652,6 +674,18 @@ impl Connection {
 		}
 	}
 
+	/// The error for a call whose wait ended without an answer: how it
+	/// ended, and how much of the reply arrived in how long. The one place
+	/// that builds it, so no exit reports less than another (#191).
+	fn unanswered(&self, ended: WaitEnd) -> RemoteError {
+		RemoteError::Stalled {
+			silent: self.last_byte.silent_ms() as f64 / 1000.0,
+			received: self.last_byte.received().saturating_sub(self.call_base),
+			elapsed: self.call_started.elapsed().as_secs_f64(),
+			ended,
+		}
+	}
+
 	/// Kills the transport process, closing the pipes a stuck write or
 	/// read is parked on. Without a process (an in-process worker) there
 	/// is nothing to kill; its stuck writer thread is simply abandoned.
@@ -680,6 +714,10 @@ impl io::Write for DeadWriter {
 }
 
 impl FrameIo for Connection {
+	fn overdue(&self) -> RemoteError {
+		self.unanswered(WaitEnd::Deadline)
+	}
+
 	fn recv(
 		&mut self,
 		timeout: Duration,
@@ -688,7 +726,6 @@ impl FrameIo for Connection {
 			Ok(frame) => {
 				// The frame left the queue; the pump may read on.
 				self.retained.fetch_sub(1, Ordering::Relaxed);
-				self.frame_base = self.last_byte.received();
 				Ok(frame?)
 			}
 			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
@@ -707,7 +744,6 @@ impl FrameIo for Connection {
 				Ok(frame) => {
 					// The frame left the queue; the pump may read on.
 					self.retained.fetch_sub(1, Ordering::Relaxed);
-					self.frame_base = self.last_byte.received();
 					return Ok(frame?);
 				}
 				Err(RecvTimeoutError::Disconnected) => return Ok(None),
@@ -717,30 +753,17 @@ impl FrameIo for Connection {
 				return Err(RemoteError::Cancelled);
 			}
 			if Instant::now() >= deadline {
-				return Err(RemoteError::TimedOut);
+				return Err(self.unanswered(WaitEnd::Deadline));
 			}
-			// No byte for `idle`: the worker is stuck, whatever it may
-			// still be computing. Bytes still moving (a large frame on a
-			// slow link, a heartbeat) keep the wait alive. A reply that has
-			// started arriving mid-frame may pause longer, still bounded by
-			// `deadline` (#191).
-			let silent = self.last_byte.silent_ms();
-			let mid_frame = self.last_byte.received() > self.frame_base;
-			let limit = if mid_frame {
-				idle.saturating_mul(MID_FRAME_IDLE_FACTOR)
-			} else {
-				idle
-			};
-			if silent >= limit.as_millis() as u64 {
-				return Err(RemoteError::Stalled {
-					silent: silent as f64 / 1000.0,
-					received: self
-						.last_byte
-						.received()
-						.saturating_sub(self.call_base),
-					elapsed: self.call_started.elapsed().as_secs_f64(),
-					ended: WaitEnd::Silence,
-				});
+			// No byte for the call's silence budget: the connection or the
+			// process froze. Bytes still moving (a large frame on a slow
+			// link, a heartbeat) keep the wait alive, and so does a reply
+			// that has begun, for REPLY_IDLE_FACTOR times longer (#191).
+			let started = self.last_byte.received() > self.call_base;
+			if self.last_byte.silent_ms()
+				>= silence_budget(idle, started).as_millis() as u64
+			{
+				return Err(self.unanswered(WaitEnd::Silence));
 			}
 		}
 	}
@@ -1083,7 +1106,7 @@ pub(crate) fn exchange(
 			Some(response) => {
 				*frames += 1;
 				if Instant::now() >= deadline {
-					return Err(RemoteError::TimedOut);
+					return Err(io.overdue());
 				}
 				match response {
 					Response::Chunk { data } => {
@@ -1609,7 +1632,6 @@ impl Client {
 			last_byte: StreamClock::new(),
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		});
 	}
 
@@ -2985,14 +3007,14 @@ impl From<RemoteError> for GitError {
 			RemoteError::Refused {
 				code: ErrorCode::Timeout,
 				..
-			}
-			| RemoteError::TimedOut
-			| RemoteError::Stalled { .. } => GitError::Timeout {
+			} => GitError::Timeout {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
 			// The rest has no typed variant of its own: the CLI prints the
-			// error's text, a front end words the reason.
+			// error's text, a front end words the reason. TimedOut and
+			// Stalled say how long and how much arrived: their own text, not
+			// a 90 s limit they may never have reached (#191).
 			other => GitError::remote(other.reason(), other.to_string()),
 		}
 	}
@@ -3896,7 +3918,6 @@ mod tests {
 			last_byte: fresh_clock(),
 			call_started: Instant::now(),
 			call_base: 0,
-			frame_base: 0,
 		}
 	}
 
@@ -4162,11 +4183,15 @@ mod tests {
 		));
 
 		let err5 = RemoteError::TimedOut;
-		assert!(matches!(
-			GitError::from(err5),
-			GitError::Timeout { ref args, secs }
-				if args == "remote view" && secs == GIT_CALL_LIMIT.as_secs()
-		));
+		let g5 = GitError::from(err5);
+		assert!(
+			matches!(
+				&g5,
+				GitError::Remote { reason, .. }
+					if matches!(**reason, Reason::TimedOut)
+			),
+			"{g5:?}"
+		);
 
 		let err6 = RemoteError::WorkerTooOld {
 			worker: "w".into(),
@@ -4907,7 +4932,7 @@ mod tests {
 
 	/// A reply that has started arriving may pause longer than the idle
 	/// bound mid-frame: the worker answered and the link is slow. The pause
-	/// here is under MID_FRAME_IDLE_FACTOR times the bound, so the call
+	/// here is under REPLY_IDLE_FACTOR times the bound, so the call
 	/// succeeds (#191).
 	#[test]
 	fn a_reply_paused_mid_frame_outlasts_the_idle_bound() {
@@ -5234,9 +5259,8 @@ mod tests {
 		drop(w);
 	}
 
-	/// Enabled with `silence_budget` (#191): a reply not yet begun gets the
-	/// idle bound, one that has begun REPLY_IDLE_FACTOR times it.
-	#[cfg(any())]
+	/// A reply not yet begun gets the idle bound, one that has begun
+	/// REPLY_IDLE_FACTOR times it (#191).
 	#[test]
 	fn silence_budget_by_reply_state() {
 		let idle = Duration::from_millis(300);

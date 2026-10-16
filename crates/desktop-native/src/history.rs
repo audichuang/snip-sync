@@ -1304,102 +1304,93 @@ impl WorkbenchModel {
 		let repo_identity = self.identity_for(&repo_root);
 		let host = self.git_host();
 
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel_bg),
-						};
-						let Some(query) = &search else {
-							let email = want_email
-								.then(|| {
-									let g = host
-										.open(
-											&repo_root,
-											repo_identity.as_ref(),
-											&read,
-										)
-										.ok()?;
-									g.user_email(&read)
-								})
-								.flatten();
-							return read_graph_page(
-								&host,
-								&repo_root,
-								repo_identity.as_ref(),
-								walk,
-								ref_filter,
-								skip,
-								page_size,
-								&read,
-							)
-							.map(|(h, w)| (h, Some(w), email));
-						};
-						let g = host.open(
+		self.spawn_owned(cx, Some(cancel), async move {
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel_bg),
+					};
+					let Some(query) = &search else {
+						let email = want_email
+							.then(|| {
+								let g = host
+									.open(
+										&repo_root,
+										repo_identity.as_ref(),
+										&read,
+									)
+									.ok()?;
+								g.user_email(&read)
+							})
+							.flatten();
+						return read_graph_page(
+							&host,
 							&repo_root,
 							repo_identity.as_ref(),
+							walk,
+							ref_filter,
+							skip,
+							page_size,
 							&read,
-						)?;
-						// Refs only for labels: no topological walk for them.
-						let (refs, head, email) = if extending {
-							(snapshot.0, snapshot.1, None)
-						} else {
-							let snap = g.refs(&read).map_err(|e| {
-								crate::githost::refs_error(&host, e)
-							})?;
-							(snap.refs, snap.head, g.user_email(&read))
-						};
-						let (commits, has_more) = g
-							.history_query(
-								ref_filter.as_deref(),
-								query,
-								skip,
-								page_size,
-								&read,
-							)
-							.map_err(crate::remote::git_error_msg)?;
-						Ok((
-							browser::RepositoryHistory {
-								root: String::new(),
-								commits,
-								refs,
-								head,
-								has_more,
-							},
-							None,
-							email,
-						))
-					})
-					.await;
+						)
+						.map(|(h, w)| (h, Some(w), email));
+					};
+					let g =
+						host.open(&repo_root, repo_identity.as_ref(), &read)?;
+					// Refs only for labels: no topological walk for them.
+					let (refs, head, email) = if extending {
+						(snapshot.0, snapshot.1, None)
+					} else {
+						let snap = g.refs(&read).map_err(|e| {
+							crate::githost::refs_error(&host, e)
+						})?;
+						(snap.refs, snap.head, g.user_email(&read))
+					};
+					let (commits, has_more) = g
+						.history_query(
+							ref_filter.as_deref(),
+							query,
+							skip,
+							page_size,
+							&read,
+						)
+						.map_err(crate::remote::git_error_msg)?;
+					Ok((
+						browser::RepositoryHistory {
+							root: String::new(),
+							commits,
+							refs,
+							head,
+							has_more,
+						},
+						None,
+						email,
+					))
+				})
+				.await;
 
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.history_generation != task_generation {
-						return;
-					}
-					model.history_extending = false;
-					match res {
-						Ok((hist, walk, email)) => {
-							model.install_history(load, hist, walk, cx);
-							if want_email {
-								model.git_user_email = email;
-							}
-						}
-						Err(e) => {
-							model.history_autoload = false;
-							model.report_graph_error(
-								GraphAdmissionError::Layout(e),
-							);
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.history_generation != task_generation {
+					return;
+				}
+				model.history_extending = false;
+				match res {
+					Ok((hist, walk, email)) => {
+						model.install_history(load, hist, walk, cx);
+						if want_email {
+							model.git_user_email = email;
 						}
 					}
-					cx.notify();
-				});
-			},
-		);
+					Err(e) => {
+						model.history_autoload = false;
+						model
+							.report_graph_error(GraphAdmissionError::Layout(e));
+					}
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// Merges a read page into the window, keeps the rows on screen where
@@ -2141,41 +2132,36 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel),
-						};
-						let g = host.open(&root, identity.as_ref(), &read)?;
-						g.commit_details(&sha, &read)
-							.map_err(crate::remote::git_error_msg)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.details_generation != generation {
-						return;
-					}
-					// A failed read leaves the row's own fields on screen.
-					// Details are keyed by the row id (merged log: with repo).
-					model.commit_details = res.ok().map(|mut d| {
-						app_log!(
-							"[APP:COMMIT_DETAILS: {} branches={}]",
-							&d.sha[..7.min(d.sha.len())],
-							d.branches.len()
-						);
-						d.sha = id;
-						d
-					});
-					cx.notify();
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel),
+					};
+					let g = host.open(&root, identity.as_ref(), &read)?;
+					g.commit_details(&sha, &read)
+						.map_err(crate::remote::git_error_msg)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.details_generation != generation {
+					return;
+				}
+				// A failed read leaves the row's own fields on screen.
+				// Details are keyed by the row id (merged log: with repo).
+				model.commit_details = res.ok().map(|mut d| {
+					app_log!(
+						"[APP:COMMIT_DETAILS: {} branches={}]",
+						&d.sha[..7.min(d.sha.len())],
+						d.branches.len()
+					);
+					d.sha = id;
+					d
 				});
-			},
-		);
+				cx.notify();
+			});
+		});
 	}
 
 	/// A new selection starts with its commit list collapsed.
@@ -2217,42 +2203,36 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel),
-						};
-						// A failed read keeps that commit's row fields.
-						reads
-							.into_iter()
-							.filter_map(|(root, identity, sha, id)| {
-								let g = host
-									.open(&root, identity.as_ref(), &read)
-									.ok()?;
-								let mut d =
-									g.commit_details(&sha, &read).ok()?;
-								d.sha = id;
-								Some(d)
-							})
-							.collect::<Vec<_>>()
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.details_generation != generation {
-						return;
-					}
-					app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
-					model.selection_details = res;
-					cx.notify();
-				});
-			},
-		);
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel),
+					};
+					// A failed read keeps that commit's row fields.
+					reads
+						.into_iter()
+						.filter_map(|(root, identity, sha, id)| {
+							let g = host
+								.open(&root, identity.as_ref(), &read)
+								.ok()?;
+							let mut d = g.commit_details(&sha, &read).ok()?;
+							d.sha = id;
+							Some(d)
+						})
+						.collect::<Vec<_>>()
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.details_generation != generation {
+					return;
+				}
+				app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
+				model.selection_details = res;
+				cx.notify();
+			});
+		});
 	}
 
 	/// Shift-selection: `selected_commit` stays the anchor.
@@ -2426,85 +2406,76 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let listing = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel),
-						};
-						let g =
-							host.open(&root, identity.as_ref(), &listing)?;
-						// Lazy: each listing is folded in and dropped
-						// before the next one is read.
-						union_changed_files(shas.into_iter().map(|sha| {
-							g.changed_paths(
-								&GitSource::Commit(sha),
-								MAX_COMMIT_FILES,
-								&listing,
-							)
-							.map_err(crate::remote::git_error_msg)
-						}))
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.preview_generation != task_generation {
-						return;
-					}
-					match res {
-						Ok((
-							files,
-							origin,
-							total,
-							gitlinks,
-							total_is_lower_bound,
-						)) => {
-							app_log!("[APP:E2E_CHANGES: files={}]", total);
-							if total > MAX_COMMIT_FILES {
-								let key = if total_is_lower_bound {
-									"status_commit_files_truncated_min"
-								} else {
-									"status_commit_files_truncated"
-								};
-								model.set_status(
-									key,
-									[
-										total.to_string(),
-										MAX_COMMIT_FILES.to_string(),
-									],
-								);
-							}
-							let first = files.first().map(|(p, _)| p.clone());
-							model.commit_files = files;
-							model.commit_file_origin = origin;
-							model.commit_file_gitlinks = gitlinks;
-							model.commit_files_truncated =
-								total > MAX_COMMIT_FILES;
-							match first {
-								Some(path) => {
-									model.select_commit_file(&path, cx)
-								}
-								None => model.show_preview_error(Msg::new(
-									"status_no_changes",
-									[],
-								)),
-							}
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let res = bg
+				.spawn(async move {
+					let listing = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel),
+					};
+					let g = host.open(&root, identity.as_ref(), &listing)?;
+					// Lazy: each listing is folded in and dropped
+					// before the next one is read.
+					union_changed_files(shas.into_iter().map(|sha| {
+						g.changed_paths(
+							&GitSource::Commit(sha),
+							MAX_COMMIT_FILES,
+							&listing,
+						)
+						.map_err(crate::remote::git_error_msg)
+					}))
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.preview_generation != task_generation {
+					return;
+				}
+				match res {
+					Ok((
+						files,
+						origin,
+						total,
+						gitlinks,
+						total_is_lower_bound,
+					)) => {
+						app_log!("[APP:E2E_CHANGES: files={}]", total);
+						if total > MAX_COMMIT_FILES {
+							let key = if total_is_lower_bound {
+								"status_commit_files_truncated_min"
+							} else {
+								"status_commit_files_truncated"
+							};
+							model.set_status(
+								key,
+								[
+									total.to_string(),
+									MAX_COMMIT_FILES.to_string(),
+								],
+							);
 						}
-						Err(e) => model.show_preview_error(Msg::with_msg_arg(
-							"error_history",
-							[String::new()],
-							0,
-							e,
-						)),
+						let first = files.first().map(|(p, _)| p.clone());
+						model.commit_files = files;
+						model.commit_file_origin = origin;
+						model.commit_file_gitlinks = gitlinks;
+						model.commit_files_truncated = total > MAX_COMMIT_FILES;
+						match first {
+							Some(path) => model.select_commit_file(&path, cx),
+							None => model.show_preview_error(Msg::new(
+								"status_no_changes",
+								[],
+							)),
+						}
 					}
-					cx.notify();
-				});
-			},
-		);
+					Err(e) => model.show_preview_error(Msg::with_msg_arg(
+						"error_history",
+						[String::new()],
+						0,
+						e,
+					)),
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// Display rows spanned by the selected range, (top, bottom).
@@ -2611,151 +2582,133 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let hold = bg.clone();
 		let delay = self.e2e_log_read_delay;
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let res = bg
-					.spawn(async move {
-						// The listing is metadata: a commit touching tens of
-						// thousands of files lists under the interactive limit
-						// and is cut to MAX_COMMIT_FILES afterwards.
-						let listing_read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel.clone()),
-						};
-						let preview_read = Read {
-							profile: ReadProfile::PreviewStrict,
-							cancel: Some(cancel),
-						};
-						// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
-						let g =
-							host.open(&root, identity.as_ref(), &listing_read)?;
-						let list = g
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let res = bg
+				.spawn(async move {
+					// The listing is metadata: a commit touching tens of
+					// thousands of files lists under the interactive limit
+					// and is cut to MAX_COMMIT_FILES afterwards.
+					let listing_read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel.clone()),
+					};
+					let preview_read = Read {
+						profile: ReadProfile::PreviewStrict,
+						cancel: Some(cancel),
+					};
+					// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
+					let g =
+						host.open(&root, identity.as_ref(), &listing_read)?;
+					let list = g
+						.changed_paths(&source, MAX_COMMIT_FILES, &listing_read)
+						.map_err(crate::remote::git_error_msg)?;
+					// A merge lists the files changed against any parent.
+					// Those unchanged against the first parent are marked
+					// (#188): the same list as a Range from the first parent.
+					let same = match (&source, parents.as_deref()) {
+						(GitSource::Commit(sha), Some(ps)) if ps.len() > 1 => g
 							.changed_paths(
-								&source,
+								&GitSource::Range(ps[0].clone(), sha.clone()),
 								MAX_COMMIT_FILES,
 								&listing_read,
 							)
-							.map_err(crate::remote::git_error_msg)?;
-						// A merge lists the files changed against any parent.
-						// Those unchanged against the first parent are marked
-						// (#188): the same list as a Range from the first parent.
-						let same = match (&source, parents.as_deref()) {
-							(GitSource::Commit(sha), Some(ps))
-								if ps.len() > 1 =>
-							{
-								g.changed_paths(
-									&GitSource::Range(
-										ps[0].clone(),
-										sha.clone(),
-									),
-									MAX_COMMIT_FILES,
-									&listing_read,
-								)
-								.ok()
-								.filter(|fp| fp.total <= MAX_COMMIT_FILES)
-								.map(|fp| {
-									let changed: std::collections::HashSet<
-										&str,
-									> = fp.paths
+							.ok()
+							.filter(|fp| fp.total <= MAX_COMMIT_FILES)
+							.map(|fp| {
+								let changed: std::collections::HashSet<&str> =
+									fp.paths
 										.iter()
 										.map(|(p, _)| p.as_str())
 										.collect();
-									let unchanged = list
-										.paths
-										.iter()
-										.filter(|(p, _)| {
-											!changed.contains(p.as_str())
-										})
-										.map(|(p, _)| p.clone())
-										.collect::<std::collections::HashSet<String>>(
-										);
-									(sha.clone(), unchanged)
-								})
-							}
-							_ => None,
-						};
-						let first = list.paths.first().map(|(p, change)| {
-							(
-								p.clone(),
-								read_preview(
-									g.as_ref(),
-									&source,
-									p,
-									*change,
-									parents.as_deref(),
-									&preview_read,
-								),
-							)
-						});
-						Ok::<_, Msg>((
-							list.paths,
-							list.gitlinks,
-							list.total,
-							first,
-							same,
-						))
-					})
-					.await;
-				if let Some(delay) = delay {
-					hold.timer(delay).await;
+								let unchanged = list
+									.paths
+									.iter()
+									.filter(|(p, _)| {
+										!changed.contains(p.as_str())
+									})
+									.map(|(p, _)| p.clone())
+									.collect::<std::collections::HashSet<String>>(
+									);
+								(sha.clone(), unchanged)
+							}),
+						_ => None,
+					};
+					let first = list.paths.first().map(|(p, change)| {
+						(
+							p.clone(),
+							read_preview(
+								g.as_ref(),
+								&source,
+								p,
+								*change,
+								parents.as_deref(),
+								&preview_read,
+							),
+						)
+					});
+					Ok::<_, Msg>((
+						list.paths,
+						list.gitlinks,
+						list.total,
+						first,
+						same,
+					))
+				})
+				.await;
+			if let Some(delay) = delay {
+				hold.timer(delay).await;
+			}
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.preview_generation != task_generation {
+					return;
 				}
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.preview_generation != task_generation {
-						return;
-					}
-					match res {
-						Ok((mut files, gitlinks, total, first, same)) => {
-							files.shrink_to_fit();
-							app_log!("[APP:E2E_CHANGES: files={}]", total);
-							if total > MAX_COMMIT_FILES {
-								model.set_status(
-									"status_commit_files_truncated",
-									[
-										total.to_string(),
-										MAX_COMMIT_FILES.to_string(),
-									],
+				match res {
+					Ok((mut files, gitlinks, total, first, same)) => {
+						files.shrink_to_fit();
+						app_log!("[APP:E2E_CHANGES: files={}]", total);
+						if total > MAX_COMMIT_FILES {
+							model.set_status(
+								"status_commit_files_truncated",
+								[
+									total.to_string(),
+									MAX_COMMIT_FILES.to_string(),
+								],
+							);
+						}
+						model.commit_files = files;
+						model.commit_files_first_parent_same = same;
+						model.commit_file_origin.clear();
+						model.commit_file_gitlinks = gitlinks;
+						model.commit_files_truncated = total > MAX_COMMIT_FILES;
+						match first {
+							Some((path, p)) => {
+								model.selected_commit_file = Some(path.clone());
+								model.commit_file_sel.clear();
+								model.apply_source_preview(
+									path,
+									p.map(|p| (p, preview_source)),
 								);
 							}
-							model.commit_files = files;
-							model.commit_files_first_parent_same = same;
-							model.commit_file_origin.clear();
-							model.commit_file_gitlinks = gitlinks;
-							model.commit_files_truncated =
-								total > MAX_COMMIT_FILES;
-							match first {
-								Some((path, p)) => {
-									model.selected_commit_file =
-										Some(path.clone());
-									model.commit_file_sel.clear();
-									model.apply_source_preview(
-										path,
-										p.map(|p| (p, preview_source)),
-									);
-								}
-								None => {
-									model.show_preview_error(Msg::new(
-										"status_no_changes",
-										[],
-									));
-								}
+							None => {
+								model.show_preview_error(Msg::new(
+									"status_no_changes",
+									[],
+								));
 							}
 						}
-						Err(e) => {
-							model.show_preview_error(Msg::with_msg_arg(
-								"error_history",
-								[String::new()],
-								0,
-								e,
-							));
-						}
 					}
-					cx.notify();
-				});
-			},
-		);
+					Err(e) => {
+						model.show_preview_error(Msg::with_msg_arg(
+							"error_history",
+							[String::new()],
+							0,
+							e,
+						));
+					}
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// Cmd/Ctrl-click in the changed files: adds or drops `path` from the
@@ -2846,45 +2799,40 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel.clone()),
-			async move {
-				let err_root = root.clone();
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::PreviewStrict,
-							cancel: Some(cancel),
-						};
-						let g = host.open(&root, identity.as_ref(), &read)?;
-						read_preview(
-							g.as_ref(),
-							&source,
-							&for_bg,
-							change,
-							parents.as_deref(),
-							&read,
-						)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.preview_generation != task_generation {
-						return;
-					}
-					if model.apply_source_preview(
-						path.clone(),
-						res.map(|p| (p, psource)),
-					) {
-						app_log!("[APP:PREVIEW_LOADED: {}]", path);
-					} else {
-						model.preview_error_root = Some(err_root);
-					}
-					cx.notify();
-				});
-			},
-		);
+		self.spawn_owned(cx, Some(cancel.clone()), async move {
+			let err_root = root.clone();
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::PreviewStrict,
+						cancel: Some(cancel),
+					};
+					let g = host.open(&root, identity.as_ref(), &read)?;
+					read_preview(
+						g.as_ref(),
+						&source,
+						&for_bg,
+						change,
+						parents.as_deref(),
+						&read,
+					)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.preview_generation != task_generation {
+					return;
+				}
+				if model.apply_source_preview(
+					path.clone(),
+					res.map(|p| (p, psource)),
+				) {
+					app_log!("[APP:PREVIEW_LOADED: {}]", path);
+				} else {
+					model.preview_error_root = Some(err_root);
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// A multi-selection's diff of `path`: the oldest selected commit's
@@ -3039,60 +2987,50 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let (sha_bg, dir_bg) = (sha.clone(), dir.clone());
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel_bg),
-						};
-						let g = host.open(&root, identity.as_ref(), &read)?;
-						g.commit_directory(
-							&sha_bg,
-							&dir_bg,
-							MAX_REV_ROWS,
-							&read,
-						)
-						.map_err(crate::remote::git_error_msg)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.tree_generation != gen {
-						return;
-					}
-					let Some(tree) = model.rev_tree.as_mut() else {
-						return;
+		self.spawn_owned(cx, Some(cancel), async move {
+			let (sha_bg, dir_bg) = (sha.clone(), dir.clone());
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel_bg),
 					};
-					match res {
-						Ok((entries, truncated)) => {
-							if e2e_on() {
-								let names: Vec<&str> = entries
-									.iter()
-									.map(|e| e.name.as_str())
-									.collect();
-								app_log!(
+					let g = host.open(&root, identity.as_ref(), &read)?;
+					g.commit_directory(&sha_bg, &dir_bg, MAX_REV_ROWS, &read)
+						.map_err(crate::remote::git_error_msg)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.tree_generation != gen {
+					return;
+				}
+				let Some(tree) = model.rev_tree.as_mut() else {
+					return;
+				};
+				match res {
+					Ok((entries, truncated)) => {
+						if e2e_on() {
+							let names: Vec<&str> = entries
+								.iter()
+								.map(|e| e.name.as_str())
+								.collect();
+							app_log!(
 									"[APP:E2E_TREE: rev={} dir={} entries={} fnv={:x}]",
 									&sha[..7],
 									if dir.is_empty() { "/" } else { &dir },
 									entries.len(),
 									fnv1a(names.join("\n").as_bytes())
 								);
-							}
-							tree.insert_dir(dir, entries, truncated);
 						}
-						Err(e) => {
-							tree.note_error(dir, e);
-						}
+						tree.insert_dir(dir, entries, truncated);
 					}
-					cx.notify();
-				});
-			},
-		);
+					Err(e) => {
+						tree.note_error(dir, e);
+					}
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	pub fn rev_tree_click(
@@ -3152,63 +3090,59 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Preview,
-							cancel: Some(cancel_bg),
-						};
-						let g = host.open(&root, identity.as_ref(), &read)?;
-						g.commit_blob(
-							&sha_bg,
-							&path_bg,
-							browser::MAX_BLOB_BYTES,
-							&read,
-						)
-						.map_err(crate::PreviewErr::git)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.preview_generation != task_generation {
-						return;
-					}
-					model.preview_loading = false;
-					match res {
-						Ok(BlobText::Text(s)) => {
-							let lang = Language::from_path_or_ext(&path, false);
-							if model.set_preview(Preview::new(
-								PreviewSource::CommitFile { sha: sha.clone() },
-								Some(path.clone()),
-								s,
-								false,
-								lang,
-							)) {
-								app_log!("[APP:PREVIEW_LOADED: {}]", path);
-							}
+		self.spawn_owned(cx, Some(cancel), async move {
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Preview,
+						cancel: Some(cancel_bg),
+					};
+					let g = host.open(&root, identity.as_ref(), &read)?;
+					g.commit_blob(
+						&sha_bg,
+						&path_bg,
+						browser::MAX_BLOB_BYTES,
+						&read,
+					)
+					.map_err(crate::PreviewErr::git)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.preview_generation != task_generation {
+					return;
+				}
+				model.preview_loading = false;
+				match res {
+					Ok(BlobText::Text(s)) => {
+						let lang = Language::from_path_or_ext(&path, false);
+						if model.set_preview(Preview::new(
+							PreviewSource::CommitFile { sha: sha.clone() },
+							Some(path.clone()),
+							s,
+							false,
+							lang,
+						)) {
+							app_log!("[APP:PREVIEW_LOADED: {}]", path);
 						}
-						Ok(BlobText::Binary) => model.show_preview_error(
-							Msg::new("error_binary", [path.clone()]),
-						),
-						Ok(BlobText::NotUtf8) => model.show_preview_error(
-							Msg::new("error_not_utf8", [path.clone()]),
-						),
-						Ok(BlobText::TooLarge(n)) => {
-							model.show_preview_error(Msg::new(
-								"error_too_large",
-								[path.clone(), n.to_string()],
-							))
-						}
-						Err(e) => model.show_preview_error(e.msg(path.clone())),
 					}
-					cx.notify();
-				});
-			},
-		);
+					Ok(BlobText::Binary) => model.show_preview_error(Msg::new(
+						"error_binary",
+						[path.clone()],
+					)),
+					Ok(BlobText::NotUtf8) => model.show_preview_error(
+						Msg::new("error_not_utf8", [path.clone()]),
+					),
+					Ok(BlobText::TooLarge(n)) => {
+						model.show_preview_error(Msg::new(
+							"error_too_large",
+							[path.clone(), n.to_string()],
+						))
+					}
+					Err(e) => model.show_preview_error(e.msg(path.clone())),
+				}
+				cx.notify();
+			});
+		});
 	}
 }
 
@@ -3834,50 +3768,44 @@ impl WorkbenchModel {
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
 		let identity = self.identity_for(&root);
-		self.spawn_owned(
-			cx,
-			crate::lifecycle::JobKind::CancellableRead,
-			Some(cancel),
-			async move {
-				let res = bg
-					.spawn(async move {
-						let read = Read {
-							profile: ReadProfile::Interactive,
-							cancel: Some(cancel_bg),
-						};
-						read_feed_page(
-							&host,
-							&root,
-							identity.as_ref(),
-							first,
-							tips,
-							ref_filter.as_deref(),
-							search.as_ref(),
-							skip,
-							want_email,
-							&read,
-						)
-					})
-					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.history_generation != generation {
-						return;
+		self.spawn_owned(cx, Some(cancel), async move {
+			let res = bg
+				.spawn(async move {
+					let read = Read {
+						profile: ReadProfile::Interactive,
+						cancel: Some(cancel_bg),
+					};
+					read_feed_page(
+						&host,
+						&root,
+						identity.as_ref(),
+						first,
+						tips,
+						ref_filter.as_deref(),
+						search.as_ref(),
+						skip,
+						want_email,
+						&read,
+					)
+				})
+				.await;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.history_generation != generation {
+					return;
+				}
+				model.history_extending = false;
+				let error = model.apply_feed_read(i, res);
+				match error {
+					Some(e) if model.log_feeds.iter().all(|f| f.failed) => {
+						model.history_autoload = false;
+						model
+							.report_graph_error(GraphAdmissionError::Layout(e));
+						cx.notify();
 					}
-					model.history_extending = false;
-					let error = model.apply_feed_read(i, res);
-					match error {
-						Some(e) if model.log_feeds.iter().all(|f| f.failed) => {
-							model.history_autoload = false;
-							model.report_graph_error(
-								GraphAdmissionError::Layout(e),
-							);
-							cx.notify();
-						}
-						_ => model.merged_step(target, cx),
-					}
-				});
-			},
-		);
+					_ => model.merged_step(target, cx),
+				}
+			});
+		});
 	}
 
 	/// Takes a feed read in, namespacing its ids; a failed read ends that

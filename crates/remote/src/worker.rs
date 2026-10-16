@@ -937,11 +937,13 @@ fn serve(
 				)?;
 			}
 			other => {
-				if let Some(d) = answer.work_delay() {
-					std::thread::sleep(d);
-				}
-				let response = state.handle(other);
-				answer.reply(&response)?;
+				let (view_deadline, _) = *lock(&state.deadlines);
+				crate::jobs::run_inline(
+					&mut answer,
+					negotiated,
+					view_deadline,
+					|covered| state.handle(other, covered),
+				)?;
 			}
 		}
 	}
@@ -1108,7 +1110,7 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 
 impl State {
 	#[allow(clippy::result_large_err)]
-	fn handle(&self, request: Request) -> Response {
+	fn handle(&self, request: Request, _: crate::jobs::Covered) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
