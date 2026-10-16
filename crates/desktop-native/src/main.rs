@@ -19969,7 +19969,7 @@ mod tests {
 				(root, cx)
 			}
 
-			fn tab(
+			pub(super) fn tab(
 				root: &Entity<TabsRoot>,
 				cx: &mut VisualTestContext,
 				ix: usize,
@@ -19984,7 +19984,7 @@ mod tests {
 				root.read_with(cx, |r, _| r.tabs.len())
 			}
 
-			fn active(
+			pub(super) fn active(
 				root: &Entity<TabsRoot>,
 				cx: &mut VisualTestContext,
 			) -> Option<usize> {
@@ -20120,7 +20120,7 @@ mod tests {
 				(tmp, a, b)
 			}
 
-			fn two_tabs(
+			pub(super) fn two_tabs(
 				cx: &mut TestAppContext,
 			) -> (
 				tempfile::TempDir,
@@ -20144,7 +20144,7 @@ mod tests {
 				(tmp, a, b, root, cx)
 			}
 
-			fn wait_scaled(
+			pub(super) fn wait_scaled(
 				cx: &mut VisualTestContext,
 				what: &str,
 				mut ready: impl FnMut(&mut VisualTestContext) -> bool,
@@ -23222,6 +23222,982 @@ mod tests {
 					.expect("first item drawn")
 					.center();
 				assert!(!covered_by_tooltip(cx, item, &text));
+			}
+		}
+
+		/// Floating and inline layers have one owner (#226): the shared
+		/// rules (Escape, exclusion, return of the focus, a tab switch) are
+		/// pinned over every layer, not over the one that last broke.
+		mod overlays {
+			use super::workspace_tabs::{active, tab, two_tabs, wait_scaled};
+			use super::*;
+			use gpui::{Modifiers, MouseButton};
+
+			/// Every open layer by name: the one place a test reads them.
+			fn open_kinds(m: &WorkbenchModel) -> Vec<String> {
+				let mut v = Vec::new();
+				if m.workspace_menu {
+					v.push("workspace-menu".to_string());
+				}
+				if let Some(k) = m.log_menu {
+					v.push(format!("log-menu:{k:?}"));
+				}
+				if let Some(k) = m.popover {
+					v.push(format!("selector:{k:?}"));
+				}
+				if m.chrome.menu.is_some() {
+					v.push("context-menu".to_string());
+				}
+				if m.reader.find_open {
+					v.push("find-bar".to_string());
+				}
+				if m.is_adding_repo {
+					v.push("add-repo".to_string());
+				}
+				v
+			}
+
+			fn is_inline(name: &str) -> bool {
+				name == "find-bar" || name == "add-repo"
+			}
+
+			fn floating(m: &WorkbenchModel) -> Vec<String> {
+				open_kinds(m)
+					.into_iter()
+					.filter(|k| !is_inline(k))
+					.collect()
+			}
+
+			fn inline(m: &WorkbenchModel) -> Vec<String> {
+				open_kinds(m).into_iter().filter(|k| is_inline(k)).collect()
+			}
+
+			fn floating_now(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> Vec<String> {
+				model.read_with(cx, |m, _| floating(m))
+			}
+
+			/// The pane or field that holds the keyboard, by name.
+			fn focus_name(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> &'static str {
+				cx.update(|window, cx| {
+					let m = model.read(cx);
+					let on = |h: &gpui::FocusHandle| h.is_focused(window);
+					if on(&m.tree_focus) {
+						"tree"
+					} else if on(&m.log_focus) {
+						"log"
+					} else if on(&m.reader_focus) {
+						"reader"
+					} else if on(&m.paste_focus) {
+						"paste"
+					} else if on(&m.chrome.menu_focus) {
+						"menu"
+					} else if on(&m.focus_handle) {
+						"root"
+					} else if on(&m.find_input.read(cx).handle())
+						|| on(&m.goto_input.read(cx).handle())
+					{
+						"find-field"
+					} else if on(&m.selector_input.read(cx).handle()) {
+						"selector-field"
+					} else if on(&m.log_path_input.read(cx).handle())
+						|| on(&m.log_branch_menu_input.read(cx).handle())
+					{
+						"log-menu-field"
+					} else if on(&m.workspace_path_input.read(cx).handle()) {
+						"workspace-field"
+					} else {
+						"other"
+					}
+				})
+			}
+
+			/// The centre of a probed control (tree rows and the editor tab
+			/// carry probe ids, not debug selectors), in window pixels.
+			fn probed_center(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> gpui::Point<gpui::Pixels> {
+				if model.read_with(cx, |m, _| m.probes.is_none()) {
+					model.update(cx, |m, cx| {
+						m.probes = Some(crate::ui::Probes::for_test());
+						cx.notify();
+					});
+				}
+				settle(cx);
+				let b = model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+					.unwrap_or_else(|| panic!("no probed control {id}"));
+				let scale = cx.update(|window, _| window.scale_factor());
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				)
+			}
+
+			/// A right press, the way the row's menu opens (on mouse down).
+			fn right_press(
+				cx: &mut VisualTestContext,
+				at: gpui::Point<gpui::Pixels>,
+			) {
+				cx.simulate_mouse_down(
+					at,
+					MouseButton::Right,
+					Modifiers::none(),
+				);
+				cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+				settle(cx);
+			}
+
+			/// Two repositories with a commit each and a dirty file in the
+			/// first, opened with its Changes row previewed in the reader:
+			/// every pane has something, and the Log has a repo chip.
+			fn fixture(
+				cx: &mut TestAppContext,
+				w: f32,
+				h: f32,
+			) -> (
+				tempfile::TempDir,
+				Entity<WorkbenchModel>,
+				&mut VisualTestContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				for name in ["alpha", "beta"] {
+					let r = repo(ws.path(), name, &[]);
+					fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+					git(&r, &["add", "."]);
+					git(&r, &["commit", "-q", "-m", "commit c1"]);
+				}
+				fs::write(ws.path().join("alpha").join("base.txt"), "dirty")
+					.unwrap();
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, w, h);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| {
+						!m.commits.is_empty() && m.log_width.get() > 0.
+					}) {
+						break;
+					}
+				}
+				settle(cx);
+				cx.simulate_keystrokes("alt-0");
+				settle(cx);
+				click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+				click_probed(&model, cx, "change-row@alpha:unstaged:base.txt");
+				settle(cx);
+				assert!(
+					model.read_with(cx, |m, _| m.preview.is_some()),
+					"the dirty file is previewed in the reader"
+				);
+				(ws, model, cx)
+			}
+
+			/// Every way a floating layer opens by a gesture.
+			#[derive(Clone, Copy, Debug)]
+			enum Opener {
+				Click(&'static str, &'static str),
+				RightLogRow,
+				RightRepoRow,
+				RightEditorTab,
+			}
+
+			impl Opener {
+				/// The layer it opens.
+				fn opens(self) -> &'static str {
+					match self {
+						Opener::Click(_, name) => name,
+						_ => "context-menu",
+					}
+				}
+
+				fn label(self) -> String {
+					match self {
+						Opener::Click(id, _) => id.to_string(),
+						other => format!("{other:?}"),
+					}
+				}
+
+				fn fire(
+					self,
+					model: &Entity<WorkbenchModel>,
+					cx: &mut VisualTestContext,
+				) {
+					match self {
+						Opener::Click(id, _) => {
+							let b = cx.debug_bounds(id).unwrap_or_else(|| {
+								panic!("opener {id} is not drawn")
+							});
+							cx.simulate_click(b.center(), Modifiers::none());
+							settle(cx);
+						}
+						Opener::RightLogRow => {
+							let b = cx
+								.debug_bounds("log-subject:0")
+								.expect("a Log row is drawn");
+							right_press(cx, b.center());
+						}
+						Opener::RightRepoRow => {
+							cx.simulate_keystrokes("alt-1");
+							settle(cx);
+							let at = probed_center(model, cx, "repo-row:alpha");
+							right_press(cx, at);
+						}
+						Opener::RightEditorTab => {
+							let at = probed_center(model, cx, "editor-tab");
+							right_press(cx, at);
+						}
+					}
+				}
+			}
+
+			const WIDE_OPENERS: [Opener; 11] = [
+				Opener::Click("btn-workspace-menu", "workspace-menu"),
+				Opener::Click("btn-repo-selector", "selector:Repo"),
+				Opener::Click("btn-ref-selector", "selector:Ref"),
+				Opener::Click("btn-log-more", "log-menu:More"),
+				Opener::Click("log-filter-repo", "log-menu:Repo"),
+				Opener::Click("log-filter-branch", "log-menu:Branch"),
+				Opener::Click("log-filter-user", "log-menu:User"),
+				Opener::Click("log-filter-date", "log-menu:Date"),
+				Opener::RightLogRow,
+				Opener::RightRepoRow,
+				Opener::RightEditorTab,
+			];
+
+			/// The focus origins: every key context the keymap names, and
+			/// the text fields that bind their own Escape.
+			const ORIGINS: [&str; 9] = [
+				"root",
+				"tree",
+				"log-row",
+				"reader",
+				"find-bar",
+				"goto-bar",
+				"log-search",
+				"branch-filter",
+				"own",
+			];
+
+			/// Closes whatever a failed cell left open, so one failure does not
+			/// become every later cell's.
+			fn reset(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) {
+				model.update(cx, |m, cx| {
+					m.workspace_menu = false;
+					m.workspace_picker = false;
+					m.remote.end_browse();
+					m.log_menu = None;
+					m.popover = None;
+					m.chrome.menu = None;
+					m.reader.find_open = false;
+					m.is_adding_repo = false;
+					cx.notify();
+				});
+				focus_origin(model, cx, "root");
+			}
+
+			fn drawn_among(
+				cx: &mut VisualTestContext,
+				ids: &[&'static str],
+			) -> Vec<&'static str> {
+				ids.iter()
+					.copied()
+					.filter(|id| cx.debug_bounds(id).is_some())
+					.collect()
+			}
+
+			/// Puts the keyboard in `origin` the way a user leaves it there:
+			/// Alt+N or a click moves a pane, a field takes its own focus.
+			fn focus_origin(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				origin: &str,
+			) {
+				if origin == "own" {
+					return;
+				}
+				let h = cx.update(|_, cx| {
+					let m = model.read(cx);
+					match origin {
+						"find-bar" => m.find_input.read(cx).handle(),
+						"goto-bar" => m.goto_input.read(cx).handle(),
+						"log-search" => m.log_search_input.read(cx).handle(),
+						"branch-filter" => {
+							m.branch_filter_input.read(cx).handle()
+						}
+						"log-row" => m.log_focus.clone(),
+						"tree" => m.tree_focus.clone(),
+						"reader" => m.reader_focus.clone(),
+						_ => m.focus_handle.clone(),
+					}
+				});
+				cx.update(|window, _| window.focus(&h));
+				settle(cx);
+				assert!(
+					cx.update(|window, _| h.is_focused(window)),
+					"{origin} holds the keyboard (it is drawn)"
+				);
+			}
+
+			/// The whole matrix: each opener against each origin. A failing
+			/// cell is named, and the cells are counted so a control that
+			/// stops being drawn cannot thin the matrix out.
+			fn escape_matrix(
+				model: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				openers: &[Opener],
+			) {
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for origin in ORIGINS {
+					for opener in openers {
+						// A find bar is open before the layer is: opening a
+						// layer leaves an inline layer alone.
+						match origin {
+							"find-bar" => cx.simulate_keystrokes("ctrl-f"),
+							"goto-bar" => cx.simulate_keystrokes("ctrl-g"),
+							_ => {}
+						}
+						settle(cx);
+						opener.fire(model, cx);
+						let open = floating_now(model, cx);
+						assert!(
+							open.iter().any(|k| k == opener.opens()),
+							"{} opened {} (open: {open:?})",
+							opener.label(),
+							opener.opens()
+						);
+						focus_origin(model, cx, origin);
+						let before = model.read_with(cx, |m, _| inline(m));
+						cx.simulate_keystrokes("escape");
+						settle(cx);
+						let (after, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						if !after.is_empty() {
+							failures.push(format!(
+								"{} from {origin}: still open {after:?}",
+								opener.label()
+							));
+						}
+						if inl != before {
+							failures.push(format!(
+								"{} from {origin}: inline layers {before:?} -> {inl:?}",
+								opener.label()
+							));
+						}
+						cases += 1;
+						// Back to a bare state for the next cell.
+						reset(model, cx);
+					}
+				}
+				assert_eq!(cases, openers.len() * ORIGINS.len());
+				assert!(
+					failures.is_empty(),
+					"Escape left layers open in {} of {cases} cases:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// The key contexts the keymap names are all covered by an origin
+			/// or are explained: a new context needs a decision here.
+			#[test]
+			fn no_plain_escape_binding_outside_the_root_rule() {
+				use gpui::AsKeystroke;
+				let offenders: Vec<String> = crate::key_bindings()
+					.iter()
+					.filter(|b| {
+						b.keystrokes().first().is_some_and(|k| {
+							let k = k.as_keystroke();
+							k.key == "escape" && !k.modifiers.modified()
+						})
+					})
+					.map(|b| {
+						format!(
+							"escape -> {:?} in {:?}",
+							b.action().name(),
+							b.predicate().map(|p| p.to_string())
+						)
+					})
+					.collect();
+				assert!(
+					offenders.is_empty(),
+					"a bare Escape belongs to the root rule \
+					 (`WorkbenchModel::on_escape`), not to a pane or a field:\n{}",
+					offenders.join("\n")
+				);
+			}
+
+			/// Escape closes the floating layer whatever holds the keyboard
+			/// (#212): the matrix over every opener and every origin.
+			#[gpui::test]
+			fn escape_closes_the_floating_layer_from_every_focus_target(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let drawn = drawn_among(
+					cx,
+					&[
+						"btn-workspace-menu",
+						"btn-repo-selector",
+						"btn-ref-selector",
+						"btn-log-more",
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+						"log-filter-more",
+					],
+				);
+				assert_eq!(
+					drawn,
+					[
+						"btn-workspace-menu",
+						"btn-repo-selector",
+						"btn-ref-selector",
+						"btn-log-more",
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+					],
+					"the openers drawn at 1080w"
+				);
+				escape_matrix(&model, cx, &WIDE_OPENERS);
+			}
+
+			/// The same at the width where the filter chips fold into the
+			/// overflow chip.
+			#[gpui::test]
+			fn escape_closes_the_overflow_layout_layers_from_every_focus_target(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 900., 600.);
+				let drawn = drawn_among(
+					cx,
+					&[
+						"log-filter-repo",
+						"log-filter-branch",
+						"log-filter-user",
+						"log-filter-date",
+						"log-filter-more",
+					],
+				);
+				assert_eq!(
+					drawn,
+					["log-filter-repo", "log-filter-more"],
+					"the chips drawn at 900w"
+				);
+				escape_matrix(
+					&model,
+					cx,
+					&[
+						Opener::Click("log-filter-repo", "log-menu:Repo"),
+						Opener::Click("log-filter-more", "log-menu:FilterMore"),
+						Opener::RightLogRow,
+					],
+				);
+			}
+
+			/// A context menu does not outlive a keyboard move to a pane
+			/// (#212): Alt+1 leaves the menu drawn, Escape still closes it.
+			#[gpui::test]
+			fn escape_closes_a_menu_after_keyboard_focus_moves(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				let at = probed_center(&model, cx, "repo-row:alpha");
+				right_press(cx, at);
+				assert_eq!(
+					floating_now(&model, cx),
+					["context-menu"],
+					"the row's menu is open"
+				);
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"Escape after Alt+1 closes the menu (focus: {})",
+					focus_name(&model, cx)
+				);
+			}
+
+			/// Escape in another pane leaves the find bar open: it belongs to
+			/// the reader, not to whatever pane the key landed in.
+			#[gpui::test]
+			fn escape_in_another_pane_keeps_the_find_bar(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("ctrl-f");
+				settle(cx);
+				assert_eq!(model.read_with(cx, |m, _| inline(m)), ["find-bar"]);
+				// Alt+9 hides a visible Log; the keyboard moves there the way a
+				// click on a row leaves it.
+				focus_origin(&model, cx, "log-row");
+				assert_eq!(focus_name(&model, cx), "log");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| inline(m)),
+					["find-bar"],
+					"Escape in the Log leaves the find bar"
+				);
+				assert_eq!(focus_name(&model, cx), "reader");
+				// With a selection, the first Escape only clears it.
+				model.update(cx, |m, cx| m.select_all_text(cx));
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| inline(m)),
+					["find-bar"],
+					"the first Escape clears the selection"
+				);
+				assert!(
+					model.read_with(cx, |m, _| m.reader.selection().is_none())
+				);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(
+					model.read_with(cx, |m, _| inline(m).is_empty()),
+					"the second Escape closes the find bar"
+				);
+			}
+
+			/// A second press on the button that opened a layer closes it,
+			/// fast or slow (#212): the chip's old 400 ms clock reopened it.
+			#[gpui::test]
+			fn a_second_press_on_a_trigger_closes_its_layer(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let buttons: Vec<Opener> = WIDE_OPENERS
+					.into_iter()
+					.filter(|o| matches!(o, Opener::Click(..)))
+					.collect();
+				for o in &buttons {
+					o.fire(&model, cx);
+					assert_eq!(
+						floating_now(&model, cx),
+						[o.opens()],
+						"{} opens its layer",
+						o.label()
+					);
+					o.fire(&model, cx);
+					let left = floating_now(&model, cx);
+					if !left.is_empty() {
+						failures.push(format!(
+							"{}: a second press left {left:?}",
+							o.label()
+						));
+						reset(&model, cx);
+					}
+				}
+				// The slow press: down, hold, up. The mouse down closes the
+				// layer; the click that follows must not reopen it.
+				for o in buttons.iter().filter(
+					|o| matches!(o, Opener::Click(id, _) if id.starts_with("log-filter-")),
+				) {
+					let Opener::Click(id, _) = o else {
+						unreachable!()
+					};
+					o.fire(&model, cx);
+					let at = cx.debug_bounds(id).unwrap().center();
+					cx.simulate_mouse_down(
+						at,
+						MouseButton::Left,
+						Modifiers::none(),
+					);
+					// Holding the button down is the point: not a wait.
+					std::thread::sleep(Duration::from_millis(450));
+					cx.simulate_mouse_up(
+						at,
+						MouseButton::Left,
+						Modifiers::none(),
+					);
+					settle(cx);
+					let left = floating_now(&model, cx);
+					if !left.is_empty() {
+						failures.push(format!(
+							"{id}: a slow press (450 ms) left {left:?}"
+						));
+						reset(&model, cx);
+					}
+				}
+				assert!(
+					failures.is_empty(),
+					"a second press must close the layer it opened:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// The overflow chip's menu holds sub-menus: the chip that opened
+			/// the first closes whatever it opened last.
+			#[gpui::test]
+			fn the_overflow_chip_closes_the_sub_menu_it_opened(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 900., 600.);
+				let more =
+					Opener::Click("log-filter-more", "log-menu:FilterMore");
+				more.fire(&model, cx);
+				let b = cx
+					.debug_bounds("log-filter-more:user")
+					.expect("the User filter is listed in the overflow menu");
+				cx.simulate_click(b.center(), Modifiers::none());
+				settle(cx);
+				assert_eq!(floating_now(&model, cx), ["log-menu:User"]);
+				more.fire(&model, cx);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"the overflow chip closes the sub-menu it opened"
+				);
+			}
+
+			/// A layer opened by the keyboard closes the floating layer that
+			/// was open; opening an inline layer does too, and an inline layer
+			/// that was open stays.
+			#[gpui::test]
+			fn opening_a_layer_by_keyboard_closes_the_floating_one(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut cases = 0;
+				for opener in WIDE_OPENERS {
+					for key in
+						["alt-shift-r", "secondary-shift-`", "ctrl-f", "ctrl-g"]
+					{
+						opener.fire(&model, cx);
+						cx.simulate_keystrokes(key);
+						settle(cx);
+						let (open, inl) = model
+							.read_with(cx, |m, _| (floating(m), inline(m)));
+						let want: Vec<String> = match (key, opener) {
+							(
+								"alt-shift-r",
+								Opener::Click(_, "selector:Repo"),
+							)
+							| (
+								"secondary-shift-`",
+								Opener::Click(_, "selector:Ref"),
+							) => Vec::new(),
+							("alt-shift-r", _) => vec!["selector:Repo".into()],
+							("secondary-shift-`", _) => {
+								vec!["selector:Ref".into()]
+							}
+							_ => Vec::new(),
+						};
+						if open != want {
+							failures.push(format!(
+								"{} then {key}: floating {open:?}, want {want:?}",
+								opener.label()
+							));
+						}
+						if key.starts_with("ctrl") && inl != ["find-bar"] {
+							failures.push(format!(
+								"{} then {key}: inline {inl:?}",
+								opener.label()
+							));
+						}
+						cases += 1;
+						reset(&model, cx);
+					}
+				}
+				assert_eq!(cases, WIDE_OPENERS.len() * 4);
+				assert!(
+					failures.is_empty(),
+					"{} of {cases} cases left two layers or the wrong one:\n{}",
+					failures.len(),
+					failures.join("\n")
+				);
+			}
+
+			/// A background workspace tab shows no layer, and the host
+			/// browse a layer owned ends with it; the focus the layer would
+			/// have given back is where the tab resumes.
+			#[gpui::test]
+			fn a_tab_switch_closes_floating_layers_and_their_browse(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+				settle(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				let tab0 = tab(&root, cx, 0);
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				tab0.update(cx, |m, cx| {
+					m.remote.hosts =
+						vec![snip_remote::RemoteHost::in_process(worker)];
+					cx.notify();
+				});
+				for _ in 0..50 {
+					settle(cx);
+					if tab0.read_with(cx, |m, _| !m.commits.is_empty())
+						&& cx.debug_bounds("log-filter-branch").is_some()
+					{
+						break;
+					}
+				}
+				let mut failures = Vec::new();
+				for case in
+					["workspace-menu", "log-menu:Branch", "selector:Repo"]
+				{
+					match case {
+						"workspace-menu" => {
+							Opener::Click("btn-workspace-menu", case)
+								.fire(&tab0, cx);
+							Opener::Click("remote-host:0", case)
+								.fire(&tab0, cx);
+							wait_scaled(
+								cx,
+								"the host's folders are listed",
+								|cx| {
+									tab0.read_with(cx, |m, _| {
+										m.remote.browse.as_ref().is_some_and(
+											|b| b.listing.is_some(),
+										)
+									})
+								},
+							);
+						}
+						"log-menu:Branch" => {
+							Opener::Click("log-filter-branch", case)
+								.fire(&tab0, cx)
+						}
+						_ => {
+							cx.simulate_keystrokes("alt-1");
+							settle(cx);
+							cx.simulate_keystrokes("alt-shift-r");
+							settle(cx);
+							assert_eq!(focus_name(&tab0, cx), "selector-field");
+						}
+					}
+					assert_eq!(
+						floating_now(&tab0, cx),
+						[case],
+						"{case} is open in the shown tab"
+					);
+					for (step, key, shown) in
+						[("away", "cmd-2", 1), ("back", "cmd-1", 0)]
+					{
+						cx.simulate_keystrokes(key);
+						settle(cx);
+						assert_eq!(active(&root, cx), Some(shown));
+						let (open, browse, hosts_ok) =
+							tab0.read_with(cx, |m, _| {
+								(
+									floating(m),
+									m.remote.browse.is_some(),
+									// The menu open implies its browse is the host's.
+									!m.workspace_menu
+										|| m.remote
+											.browse
+											.as_ref()
+											.is_none_or(|b| b.host == 0),
+								)
+							});
+						if !open.is_empty() {
+							failures.push(format!(
+								"{case} {step}: still open {open:?}"
+							));
+						}
+						if browse && !open.iter().any(|k| k == "workspace-menu")
+						{
+							failures.push(format!(
+								"{case} {step}: a browse without its menu"
+							));
+						}
+						if !hosts_ok {
+							failures.push(format!(
+								"{case} {step}: a menu over another host's browse"
+							));
+						}
+					}
+					if case == "workspace-menu" {
+						// The menu is gone, so its browse must be too.
+						let browse = tab0
+							.read_with(cx, |m, _| m.remote.browse.is_some());
+						if browse {
+							failures
+								.push("workspace-menu: a browse kept".into());
+						}
+					}
+					if case == "selector:Repo" {
+						let at = focus_name(&tab0, cx);
+						if at != "tree" {
+							failures.push(format!(
+								"selector:Repo: focus resumes in {at}, not the tree it was opened from"
+							));
+						}
+					}
+					// Leave nothing open for the next case.
+					reset(&tab0, cx);
+				}
+				assert!(
+					failures.is_empty(),
+					"a tab switch must close the floating layers:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// One rule for the keyboard after a layer closes (the user's
+			/// decision): back to where it was opened from, or the root.
+			#[gpui::test]
+			fn closing_a_layer_returns_focus_by_one_rule(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				let mut failures = Vec::new();
+				let mut check = |row: &str,
+				                 got: &'static str,
+				                 want: &'static str| {
+					if got != want {
+						failures
+							.push(format!("{row}: focus {got}, want {want}"));
+					}
+				};
+				// 1: a selector opened from the project tree.
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				assert_eq!(focus_name(&model, cx), "tree");
+				cx.simulate_keystrokes("alt-shift-r");
+				settle(cx);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				check("1 selector, Escape", focus_name(&model, cx), "tree");
+				assert!(floating_now(&model, cx).is_empty());
+
+				// 2: a Log chip, closed by a press on bare header space.
+				Opener::Click("log-filter-repo", "log-menu:Repo")
+					.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["log-menu:Repo"]);
+				let ref_b = cx.debug_bounds("btn-ref-selector").unwrap();
+				let paste = probed_center(&model, cx, "btn-paste");
+				let left = f32::from(ref_b.origin.x + ref_b.size.width);
+				let blank = gpui::point(gpui::px(left + 40.), ref_b.center().y);
+				assert!(
+					f32::from(paste.x) - (left + 40.) > 40.,
+					"bare header space: {left}..{:?}",
+					paste.x
+				);
+				cx.simulate_click(blank, Modifiers::none());
+				settle(cx);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"2 Log chip, outside press",
+					focus_name(&model, cx),
+					"log",
+				);
+
+				// 3: a context menu opened on a tree row.
+				Opener::RightRepoRow.fire(&model, cx);
+				assert_eq!(floating_now(&model, cx), ["context-menu"]);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				check("3 context menu, Escape", focus_name(&model, cx), "tree");
+
+				// 4: the find bar.
+				cx.simulate_keystrokes("ctrl-f");
+				settle(cx);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				check("4 find bar, Escape", focus_name(&model, cx), "reader");
+
+				// 5: the workspace menu's path field.
+				Opener::Click("btn-workspace-menu", "workspace-menu")
+					.fire(&model, cx);
+				let at = probed_center(&model, cx, "btn-open-workspace");
+				cx.simulate_click(at, Modifiers::none());
+				settle(cx);
+				assert_eq!(focus_name(&model, cx), "workspace-field");
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"5 workspace field, Escape",
+					focus_name(&model, cx),
+					"root",
+				);
+
+				// 6: a press on another pane keeps what that pane took.
+				Opener::Click("btn-ref-selector", "selector:Ref")
+					.fire(&model, cx);
+				let at = probed_center(&model, cx, "repo-row:alpha");
+				cx.simulate_click(at, Modifiers::none());
+				settle(cx);
+				assert!(floating_now(&model, cx).is_empty());
+				check(
+					"6 outside press on the tree",
+					focus_name(&model, cx),
+					"tree",
+				);
+				assert!(
+					failures.is_empty(),
+					"the focus after a layer closes:\n{}",
+					failures.join("\n")
+				);
+			}
+
+			/// An IME composition owns Escape: the first one ends the
+			/// composition, the next closes the layer.
+			#[gpui::test]
+			fn escape_during_ime_composition_goes_to_the_ime(
+				cx: &mut TestAppContext,
+			) {
+				let (_ws, model, cx) = fixture(cx, 1080., 720.);
+				cx.simulate_keystrokes("alt-shift-r");
+				settle(cx);
+				assert_eq!(floating_now(&model, cx), ["selector:Repo"]);
+				let input =
+					model.read_with(cx, |m, _| m.selector_input.clone());
+				input.update(cx, |i, _| {
+					i.handle_replace_and_mark(None, "\u{3110}\u{3127}", None)
+				});
+				assert!(input.read_with(cx, |i, _| i.marked_range().is_some()));
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert_eq!(
+					floating_now(&model, cx),
+					["selector:Repo"],
+					"Escape during a composition is the IME's"
+				);
+				assert!(
+					input.read_with(cx, |i, _| i.marked_range().is_some()),
+					"the composition is untouched"
+				);
+				input.update(cx, |i, _| {
+					i.handle_unmark();
+				});
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				assert_eq!(
+					floating_now(&model, cx),
+					Vec::<String>::new(),
+					"Escape with no composition closes the selector"
+				);
 			}
 		}
 	}
