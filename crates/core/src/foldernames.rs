@@ -22,6 +22,14 @@
 //! it. (An earlier version folded the whole path; two roots that differ in
 //! case were merged, and the folder the user named under the second one was
 //! made without asking.)
+//!
+//! None of this is a safety check. Which names a filesystem merges is its
+//! own rule, and no table of ours is complete (HFS+ ignores U+200C, which
+//! no normalization removes). What this module tells is what the preview
+//! shows: the folders listed as named, and a collision refused before the
+//! user is asked. Apply asks the filesystem itself, under the write lock
+//! (`TransferImportPlan::apply_observed`): consent is to a placed folder,
+//! two writes to one file meet at `create_new`.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};

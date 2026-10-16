@@ -1035,7 +1035,7 @@ pub struct DestinationFreshnessSnapshot {
 	/// worker's paths only as they are written: it never takes them apart
 	/// by its own path rules (on Unix `\` is part of a name), so what a
 	/// worker on another OS makes comes from here. Recorded only when the
-	/// plan places a folder (`placed_tails`), so a plan without one is what
+	/// plan places a folder (`placed`), so a plan without one is what
 	/// it was. `None`: no tail, or an older peer; then the folders are read
 	/// off the paths, right only when both machines share path rules.
 	/// Not compared by `matches_preview`: it follows from the plan the

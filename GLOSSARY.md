@@ -35,7 +35,7 @@ _Avoid_: 對應資料夾、mapping folder
 _Avoid_: base、missing parts
 
 **指定新資料夾**（requested folder）與**順帶新資料夾**（incidental folder）:
-還不存在、要在 Apply 建立的資料夾分兩種。指定新資料夾是使用者指名的目的資料夾或導入路徑的尾段（`requested_dirs`），只在 Apply 經同意（`confirmed_new_dirs`）後、在寫入鎖之下建立。順帶新資料夾是檔案路徑隱含的中間資料夾，照舊在寫檔時直接建立、不需同意。
+還不存在、要在 Apply 建立的資料夾分兩種。指定新資料夾是使用者指名的目的資料夾或導入路徑的尾段（`requested_dirs`），只在 Apply 經同意後、在寫入鎖之下建立；同意的單位是它所屬的 `PlacedRoot`（`confirmed_placed`，計畫裡的位置），不是路徑或名稱。順帶新資料夾是檔案路徑隱含的中間資料夾，在 Apply 寫入內容前逐層建立、不需同意；它若以另一個名稱建出了未同意的指定新資料夾，整批拒絕。
 _Avoid_: 新資料夾（單獨使用，分不出需不需要同意）
 
 ## 錯誤
