@@ -267,6 +267,9 @@ pub fn reason_msg(r: &Reason) -> Msg {
 			headed("err_source_changed", changed(change))
 		}
 		Reason::DestinationChanged { change } => destination_changed(change),
+		Reason::NewDirsNotConfirmed { count } => {
+			Msg::new("err_new_dirs_not_confirmed", [count.to_string()])
+		}
 		Reason::CrossRepoCommits => Msg::new("err_cross_repo_commits", []),
 		Reason::Discontinuous {
 			base,

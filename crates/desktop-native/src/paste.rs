@@ -1065,6 +1065,7 @@ impl ApplyToken {
 			| Reason::AmbiguousRoots { .. }
 			| Reason::PayloadTooLarge { .. }
 			| Reason::SourceChanged { .. }
+			| Reason::NewDirsNotConfirmed { .. }
 			| Reason::CrossRepoCommits
 			| Reason::Discontinuous { .. }
 			| Reason::NotEnoughCommits { .. }
@@ -1113,8 +1114,11 @@ fn paste_target(
 	dest: &Path,
 ) -> Result<PasteTarget, Msg> {
 	Ok(match remote {
+		// The app never makes folders that do not exist: `allow_new_dirs`
+		// stays off, so `bound` is not read.
 		None => PasteTarget::Local {
 			dest: dest.to_path_buf(),
+			bound: None,
 		},
 		Some(r) => PasteTarget::Remote {
 			client: r.session.client.clone(),
@@ -3477,6 +3481,7 @@ impl PastePreviewPlan {
 			skip_existing: false,
 			unchecked_creates,
 			unchecked_deletes,
+			..Default::default()
 		};
 
 		// Run confirmed plan directly through shared transfer engine with freshness check
@@ -3617,6 +3622,7 @@ impl PastePreviewPlan {
 				planned_skipped_count: 0,
 				errors: Vec::new(),
 				failures: Vec::new(),
+				..Default::default()
 			},
 			created_commits: replay_res.created,
 		})
@@ -3662,6 +3668,7 @@ pub(crate) mod tests {
 					"gamma broke".into(),
 				],
 				failures: Vec::new(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3698,6 +3705,7 @@ pub(crate) mod tests {
 						reason: Some(r),
 					})
 					.collect(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3776,6 +3784,7 @@ pub(crate) mod tests {
 				deleted_count: 0,
 				errors: failures.iter().map(|f| f.path.clone()).collect(),
 				failures: failures.clone(),
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3819,6 +3828,7 @@ pub(crate) mod tests {
 				deleted_count: 0,
 				errors: failures.iter().map(|f| f.path.clone()).collect(),
 				failures,
+				..Default::default()
 			},
 			created_commits: Vec::new(),
 		};
@@ -3846,14 +3856,17 @@ pub(crate) mod tests {
 				prefixes: vec![("src".into(), bad.clone())],
 				..Default::default()
 			};
-			let err = PasteTarget::Local { dest: dest.clone() }
-				.plan_files(
-					"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
-					&route,
-					&RunOptions::default(),
-					None,
-				)
-				.expect_err("the prefix folder does not resolve");
+			let err = PasteTarget::Local {
+				dest: dest.clone(),
+				bound: None,
+			}
+			.plan_files(
+				"// clipcode-root: src\n// FILE: src/a.txt\nx\n",
+				&route,
+				&RunOptions::default(),
+				None,
+			)
+			.expect_err("the prefix folder does not resolve");
 			let msg = destination_msg(None, &dest, err);
 			assert_eq!(msg.args[0], bad.display().to_string(), "{msg:?}");
 			for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
