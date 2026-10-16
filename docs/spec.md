@@ -85,6 +85,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 - GUI:在**歷史時間軸**(commit graph)上選一段:點起點,Shift + 點終點（在兩端點間沿著 first-parent 鏈選取，自動略過分支上的 side commit；若無法構成 first-parent 鏈則退回可見列選取並在複製時拒絕；沿鏈只走目前顯示的 commit，若搜尋、ref 或路徑篩選隱藏了鏈中間的 commit（例如搜尋 `多行中文|C3 merge` 會隱藏 C2），選取就退回可見列範圍，複製時拒絕；清除篩選，或在隱藏的 commit 顯示時再選取，才能複製整條鏈）。
 - 顯示本機所有分支、遠端追蹤分支、標籤與 HEAD 的拓撲圖;可依 ref 篩選、搜尋 message / SHA,每頁 50 筆並能繼續載入（單一 repo 與多 repo 合併的 log 相同）。瀏覽不切換分支、不自動 fetch。
 - Log 的 Repository 篩選獨立於 Project 選取；單一 repo 的分支清單與 graph 都以該 Log repo 的 HEAD 標示目前位置。detached HEAD 不標任何分支為目前分支；多 repo 合併清單不顯示單一目前分支圖示，graph 仍依各列所屬 repo 判斷。
+- Log 重新載入後選取的 commit 不在清單裡時，選取連同它的檔案、詳情與預覽一併清除；篩選或搜尋的重載失敗（例如不成對的正規表示式）也一樣，右側不會留著清單已經沒有的 commit。分頁正在關閉（等待進行中的工作結束）時，點 Log 的列不改變選取，也不啟動任何讀取。
 - 點 commit 顯示它的檔案樹、內容與 diff;包含 root 的選取固定從所選 tip 回溯,也支援尚未合併的其他分支。
 - merge commit 的檔案清單保留 all-parent union，預覽 diff 比較 first parent；只相對其他 parent 改動、相對 first parent 不變的檔案顯示原文，不合成新增 diff。
 - merge commit 的檔案清單中，相對 first parent 不變、只因其他 parent 才列出的檔案以 muted 文字標示，tooltip 說明「與 first parent 相同（只在其他 parent 有變更）」。標記由 first parent 與 merge 的一次額外比較算出，不需改協定。
@@ -175,10 +176,16 @@ snip-sync 自訂,只要求 snip ↔ snip 互通:
     - 遠端分頁立刻以「主機 ▸ 名稱」顯示並存檔,在背景連線,狀態列顯示「正在重新連線 …」。連不上時分頁留著,狀態是失敗(警告圖示),分頁提示文字最後加「連線失敗:<原因>」,狀態列顯示「無法開啟遠端工作區:<原因>」;暫時性失敗會在背景重試,間隔 5、10、20、40 秒,之後每 60 秒一次:連線逾時或中斷、ssh 啟動失敗(含 ssh 訊息無法歸類的,例如網路尚未就緒)、遠端資料夾暫時不存在(NotFound)、worker 忙碌或逾時。已知永久拒絕停止自動重試,保留錯誤供使用者處理:權限拒絕(Forbidden)、缺少 worker、協定錯誤、版本過舊,以及其他拒絕碼。重試成功就在同一個分頁連上。按 Refresh 會立即重試失敗的還原分頁,不必等退避計時器。
     - 還原先依保存順序建立分頁，再優先啟動保存的作用中遠端分頁；同主機的背景分頁等它第一個 OpenWorkspace probe 完成、失敗或取消後才開始，最多等 30 秒，其他主機不等待。這是有界的啟動優先，不保證任意網路延遲下的回應順序；背景連線完成不能改變作用中 identity。成功開啟工作區的 Client 交給該分頁繼續使用，初次掃描不另建一個 Client。
     - e2e 日誌:還原時印 `[APP:REMOTE_REOPEN: host=.. path=..]`,每次 open 重試印 `[APP:REMOTE_RETRY: attempt=N]`；scan 失敗仍印 `REMOTE_SCAN_FAILED`，暫時失敗排程時印 `[APP:REMOTE_SCAN_RETRY: attempt=N delay_ms=..]`，恢復時印 `[APP:REMOTE_SCAN_RECOVERED: retries=N repos=N]`;啟動時若讀到存下的清單,印一次 `[APP:WS_TABS_RESTORED: count=<還原後的分頁數> skipped=<N>]`。每個還原的分頁各印一行 `[APP:WS_TAB_OPENED: id=.. count=..]`,id 依存下的順序指派,`--workspace` 的分頁(若是新開的)排最後。測試用的探針:`ws-tab-state:<索引>:failed`。
+  - **Log 一列放不下時誰先讓**(規則表與理由見 `docs/adr/0005-one-fit-rule-table.md`):日期一定完整;subject 先拿到可辨識下限(6 個字);標籤組(分支、tag、`+N`)排在作者欄之前,所以放不下時先隱藏作者欄(每列都一樣),標籤再整組捨棄,1080 寬以上一定有標籤;收合的 merge 列上「已收合 N」這段說明只是 gutter 裡 `+` 的註解,排在標籤組與作者欄之後,放不下時它先消失,不會讓這一列丟掉標籤,也不會讓整份清單失去作者欄;之後短的識別字先完整,再給 subject 舒適寬,再給作者(下限 3 個字)與日期。篩選 chip、分支窗格與選單、標頭的 ref 提示同一套規則:放不下的整個 chip 收進「更多」,repo 後綴整段或沒有,名稱至少 6 個字。每段文字畫出來的結果以 `[APP:TEXT_FIT: ...]` 對帳(見 `docs/real-ui-operator-protocol.md`)。
   - 選 repo / 資料夾。
   - 檔案模式:專案工具視窗照實顯示工作區資料夾(含非 Git 檔案,儲存庫在其所在位置標出分支與變更數),逐層載入目錄,單擊任一列即單獨選取(檔案在右側預覽,資料夾同時展開/收合;箭頭只展開不選取),選資料夾只選它本身,複製時才走訪;以 Ctrl/Cmd 多選、Shift 範圍選取,右鍵複製所選檔案與資料夾。選來源(檔案、working tree、staged、commit、區間);Git 來源(Changes)顯示真正的目錄階層、變更狀態與 diff;沒有勾選框也沒有選取籃,對任一節點右鍵「複製」就只複製那個節點:檔案列是該檔(帶它的來源 staged／unstaged／untracked),資料夾列是該 repo、該群組底下的檔案,repo 列是該 repo 在該群組的檔案,群組列是所有 repo 在該群組的檔案;名稱不是有效 UTF-8 的列不納入,沒有可複製內容時「複製」停用。commit 樹瀏覽的檔案列右鍵「複製」該檔在那個 commit 的內容。Cmd/Ctrl+C 複製左側工具視窗游標所在的節點(專案工具視窗是選取的列;閱讀器有選取文字時複製文字;Git Log 有焦點時複製選取的 commit)。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
   - commit 模式:歷史時間軸,選一段連續 commit → 複製(亦可於 Git Log 有焦點時按 Cmd/Ctrl+C 複製)。
   - 貼上:預覽(3.2 / 4.3)→ 確認 → 結果。
+    - 目的資料夾列(#238):預覽面板在 Apply／Cancel 底下有一列「貼上到」,窄視窗時折行。內容是麵包屑(工作區名稱 ▸ 各層資料夾,每一段都能點,回到那一層)、［工作區根目錄］［目前 repo］［左側選取］三個 chip(目前的資料夾用主色標出;［目前 repo］在沒有 repo、repo 就是工作區根目錄、或 repo 在工作區之外時不畫;［左側選取］只在 Project 恰好選了一列時畫,資料夾列取它本身、檔案列取它的資料夾)、［變更…］就地輸入工作區內的相對路徑、［瀏覽…］開 OS 資料夾對話框(只有本機)。目的地在 Cmd+V 當下仍依現行規則決定(`--restore-dir`,否則選取的 repo,否則工作區資料夾),之後由這一列改。目的地在工作區之外(例如工作區位在某個 repo 裡,預設是上層的 repo)時,麵包屑只畫一個不可點的路徑標籤。
+    - 換目的資料夾用同一份預覽過的內容重新規劃,不重讀剪貼簿;換掉之後前綴對應的選擇要重新選,新的預覽出來前 Apply 停用。只接受工作區內已存在的資料夾(含 symlink 解開之後仍在工作區內):不存在、不是資料夾、或在工作區之外時,本機的錯誤(麵包屑、chip、右鍵、瀏覽挑到的資料夾)顯示在這一列的狀態格,直到換了目的地或開始打字,原本的預覽維持可 Apply,焦點留在面板;瀏覽對話框回來時預覽已關閉或換成別份內容,結果丟棄(`[APP:PASTE_DEST_IGNORED: via=browse stale]`);遠端由 worker 判斷,面板停在新的資料夾,Apply 停用,錯誤條顯示 worker 的拒絕原因。不存在的資料夾不會被建立。來自檔案系統的資料夾(麵包屑、chip、右鍵、瀏覽、左側選取)是資料,名稱一個字元都不改:首尾空白的資料夾(`docs ` 與 `docs` 並存)就是那一個資料夾;只有使用者在輸入框打的字才會去掉首尾空白,輸入框開在某個資料夾上而沒動它時,那個名稱本身仍是該資料夾。寫入引擎(與 CLI 的 `--repo`)會把目的 root 的路徑結尾空白去掉(照 TS 的 `trim()`),所以名稱以空白結尾(含整個名稱都是空白)的資料夾寫不進去:狀態格以「資料夾名稱以空白結尾,貼上引擎不支援」直接拒絕,原本的預覽維持可 Apply,不會改寫成別的資料夾;開頭是空白的名稱照常使用。
+    - 就地輸入:［變更…］開啟輸入框並全選目前的相對路徑。Enter 套用該資料夾(錯了就留在輸入框並顯示原因),Esc 放棄輸入、保留原資料夾,再按一次 Esc 才關閉面板;輸入框開著時 Apply 停用(提示「先按 Enter 套用目的資料夾,或按 Esc 取消」;面板拿到焦點時按 Enter 也不會 Apply,日誌 `[APP:APPLY_IGNORED: editing]`,新預覽在輸入框開著時落地,焦點仍留在輸入框),空白字元進輸入框,不會切換預覽列的勾選。輸入框畫在面板的版面裡,是內嵌層(ADR 0004):Esc 走同一條 Escape 規則,關掉後焦點回到預覽面板;預覽關閉或換成新的一份時輸入框跟著關掉。
+    - 右鍵 Project 的資料夾列或 repo 列選「貼上到此資料夾」:預覽已開著就換目的地(同樣用預覽過的內容),沒開就從剪貼簿開新預覽;選單關閉後焦點在預覽面板,下一個 Enter 就是 Apply。
+    - e2e 日誌:`[APP:PASTE_DEST: via=<crumb|root|repo|left|input|browse|menu> dest=..]`、`[APP:PASTE_DEST_SAME: via=..]`(已經是這個資料夾)、`[APP:PASTE_DEST_REFUSED: via=.. reason=<訊息 key>]`、`[APP:PASTE_DEST_EDIT: open|closed]`,新預覽出來時印 `[APP:PASTE_RETARGETED: items=N dest=.. executable=<bool> error=<key 或 ->]`。
 - 複製與貼上的通知內容見 3.1、4.2。
 - 語言:繁體中文與英文。
 
@@ -260,7 +267,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 點檔案就預覽,規則與本機相同:上限 1 MiB,二進位與非 UTF-8 不顯示文字。重新整理會重讀樹和開著的預覽,檔案在 worker 上已刪除就顯示錯誤。
   - 複製與貼上和本機一樣(見下方「貼上」)。加入儲存庫路徑（`add_repo_path`）會拒絕,狀態列顯示「遠端工作區不支援這個操作」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
 - **貼上**(協定 4):
-  - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地是目前的 repo,沒有 repo 時是工作區資料夾。
+  - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地預設是目前的 repo,沒有 repo 時是工作區資料夾;可在目的資料夾列(5.1)改成工作區內任何已存在的資料夾,由 worker 驗證。
   - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
   - Apply 不信任保留的舊計畫:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。master 送回的快照裡的 repo 清單必須和 worker 從同一份目標路徑算出的完全相同,比對在執行任何 git 之前;快照列出的新資料夾與 symlink 資料夾必須在工作區內。worker 重新規劃後比對預覽時,現在多出的 symlink 資料夾、或改指向別處的,算預覽已變動。舊 master 送回的快照沒有這些欄位時,只比對原有欄位。
   - 協定 7 的檔案預覽以 `PrepareImport` 上傳 payload，回覆路徑、動作、略過原因、新鮮度、摘要與來源 entry 序號，不回傳檔案全文。master 從同一份 payload 還原內容，核對完整計畫 digest；目的端 diff 仍按需求讀取。

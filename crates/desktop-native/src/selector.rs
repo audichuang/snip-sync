@@ -4,6 +4,7 @@
 
 use gpui::{Context, Window};
 
+use crate::overlay::{CloseWhy, OverlayKind, TriggerId};
 use crate::text_input::InputEvent;
 use crate::{Popover, WorkbenchModel};
 
@@ -47,7 +48,7 @@ thread_local! {
 
 impl SelectorCandidate<'_> {
 	/// The root of a repo row.
-	fn repo_root(&self) -> Option<&std::path::Path> {
+	pub(crate) fn repo_root(&self) -> Option<&std::path::Path> {
 		match self {
 			Self::Repo { index, repos, .. } => Some(&repos[*index].root),
 			Self::Ref { .. } => None,
@@ -243,7 +244,7 @@ impl WorkbenchModel {
 		q: &str,
 	) -> impl Iterator<Item = SelectorCandidate<'_>> {
 		candidates(
-			self.popover,
+			self.overlays.selector(),
 			&self.repos,
 			self.remote.session.as_ref(),
 			&self.refs,
@@ -262,71 +263,48 @@ impl WorkbenchModel {
 		items_for_range(self.selector_candidates(q), range)
 	}
 
-	/// The repo list changed under an open repo selector: the cursor stays
-	/// on the repo it pointed at (it is an index into the filtered list, so
-	/// a repo found ahead of it would move it onto another one), or is
-	/// clamped when that repo is gone. `before` is the list as the cursor
-	/// last saw it.
-	pub(crate) fn rebind_selector_cursor(
-		&mut self,
-		before: &[(std::path::PathBuf, String)],
-		cx: &mut Context<Self>,
-	) {
-		if self.popover != Some(Popover::Repo) {
-			return;
-		}
-		let q = self.selector_input.read(cx).text().to_string();
-		let query = q.to_lowercase();
-		let under_cursor = before
-			.iter()
-			.filter(|(_, name)| {
-				query.is_empty() || name.to_lowercase().contains(&query)
-			})
-			.nth(self.popover_cursor)
-			.map(|(root, _)| root);
-		let moved = under_cursor.and_then(|root| {
-			self.selector_candidates(&q)
-				.position(|row| row.repo_root() == Some(root.as_path()))
-		});
-		let last = self.selector_candidates(&q).count().saturating_sub(1);
-		self.popover_cursor = moved.unwrap_or(self.popover_cursor.min(last));
-	}
-
+	/// The header's repo / ref button, or its key: opens the selector, or
+	/// closes the one that control opened. The keyboard goes back to where
+	/// it was.
 	pub fn open_popover(
 		&mut self,
 		kind: Popover,
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		if self.popover == Some(kind) {
-			self.close_popover(cx);
-			return;
-		}
-		self.popover = Some(kind);
-		self.popover_cursor = 0;
-		self.selector_input.update(cx, |i, cx| i.set_text("", cx));
-		window.focus(&self.selector_input.read(cx).handle());
-		let n = self.selector_candidates("").count();
-		app_log!("[APP:SELECTOR_OPEN: {:?} items={}]", kind, n);
-		cx.notify();
+		let trigger = match kind {
+			Popover::Repo => TriggerId::RepoSelector,
+			Popover::Ref => TriggerId::RefSelector,
+		};
+		self.open_popover_from(kind, trigger, window, cx);
 	}
 
-	pub fn close_popover(&mut self, cx: &mut Context<Self>) {
-		if self.popover.take().is_some() {
-			self.pending_focus = Some(self.focus_handle.clone());
-			app_log!("[APP:SELECTOR_CLOSED]");
-			cx.notify();
-		}
+	/// [`Self::open_popover`] for a control other than the header's.
+	pub(crate) fn open_popover_from(
+		&mut self,
+		kind: Popover,
+		trigger: TriggerId,
+		window: &mut Window,
+		cx: &mut Context<Self>,
+	) {
+		let ret = self.return_here(window, cx);
+		self.toggle_overlay(
+			OverlayKind::Selector(kind),
+			Some(trigger),
+			ret,
+			Some(window),
+			cx,
+		);
 	}
 
 	pub fn selector_event(&mut self, ev: InputEvent, cx: &mut Context<Self>) {
-		if self.popover.is_none() {
+		if self.overlays.selector().is_none() {
 			return;
 		}
 		let q = self.selector_input.read(cx).text().to_string();
 		match ev {
 			InputEvent::Changed => {
-				self.popover_cursor = 0;
+				self.set_selector_cursor(0);
 				// The quoted query tells a driver which keystroke this
 				// filter answers.
 				app_log!(
@@ -336,17 +314,19 @@ impl WorkbenchModel {
 				);
 			}
 			InputEvent::Down => {
-				self.popover_cursor = (self.popover_cursor + 1).min(
-					self.selector_candidates(&q).count().saturating_sub(1),
-				);
+				let last =
+					self.selector_candidates(&q).count().saturating_sub(1);
+				let now = self.overlays.selector_cursor();
+				self.set_selector_cursor((now + 1).min(last));
 			}
 			InputEvent::Up => {
-				self.popover_cursor = self.popover_cursor.saturating_sub(1)
+				let now = self.overlays.selector_cursor();
+				self.set_selector_cursor(now.saturating_sub(1));
 			}
 			InputEvent::Submit => {
 				let pick = self
 					.selector_candidates(&q)
-					.nth(self.popover_cursor)
+					.nth(self.overlays.selector_cursor())
 					.map(SelectorCandidate::pick);
 				if let Some(pick) = pick {
 					self.choose(pick, cx);
@@ -354,16 +334,24 @@ impl WorkbenchModel {
 				return;
 			}
 			InputEvent::SubmitPrev => {}
-			InputEvent::Dismiss => {
-				self.close_popover(cx);
-				return;
-			}
 		}
 		cx.notify();
 	}
 
+	fn set_selector_cursor(&mut self, to: usize) {
+		if let Some(cursor) = self.overlays.selector_cursor_mut() {
+			*cursor = to;
+		}
+	}
+
 	pub fn choose(&mut self, pick: Pick, cx: &mut Context<Self>) {
-		self.close_popover(cx);
+		if let Some(kind) = self.overlays.selector() {
+			self.close_overlay(
+				OverlayKind::Selector(kind),
+				CloseWhy::Picked,
+				cx,
+			);
+		}
 		match pick {
 			Pick::Repo(i) => {
 				app_log!(

@@ -2,7 +2,7 @@
 //! Automated real-window OS input driver smoke and integration test for snip-desktop-native.
 //!
 //! Every click targets bounds the app reports for the rendered control
-//! (`[APP:CTRL_BOUNDS: id=...]`, only emitted when the test opts in with
+//! (`[APP:CTRL_BOUNDS: ... id=...]`, only emitted when the test opts in with
 //! `SNIP_NATIVE_E2E=1`), never hard-coded coordinates, and every clicked
 //! control is asserted to lie fully inside the window. Controls the app
 //! reports as gone (`[APP:CTRL_GONE: id=...]`) are forgotten, so a stale
@@ -12,7 +12,7 @@
 //! driving via X11 xdotool is unvalidated on this milestone; compilation is verified
 //! via standard cargo check/build. No empty test is advertised as passed on non-Linux.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,10 @@ use std::time::{Duration, Instant, SystemTime};
 use snip_core::clip;
 use snip_core::commits;
 
-use snip_native_e2e::{native_bin, parse_covered, parse_duplicate, scaled};
+use snip_native_e2e::{
+	native_bin, parse_bounds, parse_covered, parse_duplicate, parse_gone,
+	parse_text_fit, parse_text_fit_drift, parse_text_fit_gone, scaled,
+};
 
 fn clipboard_matching(what: &str, matches: impl FnMut(&str) -> bool) -> String {
 	snip_native_e2e::wait_for_clipboard(
@@ -67,23 +70,6 @@ type Viewport = Arc<Mutex<(i32, i32)>>;
 /// can prove the confirmation controls are locked while it runs.
 const APPLY_DELAY_MS: u64 = 2500;
 
-fn parse_bounds(line: &str) -> Option<(String, [i32; 4])> {
-	let rest = line.split("[APP:CTRL_BOUNDS: id=").nth(1)?;
-	let (id, nums) = rest.rsplit_once(" x=")?;
-	let mut vals = nums.trim_end_matches(']').split(' ');
-	let x = vals.next()?.parse().ok()?;
-	let mut v = [x, 0, 0, 0];
-	for slot in &mut v[1..] {
-		*slot = vals.next()?.split('=').nth(1)?.parse().ok()?;
-	}
-	Some((id.to_string(), v))
-}
-
-fn parse_gone(line: &str) -> Option<String> {
-	let rest = line.split("[APP:CTRL_GONE: id=").nth(1)?;
-	Some(rest.strip_suffix(']')?.to_string())
-}
-
 fn parse_viewport(line: &str) -> Option<(i32, i32)> {
 	let rest = line.split("[APP:VIEWPORT: ").nth(1)?;
 	let (w, h) = rest.trim_end_matches(']').split_once('x')?;
@@ -93,7 +79,7 @@ fn parse_viewport(line: &str) -> Option<(i32, i32)> {
 #[test]
 fn bounds_line_parsing() {
 	let (id, v) = parse_bounds(
-		"[APP:CTRL_BOUNDS: id=paste-overwrite:3:長路徑/a b.txt x=12 y=-3 w=100 h=20]",
+		"[APP:CTRL_BOUNDS: x=12 y=-3 w=100 h=20 id=paste-overwrite:3:長路徑/a b.txt]",
 	)
 	.unwrap();
 	assert_eq!(id, "paste-overwrite:3:長路徑/a b.txt");
@@ -113,7 +99,7 @@ fn bounds_line_parsing() {
 	);
 	assert_eq!(
 		parse_covered(
-			"[APP:CTRL_COVERED: id=log-filter-user by=btn-log-refresh]"
+			"[APP:CTRL_COVERED: by=btn-log-refresh id=log-filter-user]"
 		),
 		Some(("log-filter-user".to_string(), "btn-log-refresh".to_string()))
 	);
@@ -127,6 +113,12 @@ struct App {
 	covered: Arc<Mutex<Vec<(String, String)>>>,
 	duplicates: Arc<Mutex<Vec<String>>>,
 	log_chips_count: Arc<std::sync::atomic::AtomicUsize>,
+	/// The texts whose box differs from the width the solver gave, and the
+	/// ones an ancestor clips: as the latest `TEXT_FIT` lines left them.
+	text_fit_drift: Arc<Mutex<HashSet<String>>>,
+	text_fit_clipped: Arc<Mutex<HashSet<String>>>,
+	/// `[APP:TEXT_FIT...` lines so far: none may come while the app idles.
+	text_fit_lines: Arc<std::sync::atomic::AtomicUsize>,
 	/// The launch's own config folder: no test restores another's tabs,
 	/// and none reads or writes the user's.
 	_config: tempfile::TempDir,
@@ -193,6 +185,14 @@ fn spawn_app_themed(
 	let covered: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
 	let duplicates: Arc<Mutex<Vec<String>>> = Arc::default();
 	let log_chips_count: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+	let text_fit_drift: Arc<Mutex<HashSet<String>>> = Arc::default();
+	let text_fit_clipped: Arc<Mutex<HashSet<String>>> = Arc::default();
+	let text_fit_lines: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+	let (t_drift, t_clipped, t_fit_lines) = (
+		text_fit_drift.clone(),
+		text_fit_clipped.clone(),
+		text_fit_lines.clone(),
+	);
 	let t_covered = covered.clone();
 	let t_duplicates = duplicates.clone();
 	let t_log_chips = log_chips_count.clone();
@@ -210,6 +210,27 @@ fn spawn_app_themed(
 			}
 			if line.contains("[APP:LOG_CHIPS:") {
 				t_log_chips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+			if line.contains("[APP:TEXT_FIT") {
+				t_fit_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+			// The latest line of a text decides: a new `TEXT_FIT` line
+			// clears what the last one said, and `DRIFT` comes after it.
+			if let Some((id, clipped)) = parse_text_fit(&line) {
+				t_drift.lock().unwrap().remove(&id);
+				let mut set = t_clipped.lock().unwrap();
+				if clipped {
+					set.insert(id);
+				} else {
+					set.remove(&id);
+				}
+			}
+			if let Some(id) = parse_text_fit_drift(&line) {
+				t_drift.lock().unwrap().insert(id);
+			}
+			if let Some(id) = parse_text_fit_gone(&line) {
+				t_drift.lock().unwrap().remove(&id);
+				t_clipped.lock().unwrap().remove(&id);
 			}
 			if let Some((bounds, viewport)) = &probes {
 				if let Some((id, v)) = parse_bounds(&line) {
@@ -242,6 +263,9 @@ fn spawn_app_themed(
 		covered,
 		duplicates,
 		log_chips_count,
+		text_fit_drift,
+		text_fit_clipped,
+		text_fit_lines,
 		_config: config,
 	}
 }
@@ -294,8 +318,24 @@ fn assert_settled_and_guards(
 		}
 	}
 
+	// Every text of the Log window is drawn in the width the solver gave it
+	// and no ancestor clips it (ADR 0005).
+	let drift = app.text_fit_drift.lock().unwrap().clone();
+	assert!(
+		drift.is_empty(),
+		"a text is not drawn in the width the solver gave at viewport {w}x{h}: {drift:?}"
+	);
+	let clipped = app.text_fit_clipped.lock().unwrap().clone();
+	assert!(
+		clipped.is_empty(),
+		"an ancestor clips a text at viewport {w}x{h}: {clipped:?}"
+	);
+
 	let before_chips = app
 		.log_chips_count
+		.load(std::sync::atomic::Ordering::Relaxed);
+	let before_fit = app
+		.text_fit_lines
 		.load(std::sync::atomic::Ordering::Relaxed);
 	std::thread::sleep(scaled(Duration::from_millis(250)));
 	let after_chips = app
@@ -305,6 +345,13 @@ fn assert_settled_and_guards(
 		before_chips,
 		after_chips,
 		"detected endless redraw: {before_chips} -> {after_chips} [APP:LOG_CHIPS ...] while idle at {w}x{h}"
+	);
+	let after_fit = app
+		.text_fit_lines
+		.load(std::sync::atomic::Ordering::Relaxed);
+	assert_eq!(
+		before_fit, after_fit,
+		"detected endless redraw: {before_fit} -> {after_fit} [APP:TEXT_FIT ...] lines while idle at {w}x{h}"
 	);
 	let snap_after = bounds.lock().unwrap().clone();
 	assert_eq!(

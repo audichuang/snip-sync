@@ -136,31 +136,27 @@ impl LineWrapper {
         truncation_suffix: &str,
         runs: &mut Vec<TextRun>,
     ) -> SharedString {
-        let mut width = px(0.);
-        let mut suffix_width = truncation_suffix
+        let suffix_width = truncation_suffix
             .chars()
             .map(|c| self.width_for_char(c))
             .fold(px(0.0), |a, x| a + x);
-        let mut char_indices = line.char_indices();
-        let mut truncate_ix = 0;
-        for (ix, c) in char_indices {
-            if width + suffix_width < truncate_width {
-                truncate_ix = ix;
-            }
-
-            let char_width = self.width_for_char(c);
-            width += char_width;
-
-            if width.floor() > truncate_width {
+        match truncation_ix(&line, truncate_width, suffix_width, |c| {
+            self.width_for_char(c)
+        }) {
+            Some(truncate_ix) => {
                 let result =
                     SharedString::from(format!("{}{}", &line[..truncate_ix], truncation_suffix));
                 update_runs_after_truncation(&result, truncation_suffix, runs);
-
-                return result;
+                result
             }
+            None => line,
         }
+    }
 
-        line
+    /// The width of `c` laid out alone: what `truncate_line` adds up a line
+    /// from, one character at a time.
+    pub fn char_advance(&mut self, c: char) -> Pixels {
+        self.width_for_char(c)
     }
 
     /// Any character in this list should be treated as a word character,
@@ -222,6 +218,32 @@ impl LineWrapper {
             )
             .width
     }
+}
+
+/// Where `LineWrapper::truncate_line` cuts `line`: the byte index its kept
+/// text ends at, or `None` when the whole line stays. `char_width` is each
+/// character's width alone and `suffix_width` the ellipsis's. Kept apart from
+/// the wrapper so that whatever predicts a cut can run the very same code.
+pub fn truncation_ix(
+    line: &str,
+    truncate_width: Pixels,
+    suffix_width: Pixels,
+    mut char_width: impl FnMut(char) -> Pixels,
+) -> Option<usize> {
+    let mut width = px(0.);
+    let mut truncate_ix = 0;
+    for (ix, c) in line.char_indices() {
+        if width + suffix_width < truncate_width {
+            truncate_ix = ix;
+        }
+
+        width += char_width(c);
+
+        if width.floor() > truncate_width {
+            return Some(truncate_ix);
+        }
+    }
+    None
 }
 
 fn update_runs_after_truncation(result: &str, ellipsis: &str, runs: &mut Vec<TextRun>) {

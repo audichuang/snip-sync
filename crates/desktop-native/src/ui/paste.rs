@@ -2,6 +2,7 @@
 
 use super::changes::{change_pad, tree_chevron};
 use super::*;
+use crate::paste::dest::WsRel;
 use crate::paste::{
 	commit_header_id, dir_control_id, DirControl, DirKey, DirSummary,
 	PasteCounts, RowControl, Tick,
@@ -88,11 +89,12 @@ impl WorkbenchModel {
 		labels
 	}
 
-	/// Destination, Apply and Cancel. Apply stays locked while a read-only
-	/// preview or remap is still running, so an older plan cannot be written.
+	/// Apply and Cancel. Apply stays locked while a read-only preview,
+	/// remap or retarget is still running, so an older plan cannot be
+	/// written, and while the destination field is open, so a path typed
+	/// but not yet confirmed cannot be pasted into the old folder.
 	pub(super) fn paste_action_bar(
 		&self,
-		dest: String,
 		applying: bool,
 		mapping_ready: bool,
 		executable: bool,
@@ -101,7 +103,8 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let log = &self.probes;
 		let loading = self.paste.is_loading();
-		let can_apply = !applying && executable && !loading;
+		let editing = self.paste_dest_edit().is_some();
+		let can_apply = !applying && executable && !loading && !editing;
 		div()
 			.flex()
 			.flex_row()
@@ -113,24 +116,7 @@ impl WorkbenchModel {
 			.bg(rgb(pal().panel_bg))
 			.border_b_1()
 			.border_color(rgb(pal().border))
-			.child(
-				div()
-					.id("paste-dest")
-					.flex()
-					.flex_row()
-					.items_center()
-					.gap(px(6.))
-					.flex_1()
-					.min_w_0()
-					.tooltip(tip(dest.clone()))
-					.child(
-						div()
-							.flex_shrink_0()
-							.text_color(rgb(pal().text_muted))
-							.child(format!("{}:", t("destination_label", loc))),
-					)
-					.child(fill_text(dest)),
-			)
+			.child(div().flex_1().min_w_0())
 			.child(
 				button("btn-apply", "", Btn::Primary, can_apply, 50)
 					.pl(px(6.))
@@ -148,11 +134,12 @@ impl WorkbenchModel {
 					} else {
 						t("apply", loc)
 					})
-					.when(loading, |b| {
-						b.tooltip(tip(t("paste_loading_refused", loc)))
+					.when(loading, |b| b.tip(t("paste_loading_refused", loc)))
+					.when(!loading && editing, |b| {
+						b.tip(t("paste_dest_editing", loc))
 					})
-					.when(!loading && !mapping_ready, |b| {
-						b.tooltip(tip(t("mapping_required", loc)))
+					.when(!loading && !editing && !mapping_ready, |b| {
+						b.tip(t("mapping_required", loc))
 					})
 					.when(can_apply, |b| {
 						b.on_click(cx.listener(|this, _, _, cx| {
@@ -173,9 +160,7 @@ impl WorkbenchModel {
 							this.cancel_paste_preview(cx)
 						}))
 					})
-					.when(applying, |b| {
-						b.tooltip(tip(t("paste_busy_refused", loc)))
-					})
+					.when(applying, |b| b.tip(t("paste_busy_refused", loc)))
 					.children(probe(log, "btn-cancel")),
 			)
 	}
@@ -198,12 +183,9 @@ impl WorkbenchModel {
 		&self,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
-		let dest = crate::remote::display_path(
-			self.remote.session.as_ref(),
-			&self.current_restore_destination(),
-		);
 		div()
 			.id("paste-panel")
+			.relative()
 			.key_context("PastePanel")
 			.track_focus(&self.paste_focus)
 			.flex()
@@ -222,8 +204,10 @@ impl WorkbenchModel {
 				Some(|this, cx| this.close_tab(0, cx)),
 				cx,
 			))
-			.child(self.paste_action_bar(dest, false, false, false, cx))
+			.child(self.paste_action_bar(false, false, false, cx))
+			.child(self.paste_dest_bar(cx))
 			.child(self.paste_loading_note())
+			.children(probe(&self.probes, "paste-panel"))
 			.into_any_element()
 	}
 
@@ -274,11 +258,11 @@ impl WorkbenchModel {
 				this.toggle_paste_commit(c, cx)
 			}))
 			.when(c > 0, |d| d.border_t_1().border_color(rgb(pal().divider)))
-			.tooltip(tip(format!(
+			.tip(format!(
 				"{}\n{author}\n{}",
 				commit.message.trim_end(),
 				commit.author_date
-			)))
+			))
 			.child(icon(
 				if folded {
 					Icon::ChevronRight
@@ -386,8 +370,7 @@ impl WorkbenchModel {
 					.items_center()
 					.justify_center()
 					.when(applying, |d| {
-						d.opacity(0.4)
-							.tooltip(tip(t("paste_busy_refused", loc)))
+						d.opacity(0.4).tip(t("paste_busy_refused", loc))
 					})
 					.when(tick == Tick::Locked, |d| d.opacity(0.4))
 					// A locked box does not fold the row it sits on.
@@ -395,7 +378,7 @@ impl WorkbenchModel {
 						d.on_click(|_, _, cx| cx.stop_propagation())
 					})
 					.when(by_commit && !applying, |d| {
-						d.tooltip(tip(t("commit_subset_rejected", loc)))
+						d.tip(t("commit_subset_rejected", loc))
 					})
 					// Still routed to the model while applying so the refusal
 					// is explicit, like a file's box.
@@ -440,7 +423,6 @@ impl WorkbenchModel {
 			skips,
 		} = plan.counts();
 		let commit_label = plan.commit_summary_label(loc);
-		let dest = plan.shown(&plan.destination);
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();
 		// A cursor on a folder row has no file to show.
@@ -460,12 +442,12 @@ impl WorkbenchModel {
 
 		let loading = self.paste.is_loading();
 		let action_bar = self.paste_action_bar(
-			dest,
 			applying,
 			mapping_ready,
 			plan.executable(),
 			cx,
 		);
+		let dest_bar = self.paste_dest_bar(cx);
 		let tab = self.tab_strip(
 			format!("{} ({})", t("paste_tab", loc), plan.items.len()),
 			Icon::Paste,
@@ -651,11 +633,11 @@ impl WorkbenchModel {
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
 				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(if planned_skip {
+				.tip(if planned_skip {
 					format!("{path}\n{}", t(paste_op(item).2, loc))
 				} else {
 					format!("{path}\n→ {}", item.dest_path.display())
-				}))
+				})
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.select_paste_item(ix, cx)
 				}))
@@ -673,8 +655,7 @@ impl WorkbenchModel {
 						.items_center()
 						.justify_center()
 						.when(applying, |d| {
-							d.opacity(0.4)
-								.tooltip(tip(t("paste_busy_refused", loc)))
+							d.opacity(0.4).tip(t("paste_busy_refused", loc))
 						})
 						// Still routed to the model while applying so the refusal
 						// is explicit (it logs and explains).
@@ -761,10 +742,8 @@ impl WorkbenchModel {
 										.hover(|s| s.bg(rgb(pal().hover_bg)))
 								})
 								.when(applying, |d| {
-									d.opacity(0.4).tooltip(tip(t(
-										"paste_busy_refused",
-										loc,
-									)))
+									d.opacity(0.4)
+										.tip(t("paste_busy_refused", loc))
 								})
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
@@ -842,11 +821,11 @@ impl WorkbenchModel {
 							!applying,
 							69,
 						)
-						.tooltip(tip(format!(
+						.tip(format!(
 							"{}/{}",
 							plan.shown(&plan.destination),
 							prefix
-						)))
+						))
 						.when(!applying, |b| {
 							b.on_click(cx.listener(move |this, _, _, cx| {
 								this.choose_paste_keep(&prefix_keep, cx);
@@ -877,7 +856,7 @@ impl WorkbenchModel {
 									70 + idx as isize,
 								)
 								.debug_selector(|| id.clone())
-								.tooltip(tip(full))
+								.tip(full)
 								.when(!applying, |b| {
 									b.on_click(cx.listener(
 										move |this, _, _, cx| {
@@ -935,7 +914,7 @@ impl WorkbenchModel {
 									} else {
 										pal().warning
 									}))
-									.tooltip(tip(target.clone()))
+									.tip(target.clone())
 									.child(format!("→ {target}"))
 									.children(probe(log, target_id)),
 							)
@@ -1002,13 +981,13 @@ impl WorkbenchModel {
 						.id("paste-restore-base-text")
 						.flex_1()
 						.min_w(px(180.))
-						.tooltip(live_tip(move |cx| {
+						.live_tip(move |cx| {
 							model
 								.upgrade()
 								.and_then(|m| m.read(cx).paste_hint_text())
 								.unwrap_or_default()
 								.into()
-						})),
+						}),
 				)
 				.child(pick("paste-adjust", t("paste_adjust", loc), true, 52))
 				.child(pick("paste-as-is", t("paste_as_is", loc), false, 53))
@@ -1020,6 +999,7 @@ impl WorkbenchModel {
 
 		div()
 			.id("paste-panel")
+			.relative()
 			.key_context("PastePanel")
 			.track_focus(&self.paste_focus)
 			.flex()
@@ -1034,6 +1014,7 @@ impl WorkbenchModel {
 			.rounded(px(ISLAND_RADIUS))
 			.child(tab)
 			.child(action_bar)
+			.child(dest_bar)
 			.child(summary)
 			.when(loading, |d| d.child(self.paste_loading_note()))
 			.when(plan.whole_commit, |d| {
@@ -1210,7 +1191,7 @@ impl WorkbenchModel {
 							.py(px(4.))
 							.text_size(px(SMALL_TEXT))
 							.text_color(rgb(pal().text_muted))
-							.tooltip(tip(metadata.clone()))
+							.tip(metadata.clone())
 							.child(clip_text(metadata))
 							.children(probe(log, "paste-commit-metadata")),
 					)
@@ -1252,6 +1233,343 @@ impl WorkbenchModel {
 				selected.is_some_and(|i| i.commit.is_some() || !i.is_delete()),
 				|d| d.child(self.render_code_view(true, cx)),
 			)
+			.children(probe(log, "paste-panel"))
 			.into_any_element()
+	}
+}
+
+/// Where the Project selection says a paste should go.
+impl WorkbenchModel {
+	/// The workspace-relative folder of the single selected Project row: the
+	/// folder itself, or a file's folder. Nothing for no selection, for
+	/// several (one cannot be guessed), for the commit tree browser, or for
+	/// a row that is no real entry.
+	fn paste_left_folder(&self) -> Option<WsRel> {
+		if self.rev_tree.is_some()
+			|| self.selected_count() != 1
+			|| self.project_targets().len() != 1
+		{
+			return None;
+		}
+		let (row, ws) =
+			self.project_rows().into_iter().find_map(|r| match r {
+				ProjRow::Ws(row) if row.selected => Some((row, true)),
+				ProjRow::Work(row) if row.selected => Some((row, false)),
+				_ => None,
+			})?;
+		if !row.is_valid_utf8
+			|| row.is_error
+			|| row.is_loading
+			|| row.is_truncation_marker
+			|| row.is_more_marker
+			|| row.is_view_limit
+		{
+			return None;
+		}
+		let root = if ws { self.ws_root() } else { self.repo_root() }?;
+		let rel = row.rel_path.trim_end_matches('/');
+		let folder = if row.is_dir {
+			rel
+		} else {
+			rel.rsplit_once('/').map_or("", |(dir, _)| dir)
+		};
+		let abs = folder
+			.split('/')
+			.filter(|part| !part.is_empty())
+			.fold(root, |path, part| path.join(part));
+		WsRel::of_folder(
+			&self.workspace_root,
+			&abs,
+			self.remote.session.is_some(),
+		)
+	}
+
+	/// The workspace's name for the breadcrumb's first segment.
+	fn paste_workspace_name(&self) -> String {
+		match self.remote.session.as_ref() {
+			Some(session) => {
+				let last = session
+					.workspace
+					.path
+					.trim_end_matches(['/', '\\'])
+					.rsplit(['/', '\\'])
+					.next()
+					.unwrap_or_default();
+				if last.is_empty() {
+					crate::remote::display_path(Some(session), &session.root)
+				} else {
+					last.to_string()
+				}
+			}
+			None => self
+				.workspace_root
+				.file_name()
+				.map(|n| n.to_string_lossy().into_owned())
+				.unwrap_or_else(|| self.workspace_root.display().to_string()),
+		}
+	}
+
+	/// The destination bar under Apply and Cancel: where the paste lands as
+	/// a breadcrumb, the places to pick it from, and a typed path. It is
+	/// part of the panel's own layout, never an overlay.
+	pub(super) fn paste_dest_bar(
+		&self,
+		cx: &mut Context<Self>,
+	) -> Stateful<Div> {
+		let loc = self.locale;
+		let log = &self.probes;
+		let plan = self.paste.plan();
+		let loading = self.paste.is_loading();
+		let enabled =
+			plan.is_some_and(|p| !p.is_applying) && self.accepting_work();
+		let editing = self.paste_dest_edit();
+		let remote = self.remote.session.is_some();
+		let folder = self.paste.folder();
+		let current_rel = folder.and_then(|f| f.rel.clone());
+		let session = self.remote.session.as_ref();
+
+		// The breadcrumb: the workspace, then each folder down to the one
+		// the paste lands in. Each is a place to go back to.
+		let crumbs = folder.map(|folder| match &folder.rel {
+			Some(rel) => {
+				let mut names = vec![self.paste_workspace_name()];
+				names.extend(rel.parts().map(str::to_string));
+				let last = names.len() - 1;
+				let mut row = div()
+					.flex()
+					.flex_row()
+					.items_center()
+					.gap(px(2.))
+					.flex_shrink()
+					.min_w_0();
+				for (i, name) in names.into_iter().enumerate() {
+					let upto = rel.ancestor(i);
+					let path = upto.to_path(&self.workspace_root);
+					let full = crate::remote::display_path(session, &path);
+					let id = format!("paste-dest-crumb:{i}");
+					let goes = enabled && i != last;
+					if i > 0 {
+						row = row.child(icon(Icon::ChevronRight, 10.));
+					}
+					row = row.child(
+						div()
+							.id(SharedString::from(id.clone()))
+							.relative()
+							.flex_shrink()
+							.min_w_0()
+							.px(px(4.))
+							.rounded(px(3.))
+							.border_1()
+							.border_color(transparent_black())
+							.when(i == last, |d| {
+								d.font_weight(FontWeight::SEMIBOLD)
+							})
+							.when(goes, |d| {
+								d.cursor_pointer()
+									.tab_index(52)
+									.hover(|s| s.bg(rgb(pal().hover_bg)))
+									.on_click(cx.listener(
+										move |this, _, _, cx| {
+											this.paste_into_rel(
+												&upto, "crumb", cx,
+											)
+										},
+									))
+							})
+							.map(focus_ring)
+							.tip(full)
+							.child(clip_text(name))
+							.children(probe(log, id)),
+					);
+				}
+				row.into_any_element()
+			}
+			// Outside the workspace (an enclosing repo, a `--restore-dir`
+			// elsewhere): one plain label, nothing to go back to.
+			None => {
+				let full = crate::remote::display_path(session, &folder.path);
+				div()
+					.id("paste-dest-path")
+					.relative()
+					.flex_shrink()
+					.min_w_0()
+					.tip(full.clone())
+					.child(clip_text(full))
+					.children(probe(log, "paste-dest-path"))
+					.into_any_element()
+			}
+		});
+
+		let chip = |id: &'static str,
+		            label: &'static str,
+		            on: bool,
+		            tab: isize,
+		            rel: WsRel,
+		            via: &'static str,
+		            cx: &mut Context<Self>| {
+			button(
+				id,
+				t(label, loc),
+				if on { Btn::Primary } else { Btn::Default },
+				enabled,
+				tab,
+			)
+			.when(enabled, |b| {
+				b.on_click(cx.listener(move |this, _, _, cx| {
+					this.paste_into_rel(&rel, via, cx)
+				}))
+			})
+			.children(probe(log, id))
+		};
+		let at = |rel: &WsRel| current_rel.as_ref() == Some(rel);
+
+		// The pinned repo, when it is a folder of the workspace of its own.
+		let repo_rel = self
+			.repo_root()
+			.and_then(|root| {
+				WsRel::of_folder(&self.workspace_root, &root, remote)
+			})
+			.filter(|rel| !rel.is_root());
+		let left_rel = self.paste_left_folder();
+
+		let status = if let Some(err) = editing
+			.and_then(|e| e.error.as_ref())
+			.or_else(|| self.paste.dest_refusal())
+		{
+			Some((false, err.render(loc)))
+		} else if let Some(plan) = plan.filter(|_| !loading) {
+			if plan.executable() {
+				Some((true, t("paste_dest_ok", loc).to_string()))
+			} else {
+				plan.error
+					.as_ref()
+					.filter(|_| plan.mapping_ready())
+					.map(|err| (false, err.render(loc)))
+			}
+		} else {
+			None
+		};
+
+		div()
+			.id("paste-dest-bar")
+			.relative()
+			.flex()
+			.flex_row()
+			.flex_wrap()
+			.items_center()
+			.flex_shrink_0()
+			.gap_x(px(8.))
+			.gap_y(px(4.))
+			.px(px(12.))
+			.py(px(4.))
+			.text_size(px(SMALL_TEXT))
+			.bg(rgb(pal().panel_bg))
+			.border_b_1()
+			.border_color(rgb(pal().border))
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_color(rgb(pal().text_muted))
+					.child(format!("{}:", t("destination_label", loc))),
+			)
+			.child(if editing.is_some() {
+				div()
+					.id("paste-dest-input")
+					.debug_selector(|| {
+						crate::overlay::OverlayKind::PasteDestField
+							.panel_selector()
+							.into()
+					})
+					.relative()
+					.flex_1()
+					.min_w(px(160.))
+					.child(self.paste_dest_input.clone())
+					.children(probe(log, "paste-dest-input"))
+					.into_any_element()
+			} else {
+				crumbs.unwrap_or_else(|| div().into_any_element())
+			})
+			.child(chip(
+				"paste-dest-root",
+				"paste_dest_root",
+				at(&WsRel::root()),
+				53,
+				WsRel::root(),
+				"root",
+				cx,
+			))
+			.children(repo_rel.map(|rel| {
+				chip(
+					"paste-dest-repo",
+					"paste_dest_repo",
+					at(&rel),
+					54,
+					rel.clone(),
+					"repo",
+					cx,
+				)
+			}))
+			.children(left_rel.map(|rel| {
+				chip(
+					"paste-dest-left",
+					"paste_dest_left",
+					at(&rel),
+					55,
+					rel.clone(),
+					"left",
+					cx,
+				)
+			}))
+			.child(
+				button(
+					"paste-dest-edit",
+					t("paste_dest_edit", loc),
+					Btn::Default,
+					enabled,
+					56,
+				)
+				.when(enabled, |b| {
+					b.on_click(cx.listener(|this, _, _, cx| {
+						this.open_paste_dest_edit(cx)
+					}))
+				})
+				.children(probe(log, "paste-dest-edit")),
+			)
+			.children((!remote).then(|| {
+				button(
+					"paste-dest-browse",
+					t("paste_dest_browse", loc),
+					Btn::Default,
+					enabled,
+					57,
+				)
+				.when(enabled, |b| {
+					b.on_click(
+						cx.listener(|this, _, _, cx| {
+							this.browse_paste_dest(cx)
+						}),
+					)
+				})
+				.children(probe(log, "paste-dest-browse"))
+			}))
+			.children(status.map(|(ok, text)| {
+				div()
+					.id("paste-dest-status")
+					.relative()
+					.flex_shrink()
+					.min_w_0()
+					.max_w(px(360.))
+					.text_color(rgb(if ok {
+						pal().git_added
+					} else {
+						pal().error
+					}))
+					.child(clip_text(format!(
+						"{} {text}",
+						if ok { "✓" } else { "✕" }
+					)))
+					.children(probe(log, "paste-dest-status"))
+			}))
+			.children(probe(log, "paste-dest-bar"))
 	}
 }

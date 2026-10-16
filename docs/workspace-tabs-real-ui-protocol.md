@@ -18,7 +18,7 @@
 - 關分頁（Cmd/Ctrl+W、Cmd/Ctrl+Shift+W、工作區選單的 `btn-close-workspace`、分頁上的 ×）：該分頁自己的關閉排空先跑，印 `[APP:WORKSPACE: state=closed generation=N]`，再印 `[APP:WS_TAB_CLOSED: id=N count=M`。**空分頁**沒有東西要排空，只印 `WS_TAB_CLOSED`，沒有 `WORKSPACE: state=closed`。關掉目前分頁後，位置上滑進來的右鄰變成目前分頁（最右的分頁被關時是左鄰），印 `WS_TAB_ACTIVE`。關背景分頁不切換，也不印 `WS_TAB_ACTIVE`；目前分頁的索引若因此改變，只是分頁列上的位置變了。
 - Cmd/Ctrl+W 與 Cmd/Ctrl+Shift+W 永遠只關**目前**分頁，不會碰背景分頁。
 - 最後一個分頁關掉後，視窗只剩分頁列與「+」，沒有工作區選單、沒有歡迎畫面，App 不結束。「+」加一個空分頁，它的工作區選單已經打開。
-- 背景（沒顯示）分頁印的 `[APP:…]` 行，在結尾的 `]` 前面多一個 ` ws_tab=<id>`（無冒號形式的行，例如 `[APP:PASTE_APPLYING]`，變成 `[APP:PASTE_APPLYING: ws_tab=<id>]`）。目前顯示的分頁印的行不變。分頁列（root）印的行**永遠不帶** ` ws_tab=`：`WS_TAB_OPENED`、`WS_TAB_ACTIVE`、`WS_TAB_CLOSED`、`QUIT: deferred`，以及 root 印的 `VIEWPORT`，都直接以 `]` 結尾。`<id>` 是分頁的穩定 id，從 1 起算、單調遞增、不重用；`ix` 是分頁列上的位置，從 0 起算，關掉前面的分頁後會變。
+- 背景（沒顯示）分頁印的 `[APP:…]` 行，**一律**把 `ws_tab=<id>` 放在 `KIND: ` 之後的第一個欄位：`[APP:WORKSPACE: ws_tab=2 state=closed generation=3]`、`[APP:CTRL_GONE: ws_tab=2 id=ws-tab-pasting:2]`、`[APP:CTRL_BOUNDS: ws_tab=2 x= y= w= h= id=<ID>]`、`[APP:REPO_SELECTING: ws_tab=2 0 (name) root=<路徑>]`；沒有欄位的行（例如 `[APP:PASTE_APPLYING]`）變成 `[APP:PASTE_APPLYING: ws_tab=<id>]`。只有這個位置算標記：行尾可以是任何使用者文字（資料夾叫 `x ws_tab=2`、ID 以 ` ws_tab=2` 結尾），不能靠行尾判斷。目前顯示的分頁印的行不變。分頁列（root）印的行**永遠不帶** ` ws_tab=`：`WS_TAB_OPENED`、`WS_TAB_ACTIVE`、`WS_TAB_CLOSED`、`QUIT: deferred`，以及 root 印的 `VIEWPORT`，都不含它。`<id>` 是分頁的穩定 id，從 1 起算、單調遞增、不重用；`ix` 是分頁列上的位置，從 0 起算，關掉前面的分頁後會變。
 - `generation` 是每個分頁自己的計數，不是全域的。不要拿一個分頁的 generation 去跟另一個分頁比大小。
 - Cmd/Ctrl+Q 與視窗關閉鈕是同一件事：所有分頁都排空之後才結束。任何一個分頁正在寫入已確認的貼上，就拒絕（`PASTE_BUSY: refused=quit`），並切到那個分頁，沒有任何分頁開始排空。每按一次 Cmd+Q 或關閉鈕，`QUIT: deferred` 恰好印一行；拒絕時 `PASTE_BUSY: refused=quit` 也恰好一行（分頁自己的 Quit 處理只轉給 root，不印日誌）。
 - 恢復分頁（#137）：設定資料夾的 `open-tabs.json`（`{"tabs":[{"kind":"local","path":<canonical>}|{"kind":"remote","host":<ssh Host 別名>,"path":<worker 真實路徑>}],"active":<索引或 null>}`）在分頁開、關、切換時寫入（只在有變化時；空的分頁列不存，目前分頁是空分頁時 `active` 是 null；Cmd+Q 不重寫它，內容是排空之前的分頁）。一般啟動先依存檔順序重開分頁，再處理 `--workspace`：它已在恢復的分頁裡就切過去（比對 canonical 路徑），否則新增一個分頁；兩者都顯示該分頁。沒帶 `--workspace` 就顯示存檔的目前分頁。從沒存過 `open-tabs.json` 時走舊的退路（`--workspace`、最近開啟的本機資料夾、啟動資料夾、空分頁）。`--mode idle/overview/preview` 只有一個分頁，不恢復也不存。存檔裡找不到的本機資料夾略過並計數（狀態列與失敗卡片「已略過 N 個找不到的工作區」）；遠端分頁立刻顯示並存成 `host ▸ name`，在背景連線，失敗時分頁保持 `failed` 狀態並在 5、10、20、40 秒、之後每 60 秒重試。`remote-last.json` 已被它取代（只在沒有 `open-tabs.json` 時轉成一個遠端分頁，然後刪除）。腳本的 `launch` 永遠帶 `--workspace`，所以沒帶 `--workspace` 的恢復不在這份規程驅動，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋。
@@ -224,7 +224,7 @@ PY
 | `[APP:WS_TABS_RESTORED: count=N skipped=K]` | root 印，啟動時恰好一行，只在讀到存檔（`open-tabs.json`，或由 `remote-last.json` 轉成的）時印。`N` 是恢復之後的分頁數（含 `--workspace` 新增的），`K` 是因資料夾不存在而略過的本機分頁數。每個恢復的分頁各自先印一行 `WS_TAB_OPENED`，`id` 依存檔順序，`--workspace` 的分頁若是新的，排在最後 |
 | `[APP:REMOTE_REOPEN: host=<h> path=<p>` | 恢復遠端分頁時印，分頁已先顯示，連線在背景進行，狀態列「正在重新連線 …」 |
 | `[APP:REMOTE_RETRY: attempt=N` | 遠端分頁恢復失敗後的背景重試：5、10、20、40 秒，之後每 60 秒一次；成功就在同一個分頁連上 |
-| `... ws_tab=<id>]` | 背景分頁印的行的標記，在結尾 `]` 前；root 印的行永不帶 |
+| `[APP:KIND: ws_tab=<id> ...]` | 背景分頁印的行的標記，永遠是 `KIND: ` 之後的第一個欄位（沒有欄位的行是 `[APP:KIND: ws_tab=<id>]`）；root 印的行永不帶 |
 | `[APP:WORKSPACE: state=open path=<p> generation=G]`／`state=closed` | 該分頁的工作區開／關 |
 | `[APP:LIFECYCLE: phase=<…> intent=<quit\|close-workspace\|open-workspace\|open-remote-workspace> …]` | 該分頁的排空階段；結束時每個分頁各印一行 `phase=drained intent=quit jobs=0 …` |
 | `[APP:QUIT: deferred` | Cmd+Q 或視窗關閉鈕，由 root 印，每按一次恰好一行，不帶 ` ws_tab=` |
@@ -407,7 +407,7 @@ PY
 - **前置狀態**：S3，目前 `beta`（`ix=2`）。
 - **操作**：(1) `pt ws-tab-close:0`（`ws-src`，背景分頁），點。`shot after-1`。(2) 現在是 `[alpha id2, beta id3]`，目前 `beta`（`ix=1`）；`Cmd+1` 切到 `alpha`，等 1 秒後 `mark`，然後 `pt ws-tab-close:1`（`beta`，背景分頁，在目前分頁右邊），點。`shot after-2`。
 - **預期畫面**：(1) `ws-src` 消失，目前分頁仍是 `beta`，只是位置從 `ix=2` 變成 `ix=1`；標題不變 `beta — snip-sync`；**沒有**切換動作。(2) `beta` 消失，目前分頁仍是 `alpha`（`ix=0`），標題 `alpha — snip-sync`。
-- **比對**：(1) `L:` `[APP:WORKSPACE: state=closed generation=<G> ws_tab=1]`（有 ` ws_tab=1`，因為關閉時它是背景分頁）、`[APP:WS_TAB_CLOSED: id=1 count=2`（root 印的，不帶 ` ws_tab=`；`NOT:` 該行含 ` ws_tab=`）。`NOT:` `WS_TAB_ACTIVE`；這一段所有帶 ` ws_tab=` 的行都是 ` ws_tab=1`（`newlog | grep -o ' ws_tab=[0-9]*' | sort -u` 只有一種）。`LIFECYCLE` 行（`intent=close-workspace`）也帶 ` ws_tab=1`。(2) `L:` `WORKSPACE: state=closed generation=<G> ws_tab=3`、`[APP:WS_TAB_CLOSED: id=3 count=1`（同樣不帶 ` ws_tab=`）；`NOT:` `WS_TAB_ACTIVE`。每一段 `wtitle` 在關閉前後相同。
+- **比對**：(1) `L:` `[APP:WORKSPACE: ws_tab=1 state=closed generation=<G>]`（有 `ws_tab=1`，因為關閉時它是背景分頁）、`[APP:WS_TAB_CLOSED: id=1 count=2`（root 印的，不帶 ` ws_tab=`；`NOT:` 該行含 ` ws_tab=`）。`NOT:` `WS_TAB_ACTIVE`；這一段所有帶 ` ws_tab=` 的行都是 ` ws_tab=1`（`newlog | grep -o ' ws_tab=[0-9]*' | sort -u` 只有一種）。`LIFECYCLE` 行（`intent=close-workspace`）也帶 ` ws_tab=1`。(2) `L:` `WORKSPACE: ws_tab=3 state=closed generation=<G>`、`[APP:WS_TAB_CLOSED: id=3 count=1`（同樣不帶 ` ws_tab=`）；`NOT:` `WS_TAB_ACTIVE`。每一段 `wtitle` 在關閉前後相同。
 - **截圖**：`before.png`、`after-1.png`、`after-2.png`。
 
 #### WT22 關掉最後一個分頁：只剩「+」，App 還在
@@ -510,7 +510,7 @@ SH
   ```
 - **操作**：(1) `case_start WT42`，`shot before`。(2) 在 `$W/tabfail` 上做 WT40 的流程（`id=2 ix=1`），等到 `ws-tab-state:1:connected`。等 2 秒，`cp "$RUN/config/open-tabs.json" "$CASE/open-tabs-before.json"`。(3) `Cmd+Q`，等 exit code 0，日誌改名，**不刪** `open-tabs.json`。(4) App 結束之後才 `ssh ubuntu "rm -rf '$W/tabfail'"`（App 開著時，已連線的 worker 還握著這個路徑）。(5) `launch --gate b`，`export PID=…`，`mark`，`resize 1080 720`。(6) 等日誌出現 `[APP:REMOTE_OPEN_FAILED: `（最多 15 秒）。在下一行 `[APP:REMOTE_RETRY: attempt=` 之前（重試間隔 5、10、20、40 秒，之後每 60 秒）`shot after`，`hv` 到 `ws-tab:1` 停 2 秒，`shot hover-failed`。(7) `Cmd+2` 切到失敗的分頁，`shot status`，轉錄狀態列。(8) 等到至少一行 `REMOTE_RETRY` 之後又有 `REMOTE_OPEN_FAILED`，`shot after-retry`。(9) 照 1.2 重置（Cmd+Q、日誌改名、`rm -f "$RUN/config/open-tabs.json"`、`launch`），後面的格子才不會帶著這個分頁。
 - **預期畫面**：重新啟動後分頁列是 `ws-src`、`ubuntu ▸ tabfail`，順序不變，目前是 `ws-src`。第二個分頁的圖示是警告圖示（錯誤色），tooltip 是 `ubuntu:$WREAL · 連線失敗：<原因>`（`<原因>` 是 worker 回的錯誤，照抄轉錄）。重試進行中的那一下圖示是連線中（灰色的重新整理圖示），重試失敗後回到警告圖示。切過去後狀態列是「無法開啟遠端工作區：<原因>」。分頁不會消失，`ws-src` 不受影響。
-- **比對**：(2) `$CASE/open-tabs-before.json` 的第二個分頁是 `{"kind":"remote","host":"ubuntu","path":"$WREAL"}`。(5) 之後 `L:` `[APP:REMOTE_REOPEN: host=ubuntu path=$WREAL`、`[APP:REMOTE_OPEN_FAILED: `（背景分頁印的行，結尾帶 ` ws_tab=2`），之後有 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。重試時探針會短暫換成 `ws-tab-state:1:connecting`，所以判的是「`REMOTE_OPEN_FAILED` 之後出現過 failed 的 `CTRL_BOUNDS`」，不是「最新的一個是 failed」。(8) 一行 `REMOTE_RETRY: attempt=` 之後，又有 `REMOTE_OPEN_FAILED` 與新的 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。`NOT:` `[APP:REMOTE_OPENED:`（這次啟動之後）。15 秒內沒有 `REMOTE_OPEN_FAILED`，或有它卻沒有 `ws-tab-state:1:failed`：判 `fail`，附上實際的狀態探針與日誌。`TODO(verify)`：`<原因>` 的實際文字。
+- **比對**：(2) `$CASE/open-tabs-before.json` 的第二個分頁是 `{"kind":"remote","host":"ubuntu","path":"$WREAL"}`。(5) 之後 `L:` `[APP:REMOTE_REOPEN: host=ubuntu path=$WREAL`、`[APP:REMOTE_OPEN_FAILED: `（背景分頁印的行，`KIND: ` 之後的第一個欄位是 `ws_tab=2`），之後有 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。重試時探針會短暫換成 `ws-tab-state:1:connecting`，所以判的是「`REMOTE_OPEN_FAILED` 之後出現過 failed 的 `CTRL_BOUNDS`」，不是「最新的一個是 failed」。(8) 一行 `REMOTE_RETRY: attempt=` 之後，又有 `REMOTE_OPEN_FAILED` 與新的 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。`NOT:` `[APP:REMOTE_OPENED:`（這次啟動之後）。15 秒內沒有 `REMOTE_OPEN_FAILED`，或有它卻沒有 `ws-tab-state:1:failed`：判 `fail`，附上實際的狀態探針與日誌。`TODO(verify)`：`<原因>` 的實際文字。
 - **截圖**：`before.png`、`after.png`、`hover-failed.png`、`status.png`、`after-retry.png`。
 
 #### WT43 本機與遠端混合
@@ -610,7 +610,7 @@ clip > "$RUN/p-busy.sha"
 - **前置狀態**：「寫入中」，目前是遠端分頁（`ix=2`）。
 - **操作**：先執行 `WT60_L0=$(wc -l < "$LOG")`（兩次拒絕共用的起點）。(1) `mark`，`Cmd+W`，等 1 秒，`shot refused-cmdw`，保存本段 `newlog`。(2) `mark`，`pt ws-tab-close:2`，點，等 1 秒，`shot refused-x`，保存本段 `newlog`。(3) `hv` 到 `ws-tab:2` 停 2 秒，`shot hover-pasting`。(4) 放開 hold，等 `PASTE_DONE`，`shot after-done`。
 - **預期畫面**：(1)(2) 分頁還在，沒有關；狀態列是「正在套用變更，已拒絕關閉、開啟與結束，以免寫入中斷。」（轉錄；不得是原始 key `workspace_busy_applying`）。分頁標籤右邊有「貼上」圖示（強調色）。(3) tooltip 是 `ubuntu:<路徑> · 貼上中`。(4) 貼上圖示消失。
-- **比對**：(1)(2) **每次**各有 `L:` `[APP:PASTE_BUSY: refused=close-workspace]`；各段 `NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。從 `WT60_L0` 起的兩次拒絕合併日誌，`[APP:LIFECYCLE: phase=refused intent=close-workspace reason=applying` **至少一次**即可；`WorkbenchModel::emit_life` 比對完整的 `last_life_log`，相同字串會去重，所以第二次拒絕可能沒有新 lifecycle 行。(3) 寫入中 `ws-tab-pasting:2` 有 `CTRL_BOUNDS`。(4) `L:` `[APP:PASTE_DONE: created=2 overwritten=0 skipped=0 deleted=0 errors=0`；之後 `CTRL_GONE: id=ws-tab-pasting:2`。磁碟：`ssh ubuntu "cd '$W/pastews/cut-dst' && sha256sum new.txt new2.txt"` 與「`ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-busy.txt"`（先 `mkdir -p '$W/oracle/cut-dst'`）之後同樣兩個檔的 `sha256sum`」相同。
+- **比對**：(1)(2) **每次**各有 `L:` `[APP:PASTE_BUSY: refused=close-workspace]`；各段 `NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。從 `WT60_L0` 起的兩次拒絕合併日誌，`[APP:LIFECYCLE: phase=refused intent=close-workspace reason=applying` **至少一次**即可；`WorkbenchModel::emit_life` 比對完整的 `last_life_log`，相同字串會去重，所以第二次拒絕可能沒有新 lifecycle 行。(3) 寫入中 `ws-tab-pasting:2` 有 `CTRL_BOUNDS`。(4) `L:` `[APP:PASTE_DONE: created=2 overwritten=0 skipped=0 deleted=0 errors=0`；之後 `CTRL_GONE: id=ws-tab-pasting:2`（分頁列的探針，由 root 印，不帶 ` ws_tab=`）。磁碟：`ssh ubuntu "cd '$W/pastews/cut-dst' && sha256sum new.txt new2.txt"` 與「`ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-busy.txt"`（先 `mkdir -p '$W/oracle/cut-dst'`）之後同樣兩個檔的 `sha256sum`」相同。
 - **截圖**：`before.png`、`refused-cmdw.png`、`refused-x.png`、`hover-pasting.png`、`after-done.png`。
 
 #### WT61 背景分頁寫入中：標記、圖示，以及對它按 ×
@@ -622,7 +622,7 @@ clip > "$RUN/p-busy.sha"
   - 61a（背景分頁自己完成）：`shot a-pasting-in-background`。`mark`。放開 hold，等 5 秒。`shot a-after-done`。`hv` 到 `ws-tab:2` 停 2 秒，`shot a-hover`。
   - 61b（對背景分頁按 ×）：重做共同設定，回到「寫入中」並讓 `ws-src` 是目前分頁。`mark`。`pt ws-tab-close:2`，點（背景分頁的 ×），等 1 秒。`shot b-after-x`。放開 hold，等 `PASTE_DONE`。`shot b-after-done`。
 - **預期畫面**：61a：背景期間貼上圖示在 `ubuntu ▸ cut-dst` 分頁上仍看得到；完成後圖示消失，目前分頁仍是 `ws-src`，沒有任何切換。61b：點 × 之後視窗切到遠端分頁（`ix=2` 成為目前分頁），狀態列是「正在套用變更，已拒絕關閉、開啟與結束，以免寫入中斷。」，分頁沒有關；完成後圖示消失。
-- **比對**：61a：`L:` `[APP:PASTE_DONE: created=2 overwritten=0 skipped=0 deleted=0 errors=0` 且該行結尾 `]` 前帶 ` ws_tab=3`（背景分頁印的行；貼上工作以那個分頁的程式執行）；`CTRL_GONE: id=ws-tab-pasting:2`；`NOT:` `WS_TAB_ACTIVE`。磁碟：`new.txt`、`new2.txt` 的 `sha256sum` 同 WT60。61b：`L:`（依序）`[APP:WS_TAB_ACTIVE: id=3 ix=2`、`[APP:PASTE_BUSY: refused=close-workspace]`（沒有 ` ws_tab=`，因為此時已是目前分頁）；`NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。Cmd+W 永遠只關目前分頁，碰不到背景分頁，所以這一格不用快捷鍵。
+- **比對**：61a：`L:` `[APP:PASTE_DONE: ws_tab=3 created=2 overwritten=0 skipped=0 deleted=0 errors=0`（背景分頁印的行，`ws_tab=3` 緊接在 `PASTE_DONE: ` 之後；貼上工作以那個分頁的程式執行）；`CTRL_GONE: id=ws-tab-pasting:2`；`NOT:` `WS_TAB_ACTIVE`。磁碟：`new.txt`、`new2.txt` 的 `sha256sum` 同 WT60。61b：`L:`（依序）`[APP:WS_TAB_ACTIVE: id=3 ix=2`、`[APP:PASTE_BUSY: refused=close-workspace]`（沒有 ` ws_tab=`，因為此時已是目前分頁）；`NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。Cmd+W 永遠只關目前分頁，碰不到背景分頁，所以這一格不用快捷鍵。
 - **截圖**：`before.png`、`a-pasting-in-background.png`、`a-after-done.png`、`a-hover.png`、`b-after-x.png`、`b-after-done.png`。
 
 #### WT62 Cmd+Q：背景分頁寫入中，拒絕結束並切到那個分頁
@@ -656,7 +656,7 @@ clip > "$RUN/p-busy.sha"
 - **前置狀態**：S4（四個分頁），目前 `gamma`（`ix=3`）。沒有貼上進行中。
 - **操作**：`mark`。`Cmd+Q`。等程序結束（最多 15 秒）。所以視窗關閉後無法再截圖，所以按之前先 `shot before-quit`，按之後只讀日誌與 exit code。
 - **預期畫面**：視窗關閉，程序結束。
-- **比對**：`L:` `[APP:QUIT: deferred`；四個分頁各有一行 `[APP:LIFECYCLE: phase=drained intent=quit jobs=0`，其中**三行**（背景分頁 `id=1`、`id=2`、`id=3`）結尾 `]` 前帶 ` ws_tab=<id>`，目前分頁 `gamma`（`id=4`）那一行沒有（`newlog | grep 'phase=drained intent=quit' | wc -l` 是 4，`grep -c ' ws_tab='` 在這幾行裡是 3）。`NOT:` `PASTE_BUSY`。程序結束：`kill -0 "$PID"` 失敗；`$RUN/app-gate-b-exit.json` 的 `exit_code` 是 0；10 秒內結束。1.3 的 `ps comm` 執行檔查核沒有 desktop 行程，這一輪出現過的 git 子程序都不在。`QUIT: deferred` 恰好一行，且不帶 ` ws_tab=`。
+- **比對**：`L:` `[APP:QUIT: deferred`；四個分頁各有一行 `[APP:LIFECYCLE: phase=drained intent=quit jobs=0`，其中**三行**（背景分頁 `id=1`、`id=2`、`id=3`）`KIND: ` 之後的第一個欄位是 `ws_tab=<id>`，目前分頁 `gamma`（`id=4`）那一行沒有（`newlog | grep 'phase=drained intent=quit' | wc -l` 是 4，`grep -c ' ws_tab='` 在這幾行裡是 3）。`NOT:` `PASTE_BUSY`。程序結束：`kill -0 "$PID"` 失敗；`$RUN/app-gate-b-exit.json` 的 `exit_code` 是 0；10 秒內結束。1.3 的 `ps comm` 執行檔查核沒有 desktop 行程，這一輪出現過的 git 子程序都不在。`QUIT: deferred` 恰好一行，且不帶 ` ws_tab=`。
 - **截圖**：`before-quit.png`。
 
 #### WT71 視窗關閉鈕與 Cmd+Q 相同

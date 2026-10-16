@@ -572,7 +572,7 @@ impl WorkbenchModel {
 			.cursor_pointer()
 			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
 			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
+			.tip(tooltip)
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.toggle_repo_collapsed(slot, group_id, cx);
@@ -771,11 +771,11 @@ impl WorkbenchModel {
 			.pr(px(6.))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(color))
-			.when(self.chrome.menu.is_none(), |d| {
-				// Read again at draw time: the language can change under a
-				// tooltip that stays open (#208).
+			// Read again at draw time: the language can change under a
+			// tooltip that stays open (#208).
+			.live_tip({
 				let model = cx.weak_entity();
-				d.tooltip(live_tip(move |cx| {
+				move |cx| {
 					model
 						.upgrade()
 						.and_then(|m| {
@@ -784,7 +784,7 @@ impl WorkbenchModel {
 						})
 						.map(|n| n.text.into())
 						.unwrap_or_default()
-				}))
+				}
 			})
 			.child(icon(Icon::Warning, 12.))
 			.child(fill_text(text))
@@ -840,7 +840,7 @@ impl WorkbenchModel {
 			.cursor_pointer()
 			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
 			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
+			.tip(tooltip)
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.toggle_dir_collapsed(slot, group_id, &p1, cx);
@@ -928,7 +928,7 @@ impl WorkbenchModel {
 		let utf8 = item.is_valid_utf8();
 		let tooltip_base = format!("{path}  ({letter})");
 		let model = cx.weak_entity();
-		let tooltip = live_tip(move |cx| {
+		let tooltip = move |cx: &App| -> SharedString {
 			let loc = model
 				.upgrade()
 				.map(|m| m.read(cx).locale)
@@ -938,7 +938,7 @@ impl WorkbenchModel {
 			} else {
 				format!("{tooltip_base}\n{}", t("change_not_utf8", loc)).into()
 			}
-		});
+		};
 
 		div()
 			.id(SharedString::from(format!("change-row-el:{ix}:{path}")))
@@ -965,7 +965,7 @@ impl WorkbenchModel {
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
-			.when(self.chrome.menu.is_none(), |d| d.tooltip(tooltip))
+			.live_tip(tooltip)
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.select_change(ix, cx);

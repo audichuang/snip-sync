@@ -1051,7 +1051,9 @@ impl WorkbenchModel {
 					.is_some_and(|r| r.open_seq == Some(open_seq));
 				match result {
 					Ok(opened) => {
-						this.hide_workspace_menu();
+						this.drop_overlays(crate::overlay::DropScope::Kind(
+							crate::overlay::OverlayKind::WorkspaceMenu,
+						));
 						let target =
 							crate::tabs::OpenTarget::Remote(Box::new(opened));
 						if restore {
@@ -1330,8 +1332,6 @@ impl WorkbenchModel {
 		self.workspace_root = root.clone();
 		self.remote.session = Some(session);
 		self.workspace_open = true;
-		self.hide_workspace_menu();
-		self.workspace_picker = false;
 		self.ws_home = Some(root.clone());
 		self.ws_tree = Some(FileTreeNode::unloaded_root(&root));
 		app_log!(

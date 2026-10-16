@@ -1,5 +1,10 @@
 //! Git Log list, commit details and changed files.
 
+use super::fit::{
+	floor_px, natural_px, record_dropped, role_measure, role_measure_for,
+	FitCell, FitId, FitRole, Measure, ELLIPSIS, FIT_MARGIN,
+};
+use super::log::row_policy::*;
 use super::*;
 use crate::i18n::Msg;
 
@@ -12,6 +17,7 @@ impl WorkbenchModel {
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
+		self.log_fit.panel.used(self.log_width.get());
 		let range = self.range_rows();
 		let header = div()
 			.flex()
@@ -29,37 +35,53 @@ impl WorkbenchModel {
 					.font_weight(FontWeight::SEMIBOLD)
 					.child("Git"),
 			)
-			.child(
+			// The ref hint gives way to the buttons beside it.
+			.child({
+				let tab = t("log_tab", loc);
+				let (hint, key_end) = match &self.active_ref_filter {
+					Some(r) => {
+						(format!("{tab}: {}", short_ref(r)), tab.len() + 2)
+					}
+					None => (tab.to_string(), 0),
+				};
 				div()
-					.flex_shrink_0()
+					.min_w_0()
 					.h(px(22.))
 					.px(px(8.))
 					.flex()
 					.items_center()
 					.rounded(px(4.))
 					.bg(rgb(pal().selection_inactive_bg))
-					.child(match &self.active_ref_filter {
-						Some(r) => {
-							format!("{}: {}", t("log_tab", loc), short_ref(r))
-						}
-						None => t("log_tab", loc).to_string(),
-					}),
-			)
-			.child(div().flex_1())
+					.child(
+						FitCell::new(
+							FitId::new("log-header", FitRole::RefHint),
+							hint,
+						)
+						.key_end(key_end)
+						.flex()
+						.render(&self.probes, window),
+					)
+			})
+			.child(fit::spacer())
 			.child(
-				log_icon_button_tip(
+				log_icon_button(
 					"btn-log-more",
 					Icon::More,
-					(self.log_menu != Some(LogMenu::More))
-						.then(|| t("tip_log_more", loc).into()),
+					t("tip_log_more", loc),
 					true,
-					self.log_menu == Some(LogMenu::More),
+					self.overlays.log_menu() == Some(LogMenu::More),
 				)
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.toggle_log_menu(LogMenu::More, cx)
+				.on_click(cx.listener(|this, _, window, cx| {
+					this.toggle_log_menu(
+						LogMenu::More,
+						TriggerId::LogMoreButton,
+						window,
+						cx,
+					)
 				}))
-				.when(self.log_menu == Some(LogMenu::More), |d| {
-					d.child(self.log_menu_panel(LogMenu::More, cx))
+				.child(self.overlay_trigger_slot(TriggerId::LogMoreButton))
+				.when(self.overlays.log_menu() == Some(LogMenu::More), |d| {
+					d.child(self.log_menu_panel(LogMenu::More, window, cx))
 				})
 				.children(probe(log, "btn-log-more")),
 			)
@@ -83,6 +105,7 @@ impl WorkbenchModel {
 		                   cx: &mut Context<Self>| {
 			div()
 				.id(id)
+				.debug_selector(|| id.into())
 				.relative()
 				.flex_shrink_0()
 				.size(px(20.))
@@ -91,7 +114,7 @@ impl WorkbenchModel {
 				.justify_center()
 				.rounded(px(3.))
 				.cursor_pointer()
-				.tooltip(tip(t(tooltip, loc)))
+				.tip(t(tooltip, loc))
 				.when(on, |d| {
 					d.bg(rgb(pal().selection_bg))
 						.border_1()
@@ -146,6 +169,7 @@ impl WorkbenchModel {
 					.child(
 						div()
 							.id("log-search-input")
+							.debug_selector(|| "log-search-input".into())
 							.relative()
 							.flex_1()
 							.min_w_0()
@@ -169,32 +193,41 @@ impl WorkbenchModel {
 			)
 			// Chips give way first on a narrow window; the actions stay.
 			.child({
-				let (visible_menus, hidden_menus) = self.log_filter_split();
+				let chip_fit = self.log_chip_fit(window);
+				let (visible_menus, hidden_menus) =
+					split_by_mask(chip_fit.mask);
 				// The overflow chip always stays reachable: on a very narrow
 				// window the search box gives way to it (down to its 96px).
 				let floor = if hidden_menus.is_empty() {
 					0.
 				} else {
-					self.log_filter_layout.more_effective_w() + 9.
+					chip_fit.more_dot
 				};
 				let mut chips = div()
 					.relative()
 					.flex()
 					.flex_row()
 					.items_center()
-					.gap(px(4.))
+					.gap(px(LOG_FILTER_GAP))
 					.flex_1()
 					.min_w(px(floor))
 					.overflow_hidden();
 				for menu in visible_menus {
 					let (label, value) = self.log_menu_value(menu, loc);
-					chips = chips.child(self.log_chip(menu, &label, value, cx));
+					chips =
+						chips.child(self.log_chip(
+							menu, &label, value, &chip_fit, window, cx,
+						));
 				}
 				if !hidden_menus.is_empty() {
-					chips = chips.child(self.log_chip_more(hidden_menus, cx));
+					chips = chips.child(self.log_chip_more(
+						hidden_menus,
+						&chip_fit,
+						window,
+						cx,
+					));
 				}
 				let layout = self.log_filter_layout.clone();
-				let has_values = self.log_filter_split_has_values(loc);
 				chips = chips.child(
 					canvas(
 						move |b, window, cx| {
@@ -205,30 +238,14 @@ impl WorkbenchModel {
 							{
 								layout.refresh_count.set(0);
 							}
-							let new_mask =
-								layout.compute_split(new_w, has_values);
-							// The cap for the new width: a resize that keeps
-							// the mask can still leave the chips truncated
-							// (or not) for the old width.
-							let stale_cap = (layout.text_cap_for(new_w)
-								- layout.text_cap())
-							.abs() > 0.5;
-							if new_mask != layout.last_mask.get() || stale_cap {
-								let ref_count = layout.refresh_count.get();
-								if ref_count < 3 {
-									layout.refresh_count.set(ref_count + 1);
-									// `refresh` is a no-op while drawing (this
-									// frame split by last frame's width):
-									// redraw once this frame is done.
-									let handle = window.window_handle();
-									cx.defer(move |cx| {
-										let _ = handle
-											.update(cx, |_, w, _| w.refresh());
-									});
-								}
-							} else {
-								layout.refresh_count.set(0);
-							}
+							// The chips were split for last frame's width:
+							// draw one more for this one's.
+							refresh_if_stale(
+								(new_w - layout.used_w.get()).abs() > 0.5,
+								&layout.refresh_count,
+								window,
+								cx,
+							);
 						},
 						|_, _, _, _| {},
 					)
@@ -306,25 +323,6 @@ impl WorkbenchModel {
 			.unwrap_or(40.0);
 		let rows = self.display_commits();
 		let n = rows.len();
-		// The widest ref-label group any row has: columns give way to it
-		// only as far as it needs (#216).
-		let measure = |s: &str| text_width(window, s, SMALL_TEXT);
-		let labels_w = self.graph_layout.as_ref().map_or(0., |l| {
-			l.rows
-				.iter()
-				.zip(rows.iter())
-				.filter(|(r, _)| !r.refs.is_empty())
-				.map(|(r, c)| {
-					ref_labels_width(
-						&r.refs,
-						self.log_current_branch(&c.sha).as_deref(),
-						&measure,
-					)
-				})
-				.fold(0., f32::max)
-		});
-		let date_need =
-			date_need_w(loc, &|s: &str| text_width(window, s, UI_TEXT));
 		// Tint rows on the current branch only when others are shown too.
 		let on_head: Rc<Vec<bool>> = {
 			let marks: HashMap<&str, bool> = self
@@ -347,16 +345,14 @@ impl WorkbenchModel {
 		let list_w = f32::from(
 			self.log_scroll.0.borrow().base_handle.bounds().size.width,
 		);
-		// One set of column widths for every row, so lanes line up.
-		let cols = if list_w > 0. {
-			list_cols(list_w, gutter_w, labels_w, date_need, self.log_show_hash)
-		} else {
-			ListCols {
-				gutter: gutter_w,
-				author: AUTHOR_W,
-				date: DATE_W,
-			}
-		};
+		// One set of column widths for every row, from the worst row of each
+		// kind, so lanes line up. Not laid out yet: a nominal width, until
+		// the list reports its own.
+		let parts = self.log_list_fit_parts(window);
+		let laid_out_w = if list_w > 0. { list_w } else { NOMINAL_LIST_W };
+		self.log_fit.list.used(laid_out_w);
+		let cols =
+			fit_list(&parts.input(laid_out_w, self.log_show_hash, gutter_w));
 		let loading_row = self.history_extending && self.history_has_more;
 		let list = uniform_list(
 			"log-rows",
@@ -393,6 +389,7 @@ impl WorkbenchModel {
 				.absolute()
 				.size_full()
 			})
+			.child(self.log_fit.panel.canvas())
 			.flex()
 			.flex_col()
 			.flex_shrink_0()
@@ -433,7 +430,7 @@ impl WorkbenchModel {
 					.min_h_0()
 					.child(self.render_branch_toolbar(cx))
 					.when(self.log_branches_visible, |d| {
-						d.child(self.render_branches(cx))
+						d.child(self.render_branches(window, cx))
 					})
 					.child(
 						div()
@@ -453,11 +450,9 @@ impl WorkbenchModel {
 										.bg(rgb(pal().error_bg))
 										.text_size(px(SMALL_TEXT))
 										.text_color(rgb(pal().error))
-										.when(self.chrome.menu.is_none(), |d| {
-											d.tooltip(tip(self
-												.failed_feed_names()
-												.join("\n")))
-										})
+										.tip(
+											self.failed_feed_names().join("\n"),
+										)
 										.child(msg.render(loc))
 										.children(probe(
 											log,
@@ -468,6 +463,7 @@ impl WorkbenchModel {
 							.child(
 								div()
 									.id("log-list")
+									.debug_selector(|| "log-list".into())
 									.relative()
 									.key_context("GitLog")
 									.track_focus(&self.log_focus)
@@ -569,6 +565,7 @@ impl WorkbenchModel {
 										},
 									)
 									.child(list)
+									.child(self.log_fit.list.canvas())
 									.children(probe(log, "log-list")),
 							),
 					)
@@ -616,6 +613,142 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// The id of a log row's probes (`commit-row:<key>`, `text-fit:row:<key>`):
+	/// `<repo>:<sha7>` in a merged log, else `<sha7>`.
+	pub(crate) fn log_row_key(
+		&self,
+		c: &snip_core::browser::CommitSummary,
+	) -> String {
+		match self.log_row_repo(&c.sha) {
+			Some((feed, _)) => format!("{}:{}", feed.name, short(&c.sha)),
+			None => short(&c.sha).to_string(),
+		}
+	}
+
+	/// Whether the commit is the viewer's own: its author's name is drawn
+	/// in the viewer's weight (see [`FitRole::style_for`]), so the author
+	/// column is floored in it too.
+	pub(super) fn is_own_commit(
+		&self,
+		c: &snip_core::browser::CommitSummary,
+	) -> bool {
+		self.git_user_email
+			.as_deref()
+			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email))
+	}
+
+	/// The worst row of each kind the list's columns are decided from
+	/// (see [`fit_list`]), kept while nothing it reads changes.
+	pub(super) fn log_list_fit_parts(
+		&self,
+		window: &Window,
+	) -> Rc<ListFitParts> {
+		use std::hash::{Hash, Hasher};
+		let loc = self.locale;
+		let rows = self.display_commits();
+		let mut h = std::collections::hash_map::DefaultHasher::new();
+		(
+			loc as u8,
+			self.collapsed_merges.len(),
+			self.log_search.is_some(),
+			rows.len(),
+		)
+			.hash(&mut h);
+		for r in &self.repos {
+			r.summary
+				.as_ref()
+				.ok()
+				.and_then(|s| s.branch.as_ref())
+				.hash(&mut h);
+		}
+		for (ix, c) in rows.iter().enumerate() {
+			c.sha.hash(&mut h);
+			c.author_name.hash(&mut h);
+			// Its weight: the viewer's email arrives after the first rows.
+			self.is_own_commit(c).hash(&mut h);
+			self.collapsed_merges.contains(&c.sha).hash(&mut h);
+			if let Some(r) =
+				self.graph_layout.as_ref().and_then(|l| l.rows.get(ix))
+			{
+				for i in &r.refs {
+					(&i.raw_name, &i.display_name).hash(&mut h);
+				}
+			}
+		}
+		let key = h.finish();
+		if let Some((k, parts)) = self.log_fit.cache.borrow().as_ref() {
+			if *k == key {
+				return parts.clone();
+			}
+		}
+		let ui = |role| role_measure(window, role);
+		let subject = ui(FitRole::Subject);
+		let bound = ["\u{6f22}", "W"]
+			.iter()
+			.map(|c| subject.drawn(&format!("{}{ELLIPSIS}", c.repeat(6))))
+			.fold(0., f32::max)
+			+ FIT_MARGIN;
+		let mut seen = HashSet::new();
+		let mut author_floor: Option<f32> = None;
+		for c in &rows {
+			// Each name in the weight it is drawn in.
+			let own = self.is_own_commit(c);
+			if seen.insert((c.author_name.as_str(), own)) {
+				let measure = role_measure_for(window, FitRole::Author, own);
+				let f = floor_px(FitRole::Author, &c.author_name, 0, &measure);
+				author_floor = Some(author_floor.map_or(f, |a| a.max(f)));
+			}
+		}
+		let collapsed_m = ui(FitRole::Collapsed);
+		let collapsed = rows
+			.iter()
+			.filter(|c| self.collapsed_merges.contains(&c.sha))
+			.map(|c| {
+				let n = crate::history::side_only(&self.commits, &c.sha).len();
+				natural_px(
+					FitRole::Collapsed,
+					&tf("collapsed_n", loc, &[&n]),
+					&collapsed_m,
+				)
+			})
+			.reduce(f32::max);
+		// The row whose labels need the most at their floors decides.
+		let mut labels: Vec<LabelPart> = Vec::new();
+		let cost = |g: &[LabelPart]| -> f32 {
+			g.iter()
+				.enumerate()
+				.map(|(n, l)| {
+					l.floor + if n == 0 { SUBJECT_LABEL_GAP } else { LABEL_GAP }
+				})
+				.sum()
+		};
+		if let Some(layout) = self.graph_layout.as_ref() {
+			for (r, c) in layout.rows.iter().zip(rows.iter()) {
+				if r.refs.is_empty() {
+					continue;
+				}
+				let data = ref_label_data(
+					&r.refs,
+					self.log_current_branch(&c.sha).as_deref(),
+				);
+				let group: Vec<LabelPart> =
+					data.iter().map(|d| label_part(window, d)).collect();
+				if cost(&group) > cost(&labels) {
+					labels = group;
+				}
+			}
+		}
+		let parts = Rc::new(ListFitParts {
+			date_need: date_need_w(loc, &ui(FitRole::Date)) + FIT_MARGIN,
+			author_floor,
+			subject_floor_bound: bound,
+			collapsed,
+			labels,
+		});
+		*self.log_fit.cache.borrow_mut() = Some((key, parts.clone()));
+		parts
+	}
+
 	pub(super) fn log_row(
 		&self,
 		ix: usize,
@@ -630,18 +763,12 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		let loc = self.locale;
-		// Row tooltips are off while a context menu is open (they would
-		// draw over it).
-		let show_tips = self.chrome.menu.is_none();
 		// Every selected row (a range selects its anchor's repository only).
 		let selected = self.log_is_selected(&c.sha);
 		let sha = c.sha.clone();
 		// The merged log: the row's repository (root stripe, ids).
 		let repo = self.log_row_repo(&c.sha);
-		let key = match repo {
-			Some((feed, _)) => format!("{}:{}", feed.name, short(&sha)),
-			None => short(&sha).to_string(),
-		};
+		let key = self.log_row_key(c);
 		// Drivers address the selected repository's rows by SHA alone.
 		let legacy_id = repo
 			.filter(|(feed, _)| self.repo_root().as_ref() == Some(&feed.root))
@@ -669,44 +796,66 @@ impl WorkbenchModel {
 			0
 		};
 		let current_branch = self.log_current_branch(&c.sha);
-		let (labels, labels_w) = graph_row
+		let data = graph_row
 			.as_ref()
-			.map(|r| {
-				ref_label_elements(
-					ix,
-					&r.refs,
-					current_branch.as_deref(),
-					&key,
-					show_tips,
-					&|s: &str| text_width(window, s, SMALL_TEXT),
-				)
-			})
+			.map(|r| ref_label_data(&r.refs, current_branch.as_deref()))
 			.unwrap_or_default();
-		let mine = self
-			.git_user_email
-			.as_deref()
-			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
-		let hash_w = if self.log_show_hash { 64. } else { 0. };
-		let subject_w = text_width(window, &c.subject, UI_TEXT);
-		// The subject cell is what the row's fixed parts leave; the graph
-		// gutter and the ref labels give way before it vanishes.
-		let widths = if list_w > 0. {
-			row_widths(list_w, cols, labels_w, subject_w, self.log_show_hash)
-		} else {
-			// Not laid out yet: no width to divide.
-			RowWidths {
-				gutter: cols.gutter,
-				labels: labels_w,
-				subject: 0.,
+		let label_parts: Vec<LabelPart> =
+			data.iter().map(|d| label_part(window, d)).collect();
+		let mine = self.is_own_commit(c);
+		let measure = |role| role_measure(window, role);
+		let collapsed_text =
+			collapsed.then(|| tf("collapsed_n", loc, &[&hidden_n]));
+		let subject_m = measure(FitRole::Subject);
+		// One solver places every cell of the row; what it cannot place is
+		// not drawn (`record_dropped` tells the probe).
+		let fit = fit_log_row(
+			if list_w > 0. { list_w } else { NOMINAL_LIST_W },
+			&cols,
+			&RowFitInput {
+				hash: self.log_show_hash,
+				subject_natural: natural_px(
+					FitRole::Subject,
+					&c.subject,
+					&subject_m,
+				),
+				subject_floor: floor_px(
+					FitRole::Subject,
+					&c.subject,
+					0,
+					&subject_m,
+				),
+				collapsed: collapsed_text.as_deref().map(|t| {
+					natural_px(
+						FitRole::Collapsed,
+						t,
+						&measure(FitRole::Collapsed),
+					)
+				}),
+				labels: label_parts,
+			},
+		);
+		let probes = &self.probes;
+		let scope = format!("row:{key}");
+		let fid = |role| FitId::new(scope.clone(), role);
+		// A cell the solver dropped: only the probe hears of it.
+		let dropped = |role: FitRole, text: &str| {
+			if probes.is_some() {
+				// Only the author's text can be the viewer's own.
+				let own = mine && role == FitRole::Author;
+				let m = role_measure_for(window, role, own);
+				record_dropped(
+					probes,
+					fid(role),
+					role.style_for(own),
+					text,
+					natural_px(role, text, &m),
+					floor_px(role, text, 0, &m),
+				);
 			}
 		};
-		let (gutter_w, subject_room) = (widths.gutter, widths.subject);
-		let labels = if widths.labels > 0. {
-			labels
-		} else {
-			Vec::new()
-		};
-		let truncated = subject_w > subject_room;
+		let truncated =
+			fit.width(LogCell::Subject) < fit.natural(LogCell::Subject) - 0.5;
 		let row_id = format!("commit-row:{key}");
 		let col_id = format!("collapse:{key}");
 		let merge_sha = sha.clone();
@@ -715,16 +864,126 @@ impl WorkbenchModel {
 			.map(|r| graph_view::lane_x(r.node.lane))
 			.unwrap_or(0.);
 		let date = log_date(&c.author_date, loc);
+		// FIT-ROW-BEGIN log_row
+		let mut cells: Vec<AnyElement> = Vec::new();
+		cells.push(
+			FitCell::new(fid(FitRole::Subject), c.subject.clone())
+				.selector(format!("log-subject:{ix}"))
+				.solved(&fit, LogCell::Subject)
+				.render(probes, window)
+				// The solver pays the gap only for a subject it places: on a
+				// list too narrow for one, a margin would push the fixed
+				// columns after it out of the row.
+				.ml(px(if fit.shown(LogCell::Subject) {
+					CELL_GAP
+				} else {
+					0.
+				}))
+				.id(SharedString::from(format!("subject:{key}")))
+				.when(truncated, |d| d.tip(c.subject.clone()))
+				.into_any_element(),
+		);
+		if let Some(text) = &collapsed_text {
+			if fit.shown(LogCell::Collapsed) {
+				cells.push(
+					FitCell::new(fid(FitRole::Collapsed), text.clone())
+						.selector(format!("log-collapsed:{ix}"))
+						.solved(&fit, LogCell::Collapsed)
+						.render(probes, window)
+						.ml(px(SUBJECT_LABEL_GAP))
+						.text_color(rgb(pal().text_muted))
+						.into_any_element(),
+				);
+			} else {
+				dropped(FitRole::Collapsed, text);
+			}
+		}
+		let mut n = 0;
+		for d in &data {
+			let role = d.cell.role().expect("a label cell has a role");
+			if !fit.shown(d.cell) {
+				dropped(role, &d.text);
+				continue;
+			}
+			let gap = if n == 0 { SUBJECT_LABEL_GAP } else { LABEL_GAP };
+			let mut cell =
+				FitCell::new(fid(role), d.text.clone()).solved(&fit, d.cell);
+			let (color, id) = match &d.label {
+				Some(l) => {
+					cell = cell
+						.leading(label_icon(l))
+						.selector(format!("log-ref-label:{ix}:{n}"));
+					(pal().text, format!("ref-badge:{key}:{}", d.text))
+				}
+				None => (pal().log_ref_text, format!("ref-more:{key}")),
+			};
+			cells.push(
+				cell.render(probes, window)
+					.ml(px(gap))
+					.text_color(rgb(color))
+					.id(SharedString::from(id))
+					.tip(d.tooltip.clone())
+					.into_any_element(),
+			);
+			n += 1;
+		}
+		cells.push(fit::spacer().into_any_element());
+		if cols.author.is_some() && fit.shown(LogCell::Author) {
+			cells.push(
+				FitCell::new(fid(FitRole::Author), c.author_name.clone())
+					.selector(format!("log-author:{ix}"))
+					.own(mine)
+					.solved(&fit, LogCell::Author)
+					.render(probes, window)
+					.ml(px(CELL_GAP))
+					.id(SharedString::from(format!("author:{key}")))
+					.tip(format!("{} <{}>", c.author_name, c.author_email))
+					.into_any_element(),
+			);
+		} else {
+			dropped(FitRole::Author, &c.author_name);
+		}
+		if cols.date.is_some() && fit.shown(LogCell::Date) {
+			cells.push(
+				FitCell::new(fid(FitRole::Date), date.clone())
+					.selector(format!("log-date:{ix}"))
+					.solved(&fit, LogCell::Date)
+					.render(probes, window)
+					.ml(px(CELL_GAP))
+					.id(SharedString::from(format!("date:{key}")))
+					.tip(short_date(&c.author_date))
+					.into_any_element(),
+			);
+		} else {
+			dropped(FitRole::Date, &date);
+		}
+		if self.log_show_hash {
+			if fit.shown(LogCell::Hash) {
+				cells.push(
+					FitCell::new(fid(FitRole::Hash), short(&c.sha).to_string())
+						.selector(format!("log-sha:{ix}"))
+						.solved(&fit, LogCell::Hash)
+						.render(probes, window)
+						.ml(px(CELL_GAP))
+						.text_color(rgb(pal().text_muted))
+						.id(SharedString::from(format!("sha:{key}")))
+						.tip(crate::multi_log::split_id(&c.sha).0.to_string())
+						.into_any_element(),
+				);
+			} else {
+				dropped(FitRole::Hash, short(&c.sha));
+			}
+		}
 		div()
 			.id(SharedString::from(row_id.clone()))
+			.debug_selector(|| format!("log-row:{ix}"))
 			.relative()
 			.w_full()
 			.flex()
 			.flex_row()
 			.items_center()
 			.h(px(graph_view::ROW_HEIGHT))
-			.pr(px(8.))
-			.gap(px(8.))
+			.pr(px(ROW_PAD_R))
 			.cursor_pointer()
 			.when(on_head && !selected, |d| {
 				d.bg(rgb(pal().log_current_branch_bg))
@@ -761,7 +1020,7 @@ impl WorkbenchModel {
 				div()
 					.relative()
 					.flex_shrink_0()
-					.w(px(gutter_w))
+					.w(px(fit.width(LogCell::Gutter)))
 					.h(px(graph_view::ROW_HEIGHT))
 					.overflow_hidden()
 					.debug_selector(|| format!("log-gutter:{ix}"))
@@ -789,16 +1048,14 @@ impl WorkbenchModel {
 								.size(px(14.))
 								.rounded(px(7.))
 								.hover(|s| s.bg(rgb(pal().hover_bg)))
-								.when(show_tips, |d| {
-									d.tooltip(tip(t(
-										if collapsed {
-											"tip_expand_merge"
-										} else {
-											"tip_collapse_merge"
-										},
-										loc,
-									)))
-								})
+								.tip(t(
+									if collapsed {
+										"tip_expand_merge"
+									} else {
+										"tip_collapse_merge"
+									},
+									loc,
+								))
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
 									this.toggle_collapse(merge_sha.clone(), cx);
@@ -807,105 +1064,7 @@ impl WorkbenchModel {
 						)
 					}),
 			)
-			.child(
-				div()
-					.debug_selector(|| format!("log-subject-room:{ix}"))
-					.flex_1()
-					.min_w_0()
-					.flex()
-					.flex_row()
-					.items_center()
-					.gap(px(6.))
-					.overflow_hidden()
-					.child(
-						div()
-							.id(SharedString::from(format!("subject:{key}")))
-							.debug_selector(|| format!("log-subject:{ix}"))
-							// Its text width, so the labels follow it (#188).
-							.flex_shrink()
-							.min_w_0()
-							.overflow_hidden()
-							.line_clamp(1)
-							.text_ellipsis()
-							.when(show_tips && truncated, |d| {
-								d.tooltip(tip(c.subject.clone()))
-							})
-							.child(c.subject.clone()),
-					)
-					// Out of scope: `row_widths` does not count this chip (and
-					// its 6px gap), so a collapsed merge row's subject is a
-					// little narrower than `subject_room` and the truncation
-					// check for its tooltip can be off.
-					.when(collapsed, |d| {
-						d.child(
-							div()
-								.flex_shrink_0()
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted))
-								.child(tf("collapsed_n", loc, &[&hidden_n])),
-						)
-					})
-					// Absent (not empty) when dropped: its 6px gap would
-					// otherwise take from the subject.
-					.when(!labels.is_empty(), |d| {
-						d.child(
-							div()
-								.flex_shrink_0()
-								.flex()
-								.flex_row()
-								.items_center()
-								.gap(px(8.))
-								.when(widths.labels < labels_w, |d| {
-									d.w(px(widths.labels)).overflow_hidden()
-								})
-								.children(labels),
-						)
-					}),
-			)
-			.child(
-				div()
-					.id(SharedString::from(format!("author:{key}")))
-					.flex_shrink_0()
-					.w(px(cols.author))
-					.when(show_tips, |d| {
-						d.tooltip(tip(format!(
-							"{} <{}>",
-							c.author_name, c.author_email
-						)))
-					})
-					.child(
-						clip_text(c.author_name.clone()).when(mine, |d| {
-							d.font_weight(FontWeight::SEMIBOLD)
-						}),
-					),
-			)
-			.child(
-				div()
-					.id(SharedString::from(format!("date:{key}")))
-					.flex_shrink_0()
-					.w(px(cols.date))
-					.when(show_tips, |d| {
-						d.tooltip(tip(short_date(&c.author_date)))
-					})
-					.child(clip_text(date)),
-			)
-			.when(self.log_show_hash, |d| {
-				d.child(
-					div()
-						.id(SharedString::from(format!("sha:{key}")))
-						.flex_shrink_0()
-						.w(px(hash_w))
-						.font_family(CODE_FONT)
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.when(show_tips, |d| {
-							d.tooltip(tip(crate::multi_log::split_id(&c.sha)
-								.0
-								.to_string()))
-						})
-						.child(short(&c.sha).to_string()),
-				)
-			})
+			.children(cells)
 			// IntelliJ's root stripe: the repository, at the row's left edge.
 			.when_some(stripe, |d, (color, name)| {
 				let id = format!("root-stripe:{key}");
@@ -918,27 +1077,33 @@ impl WorkbenchModel {
 						.w(px(4.))
 						.h_full()
 						.bg(color)
-						.when(show_tips, |d| d.tooltip(tip(name)))
+						.tip(name)
 						.children(probe(&self.probes, id)),
 				)
 			})
 			.children(probe(&self.probes, row_id))
 			.children(legacy_id.and_then(|id| probe(&self.probes, id)))
 			.into_any_element()
+		// FIT-ROW-END
 	}
 
 	/// The changed-files rows, rebuilt only when their inputs change.
 	fn commit_rows(&self, by_dir: bool) -> Rc<Vec<ChangeItemRow>> {
 		use std::hash::{Hash, Hasher};
 		let mut h = std::collections::hash_map::DefaultHasher::new();
-		(&self.commit_files, by_dir, &self.changed_dirs_collapsed).hash(&mut h);
+		(
+			&self.commit_view.commit_files,
+			by_dir,
+			&self.changed_dirs_collapsed,
+		)
+			.hash(&mut h);
 		let key = h.finish();
 		let mut cache = self.commit_rows_cache.borrow_mut();
 		if let Some((_, rows)) = cache.as_ref().filter(|(k, _)| *k == key) {
 			return rows.clone();
 		}
 		let rows = Rc::new(super::changes::commit_file_rows(
-			&self.commit_files,
+			&self.commit_view.commit_files,
 			by_dir,
 			&self.changed_dirs_collapsed,
 		));
@@ -954,9 +1119,11 @@ impl WorkbenchModel {
 			.iter()
 			.filter_map(|r| match r {
 				ChangeItemRow::Dir { path, .. } => Some(format!("{path}/")),
-				ChangeItemRow::File { file_idx, .. } => {
-					self.commit_files.get(*file_idx).map(|(p, _)| p.clone())
-				}
+				ChangeItemRow::File { file_idx, .. } => self
+					.commit_view
+					.commit_files
+					.get(*file_idx)
+					.map(|(p, _)| p.clone()),
 				_ => None,
 			})
 			.collect();
@@ -974,7 +1141,7 @@ impl WorkbenchModel {
 		let log = &self.probes;
 		let by_dir = self.log_details_by_dir;
 		let rows = self.commit_rows(by_dir);
-		let n = self.commit_files.len();
+		let n = self.commit_view.commit_files.len();
 		let files_header = div()
 			.flex()
 			.flex_row()
@@ -986,6 +1153,7 @@ impl WorkbenchModel {
 			.border_b_1()
 			.border_color(rgb(pal().divider))
 			.child(
+				// FIT-EXEMPT: the changed-files count shares its header with fixed buttons only
 				fill_text(if n > 0 {
 					tf("changed_files", loc, &[&n])
 				} else {
@@ -1036,7 +1204,9 @@ impl WorkbenchModel {
 				)
 				.on_click(cx.listener(|this, _, _, cx| {
 					this.changed_dirs_collapsed =
-						super::changes::commit_file_dirs(&this.commit_files);
+						super::changes::commit_file_dirs(
+							&this.commit_view.commit_files,
+						);
 					cx.notify();
 				}))
 				.children(probe(log, "details-collapse-all")),
@@ -1135,7 +1305,7 @@ impl WorkbenchModel {
 				// A folder in the selection is keyed "dir/".
 				let key = format!("{path}/");
 				let sel = self.rev_tree.is_none()
-					&& self.commit_file_sel.contains(&key);
+					&& self.commit_view.commit_file_sel.contains(&key);
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
@@ -1150,17 +1320,18 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(self.chrome.menu.is_none(), |d| {
-						d.tooltip(tip(path.clone()))
-					})
+					.tip(path.clone())
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
 						let key = key.clone();
 						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 							// IntelliJ: a menu outside the selection selects
 							// its row alone.
-							if !sel && !this.commit_file_sel.is_empty() {
-								this.commit_file_sel = vec![key.clone()];
+							if !sel
+								&& !this.commit_view.commit_file_sel.is_empty()
+							{
+								this.commit_view.commit_file_sel =
+									vec![key.clone()];
 							}
 							let items = this.commit_file_menu(&path, true);
 							w.focus(&this.log_focus);
@@ -1204,6 +1375,7 @@ impl WorkbenchModel {
 							.child(icon(Icon::Folder, 14.)),
 					)
 					.child(
+						// FIT-EXEMPT: details pane, a follow-up issue: its file names are outside ADR 0005's table
 						clip_text(name)
 							.ml(px(4.))
 							.flex_shrink()
@@ -1214,17 +1386,19 @@ impl WorkbenchModel {
 					.into_any_element()
 			}
 			ChangeItemRow::File { file_idx, depth } => {
-				let Some((path, ct)) = self.commit_files.get(file_idx).cloned()
+				let Some((path, ct)) =
+					self.commit_view.commit_files.get(file_idx).cloned()
 				else {
 					return div().into_any_element();
 				};
 				let (letter, color) = change_style(ct);
 				let deleted = ct == Some(ChangeType::Deleted);
 				let sel = self.rev_tree.is_none()
-					&& if self.commit_file_sel.is_empty() {
-						self.selected_commit_file.as_deref() == Some(&path)
+					&& if self.commit_view.commit_file_sel.is_empty() {
+						self.commit_view.selected_commit_file.as_deref()
+							== Some(&path)
 					} else {
-						self.commit_file_sel.contains(&path)
+						self.commit_view.commit_file_sel.contains(&path)
 					};
 				let id = format!("commit-file:{path}");
 				let (dir, name) = match path.rsplit_once('/') {
@@ -1235,6 +1409,7 @@ impl WorkbenchModel {
 				// A merge's file that the first parent has as well: it is
 				// listed only because another parent changed it (#188).
 				let same_first = self
+					.commit_view
 					.commit_files_first_parent_same
 					.as_ref()
 					.is_some_and(|(sha, set)| {
@@ -1260,13 +1435,13 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(self.chrome.menu.is_none(), |d| {
+					.tip({
 						let mut tip_text = format!("{path}  ({letter})");
 						if let Some(note) = &same_note {
 							tip_text.push('\n');
 							tip_text.push_str(note);
 						}
-						d.tooltip(tip(tip_text))
+						tip_text
 					})
 					.on_click(cx.listener(
 						move |this, ev: &gpui::ClickEvent, _, cx| {
@@ -1301,6 +1476,7 @@ impl WorkbenchModel {
 					})
 					.child(icon(file_icon(&path), 14.))
 					.child(
+						// FIT-EXEMPT: details pane, a follow-up issue: its file names are outside ADR 0005's table
 						clip_text(name)
 							.flex_shrink_0()
 							.max_w(gpui::relative(0.7))
@@ -1314,6 +1490,7 @@ impl WorkbenchModel {
 					// The flat list names the file's folder after it.
 					.when(!self.log_details_by_dir, |d| {
 						d.child(
+							// FIT-EXEMPT: details pane, a follow-up issue: its directory names are outside ADR 0005's table
 							fill_text(dir)
 								.text_size(px(SMALL_TEXT))
 								.text_color(rgb(pal().text_muted)),
@@ -1428,10 +1605,16 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let row = self.commits.iter().find(|c| c.sha == sha);
 		let details = self
+			.commit_view
 			.commit_details
 			.as_ref()
 			.filter(|d| d.sha == sha)
-			.or_else(|| self.selection_details.iter().find(|d| d.sha == sha));
+			.or_else(|| {
+				self.commit_view
+					.selection_details
+					.iter()
+					.find(|d| d.sha == sha)
+			});
 		let message = details
 			.map(|d| d.message.clone())
 			.or_else(|| row.map(|c| c.subject.clone()))
