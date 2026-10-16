@@ -2563,6 +2563,10 @@ impl PastePreviewPlan {
 	/// while the new plan is built. Unlike [`Self::clear_file_plan`] it also
 	/// drops a whole-commit replay (which has no mapping to rebuild from),
 	/// and the prefix choices, which are the new destination's to ask again.
+	/// The tree's folds and folder cursor name rows under the old folder's
+	/// roots, and the restore-base hint is what the old folder's engine
+	/// suggested: both start over with the new folder, as on a new paste,
+	/// and [Adjust paths] is off again until the user asks.
 	pub(crate) fn disarm_for(&mut self, dest: PathBuf) {
 		self.destination = dest;
 		self.items = Vec::new();
@@ -2572,6 +2576,11 @@ impl PastePreviewPlan {
 		self.commit_preview = None;
 		self.commit_prepared = Default::default();
 		self.collapsed_commits.clear();
+		self.collapsed_dirs.clear();
+		self.cursor_dir = None;
+		self.fold_seeded = false;
+		self.restore_base = None;
+		self.adjust_paths = false;
 		self.prefix_choices = Vec::new();
 		self.error = None;
 	}
@@ -4144,6 +4153,62 @@ pub(crate) mod tests {
 		);
 		assert!(!plan.adjust_paths);
 		assert_eq!(item_paths(&plan), ["sub/a.ts"]);
+	}
+
+	/// A retarget starts the tree and the restore-base hint over: the shell
+	/// shown while the new folder is planned keeps no fold, folder cursor,
+	/// hint or [Adjust paths] of the old one, and the new plan is not
+	/// adjusted unasked (#238 over #239 / #240).
+	#[test]
+	fn retarget_starts_the_tree_and_the_hint_over() {
+		let tmp = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(tmp.path()).unwrap();
+		let dest = root.join("sub");
+		let other = root.join("other");
+		fs::create_dir(&dest).unwrap();
+		fs::create_dir(&other).unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/d/b.ts\ny\n",
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+		plan.set_adjust_paths(true).unwrap();
+		assert!(plan.restore_hint().is_some());
+		let (root_key, path, _) = plan
+			.all_dirs()
+			.into_iter()
+			.find(|(_, path, _)| !path.is_empty())
+			.expect("a folder row");
+		let key = DirKey {
+			commit: None,
+			root: root_key,
+			path,
+		};
+		plan.collapsed_dirs.insert(key.clone());
+		plan.cursor_dir = Some(key);
+
+		plan.disarm_for(other.clone());
+		assert!(plan.restore_hint().is_none(), "the old folder's hint");
+		assert!(!plan.adjust_paths);
+		assert!(plan.collapsed_dirs.is_empty());
+		assert!(plan.cursor_dir.is_none());
+		assert_eq!(plan.cursor(), PasteCursor::Item(0));
+
+		let plan = plan
+			.retarget_with(
+				&other,
+				&[],
+				2,
+				&RunOptions::default(),
+				MAX_RETAINED_PREVIEW_BYTES,
+			)
+			.unwrap();
+		assert_eq!(plan.destination, other);
+		assert!(!plan.adjust_paths, "nothing adjusted unasked");
+		assert_eq!(item_paths(&plan), ["sub/a.ts", "sub/d/b.ts"]);
+		assert!(plan.cursor_dir.is_none());
 	}
 
 	#[test]
