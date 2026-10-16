@@ -5,11 +5,14 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::foldernames::DirKey;
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
@@ -353,10 +356,29 @@ pub fn execute_restore_plan_observed(
 #[derive(Debug)]
 pub(crate) enum Reservation {
 	/// An empty file of this Apply's own is there (`create_new`): the row
-	/// writes into it.
-	Made,
+	/// writes into it while it is still that file, untouched.
+	Made(Reserved),
 	/// Making it failed: the row fails with this, and writes nothing.
 	Failed(std::io::Error),
+}
+
+/// The empty file an Apply made for a new file, as it was right after:
+/// which object it is and when it was last modified (its length is 0).
+#[derive(Debug, Clone)]
+pub(crate) struct Reserved {
+	pub(crate) key: DirKey,
+	pub(crate) modified: Option<SystemTime>,
+}
+
+impl Reserved {
+	/// Whether `info` still reads as the file made: a file, empty, not
+	/// modified since. The object is checked apart from this.
+	fn untouched(&self, info: &fs::Metadata) -> bool {
+		info.is_file()
+			&& info.len() == 0
+			&& (self.modified.is_none()
+				|| info.modified().ok() == self.modified)
+	}
 }
 
 /// Whether the shared write path refuses `op` before writing anything.
@@ -393,9 +415,10 @@ pub(crate) fn execute_restore_plan_reserved(
 				text: e.to_string(),
 				reason: io_reason(e, &op.relative_path),
 			}),
-			Some(Reservation::Made) => {
-				let run = run_reserved_create(&plan.roots, op);
-				if run.is_err() {
+			Some(Reservation::Made(reserved)) => {
+				let run =
+					run_reserved_create(&plan.roots, selection, op, reserved);
+				if matches!(run, Err(_) | Ok(CreateOutcome::Skipped)) {
 					unwritten.push(i);
 				}
 				run
@@ -466,12 +489,27 @@ struct CreateFailure {
 	reason: Reason,
 }
 
-/// A new file whose empty file this Apply made: it is the one written,
-/// as a file that was not there would be.
+/// A new file whose empty file this Apply made. While that file is still
+/// there, the same object, empty and not modified since, the content is
+/// written into it through its own handle, as a file that was not there
+/// would be: nothing is renamed over the name. Anything else at the name
+/// (written into, replaced, removed) is someone else's by now, and the
+/// row runs as any row onto an existing file does ([`run_create`]): kept
+/// unless overwriting is allowed, and never when it is not UTF-8.
+///
+/// What is left is the moment between the check of the handle and the
+/// write: a writer that puts content into the file then has it
+/// overwritten. Nothing in a filesystem's plain file API closes it.
 fn run_reserved_create(
 	roots: &[PathBuf],
+	selection: &RestoreSelection,
 	op: &CreateOperation,
+	reserved: &Reserved,
 ) -> Result<CreateOutcome, CreateFailure> {
+	let failure = |e: std::io::Error| CreateFailure {
+		text: e.to_string(),
+		reason: io_reason(&e, &op.relative_path),
+	};
 	if create_is_refused(roots, op) {
 		return Err(CreateFailure {
 			text: "unsafe path".into(),
@@ -480,13 +518,52 @@ fn run_reserved_create(
 			},
 		});
 	}
-	write_text_file(&op.absolute_path, &op.content).map_err(|e| {
-		CreateFailure {
-			text: e.to_string(),
-			reason: io_reason(&e, &op.relative_path),
-		}
-	})?;
+	let Some(mut file) =
+		open_untouched(&op.absolute_path, reserved).map_err(failure)?
+	else {
+		return run_create(roots, selection, op);
+	};
+	let written = file
+		.write_all(op.content.as_bytes())
+		.and_then(|()| file.sync_all());
+	if let Err(e) = written {
+		// Back to empty, so the file can be taken back as made.
+		let _ = file.set_len(0);
+		return Err(failure(e));
+	}
 	Ok(CreateOutcome::Created)
+}
+
+/// The empty file made for a new file, opened to write, when what is at
+/// `path` is still that file untouched: by its name (a file, not a link)
+/// and by the handle (the same object). `None` when it is not.
+fn open_untouched(
+	path: &Path,
+	reserved: &Reserved,
+) -> std::io::Result<Option<fs::File>> {
+	use std::io::ErrorKind::NotFound;
+	match fs::symlink_metadata(path) {
+		Ok(info) if reserved.untouched(&info) => {}
+		Ok(_) => return Ok(None),
+		Err(e) if e.kind() == NotFound => return Ok(None),
+		Err(e) => return Err(e),
+	}
+	let mut options = fs::OpenOptions::new();
+	options.write(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.custom_flags(libc::O_NOFOLLOW);
+	}
+	let file = match options.open(path) {
+		Ok(file) => file,
+		Err(e) if e.kind() == NotFound => return Ok(None),
+		Err(e) => return Err(e),
+	};
+	let key = DirKey::of_file(&file).unwrap_or_else(|| DirKey::of(path));
+	let ours = key == reserved.key
+		&& file.metadata().is_ok_and(|info| reserved.untouched(&info));
+	Ok(ours.then_some(file))
 }
 
 fn run_create(

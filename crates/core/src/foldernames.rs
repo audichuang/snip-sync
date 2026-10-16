@@ -62,6 +62,27 @@ impl DirKey {
 			),
 		}
 	}
+
+	/// What the filesystem says the open `file` is, in the terms of
+	/// [`Self::of`]; `None` when it cannot say. Read from the handle, so
+	/// it is the object opened, whatever is at its name by now.
+	pub(crate) fn of_file(file: &fs::File) -> Option<Self> {
+		object_of_file(file).map(|(volume, index)| Self::Object(volume, index))
+	}
+}
+
+#[cfg(unix)]
+fn object_of_file(file: &fs::File) -> Option<(u64, u64)> {
+	use std::os::unix::fs::MetadataExt;
+	let md = file.metadata().ok()?;
+	Some((md.dev(), md.ino()))
+}
+
+#[cfg(windows)]
+fn object_of_file(file: &fs::File) -> Option<(u64, u64)> {
+	let handle = winapi_util::HandleRef::from_file(file);
+	let info = winapi_util::file::information(&handle).ok()?;
+	Some((info.volume_serial_number(), info.file_index()))
 }
 
 #[cfg(unix)]

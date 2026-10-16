@@ -2171,8 +2171,8 @@ impl TransferImportPlan {
 				continue;
 			}
 			match self.make_new_file(op, made, &existing) {
-				Ok(()) => {
-					reserved.insert(i, restore::Reservation::Made);
+				Ok(made_file) => {
+					reserved.insert(i, restore::Reservation::Made(made_file));
 				}
 				Err(Reserve::Row(e)) => {
 					reserved.insert(i, restore::Reservation::Failed(e));
@@ -2269,13 +2269,14 @@ impl TransferImportPlan {
 	}
 
 	/// Makes `op`'s file empty with `create_new`, and the folders on its
-	/// way that are missing, level by level.
+	/// way that are missing, level by level. Returns the file as made, for
+	/// its row to write into only while it is still that file untouched.
 	fn make_new_file(
 		&self,
 		op: &CreateOperation,
 		made: &mut Made,
 		existing: &HashMap<DirKey, String>,
-	) -> Result<(), Reserve> {
+	) -> Result<restore::Reserved, Reserve> {
 		let path = &op.absolute_path;
 		let mut missing: Vec<&Path> = Vec::new();
 		let mut cur = path.parent();
@@ -2321,10 +2322,20 @@ impl TransferImportPlan {
 		options.write(true).create_new(true);
 		match options.open(path) {
 			Ok(file) => {
-				// Released at once: Windows cannot replace an open file.
+				// The object made, read from its handle: what is at the
+				// name a moment later may be someone else's.
+				let key =
+					DirKey::of_file(&file).unwrap_or_else(|| DirKey::of(path));
+				// Released at once: one held per new file would run out of
+				// descriptors on a large paste, and Windows cannot replace
+				// an open file.
 				drop(file);
-				made.file(path, DirKey::of(path), &op.relative_path);
-				Ok(())
+				// Read after the release, as the row will read it.
+				let modified = fs::symlink_metadata(path)
+					.and_then(|info| info.modified())
+					.ok();
+				made.file(path, key.clone(), &op.relative_path);
+				Ok(restore::Reserved { key, modified })
 			}
 			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
 				Err(Reserve::Batch(self.met(op, path, made, existing)))
