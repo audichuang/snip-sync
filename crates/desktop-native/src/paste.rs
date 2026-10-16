@@ -970,7 +970,7 @@ fn commit_msg(
 	}
 }
 
-fn roots_digest(roots: &[PathBuf]) -> u64 {
+pub(crate) fn roots_digest(roots: &[PathBuf]) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	roots.hash(&mut hasher);
@@ -1371,7 +1371,9 @@ impl PastePreviewPlan {
 	}
 
 	/// Adds repos discovered after this preview opened to every prefix
-	/// choice's candidates. Existing candidates keep their index and made
+	/// choice's candidates. Called by `repos_changed` on every change of the
+	/// repo list, and on each transition that returns an open preview to
+	/// idle (a job landing, a failed Apply). Existing candidates keep their index and made
 	/// choices stay, so nothing the user did is invalidated. Returns whether
 	/// any candidate was added. Does nothing, and touches no file system,
 	/// when there is no mapping to extend or the repo set is the one the
@@ -1382,6 +1384,12 @@ impl PastePreviewPlan {
 			Some(found) => self.extend_candidates(&found).is_some(),
 			None => false,
 		}
+	}
+
+	/// The digest of the repo roots this plan last saw.
+	#[cfg(test)]
+	pub(crate) fn seen_roots(&self) -> u64 {
+		self.seen_roots
 	}
 
 	/// The repo roots this plan has not seen, canonical (or as the worker

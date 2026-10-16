@@ -3634,6 +3634,11 @@ impl WorkbenchModel {
 	/// A discovery that changed the workspace's repositories reloads a
 	/// loaded log.
 	pub fn sync_log_scope(&mut self, cx: &mut Context<Self>) {
+		// The open repo's read is in flight and reloads the log when it
+		// lands: reloading here too would read it twice.
+		if self.log_reload_for == Some(self.generation) {
+			return;
+		}
 		if self.log_deferred {
 			if self.reset_history_query(
 				self.active_ref_filter.clone(),
