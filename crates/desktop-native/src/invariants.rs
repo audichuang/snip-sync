@@ -6,7 +6,13 @@
 //! test written for one path, is not enough: any other path to the same
 //! state can break it. So the properties live here, once, are evaluated by
 //! the same `eval` everywhere, and are driven by the `fuzz_` lanes in
-//! `main.rs` `tests::in_process::fuzz` over random gestures.
+//! `src/tests/in_process/invariant_tests.rs` over random gestures.
+//!
+//! A failing seed replays: the same seed gives the same steps. CI runs only
+//! the fixed seeds (gpui starts at 0 without `SEED`: local 0-3, paste 0-2,
+//! remote 0-2), so it does not explore new ones. Exploring is a manual long
+//! run: `SEED=<n> ITERATIONS=<k> cargo nextest run -p snip-desktop-native
+//! fuzz_`.
 //!
 //! A member is
 //!

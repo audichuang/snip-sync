@@ -215,7 +215,10 @@ impl Worker {
 		self.state.armed.store(true, Ordering::SeqCst);
 	}
 
-	/// Drops every injected fault and disarms the book.
+	/// Drops every injected fault and disarms the book. The scan failures of
+	/// [`Self::set_scan_failures_for_tests`] are rules of the same book: they
+	/// go too, and [`Self::scan_requests_for_tests`] stops counting until a
+	/// fault is armed again. Call it before setting them, not after.
 	#[doc(hidden)]
 	pub fn clear_faults_for_tests(&self) {
 		lock(&self.state.faults).clear();
@@ -242,7 +245,8 @@ impl Worker {
 	/// `eofs` scans of `workspace` are cut off (the stream closes), and every
 	/// scan after them is refused with `refusal`, when there is one. A
 	/// wrapper over [`crate::fault::FaultRule`]s; it starts the workspace's
-	/// scan count and its open record over.
+	/// scan count and its open record over, and arms the book (so counting
+	/// works) until [`Self::clear_faults_for_tests`] drops these rules too.
 	#[doc(hidden)]
 	pub fn set_scan_failures_for_tests(
 		&self,

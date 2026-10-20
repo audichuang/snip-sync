@@ -2039,9 +2039,8 @@ fn remote_lane_window<'a>(
 	});
 	settle(cx);
 	land_remote_open(&model, cx);
-	for _ in 0..10 {
-		settle(cx);
-		let done = model.read_with(cx, |m, _| {
+	let opened = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| {
 			!m.is_loading
 				&& (m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
 					|| m.file_tree.as_ref().is_some_and(|t| t.is_loaded)
@@ -2050,9 +2049,29 @@ fn remote_lane_window<'a>(
 					|| m.change_repos.is_empty()
 					|| m.change_repos[0].state
 						!= crate::ChangeRepoState::Loading)
-		});
-		if done {
+		})
+	};
+	let mut rounds = 0;
+	loop {
+		settle(cx);
+		if opened(cx) {
 			break;
+		}
+		rounds += 1;
+		if rounds >= 10 {
+			let state = model.read_with(cx, |m, _| {
+				format!(
+					"is_loading={} ws_tree={:?} file_tree={:?} \
+					 scan_error={} repos={} change_repos={}",
+					m.is_loading,
+					m.ws_tree.as_ref().map(|t| t.is_loaded),
+					m.file_tree.as_ref().map(|t| t.is_loaded),
+					m.remote.scan_error.is_some(),
+					m.repos.len(),
+					m.change_repos.len(),
+				)
+			});
+			panic!("the remote workspace did not open in 10 rounds: {state}");
 		}
 	}
 	model.update(cx, |m, cx| {

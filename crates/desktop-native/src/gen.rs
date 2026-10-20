@@ -8,6 +8,11 @@
 //! lane's own counter accepts the stamp, and the lane's marker type is
 //! what the compiler tells them apart by.
 //!
+//! The type separates lanes, not instances: two `WorkbenchModel`s (two tabs)
+//! have counters of the same lane, and a stamp of one is accepted by the
+//! other. A read lands on its own model, so that comparison does not arise
+//! today; the types do not forbid it.
+//!
 //! The counter wraps (`wrapping_add`): a stamp that comes back after 2^64
 //! bumps is not a case anyone lives long enough to see.
 
