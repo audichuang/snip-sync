@@ -430,9 +430,24 @@ pub(crate) fn eval(
 			if selected {
 				return None;
 			}
-			// A rev tree outlives the selection and keeps its own file
-			// selected here; nothing else of the view may be left.
-			let reset = if m.rev_tree.is_some() {
+			// A rev tree outlives the selection and keeps one of its own
+			// files selected here (`open_rev_file`); only then is the rest
+			// allowed: no commit file selection of the Log, and the Log's
+			// preview flag is the tree file's.
+			let tree_file = m.rev_tree.as_ref().is_some_and(|tree| {
+				view.selected_commit_file.as_deref().is_some_and(|path| {
+					tree.lists_file(path)
+						|| m.preview.as_ref().is_some_and(|p| {
+							p.path.as_deref() == Some(path)
+								&& matches!(
+									&p.source,
+									PreviewSource::CommitFile { sha }
+										if *sha == tree.sha
+								)
+						})
+				})
+			});
+			let reset = if tree_file {
 				view.is_reset_but_for_tree_file()
 			} else {
 				view.is_reset()
@@ -440,8 +455,7 @@ pub(crate) fn eval(
 			if !reset {
 				return Some("no selection, but a commit view is left".into());
 			}
-			// A rev tree's file is read as the Log's too (`open_rev_file`).
-			if m.preview_pending_from_log && m.rev_tree.is_none() {
+			if m.preview_pending_from_log && !tree_file {
 				return Some(
 					"no selection, but the preview is marked from the Log"
 						.into(),

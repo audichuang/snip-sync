@@ -149,7 +149,7 @@ impl CommitView {
 }
 
 impl CommitView {
-	/// [`Self::is_reset`], except for the file selection of a rev tree: a
+	/// [`Self::is_reset`], except for the selected file of a rev tree: a
 	/// tree opened from a commit outlives the selection (the editor tab
 	/// closes, its own button leaves it) and a file of it is selected here
 	/// with no commit selected. Destructures every field without `..`, like
@@ -162,7 +162,7 @@ impl CommitView {
 			commit_files_truncated,
 			commit_files_first_parent_same,
 			selected_commit_file: _,
-			commit_file_sel: _,
+			commit_file_sel,
 			commit_details,
 			selection_details,
 			log_commit_root,
@@ -172,6 +172,7 @@ impl CommitView {
 			&& commit_file_gitlinks.is_empty()
 			&& !commit_files_truncated
 			&& commit_files_first_parent_same.is_none()
+			&& commit_file_sel.is_empty()
 			&& commit_details.is_none()
 			&& selection_details.is_empty()
 			&& log_commit_root.is_none()
@@ -351,6 +352,16 @@ impl RevTree {
 			errors: Vec::new(),
 			error_order: VecDeque::new(),
 		}
+	}
+
+	/// Whether `path` is a file this tree lists (a listing the budget has
+	/// evicted does not answer).
+	pub fn lists_file(&self, path: &str) -> bool {
+		self.dirs.iter().any(|(_, (entries, _))| {
+			entries
+				.iter()
+				.any(|e| e.path == path && e.kind != TreeKind::Tree)
+		})
 	}
 
 	pub fn retained_bytes(&self) -> usize {

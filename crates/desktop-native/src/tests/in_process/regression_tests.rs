@@ -499,3 +499,69 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 		invariants::assert_holds(m, cx, &[L2, L6]);
 	});
 }
+
+/// L6: an open rev tree excuses only its own file. The selection a manual
+/// reset leaves behind (a Log commit file, a file selection, the Log's
+/// preview flag with no tree file selected) is still a violation while the
+/// tree is open.
+#[gpui::test]
+fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let rev_row = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with("rev-row:"))
+		})
+	};
+	let browse = model.read_with(cx, |m, _| {
+		m.probes
+			.as_ref()
+			.unwrap()
+			.drawn()
+			.into_iter()
+			.find(|id| id.starts_with("btn-browse-tree:"))
+			.expect("the commit offers its tree")
+	});
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "the tree", |cx| rev_row(cx).is_some());
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	let row = rev_row(cx).expect("a file of the tree");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	let l6 = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, cx| {
+			m.rev_tree.is_some().then(|| invariants::eval(L6, m, cx))
+		})
+	};
+	assert_eq!(l6(cx), Some(None), "the tree's own file is legal");
+
+	// The flag with no tree file selected.
+	let file = model.update(cx, |m, _| {
+		m.commit_view.selected_commit_file.take().expect("a file")
+	});
+	assert!(l6(cx).unwrap().is_some(), "a leftover flag is caught");
+	model.update(cx, |m, _| {
+		m.preview_pending_from_log = false;
+	});
+	assert_eq!(l6(cx), Some(None), "no selection, no flag");
+
+	// A selected file the tree does not list and the preview is not.
+	model.update(cx, |m, _| {
+		m.commit_view.selected_commit_file = Some("no/such/file".into());
+	});
+	assert!(l6(cx).unwrap().is_some(), "a stranger's file is caught");
+	model.update(cx, |m, _| {
+		m.commit_view.selected_commit_file = Some(file);
+		m.commit_view.commit_file_sel = vec!["other".into()];
+	});
+	assert!(l6(cx).unwrap().is_some(), "a leftover file selection is caught");
+}
