@@ -94,6 +94,39 @@ class CheckGenerationTypes(unittest.TestCase):
         self.assertIn("lib.rs:5", r.stderr)
         self.assertNotIn("lib.rs:3", r.stderr)
 
+    def _refused(self, source: str, line: int = 1):
+        r = run_check(source)
+        self.assertNotEqual(r.returncode, 0, source)
+        self.assertIn(f"lib.rs:{line}", r.stderr)
+
+    def test_a_u64_in_any_position_of_a_tuple_or_generic_is_seen(self):
+        for source in [
+            "struct S { m: HashMap<String, u64> }\n",
+            "fn f() -> (bool, u64) { todo!() }\n",
+            "struct S { o: Option<(String, u64)> }\n",
+            "struct S { a: [u64; 2] }\n",
+            "struct S { c: Box<dyn Fn(u64)> }\n",
+            "fn f(x: impl Into<u64>) {}\n",
+            "type Counter = u64;\n",
+            "fn f() { let mut generation = 0u64; }\n",
+            "static N: std::sync::atomic::AtomicU64 = todo!();\n",
+            "struct S { n: AtomicU64 }\n",
+        ]:
+            with self.subTest(source=source):
+                self._refused(source)
+
+    def test_a_path_on_u64_is_not_a_declaration(self):
+        r = run_check("fn f() { let m = u64::MAX; let n = u64::from(1u8); }\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_longer_name_is_not_u64(self):
+        r = run_check("fn f() { let x = my_u64_thing(); let y = i64_max; }\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_comment_line_may_say_u64(self):
+        r = run_check("// a u64 counter\nfn f() {}\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_real_tree_passes(self):
         r = subprocess.run(
             ["bash", str(SCRIPT)],

@@ -401,6 +401,7 @@ pub struct Restoring {
 /// each time, at most a minute.
 pub fn retry_delay(attempts: u32) -> std::time::Duration {
 	let doublings = attempts.saturating_sub(1).min(4);
+	// U64-NOT-GEN: seconds of a delay, not a counter
 	std::time::Duration::from_secs((5u64 << doublings).min(60))
 }
 
@@ -1170,7 +1171,9 @@ impl WorkbenchModel {
 			"remote_reconnecting",
 			[format!("{} ▸ {}", folder.host, folder.path)],
 		);
+		// U64-NOT-GEN: the source of `Restoring::id`, an identity (see its field)
 		static IDS: std::sync::atomic::AtomicU64 =
+			// U64-NOT-GEN: same counter as above
 			std::sync::atomic::AtomicU64::new(0);
 		self.remote.restoring = Some(Restoring {
 			folder,
