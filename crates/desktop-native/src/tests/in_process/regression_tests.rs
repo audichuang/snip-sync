@@ -543,6 +543,10 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 		})
 	};
 	assert_eq!(l6(cx), Some(None), "the tree's own file is legal");
+	let eval = |cx: &mut VisualTestContext, id| {
+		model.read_with(cx, |m, cx| invariants::eval(id, m, cx))
+	};
+	assert!(eval(cx, L2).is_none(), "L2 allows the tree's own file");
 
 	// The flag with no tree file selected.
 	let file = model.update(cx, |m, _| {
@@ -559,6 +563,7 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 		m.commit_view.selected_commit_file = Some("no/such/file".into());
 	});
 	assert!(l6(cx).unwrap().is_some(), "a stranger's file is caught");
+	assert!(eval(cx, L2).is_some(), "L2 catches a stranger's file too");
 	model.update(cx, |m, _| {
 		m.commit_view.selected_commit_file = Some(file);
 		m.commit_view.commit_file_sel = vec!["other".into()];
@@ -567,4 +572,131 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 		l6(cx).unwrap().is_some(),
 		"a leftover file selection is caught"
 	);
+	assert!(
+		eval(cx, L3).is_some(),
+		"L3 catches a selection the tree does not list"
+	);
+}
+
+/// A fixture with two commits in the open repo, the Log read.
+fn two_commits(
+	cx: &mut TestAppContext,
+) -> (
+	tempfile::TempDir,
+	Entity<WorkbenchModel>,
+	&mut VisualTestContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	let alpha = repo(ws.path(), "alpha", &[]);
+	fs::write(alpha.join("a.txt"), "one").unwrap();
+	git(&alpha, &["add", "."]);
+	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	fs::write(alpha.join("b.txt"), "two").unwrap();
+	git(&alpha, &["add", "."]);
+	git(&alpha, &["commit", "-q", "-m", "add b"]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| m.commits.len() >= 2 && !m.is_loading)
+	});
+	(ws, model, cx)
+}
+
+/// L6, L8: the details of a multi-selection must not land on the view when
+/// a file took the selection while the read was in flight (the class of
+/// `fuzz_regression_a_details_read_does_not_land_on_a_selection_a_file_took`,
+/// for the multi-selection's list). Without the guard in
+/// `view_of_multi_selection` the list lands on the live view, which then
+/// outlives the selection.
+#[gpui::test]
+fn fuzz_regression_a_selection_list_read_does_not_land_after_a_file_took_the_selection(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = two_commits(cx);
+	let shown = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	};
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx);
+	});
+	settle_until(cx, "the first commit's preview", |cx| shown(cx));
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[1].sha.clone();
+		m.extend_range(&sha, cx);
+		assert_eq!(m.log_selected.len(), 2, "two commits are selected");
+	});
+	settle_until(cx, "the selection's preview", |cx| shown(cx));
+	// One turn of the event loop: the list read has not run when the file
+	// takes the selection.
+	model.update_in(cx, |m, _, cx| {
+		m.toggle_selection_expanded(cx);
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.log_selected.is_empty(), "the file takes the selection");
+	});
+	settle_until(cx, "the file", |cx| shown(cx));
+	model.read_with(cx, |m, cx| {
+		assert!(m.held_selection.is_none(), "the file's read landed");
+		assert!(
+			m.commit_view.selection_details.is_empty(),
+			"a list landed with nothing selected"
+		);
+		invariants::assert_holds(m, cx, &[L6, L8]);
+	});
+}
+
+/// L8: the details of a commit that land while a file read holds its
+/// selection aside belong to the held view, so a read that gives the
+/// selection back finds them. Without the held branch of `view_of_selected_commit` they
+/// were dropped and the details pane kept the row's own fields.
+#[gpui::test]
+fn fuzz_regression_details_landing_on_a_held_selection_survive_its_restore(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = two_commits(cx);
+	let shown = |cx: &mut VisualTestContext| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	};
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx);
+	});
+	settle_until(cx, "the commit's preview and details", |cx| {
+		shown(cx)
+			&& model
+				.read_with(cx, |m, _| m.commit_view.commit_details.is_some())
+	});
+	// The file's read is held, so the selection stays aside while the
+	// details land.
+	model.update(cx, |m, _| {
+		m.e2e_read_delay = Some(std::time::Duration::from_secs(60))
+	});
+	let id = model.update_in(cx, |m, _, cx| {
+		let id = m.selected_commit.clone().expect("a selection");
+		m.commit_view.commit_details = None;
+		m.reload_selected_commit_details_for_tests(cx);
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.held_selection.is_some(), "the selection is held");
+		id
+	});
+	settle(cx);
+	// The file's read is refused (the retained budget) and gives the
+	// selection back.
+	model.update(cx, |m, _| {
+		let held = m.held_selection.as_ref().expect("still held");
+		assert_eq!(
+			held.view.commit_details.as_ref().map(|d| d.sha.as_str()),
+			Some(id.as_str()),
+			"the details landed on the held view"
+		);
+		m.restore_shown_selection();
+		assert_eq!(
+			m.commit_view
+				.commit_details
+				.as_ref()
+				.map(|d| d.sha.as_str()),
+			Some(id.as_str()),
+			"the restored view has its details"
+		);
+	});
 }

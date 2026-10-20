@@ -2292,6 +2292,19 @@ impl WorkbenchModel {
 		});
 	}
 
+	/// Starts the selected commit's details read again with the shown
+	/// preview left alone: the details outlasting the preview, which a test
+	/// cannot otherwise arrange without a delay seam.
+	#[cfg(test)]
+	pub(crate) fn reload_selected_commit_details_for_tests(
+		&mut self,
+		cx: &mut Context<Self>,
+	) {
+		let id = self.selected_commit.clone().expect("a selected commit");
+		let (root, sha) = self.log_root_for(&id).expect("its repo is open");
+		self.load_commit_details(root, sha, id, cx);
+	}
+
 	/// The commit view a read about the selected commit `id` fills: the live
 	/// one, or the one a file read holds aside while it is open. `None` when
 	/// no selection is of that commit.

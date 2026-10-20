@@ -349,6 +349,22 @@ fn roots_text(m: &WorkbenchModel) -> String {
 	format!("{roots:?} + {:?} + {:?}", m.workspace_root, m.ws_home)
 }
 
+/// Whether `path` is a file the open rev tree owns: it lists it, or the
+/// preview shows it as a file of the tree's commit. Only then may a commit
+/// view name it with no row of the Log's list behind it.
+fn tree_owns_file(m: &WorkbenchModel, path: &str) -> bool {
+	m.rev_tree.as_ref().is_some_and(|tree| {
+		tree.lists_file(path)
+			|| m.preview.as_ref().is_some_and(|p| {
+				p.path.as_deref() == Some(path)
+					&& matches!(
+						&p.source,
+						PreviewSource::CommitFile { sha } if *sha == tree.sha
+					)
+			})
+	})
+}
+
 /// One member; `None` means it holds. A member the driver evaluates
 /// (`driver_only`) is `None` here.
 pub(crate) fn eval(
@@ -370,27 +386,23 @@ pub(crate) fn eval(
 			.then(|| "a range endpoint without a selected commit".to_string()),
 		L2 => {
 			let open = view.selected_commit_file.as_ref()?;
-			let listed = view.commit_files.iter().any(|(p, _)| p == open);
-			(!listed && m.rev_tree.is_none()).then(|| {
+			let listed = view.commit_files.iter().any(|(p, _)| p == open)
+				|| tree_owns_file(m, open);
+			(!listed).then(|| {
 				format!("the open commit file {open:?} is not in the list")
 			})
 		}
-		L3 => {
-			if m.rev_tree.is_some() {
-				return None;
-			}
-			view.commit_file_sel.iter().find_map(|sel| {
-				let listed = view.commit_files.iter().any(|(p, _)| {
-					p == sel
-						|| sel.strip_suffix('/').is_some_and(|dir| {
-							p.starts_with(&format!("{dir}/"))
-						})
-				});
-				(!listed).then(|| {
-					format!("{sel:?} is selected and not in the file list")
-				})
+		L3 => view.commit_file_sel.iter().find_map(|sel| {
+			let listed = view.commit_files.iter().any(|(p, _)| {
+				p == sel
+					|| sel
+						.strip_suffix('/')
+						.is_some_and(|dir| p.starts_with(&format!("{dir}/")))
+			}) || tree_owns_file(m, sel);
+			(!listed).then(|| {
+				format!("{sel:?} is selected and not in the file list")
 			})
-		}
+		}),
 		L4 => {
 			let origin = &view.commit_file_origin;
 			if origin.is_empty() {
@@ -440,19 +452,10 @@ pub(crate) fn eval(
 			// files selected here (`open_rev_file`); only then is the rest
 			// allowed: no commit file selection of the Log, and the Log's
 			// preview flag is the tree file's.
-			let tree_file = m.rev_tree.as_ref().is_some_and(|tree| {
-				view.selected_commit_file.as_deref().is_some_and(|path| {
-					tree.lists_file(path)
-						|| m.preview.as_ref().is_some_and(|p| {
-							p.path.as_deref() == Some(path)
-								&& matches!(
-									&p.source,
-									PreviewSource::CommitFile { sha }
-										if *sha == tree.sha
-								)
-						})
-				})
-			});
+			let tree_file = view
+				.selected_commit_file
+				.as_deref()
+				.is_some_and(|path| tree_owns_file(m, path));
 			let reset = if tree_file {
 				view.is_reset_but_for_tree_file()
 			} else {
