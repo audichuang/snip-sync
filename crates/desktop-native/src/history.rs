@@ -1664,6 +1664,16 @@ impl WorkbenchModel {
 	/// Drops every commit selection and the details, files and previews that
 	/// came from it, so a selection that left the list leaves nothing stale.
 	pub(crate) fn clear_commit_selection(&mut self) {
+		self.drop_commit_selection();
+		self.clear_commit_preview();
+	}
+
+	/// [`Self::clear_commit_selection`] without touching the shown preview:
+	/// for a caller that decides what the preview becomes itself (a repo
+	/// switch). It is the only place that sets `selected_commit` to `None`
+	/// (`a_commit_selection_is_dropped_in_one_place` keeps it so), so a new
+	/// member of the selection is added here once.
+	pub(crate) fn drop_commit_selection(&mut self) {
 		// `preview_pending_from_log` names the owner of the latest read and
 		// only a file read resets it, so it is not tied to `preview_loading`:
 		// an error that cleared the loading flag must not leave the Log's
@@ -1675,13 +1685,28 @@ impl WorkbenchModel {
 			self.preview_loading = false;
 		}
 		self.details_generation.invalidate();
+		let _ = arm_cancel(&mut self.details_cancel);
 		self.selected_commit = None;
 		self.range_head = None;
 		self.log_selected.clear();
 		self.reset_commit_view();
 		self.reset_selection_details();
 		self.compare = None;
-		self.clear_commit_preview();
+	}
+
+	/// A repo reload that keeps `commit` selected: its details and its
+	/// repository stay (the Log may be pinned to another repo than the one
+	/// now open), the rest of the Log selection and the view is read anew.
+	pub(crate) fn keep_commit_selection_for_reload(&mut self, commit: String) {
+		self.selected_commit = Some(commit);
+		self.range_head = None;
+		self.log_selected.clear();
+		self.compare = None;
+		let details = self.commit_view.commit_details.take();
+		let root = self.commit_view.log_commit_root.take();
+		self.reset_commit_view();
+		self.commit_view.commit_details = details;
+		self.commit_view.log_commit_root = root;
 	}
 
 	/// The one place the Log selection's view is dropped: every member of

@@ -2726,11 +2726,9 @@ impl WorkbenchModel {
 		release_vec(&mut self.collapsed_merges);
 		release_vec(&mut self.hidden_commits);
 		self.history_walk = None;
-		self.selected_commit = None;
-		self.range_head = None;
+		self.drop_commit_selection();
 		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
-		self.reset_commit_view();
 		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
@@ -2748,9 +2746,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_reload_for = None;
-		self.details_generation.invalidate();
 		self.git_user_email = None;
-		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
 		self.rev_tree = None;
@@ -4118,27 +4114,13 @@ impl WorkbenchModel {
 		self.selected_repo_idx = Some(idx);
 		self.selected_file = anchor_file.clone();
 		self.selected_file_root = anchor_file_root;
-		self.selected_commit = anchor_commit.clone();
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
-		if self.selected_commit.is_none() {
-			// No selection is left, so the Log has no claim on the latest
-			// preview read, and the details read of the commit that was
-			// selected must not land (L6 and L8 of `invariants`).
-			self.preview_pending_from_log = false;
-			self.details_generation.invalidate();
-			let _ = arm_cancel(&mut self.details_cancel);
-		}
-		// The same commit stays selected while the repo is read again, so
-		// its details and its repository stay (the Log may be pinned to
-		// another repo than the one now open); the rest is read anew.
-		let details = self.commit_view.commit_details.take();
-		let root = self.commit_view.log_commit_root.take();
-		self.reset_commit_view();
-		if self.selected_commit.is_some() {
-			self.commit_view.commit_details = details;
-			self.commit_view.log_commit_root = root;
+		// No selection left: the Log has no claim on the latest preview read,
+		// and the details read of the commit that was selected must not land
+		// (L6 and L8 of `invariants`). The same commit stays selected while
+		// the repo is read again.
+		match anchor_commit.clone() {
+			Some(commit) => self.keep_commit_selection_for_reload(commit),
+			None => self.drop_commit_selection(),
 		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.

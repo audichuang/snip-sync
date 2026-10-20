@@ -563,5 +563,8 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 		m.commit_view.selected_commit_file = Some(file);
 		m.commit_view.commit_file_sel = vec!["other".into()];
 	});
-	assert!(l6(cx).unwrap().is_some(), "a leftover file selection is caught");
+	assert!(
+		l6(cx).unwrap().is_some(),
+		"a leftover file selection is caught"
+	);
 }

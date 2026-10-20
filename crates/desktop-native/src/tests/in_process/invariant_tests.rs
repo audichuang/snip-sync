@@ -2662,3 +2662,44 @@ fn a_refused_remote_reload_drops_the_selection_it_hid(cx: &mut TestAppContext) {
 		invariants::assert_holds(m, cx, &[L6, L7]);
 	});
 }
+
+/// The Log selection is dropped in one place (`drop_commit_selection`): a
+/// hand-written `selected_commit = None` elsewhere leaves out whatever the
+/// next member of the selection is (Bugs 3, 4, 5 and 7 of #230 were each a
+/// copy that missed one).
+#[test]
+fn a_commit_selection_is_dropped_in_one_place() {
+	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+		for entry in std::fs::read_dir(dir).expect("the source dir") {
+			let path = entry.expect("an entry").path();
+			if path.is_dir() {
+				if path.file_name().is_some_and(|n| n == "tests") {
+					continue;
+				}
+				walk(&path, hits);
+			} else if path.extension().is_some_and(|e| e == "rs")
+				&& !path
+					.file_name()
+					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
+			{
+				let text = std::fs::read_to_string(&path).expect("a source");
+				for (i, line) in text.lines().enumerate() {
+					if line.contains("selected_commit = None") {
+						hits.push(format!("{}:{}", path.display(), i + 1));
+					}
+				}
+			}
+		}
+	}
+	let mut hits = Vec::new();
+	walk(
+		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+		&mut hits,
+	);
+	assert_eq!(
+		hits.len(),
+		1,
+		"`selected_commit = None` only in drop_commit_selection: {hits:#?}"
+	);
+	assert!(hits[0].contains("history.rs"), "{hits:?}");
+}
