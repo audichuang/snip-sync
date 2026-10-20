@@ -105,6 +105,13 @@ impl<L> Stamp<L> {
 	}
 }
 
+/// The stamp of a counter that has not been bumped.
+impl<L> Default for Stamp<L> {
+	fn default() -> Self {
+		Gen::<L>::new().current()
+	}
+}
+
 impl<L> Default for Gen<L> {
 	fn default() -> Self {
 		Self::new()
@@ -181,6 +188,9 @@ lanes! {
 	BrowseLane,
 	/// The workspace the tab shows: the whole drain.
 	WorkspaceLane,
+	/// A paste request: its worker's result lands only while no request,
+	/// remap or cancel came after it.
+	PasteLane,
 }
 
 #[cfg(test)]

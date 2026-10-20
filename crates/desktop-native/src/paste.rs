@@ -193,10 +193,12 @@ pub struct PastePending {
 	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
 	ui_commit: Option<Weak<CommitReplayPreview>>,
-	// U64-NOT-GEN: module-private sequence, compared only inside paste
-	seq: u64,
-	// U64-NOT-GEN: module-private sequence, compared only inside paste
-	input: Option<(u64, usize, Option<Weak<str>>)>,
+	seq: crate::gen::Stamp<crate::gen::PasteLane>,
+	input: Option<(
+		crate::gen::Stamp<crate::gen::PasteLane>,
+		usize,
+		Option<Weak<str>>,
+	)>,
 	latest: Option<PasteRequest>,
 	pub ready: Option<PasteOutcome>,
 }
@@ -330,8 +332,10 @@ impl PastePending {
 		))
 	}
 
-	// U64-NOT-GEN: module-private sequence, compared only inside paste
-	pub fn invalidate(&mut self, seq: u64) {
+	pub fn invalidate(
+		&mut self,
+		seq: crate::gen::Stamp<crate::gen::PasteLane>,
+	) {
 		self.seq = seq;
 		self.latest = None;
 		self.ready = None;
@@ -463,8 +467,7 @@ pub struct PasteWorker {
 	input: Option<PasteInput>,
 	pool: Arc<Mutex<PastePending>>,
 	cancel: CancelToken,
-	// U64-NOT-GEN: module-private sequence, compared only inside paste
-	seq: u64,
+	seq: crate::gen::Stamp<crate::gen::PasteLane>,
 }
 impl PasteWorker {
 	pub fn run(mut self, opts: &RunOptions) {
@@ -5426,7 +5429,7 @@ pub(crate) mod tests {
 		token.cancel();
 		for n in 1..=100 {
 			let mut pending = lock_pending(&pool);
-			pending.invalidate(n);
+			pending.invalidate(crate::gen::Stamp::for_tests(n));
 			pending
 				.enqueue(captured(
 					format!("// FILE: latest-{n}.txt\ncaptured-{n}"),
@@ -5588,12 +5591,12 @@ pub(crate) mod tests {
 				.unwrap()
 				.unwrap();
 			if invalidate_before {
-				lock_pending(&pool).invalidate(1);
+				lock_pending(&pool).invalidate(crate::gen::Stamp::for_tests(1));
 			}
 			work.run(&RunOptions::default());
 			assert!(lock_pending(&pool).input.is_none());
 			assert_eq!(lock_pending(&pool).ready.is_none(), invalidate_before);
-			lock_pending(&pool).invalidate(2);
+			lock_pending(&pool).invalidate(crate::gen::Stamp::for_tests(2));
 			assert!(lock_pending(&pool).ready.is_none());
 		}
 		let pool = Arc::new(Mutex::new(PastePending::default()));

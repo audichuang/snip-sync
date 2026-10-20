@@ -1745,16 +1745,39 @@ fn broken_quiet(
 	broken
 }
 
+/// What each worker saw while a fault was armed, by kind: a remote failure
+/// cannot be replayed from its seed, so the failure says what the workers
+/// were asked.
+fn worker_report(env: &Env) -> String {
+	env.workers
+		.iter()
+		.enumerate()
+		.map(|(i, w)| {
+			let seen: Vec<String> = snip_remote::fault::ALL_REQUEST_KINDS
+				.iter()
+				.filter_map(|k| {
+					let n = w.requests_seen_for_tests(*k);
+					(n > 0).then(|| format!("{k:?}={n}"))
+				})
+				.collect();
+			format!("worker {i} saw: {}", seen.join(" "))
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 fn fail(env: &Env, at: usize, steps: &[Step], broken: &[String]) -> ! {
 	panic!(
 		"the {lane} lane broke an invariant at step {at} of {total}\n\
 		 violations: {broken:#?}\n\
-		 steps: {steps:#?}\n\
+		 steps (the `Fault` steps are the faults armed): {steps:#?}\n\
+		 {workers}\n\
 		 reproduce: SEED=<the `failing seed` printed above> ITERATIONS=1 \
 		 cargo nextest run -p snip-desktop-native {test}\n\
 		 (the steps are the replay; a remote worker's reply times are not in the seed)",
 		lane = env.lane.name(),
 		total = STEPS,
+		workers = worker_report(env),
 		test = env.lane.test(),
 	)
 }

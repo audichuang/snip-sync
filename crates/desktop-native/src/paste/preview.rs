@@ -20,8 +20,7 @@ pub struct PastePreview {
 	/// A read-only preview or mapping rebuild is running; nothing can be applied until it lands.
 	loading: bool,
 	/// Bumped for every paste request, remap and cancel; an older result is dropped.
-	// U64-NOT-GEN: module-private sequence, compared only inside paste
-	generation: u64,
+	generation: crate::gen::Gen<crate::gen::PasteLane>,
 	pending: Arc<Mutex<PastePending>>,
 	// U64-NOT-GEN: id, not a landing guard
 	worker: Option<(u64, CancelToken)>,
@@ -133,7 +132,7 @@ impl PastePreview {
 			plan: None,
 			detail: None,
 			loading: false,
-			generation: 0,
+			generation: crate::gen::Gen::new(),
 			pending: Arc::new(Mutex::new(PastePending::default())),
 			worker: None,
 			cancel: None,
@@ -263,8 +262,8 @@ impl PastePreview {
 		if let Some(token) = self.cancel.take() {
 			token.cancel();
 		}
-		self.generation = self.generation.wrapping_add(1);
-		lock_pending(&self.pending).invalidate(self.generation);
+		let seq = self.generation.bump();
+		lock_pending(&self.pending).invalidate(seq);
 		self.loading = false;
 	}
 
