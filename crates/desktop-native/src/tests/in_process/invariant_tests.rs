@@ -2763,6 +2763,55 @@ fn a_commit_selection_is_dropped_in_one_place() {
 	assert!(hits[0].contains("history.rs"), "{hits:?}");
 }
 
+/// The lines of one source file that assign `commit_view.selected_commit_file`
+/// outside test code. Test code is excluded by scope, never by what the
+/// receiver is called: a `#[cfg(test)] mod name {` at column 0 is skipped to
+/// its closing `}`. An external `#[cfg(test)] mod name;` has no body here, so
+/// it skips nothing and the production code after it is still scanned.
+fn selection_writes_outside_tests(text: &str) -> Vec<usize> {
+	let mut hits = Vec::new();
+	let mut in_test_mod = false;
+	let mut prev = "";
+	for (i, line) in text.lines().enumerate() {
+		if in_test_mod {
+			in_test_mod = line != "}";
+			prev = line;
+			continue;
+		}
+		if prev == "#[cfg(test)]" && line.starts_with("mod ") {
+			in_test_mod = true;
+			prev = line;
+			continue;
+		}
+		prev = line;
+		let code = line.split("//").next().unwrap_or("");
+		if code.contains("commit_view.selected_commit_file =")
+			&& !code.contains("commit_view.selected_commit_file ==")
+		{
+			hits.push(i + 1);
+		}
+	}
+	hits
+}
+
+#[test]
+fn the_selection_write_scanner_reads_only_real_test_module_bodies() {
+	let write = "\tm.commit_view.selected_commit_file = None;\n";
+	// An external test module declaration has no body to skip.
+	let external = format!("#[cfg(test)]\nmod helper;\nfn f() {{\n{write}}}\n");
+	assert_eq!(selection_writes_outside_tests(&external), vec![4]);
+	// An inline test module's writes are test code.
+	let inline = format!(
+		"#[cfg(test)]\nmod tests {{\n{write}}}\nfn f() {{\n{write}}}\n"
+	);
+	assert_eq!(selection_writes_outside_tests(&inline), vec![6]);
+	// A write before any test module counts, a comparison does not.
+	let plain = format!(
+		"fn f() {{\n{write}\tif m.commit_view.selected_commit_file == None {{}}\n}}\n"
+	);
+	assert_eq!(selection_writes_outside_tests(&plain), vec![2]);
+}
+
 /// L9: the live file selection of the commit view is written in
 /// `set_commit_file_selection` alone. The selection and the commit-file
 /// preview it names live and die together, and a write that went around that
@@ -2786,31 +2835,8 @@ fn a_commit_file_selection_is_written_in_one_place() {
 					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
 			{
 				let text = std::fs::read_to_string(&path).expect("a source");
-				// Test code is excluded by scope, never by what the receiver
-				// is called: a `#[cfg(test)] mod ... {` at column 0 is skipped
-				// to its closing `}`, and `tests/` and `*_tests.rs` are
-				// skipped above. A direct write inside a production callback
-				// (an async landing) is a hit whatever its receiver's name.
-				let mut in_test_mod = false;
-				let mut prev = "";
-				for (i, line) in text.lines().enumerate() {
-					if in_test_mod {
-						in_test_mod = line != "}";
-						prev = line;
-						continue;
-					}
-					if prev == "#[cfg(test)]" && line.starts_with("mod ") {
-						in_test_mod = true;
-						prev = line;
-						continue;
-					}
-					prev = line;
-					let code = line.split("//").next().unwrap_or("");
-					if code.contains("commit_view.selected_commit_file =")
-						&& !code.contains("commit_view.selected_commit_file ==")
-					{
-						hits.push(format!("{}:{}", path.display(), i + 1));
-					}
+				for line in selection_writes_outside_tests(&text) {
+					hits.push(format!("{}:{}", path.display(), line));
 				}
 			}
 		}
