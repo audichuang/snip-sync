@@ -265,7 +265,7 @@ fn ready_marker(name: &str) {
 }
 
 mod dirtree;
-mod gen;
+mod generation;
 mod githost;
 pub mod graph_view;
 mod history;
@@ -901,7 +901,8 @@ pub struct WorkbenchModel {
 	pub log_selection_expanded: bool,
 	/// Commits whose details list every containing branch read.
 	pub log_branches_all: Vec<String>,
-	pub details_generation: crate::gen::Gen<crate::gen::DetailsLane>,
+	pub details_generation:
+		crate::generation::Gen<crate::generation::DetailsLane>,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
 
@@ -962,14 +963,16 @@ pub struct WorkbenchModel {
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
 	pub paste_diff_cancel: Option<CancelToken>,
-	pub paste_diff_generation: crate::gen::Gen<crate::gen::PasteDiffLane>,
+	pub paste_diff_generation:
+		crate::generation::Gen<crate::generation::PasteDiffLane>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, Failure)>,
 	pub discovery_depth_limited: Vec<PathBuf>,
 	pub discovery_error_overflow: usize,
 	pub discovery_depth_overflow: usize,
-	discovery_generation: crate::gen::Gen<crate::gen::DiscoveryLane>,
+	discovery_generation:
+		crate::generation::Gen<crate::generation::DiscoveryLane>,
 	pinned_repo: Option<(PathBuf, PathBuf)>,
 	/// The open repo kept across a rescan's wipe until the walk finds it
 	/// again; still set when a complete walk ends means it is gone.
@@ -978,7 +981,7 @@ pub struct WorkbenchModel {
 	refresh_reload: bool,
 	manual_repos: Vec<RepoEntry>,
 	tree_queue: VecDeque<TreeIo>,
-	tree_worker: crate::gen::Gen<crate::gen::TreeWorkerLane>,
+	tree_worker: crate::generation::Gen<crate::generation::TreeWorkerLane>,
 	tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
@@ -1000,15 +1003,17 @@ pub struct WorkbenchModel {
 	pub is_loading: bool,
 	pub is_copying: bool,
 	pub locale: Locale,
-	pub generation: crate::gen::Gen<crate::gen::RepoLoadLane>,
-	pub preview_generation: crate::gen::Gen<crate::gen::PreviewLane>,
-	pub history_generation: crate::gen::Gen<crate::gen::HistoryLane>,
+	pub generation: crate::generation::Gen<crate::generation::RepoLoadLane>,
+	pub preview_generation:
+		crate::generation::Gen<crate::generation::PreviewLane>,
+	pub history_generation:
+		crate::generation::Gen<crate::generation::HistoryLane>,
 	/// Replace loads of the log that got past the discovery wait: a test
 	/// counts how many one repo-set change costs.
 	#[cfg(test)]
 	// U64-NOT-GEN: test counter
 	pub(crate) history_replace_loads: u64,
-	pub tree_generation: crate::gen::Gen<crate::gen::TreeLane>,
+	pub tree_generation: crate::generation::Gen<crate::generation::TreeLane>,
 	pub mode: String,
 	pub focus_handle: FocusHandle,
 	pub reader_focus: FocusHandle,
@@ -1086,7 +1091,8 @@ pub struct WorkbenchModel {
 	/// Status reads of the repos other than the open one.
 	pub changes_queue: ReadQueue<PathBuf>,
 	pub changes_cancel: Option<CancelToken>,
-	pub changes_generation: crate::gen::Gen<crate::gen::ChangesLane>,
+	pub changes_generation:
+		crate::generation::Gen<crate::generation::ChangesLane>,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
 	/// The current branch the branches pane drew its HEAD marker from this
@@ -1108,7 +1114,8 @@ pub struct WorkbenchModel {
 	pub log_deferred: bool,
 	/// The `generation` of the repo read whose landing reloads the Log: the
 	/// scope sync leaves the reload to it, so one change reads the Log once.
-	log_reload_for: Option<crate::gen::Stamp<crate::gen::RepoLoadLane>>,
+	log_reload_for:
+		Option<crate::generation::Stamp<crate::generation::RepoLoadLane>>,
 	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
 	pub remote_path_input: Entity<TextInput>,
@@ -1589,9 +1596,9 @@ impl WorkbenchModel {
 			workspace_path_input,
 			paste_dest_input,
 			recent_workspaces: recent::load(),
-			lifecycle: lifecycle::Lifecycle::new(crate::gen::Gen::starting_at(
-				1,
-			)),
+			lifecycle: lifecycle::Lifecycle::new(
+				crate::generation::Gen::starting_at(1),
+			),
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
@@ -3092,7 +3099,7 @@ impl WorkbenchModel {
 	/// generation change drops the text.
 	fn accept_copy_result(
 		&mut self,
-		ws_gen: crate::gen::Stamp<crate::gen::WorkspaceLane>,
+		ws_gen: crate::generation::Stamp<crate::generation::WorkspaceLane>,
 		token: &CancelToken,
 	) -> bool {
 		self.is_copying = false;
@@ -4930,7 +4937,7 @@ impl WorkbenchModel {
 	/// reports it.
 	fn finish_copy(
 		&mut self,
-		ws_gen: crate::gen::Stamp<crate::gen::WorkspaceLane>,
+		ws_gen: crate::generation::Stamp<crate::generation::WorkspaceLane>,
 		cancel: &CancelToken,
 		result: Result<(String, usize, Msg), Msg>,
 		cx: &mut Context<Self>,
@@ -6370,7 +6377,7 @@ async fn drive_discovery(
 	this: gpui::WeakEntity<WorkbenchModel>,
 	cx: &mut gpui::AsyncApp,
 	mut disc: Discovery,
-	generation: crate::gen::Stamp<crate::gen::DiscoveryLane>,
+	generation: crate::generation::Stamp<crate::generation::DiscoveryLane>,
 	cancel: CancelToken,
 	mut wipe: bool,
 ) {
@@ -7645,7 +7652,7 @@ mod tests {
 			let probe = listed_tree_result(
 				TreeIo {
 					key: NodeKey::root(),
-					epoch: crate::gen::Stamp::for_tests(0),
+					epoch: crate::generation::Stamp::for_tests(0),
 					dir: root.clone(),
 					base: root.clone(),
 					depth: 1,
@@ -8682,7 +8689,7 @@ mod tests {
 			model.update(cx, |m, cx| {
 				let seq = m.remote.browse.as_ref().unwrap().seq();
 				m.remote_listing_landed(
-					crate::gen::Stamp::for_tests(
+					crate::generation::Stamp::for_tests(
 						seq.raw_for_tests().wrapping_sub(1),
 					),
 					Ok(crate::remote::FolderListing {
@@ -11556,7 +11563,7 @@ mod tests {
 			assert_eq!(load_after, crate::lifecycle::GitLoad::idle());
 
 			let mut lc = crate::lifecycle::Lifecycle::new(
-				crate::gen::Gen::starting_at(1),
+				crate::generation::Gen::starting_at(1),
 			);
 			let now = std::time::Instant::now();
 			let req = lc.request(crate::lifecycle::Intent::CloseWorkspace, now);
@@ -23038,7 +23045,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: crate::gen::Stamp::for_tests(0),
+						generation: crate::generation::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");
@@ -23646,7 +23653,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: crate::gen::Stamp::for_tests(0),
+						generation: crate::generation::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");

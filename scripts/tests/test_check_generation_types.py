@@ -58,7 +58,7 @@ class CheckGenerationTypes(unittest.TestCase):
         self.assertIn("lib.rs:1", r.stderr)
 
     def test_gen_rs_is_the_one_file_that_names_the_raw_counter(self):
-        r = run_check("pub(crate) struct Gen<L> { n: u64 }\n", "gen.rs")
+        r = run_check("pub(crate) struct Gen<L> { n: u64 }\n", "generation.rs")
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_a_whole_file_test_module_is_test_code(self):

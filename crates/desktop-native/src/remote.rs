@@ -237,7 +237,7 @@ pub struct Browse {
 	pub listing: Option<Result<FolderListing, Msg>>,
 	/// A listing that lands with another number is for a folder no longer
 	/// shown.
-	seq: crate::gen::Stamp<crate::gen::BrowseLane>,
+	seq: crate::generation::Stamp<crate::generation::BrowseLane>,
 	/// Kept across hops on one host, so a click does not start ssh again.
 	client: Option<Arc<Client>>,
 	/// Ends this listing's connect and calls once another listing, a
@@ -267,7 +267,9 @@ impl Browse {
 		self.client.clone()
 	}
 
-	pub fn seq(&self) -> crate::gen::Stamp<crate::gen::BrowseLane> {
+	pub fn seq(
+		&self,
+	) -> crate::generation::Stamp<crate::generation::BrowseLane> {
 		self.seq
 	}
 
@@ -286,7 +288,7 @@ impl Browse {
 			host,
 			path: String::new(),
 			listing: None,
-			seq: crate::gen::Stamp::for_tests(0),
+			seq: crate::generation::Stamp::for_tests(0),
 			client: None,
 			cancel: snip_core::gitrun::CancelToken::new(),
 			prefill: String::new(),
@@ -324,11 +326,12 @@ pub struct MasterState {
 	/// in-flight open: a local open, a close or a newer remote open. A
 	/// result landing with an older seq is dropped, workspace and status
 	/// bar untouched.
-	pub open_seq: crate::gen::Gen<crate::gen::RemoteOpenLane>,
+	pub open_seq: crate::generation::Gen<crate::generation::RemoteOpenLane>,
 	pub message: Option<(bool, Msg)>,
 	/// The host whose folders are listed, and the folder shown.
 	pub browse: Option<Browse>,
-	pub(crate) browse_seq: crate::gen::Gen<crate::gen::BrowseLane>,
+	pub(crate) browse_seq:
+		crate::generation::Gen<crate::generation::BrowseLane>,
 	pub scan_error: Option<Msg>,
 	/// A scan still in flight or waiting to retry. Kept across a cancelled
 	/// drain so an initial scan with no selected repository can resume.
@@ -389,7 +392,8 @@ pub struct Restoring {
 	/// Why the last attempt failed; the tab shows it until one succeeds.
 	pub failed: Option<Msg>,
 	/// The `open_seq` of the attempt in flight.
-	pub(crate) open_seq: Option<crate::gen::Stamp<crate::gen::RemoteOpenLane>>,
+	pub(crate) open_seq:
+		Option<crate::generation::Stamp<crate::generation::RemoteOpenLane>>,
 	/// Attempts made; the next one waits [`retry_delay`] of it.
 	pub(crate) attempts: u32,
 	/// Tells a retry timer of an earlier restore of this tab from this one.
@@ -886,7 +890,7 @@ impl WorkbenchModel {
 	/// shown now.
 	pub(crate) fn remote_listing_landed(
 		&mut self,
-		seq: crate::gen::Stamp<crate::gen::BrowseLane>,
+		seq: crate::generation::Stamp<crate::generation::BrowseLane>,
 		result: Result<FolderListing, Msg>,
 		cx: &mut Context<Self>,
 	) {

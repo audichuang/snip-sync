@@ -1256,7 +1256,8 @@ struct Env {
 	payloads: Vec<String>,
 	/// The menu's path field was typed into since its browse began (M3).
 	typed_in_path_field: bool,
-	last_browse: Option<crate::gen::Stamp<crate::gen::BrowseLane>>,
+	last_browse:
+		Option<crate::generation::Stamp<crate::generation::BrowseLane>>,
 	/// The step before was a paste.
 	just_pasted: bool,
 	/// The step before armed a fault.

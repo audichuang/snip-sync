@@ -191,7 +191,7 @@ pub(crate) enum Family {
 	Source,
 	/// Widths, heights and fit results: layout is #228 and #229.
 	Layout,
-	/// The counters that drop a landing result (`gen.rs`).
+	/// The counters that drop a landing result (`generation.rs`).
 	Generation,
 	/// Cancel tokens: P1 and Q7 guard them indirectly.
 	Cancel,

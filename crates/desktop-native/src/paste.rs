@@ -106,7 +106,7 @@ pub enum PasteRequest {
 		text: String,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		/// Set in a remote workspace: `dest` and `roots` are tree paths
 		/// under its session root, and its worker plans and writes.
 		remote: Option<RemotePaste>,
@@ -117,7 +117,7 @@ pub enum PasteRequest {
 	Retarget {
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	},
 }
 
@@ -193,9 +193,9 @@ pub struct PastePending {
 	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
 	ui_commit: Option<Weak<CommitReplayPreview>>,
-	seq: crate::gen::Stamp<crate::gen::PasteLane>,
+	seq: crate::generation::Stamp<crate::generation::PasteLane>,
 	input: Option<(
-		crate::gen::Stamp<crate::gen::PasteLane>,
+		crate::generation::Stamp<crate::generation::PasteLane>,
 		usize,
 		Option<Weak<str>>,
 	)>,
@@ -334,7 +334,7 @@ impl PastePending {
 
 	pub fn invalidate(
 		&mut self,
-		seq: crate::gen::Stamp<crate::gen::PasteLane>,
+		seq: crate::generation::Stamp<crate::generation::PasteLane>,
 	) {
 		self.seq = seq;
 		self.latest = None;
@@ -444,7 +444,7 @@ enum PasteInput {
 		plan: PastePreviewPlan,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	},
 }
 impl PasteInput {
@@ -467,7 +467,7 @@ pub struct PasteWorker {
 	input: Option<PasteInput>,
 	pool: Arc<Mutex<PastePending>>,
 	cancel: CancelToken,
-	seq: crate::gen::Stamp<crate::gen::PasteLane>,
+	seq: crate::generation::Stamp<crate::generation::PasteLane>,
 }
 impl PasteWorker {
 	pub fn run(mut self, opts: &RunOptions) {
@@ -1357,7 +1357,8 @@ pub struct PastePreviewPlan {
 	pub items: Vec<PasteItem>,
 	pub selected_item_idx: usize,
 	pub is_applying: bool,
-	pub generation_snapshot: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+	pub generation_snapshot:
+		crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	pub error: Option<Msg>,
 	/// Shared so a clone for a background rebuild or an apply is cheap.
 	raw_payload: Arc<str>,
@@ -2140,7 +2141,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	) -> Result<Self, Msg> {
 		Self::build_from_clipboard_text_with(
 			raw_text,
@@ -2157,7 +2158,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 	) -> Result<Self, Msg> {
 		Self::build_with_limit(
@@ -2174,7 +2175,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 	) -> Result<Self, Msg> {
@@ -2194,7 +2195,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2220,7 +2221,7 @@ impl PastePreviewPlan {
 		raw: Arc<str>,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2267,7 +2268,7 @@ impl PastePreviewPlan {
 		raw: Arc<str>,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2361,7 +2362,7 @@ impl PastePreviewPlan {
 	fn build_commit(
 		raw: Arc<str>,
 		dest: &Path,
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2680,7 +2681,7 @@ impl PastePreviewPlan {
 		mut self,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 	) -> Result<Self, Msg> {
@@ -4208,7 +4209,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -4278,7 +4279,7 @@ pub(crate) mod tests {
 			RESTORE_BASE_PAYLOAD,
 			&dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -4307,7 +4308,7 @@ pub(crate) mod tests {
 			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/d/b.ts\ny\n",
 			&dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.set_adjust_paths(true).unwrap();
@@ -4336,7 +4337,7 @@ pub(crate) mod tests {
 			.retarget_with(
 				&other,
 				&[],
-				crate::gen::Stamp::for_tests(2),
+				crate::generation::Stamp::for_tests(2),
 				&RunOptions::default(),
 				MAX_RETAINED_PREVIEW_BYTES,
 			)
@@ -4356,7 +4357,7 @@ pub(crate) mod tests {
 			RESTORE_BASE_PAYLOAD,
 			&dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.set_adjust_paths(true).unwrap();
@@ -4381,7 +4382,7 @@ pub(crate) mod tests {
 			"// clipcode-root: app\n// FILE: src/a.ts\nx\n",
 			&ws,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -4419,7 +4420,7 @@ pub(crate) mod tests {
 			text,
 			&ws,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.set_keep_relative("a").unwrap();
@@ -4441,7 +4442,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.whole_commit);
@@ -4457,7 +4458,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let root = root_label(&plan);
@@ -4535,7 +4536,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let root = root_label(&plan);
@@ -4625,7 +4626,7 @@ pub(crate) mod tests {
 			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n",
 			&link,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let roots = shape(&plan).iter().filter(|l| l.starts_with("R ")).count();
@@ -4648,7 +4649,7 @@ pub(crate) mod tests {
 			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: [DELETED] p/gone.txt\n// This file has been deleted in this change\n",
 			&link,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let gone = ix_of(&plan, "p/gone.txt");
@@ -4747,7 +4748,7 @@ pub(crate) mod tests {
 			raw,
 			&dest,
 			&[dest.clone(), sub.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.choose_prefix_destination("p", &sub).unwrap();
@@ -4923,7 +4924,7 @@ pub(crate) mod tests {
 			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.choose_keep_relative("a").unwrap();
@@ -5405,7 +5406,7 @@ pub(crate) mod tests {
 			text,
 			dest: dest.into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		}
 	}
@@ -5422,14 +5423,15 @@ pub(crate) mod tests {
 		let first = PastePending::start(&pool, None, token.clone())
 			.unwrap()
 			.unwrap();
-		let mut life =
-			crate::lifecycle::Lifecycle::new(crate::gen::Gen::starting_at(1));
+		let mut life = crate::lifecycle::Lifecycle::new(
+			crate::generation::Gen::starting_at(1),
+		);
 		let (id, held) = life.register_read(Some(token.clone()));
 		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
 		token.cancel();
 		for n in 1..=100 {
 			let mut pending = lock_pending(&pool);
-			pending.invalidate(crate::gen::Stamp::for_tests(n));
+			pending.invalidate(crate::generation::Stamp::for_tests(n));
 			pending
 				.enqueue(captured(
 					format!("// FILE: latest-{n}.txt\ncaptured-{n}"),
@@ -5477,7 +5479,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.disarm_for(other.path().into());
@@ -5488,7 +5490,7 @@ pub(crate) mod tests {
 		let retarget = || PasteRequest::Retarget {
 			dest: other.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(2),
+			generation: crate::generation::Stamp::for_tests(2),
 		};
 		// Nothing to plan from: no job.
 		lock_pending(&pool).enqueue(retarget()).unwrap();
@@ -5525,7 +5527,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.clear_file_plan();
@@ -5591,12 +5593,14 @@ pub(crate) mod tests {
 				.unwrap()
 				.unwrap();
 			if invalidate_before {
-				lock_pending(&pool).invalidate(crate::gen::Stamp::for_tests(1));
+				lock_pending(&pool)
+					.invalidate(crate::generation::Stamp::for_tests(1));
 			}
 			work.run(&RunOptions::default());
 			assert!(lock_pending(&pool).input.is_none());
 			assert_eq!(lock_pending(&pool).ready.is_none(), invalidate_before);
-			lock_pending(&pool).invalidate(crate::gen::Stamp::for_tests(2));
+			lock_pending(&pool)
+				.invalidate(crate::generation::Stamp::for_tests(2));
 			assert!(lock_pending(&pool).ready.is_none());
 		}
 		let pool = Arc::new(Mutex::new(PastePending::default()));
@@ -5723,7 +5727,7 @@ pub(crate) mod tests {
 				raw,
 				dir.path(),
 				&[],
-				crate::gen::Stamp::for_tests(1),
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				raw.len() - 1
 			)
@@ -5738,7 +5742,7 @@ pub(crate) mod tests {
 				&raw,
 				dir.path(),
 				&[],
-				crate::gen::Stamp::for_tests(1),
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5760,7 +5764,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		for item in &mut plan.items {
@@ -5801,7 +5805,7 @@ pub(crate) mod tests {
 			&raw,
 			&roots[0],
 			&roots,
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let limit = full.retained_bytes() - 1;
@@ -5812,7 +5816,7 @@ pub(crate) mod tests {
 				&raw,
 				&roots[0],
 				&roots,
-				crate::gen::Stamp::for_tests(1),
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5832,7 +5836,7 @@ pub(crate) mod tests {
 			"// FILE: a.txt\nx\n",
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let before = plan.retained_bytes();
@@ -5873,7 +5877,7 @@ pub(crate) mod tests {
 			&raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let ordinary = Preview::new(
@@ -5937,7 +5941,7 @@ pub(crate) mod tests {
 			&raw,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let limit = full.retained_bytes() - 1;
@@ -5947,7 +5951,7 @@ pub(crate) mod tests {
 				&raw,
 				dir.path(),
 				&[],
-				crate::gen::Stamp::for_tests(1),
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5977,7 +5981,7 @@ pub(crate) mod tests {
 			payload,
 			dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6021,7 +6025,7 @@ pub(crate) mod tests {
 			&payload,
 			&dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6050,7 +6054,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6077,7 +6081,7 @@ pub(crate) mod tests {
 			payload,
 			dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6109,7 +6113,7 @@ pub(crate) mod tests {
 			payload,
 			dest,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6135,7 +6139,7 @@ pub(crate) mod tests {
 			payload,
 			dest,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 		let del_idx2 = plan2
@@ -6171,7 +6175,7 @@ pub(crate) mod tests {
 			payload,
 			&repo_a,
 			&[repo_a.clone(), repo_b.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6330,7 +6334,7 @@ pub(crate) mod tests {
 			&commit_payload_mixed(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -6425,7 +6429,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[repo.clone(), dest.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6457,7 +6461,7 @@ pub(crate) mod tests {
 			payload,
 			&primary,
 			&[primary.clone(), wanted.clone(), same.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6483,7 +6487,7 @@ pub(crate) mod tests {
 			"// FILE: lib/a.txt\nbody\n",
 			&primary,
 			std::slice::from_ref(&primary),
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let below = blocker.join("lib");
@@ -6531,7 +6535,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.expect("the blocked file is planned with layout refusal");
 
@@ -6706,7 +6710,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.expect("preview plan builds");
 
@@ -6798,7 +6802,7 @@ pub(crate) mod tests {
 			"// FILE: new.txt\nnew content\n",
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = files.execute().unwrap_err().msg;
@@ -6824,7 +6828,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = replay.execute().unwrap_err().msg;
@@ -6873,7 +6877,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6932,7 +6936,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -6999,7 +7003,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 
@@ -7124,7 +7128,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 
@@ -7193,7 +7197,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 
@@ -7222,7 +7226,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[trap.clone(), dest.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.prefix_choices.is_empty());
@@ -7246,7 +7250,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			std::slice::from_ref(&dest),
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let primary = plan.destination.clone();
@@ -7281,7 +7285,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[dest.clone(), trap.clone(), want.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -7313,7 +7317,7 @@ pub(crate) mod tests {
 			&text,
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -7347,7 +7351,7 @@ pub(crate) mod tests {
 			&text,
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(unchecked.items[0].content.contains("incoming"));
@@ -7371,7 +7375,7 @@ pub(crate) mod tests {
 			&text,
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 		stale.items[0].overwrite_allowed = true;
@@ -7463,7 +7467,7 @@ pub(crate) mod tests {
 			"// FILE: repo-a/a.txt\nA\n// FILE: repo-b/b.txt\nB\n",
 			&repo_a,
 			&[repo_a.clone(), repo_b.clone()],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = plan.execute().unwrap_err();
@@ -7477,7 +7481,7 @@ pub(crate) mod tests {
 			"// FILE: a.txt\nA\n",
 			&dest,
 			std::slice::from_ref(&dest),
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		// stale_created: the file appeared after the preview.
@@ -7502,7 +7506,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = plan.execute().unwrap_err();
@@ -7515,7 +7519,7 @@ pub(crate) mod tests {
 			&text,
 			&repo,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 		plan.items[0].overwrite_allowed = true;
@@ -7606,7 +7610,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(plan.items[0].op, PlannedOp::Skip(SkipCause::NonUtf8Target));
@@ -7641,7 +7645,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -7691,7 +7695,7 @@ pub(crate) mod tests {
 			&commits::to_clipboard_text(&nested),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 		let err = nested_plan.execute().unwrap_err().msg;
@@ -7720,7 +7724,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -7901,7 +7905,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.whole_commit);
@@ -8029,7 +8033,7 @@ pub(crate) mod tests {
 			&payload,
 			&path,
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let shown: Vec<String> = plan
@@ -8086,7 +8090,7 @@ pub(crate) mod tests {
 			&payload,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -8220,7 +8224,7 @@ pub(crate) mod tests {
 			payload,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let order: Vec<String> = plan
@@ -8240,7 +8244,7 @@ pub(crate) mod tests {
 			payload,
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(

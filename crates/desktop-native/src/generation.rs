@@ -221,26 +221,67 @@ mod tests {
 		assert!(g.is_current(wrapped));
 	}
 
+	/// The edition the snippets compile under: the workspace's
+	/// (`edition` in the root `Cargo.toml`; `the_snippet_edition_is_the_workspaces`
+	/// keeps the two equal). A snippet is built by bare `rustc`, which does
+	/// not read it from Cargo.
+	const SNIPPET_EDITION: &str = "2021";
+
+	/// The compiler for the snippets: the one Cargo runs the tests with
+	/// (`RUSTC`), else the rustup proxy of this user (`CARGO_HOME/bin`, then
+	/// `~/.cargo/bin`), else whatever `PATH` finds.
+	fn rustc_path() -> std::ffi::OsString {
+		if let Some(rustc) = std::env::var_os("RUSTC") {
+			return rustc;
+		}
+		let name = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+		let homes = [
+			std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from),
+			std::env::var_os("HOME")
+				.or_else(|| std::env::var_os("USERPROFILE"))
+				.map(|h| std::path::PathBuf::from(h).join(".cargo")),
+		];
+		homes
+			.into_iter()
+			.flatten()
+			.map(|home| home.join("bin").join(name))
+			.find(|candidate| candidate.is_file())
+			.map(Into::into)
+			.unwrap_or_else(|| "rustc".into())
+	}
+
+	#[test]
+	fn the_snippet_edition_is_the_workspaces() {
+		let manifest = std::fs::read_to_string(
+			std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+				.join("../../Cargo.toml"),
+		)
+		.expect("the workspace manifest");
+		assert!(
+			manifest.contains(&format!("edition = \"{SNIPPET_EDITION}\"")),
+			"the workspace edition is not {SNIPPET_EDITION}: change SNIPPET_EDITION"
+		);
+	}
+
 	/// Compiles `source` as a crate that holds this very file as a module,
 	/// and says whether it built. (A doctest cannot say it: the desktop is a
 	/// binary crate, and `cargo test --doc` skips those.)
 	fn compiles(source: &str) -> bool {
 		let dir = tempfile::tempdir().unwrap();
 		let main = dir.path().join("main.rs");
-		let gen_rs =
-			std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gen.rs");
+		let generation_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("src/generation.rs");
 		std::fs::write(
 			&main,
 			format!(
-				"#![allow(dead_code)]\n#[path = {gen_rs:?}]\nmod gen;\n{source}\nfn main() {{}}\n"
+				"#![allow(dead_code)]\n#[path = {generation_rs:?}]\nmod generation;\n{source}\nfn main() {{}}\n"
 			),
 		)
 		.unwrap();
-		let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-		let out = std::process::Command::new(rustc)
+		let out = std::process::Command::new(rustc_path())
 			.args([
 				"--edition",
-				"2021",
+				SNIPPET_EDITION,
 				"--crate-type",
 				"bin",
 				"--emit=metadata",
@@ -259,19 +300,19 @@ mod tests {
 	#[test]
 	fn a_stamp_of_one_lane_does_not_typecheck_against_another() {
 		let alike = "
-			fn f(mut a: gen::Gen<gen::PreviewLane>) -> bool {
+			fn f(mut a: generation::Gen<generation::PreviewLane>) -> bool {
 				let s = a.bump();
 				a.is_current(s)
 			}";
 		assert!(compiles(alike), "the control did not compile");
 		let mixed = "
-			fn f(a: gen::Gen<gen::HistoryLane>, s: gen::Stamp<gen::PreviewLane>) -> bool {
+			fn f(a: generation::Gen<generation::HistoryLane>, s: generation::Stamp<generation::PreviewLane>) -> bool {
 				a.is_current(s)
 			}";
 		assert!(!compiles(mixed), "a stamp of another lane was accepted");
 		let stored = "
-			struct Landing { at: gen::Stamp<gen::TreeLane> }
-			fn f(a: &gen::Gen<gen::PreviewLane>) -> Landing {
+			struct Landing { at: generation::Stamp<generation::TreeLane> }
+			fn f(a: &generation::Gen<generation::PreviewLane>) -> Landing {
 				Landing { at: a.current() }
 			}";
 		assert!(!compiles(stored), "a stamp was stored under another lane");

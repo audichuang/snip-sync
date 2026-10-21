@@ -171,7 +171,7 @@ enum Phase {
 }
 
 pub struct Lifecycle {
-	generation: crate::gen::Gen<crate::gen::WorkspaceLane>,
+	generation: crate::generation::Gen<crate::generation::WorkspaceLane>,
 	// U64-NOT-GEN: lifecycle job id
 	next_id: u64,
 	jobs: Vec<Job>,
@@ -179,7 +179,9 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
-	pub fn new(generation: crate::gen::Gen<crate::gen::WorkspaceLane>) -> Self {
+	pub fn new(
+		generation: crate::generation::Gen<crate::generation::WorkspaceLane>,
+	) -> Self {
 		Self {
 			generation,
 			next_id: 1,
@@ -191,14 +193,16 @@ impl Lifecycle {
 	/// The workspace this tab shows: a read that outlives a close or a
 	/// reopen leaves with this stamp and is dropped when it no longer is
 	/// current.
-	pub fn generation(&self) -> crate::gen::Stamp<crate::gen::WorkspaceLane> {
+	pub fn generation(
+		&self,
+	) -> crate::generation::Stamp<crate::generation::WorkspaceLane> {
 		self.generation.current()
 	}
 
 	/// Whether `stamp` is still the workspace this tab shows.
 	pub fn is_current(
 		&self,
-		stamp: crate::gen::Stamp<crate::gen::WorkspaceLane>,
+		stamp: crate::generation::Stamp<crate::generation::WorkspaceLane>,
 	) -> bool {
 		self.generation.is_current(stamp)
 	}
@@ -407,7 +411,7 @@ pub fn format_line(
 	reason: Option<&str>,
 	jobs: usize,
 	git: GitLoad,
-	generation: crate::gen::Stamp<crate::gen::WorkspaceLane>,
+	generation: crate::generation::Stamp<crate::generation::WorkspaceLane>,
 ) -> String {
 	match reason {
 		Some(reason) => format!(
@@ -426,7 +430,7 @@ mod tests {
 	use super::*;
 
 	fn fresh() -> Lifecycle {
-		Lifecycle::new(crate::gen::Gen::starting_at(1))
+		Lifecycle::new(crate::generation::Gen::starting_at(1))
 	}
 
 	#[test]
@@ -437,7 +441,7 @@ mod tests {
 		let flag = life.register_read(Some(token.clone())).1;
 		assert_eq!(life.request(Intent::Quit, now), Request::Accepted);
 		assert!(token.is_cancelled());
-		assert_eq!(life.generation(), crate::gen::Stamp::for_tests(2));
+		assert_eq!(life.generation(), crate::generation::Stamp::for_tests(2));
 		let busy = GitLoad {
 			in_flight: 1,
 			queued: 0,
@@ -466,7 +470,7 @@ mod tests {
 		let _write = life.register_mutating().1;
 		assert_eq!(life.request(Intent::Quit, now), Request::RefusedApplying);
 		assert!(!read.is_cancelled());
-		assert_eq!(life.generation(), crate::gen::Stamp::for_tests(1));
+		assert_eq!(life.generation(), crate::generation::Stamp::for_tests(1));
 		assert!(!life.is_draining());
 	}
 
@@ -570,9 +574,9 @@ mod tests {
 			life.request(Intent::CloseWorkspace, now),
 			Request::Accepted
 		);
-		assert_eq!(life.generation(), crate::gen::Stamp::for_tests(2));
+		assert_eq!(life.generation(), crate::generation::Stamp::for_tests(2));
 		assert_eq!(life.request(Intent::Quit, now), Request::Busy);
-		assert_eq!(life.generation(), crate::gen::Stamp::for_tests(2));
+		assert_eq!(life.generation(), crate::generation::Stamp::for_tests(2));
 		assert_eq!(life.intent_name(), "quit");
 	}
 
@@ -590,7 +594,7 @@ mod tests {
 			life.request(Intent::OpenWorkspace(path.clone()), now),
 			Request::Busy
 		);
-		assert_eq!(life.generation(), crate::gen::Stamp::for_tests(2));
+		assert_eq!(life.generation(), crate::generation::Stamp::for_tests(2));
 		drop(flag);
 		assert_eq!(
 			life.poll_at(now, GitLoad::idle()),
@@ -614,7 +618,7 @@ mod tests {
 			None,
 			0,
 			GitLoad::idle(),
-			crate::gen::Stamp::for_tests(3),
+			crate::generation::Stamp::for_tests(3),
 		);
 		assert_eq!(
 			line,
@@ -630,7 +634,7 @@ mod tests {
 				queued: 0,
 				leaked: 0,
 			},
-			crate::gen::Stamp::for_tests(3),
+			crate::generation::Stamp::for_tests(3),
 		);
 		assert!(!blocked.contains("phase=drained"));
 		assert!(blocked.contains("reason=timeout"));

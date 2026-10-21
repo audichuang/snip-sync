@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # A counter that decides whether a landing result is still wanted is a
-# `Gen<Lane>` (crates/desktop-native/src/gen.rs): its stamp does not typecheck
+# `Gen<Lane>` (crates/desktop-native/src/generation.rs): its stamp does not typecheck
 # against another lane's counter, so "compare the wrong generation" does not
 # compile (#230). This check keeps a bare `u64` out of the desktop's types: in
 # the non-test code of crates/desktop-native/src, every `u64` token on a line (a field, a
@@ -10,7 +10,7 @@ set -euo pipefail
 # array, a type alias, a `0u64` literal) and every `AtomicU64` has
 # `// U64-NOT-GEN: <why>` on its line or the line above, and the reason is not
 # empty. Not looked at: a cast (`n as u64`), a path (`u64::MAX`,
-# `u64::from`) and a comment line. gen.rs is the one file that names the raw
+# `u64::from`) and a comment line. generation.rs is the one file that names the raw
 # counter.
 #
 # Which lines are test code is decided by scripts/lib/test_code.sh, shared with
@@ -41,7 +41,7 @@ BARE_RE='(^|[^A-Za-z])u64([^A-Za-z0-9_]|$)|AtomicU64'
 REASON_RE='//[[:space:]]*U64-NOT-GEN:[[:space:]]*[^[:space:]]'
 
 while IFS=: read -r file line_num line_content; do
-	[[ "$file" == "$SRC/gen.rs" ]] && continue
+	[[ "$file" == "$SRC/generation.rs" ]] && continue
 	# Comments say u64 in prose.
 	[[ "$line_content" =~ ^[[:space:]]*// ]] && continue
 	is_test_line "$file" "$line_num" && continue
@@ -57,7 +57,7 @@ while IFS=: read -r file line_num line_content; do
 		continue
 	fi
 	echo "ERROR: a bare u64 at ${file}:${line_num}: ${line_content}" >&2
-	echo "  A counter a landing result is compared with is a Gen<Lane> (gen.rs)." >&2
+	echo "  A counter a landing result is compared with is a Gen<Lane> (generation.rs)." >&2
 	echo "  Anything else says so: '// U64-NOT-GEN: <why>' on this line or the one above." >&2
 	ERRORS=$((ERRORS + 1))
 done < <(grep -rnE --include='*.rs' -e "$BARE_RE" "$SRC" || true)

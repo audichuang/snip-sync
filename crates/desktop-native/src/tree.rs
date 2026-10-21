@@ -51,7 +51,7 @@ pub struct FileTreeNode {
 	scan: Option<DirectoryScan>,
 	held: VecDeque<HeldEntry>,
 	loading: bool,
-	load_epoch: crate::gen::Gen<crate::gen::TreeEpochLane>,
+	load_epoch: crate::generation::Gen<crate::generation::TreeEpochLane>,
 	selected_paths: Vec<String>,
 	budget_blocked: bool,
 	extra_rows: usize,
@@ -161,7 +161,7 @@ pub enum TreeEffect {
 
 pub struct TreeIo {
 	pub key: NodeKey,
-	pub epoch: crate::gen::Stamp<crate::gen::TreeEpochLane>,
+	pub epoch: crate::generation::Stamp<crate::generation::TreeEpochLane>,
 	pub dir: PathBuf,
 	pub base: PathBuf,
 	pub depth: usize,
@@ -192,7 +192,7 @@ impl TreeIo {
 
 pub struct TreeIoResult {
 	pub key: NodeKey,
-	pub epoch: crate::gen::Stamp<crate::gen::TreeEpochLane>,
+	pub epoch: crate::generation::Stamp<crate::generation::TreeEpochLane>,
 	pub base: PathBuf,
 	pub kind: TreeIoKind,
 	pub children: Vec<FileTreeNode>,
@@ -1386,7 +1386,7 @@ mod tests {
 		let key = NodeKey::root();
 		let io_for = |budget: usize, kind: TreeIoKind| TreeIo {
 			key: key.clone(),
-			epoch: crate::gen::Stamp::for_tests(1),
+			epoch: crate::generation::Stamp::for_tests(1),
 			dir: PathBuf::from("/remote"),
 			base: PathBuf::from("/remote"),
 			depth: 1,

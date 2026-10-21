@@ -20,7 +20,7 @@ pub struct PastePreview {
 	/// A read-only preview or mapping rebuild is running; nothing can be applied until it lands.
 	loading: bool,
 	/// Bumped for every paste request, remap and cancel; an older result is dropped.
-	generation: crate::gen::Gen<crate::gen::PasteLane>,
+	generation: crate::generation::Gen<crate::generation::PasteLane>,
 	pending: Arc<Mutex<PastePending>>,
 	// U64-NOT-GEN: id, not a landing guard
 	worker: Option<(u64, CancelToken)>,
@@ -132,7 +132,7 @@ impl PastePreview {
 			plan: None,
 			detail: None,
 			loading: false,
-			generation: crate::gen::Gen::new(),
+			generation: crate::generation::Gen::new(),
 			pending: Arc::new(Mutex::new(PastePending::default())),
 			worker: None,
 			cancel: None,
@@ -528,7 +528,7 @@ impl PastePreview {
 		&mut self,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: crate::gen::Stamp<crate::gen::RepoLoadLane>,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		ordinary: Option<&Preview>,
 	) -> Remapped {
 		self.invalidate_job();
@@ -802,7 +802,7 @@ mod tests {
 			text: text.into(),
 			dest: dest.into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -872,7 +872,7 @@ mod tests {
 			let Remapped::Ready(request) = session.retarget(
 				other.path().into(),
 				Vec::new(),
-				crate::gen::Stamp::for_tests(2),
+				crate::generation::Stamp::for_tests(2),
 				None,
 			) else {
 				panic!("a plan is open");
@@ -911,7 +911,7 @@ mod tests {
 			let Remapped::Ready(request) = session.retarget(
 				to.clone(),
 				Vec::new(),
-				crate::gen::Stamp::for_tests(2),
+				crate::generation::Stamp::for_tests(2),
 				None,
 			) else {
 				panic!("a plan is open");
@@ -935,7 +935,7 @@ mod tests {
 			let Remapped::Ready(request) = session.retarget(
 				missing.clone(),
 				Vec::new(),
-				crate::gen::Stamp::for_tests(2),
+				crate::generation::Stamp::for_tests(2),
 				None,
 			) else {
 				panic!("a plan is open");
@@ -951,7 +951,7 @@ mod tests {
 			"// FILE: a.txt\nA\n",
 			dir.path(),
 			&[],
-			crate::gen::Stamp::for_tests(1),
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.disarm_for(dir.path().into());
@@ -959,7 +959,7 @@ mod tests {
 			.retarget_with(
 				dir.path(),
 				&[],
-				crate::gen::Stamp::for_tests(2),
+				crate::generation::Stamp::for_tests(2),
 				&RunOptions::default(),
 				5,
 			)
@@ -988,7 +988,7 @@ mod tests {
 		let Remapped::Ready(request) = session.retarget(
 			sub.clone(),
 			Vec::new(),
-			crate::gen::Stamp::for_tests(2),
+			crate::generation::Stamp::for_tests(2),
 			None,
 		) else {
 			panic!("a plan is open");
@@ -1103,7 +1103,7 @@ mod tests {
 			text: "n".repeat(MAX_RETAINED_PREVIEW_BYTES - 1024 * 1024),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(2),
+			generation: crate::generation::Stamp::for_tests(2),
 			remote: None,
 		};
 		assert_eq!(
@@ -1479,7 +1479,7 @@ mod tests {
 			text: text.into(),
 			dest,
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: Some(remote),
 		})
 		.unwrap();
@@ -1756,7 +1756,7 @@ mod tests {
 			text: text.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		};
 		let req_bytes = req.bytes();
@@ -1801,7 +1801,7 @@ mod tests {
 			text: text1.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -1824,7 +1824,7 @@ mod tests {
 			text: text2.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(2),
+			generation: crate::generation::Stamp::for_tests(2),
 			remote: None,
 		};
 		s.enqueue(req2).unwrap();
@@ -1880,7 +1880,7 @@ mod tests {
 			text: "// FILE: a.txt\nbody\n".into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -2007,7 +2007,7 @@ mod tests {
 			text: "// FILE: a.txt\nbody\n".into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: crate::gen::Stamp::for_tests(1),
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();

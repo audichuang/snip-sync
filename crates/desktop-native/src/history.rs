@@ -2750,7 +2750,9 @@ impl WorkbenchModel {
 		source: GitSource,
 		preview_source: PreviewSource,
 		parents: Option<Vec<String>>,
-		task_generation: crate::gen::Stamp<crate::gen::PreviewLane>,
+		task_generation: crate::generation::Stamp<
+			crate::generation::PreviewLane,
+		>,
 		cx: &mut Context<Self>,
 	) {
 		if !self.accepting_work() {
@@ -3185,7 +3187,7 @@ impl WorkbenchModel {
 			return;
 		};
 		let sha = tree.sha.clone();
-		let gen = self.tree_generation.current();
+		let stamp = self.tree_generation.current();
 		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
@@ -3208,7 +3210,7 @@ impl WorkbenchModel {
 				})
 				.await;
 			let _ = this.update(&mut async_app, |model, cx| {
-				if !model.tree_generation.is_current(gen) {
+				if !model.tree_generation.is_current(stamp) {
 					return;
 				}
 				let Some(tree) = model.rev_tree.as_mut() else {
