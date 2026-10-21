@@ -1,0 +1,13 @@
+# Every test fixture repo (`git init` in desktop, core, remote, cli, native-e2e)
+# runs without git's automatic maintenance. `git commit` starts
+# `git maintenance run --auto --detach`, which under load packed a fixture's
+# loose objects behind a test (one that deletes a loose object found none).
+# One process-wide setting reaches every helper, including ones added later;
+# product git calls drop GIT_CONFIG_COUNT (`gitsrc.rs`), so only fixtures see
+# it. `crates/core/tests/fixture_git_env.rs` fails if it stops reaching tests.
+[env]
+GIT_CONFIG_COUNT = "2"
+GIT_CONFIG_KEY_0 = "gc.auto"
+GIT_CONFIG_VALUE_0 = "0"
+GIT_CONFIG_KEY_1 = "maintenance.auto"
+GIT_CONFIG_VALUE_1 = "false"
