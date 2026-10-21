@@ -2785,6 +2785,7 @@ impl WorkbenchModel {
 			.map(|id| multi_log::split_id(id).0.to_string())
 			.collect();
 		let cancel = arm_cancel(&mut self.preview_cancel);
+		let shown_root = root.clone();
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
 		let mut async_app = cx.to_async();
@@ -2845,18 +2846,21 @@ impl WorkbenchModel {
 							total > MAX_COMMIT_FILES;
 						match first {
 							Some(path) => model.select_commit_file(&path, cx),
-							None => model.show_preview_error(Msg::new(
-								"status_no_changes",
-								[],
-							)),
+							None => model.show_preview_error(
+								Some(shown_root.clone()),
+								Msg::new("status_no_changes", []),
+							),
 						}
 					}
-					Err(e) => model.show_preview_error(Msg::with_msg_arg(
-						"error_history",
-						[String::new()],
-						0,
-						e,
-					)),
+					Err(e) => model.show_preview_error(
+						Some(shown_root.clone()),
+						Msg::with_msg_arg(
+							"error_history",
+							[String::new()],
+							0,
+							e,
+						),
+					),
 				}
 				cx.notify();
 			});
@@ -3086,20 +3090,23 @@ impl WorkbenchModel {
 								);
 							}
 							None => {
-								model.show_preview_error(Msg::new(
-									"status_no_changes",
-									[],
-								));
+								model.show_preview_error(
+									Some(shown_root),
+									Msg::new("status_no_changes", []),
+								);
 							}
 						}
 					}
 					Err(e) => {
-						model.show_preview_error(Msg::with_msg_arg(
-							"error_history",
-							[String::new()],
-							0,
-							e,
-						));
+						model.show_preview_error(
+							Some(shown_root.clone()),
+							Msg::with_msg_arg(
+								"error_history",
+								[String::new()],
+								0,
+								e,
+							),
+						);
 					}
 				}
 				cx.notify();
@@ -3230,8 +3237,6 @@ impl WorkbenchModel {
 					// Refused by the retained budget: the previous diff is
 					// still shown, so the selection must name it again.
 					model.restore_shown_selection();
-				} else {
-					model.preview_error_root = Some(err_root);
 				}
 				cx.notify();
 			});
@@ -3555,20 +3560,25 @@ impl WorkbenchModel {
 							model.restore_shown_selection();
 						}
 					}
-					Ok(BlobText::Binary) => model.show_preview_error(Msg::new(
-						"error_binary",
-						[path.clone()],
-					)),
+					Ok(BlobText::Binary) => model.show_preview_error(
+						Some(shown_root.clone()),
+						Msg::new("error_binary", [path.clone()]),
+					),
 					Ok(BlobText::NotUtf8) => model.show_preview_error(
+						Some(shown_root.clone()),
 						Msg::new("error_not_utf8", [path.clone()]),
 					),
-					Ok(BlobText::TooLarge(n)) => {
-						model.show_preview_error(Msg::new(
+					Ok(BlobText::TooLarge(n)) => model.show_preview_error(
+						Some(shown_root.clone()),
+						Msg::new(
 							"error_too_large",
 							[path.clone(), n.to_string()],
-						))
-					}
-					Err(e) => model.show_preview_error(e.msg(path.clone())),
+						),
+					),
+					Err(e) => model.show_preview_error(
+						Some(shown_root.clone()),
+						e.msg(path.clone()),
+					),
 				}
 				cx.notify();
 			});

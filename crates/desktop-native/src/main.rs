@@ -2168,11 +2168,21 @@ impl WorkbenchModel {
 
 	/// Replace a failed read with its error body, releasing the hidden source.
 	/// Capacity refusal instead keeps the previous preview in `set_preview`.
-	pub(crate) fn show_preview_error(&mut self, error: Msg) {
+	///
+	/// The only way an error page is installed, so it always names the repo
+	/// the failed read was about (`None`: no repo, e.g. a status error before
+	/// any read); no caller can show one and leave `preview_root()` on
+	/// whatever repo is open.
+	pub(crate) fn show_preview_error(
+		&mut self,
+		root: Option<PathBuf>,
+		error: Msg,
+	) {
 		self.clear_preview();
 		self.reader.release_retained();
 		self.preview_loading = false;
 		self.preview_error = Some(error);
+		self.preview_error_root = root;
 	}
 
 	pub(crate) fn can_copy_preview(&self) -> bool {
@@ -4167,12 +4177,15 @@ impl WorkbenchModel {
 			&& anchor_file.is_some();
 		if !is_file_anchor {
 			if let Err(e) = &self.repos[idx].summary {
-				self.show_preview_error(Msg::with_msg_arg(
-					"error_repo_status",
-					[String::new()],
-					0,
-					crate::reason::failure_msg(e),
-				));
+				self.show_preview_error(
+					Some(repo_root.clone()),
+					Msg::with_msg_arg(
+						"error_repo_status",
+						[String::new()],
+						0,
+						crate::reason::failure_msg(e),
+					),
+				);
 			}
 		}
 
@@ -4370,12 +4383,15 @@ impl WorkbenchModel {
 								cx,
 							);
 						} else {
-							model.show_preview_error(Msg::with_msg_arg(
-								"error_repo_changes",
-								[repo_name.clone(), String::new()],
-								1,
-								err,
-							));
+							model.show_preview_error(
+								Some(repo_root_for_update.clone()),
+								Msg::with_msg_arg(
+									"error_repo_changes",
+									[repo_name.clone(), String::new()],
+									1,
+									err,
+								),
+							);
 						}
 					}
 				}
@@ -4532,8 +4548,6 @@ impl WorkbenchModel {
 					// Refused by the retained budget: the previous text is
 					// still shown, so the selection must name it again.
 					model.restore_shown_selection();
-				} else {
-					model.preview_error_root = Some(shown_root);
 				}
 				cx.notify();
 			});
@@ -4567,12 +4581,15 @@ impl WorkbenchModel {
 							.with_root(Some(root)),
 					)
 				} else {
-					self.show_preview_error(Msg::new("error_binary", [path]));
+					self.show_preview_error(
+						Some(root),
+						Msg::new("error_binary", [path]),
+					);
 					false
 				}
 			}
 			Err(e) => {
-				self.show_preview_error(e.msg(path));
+				self.show_preview_error(Some(root), e.msg(path));
 				false
 			}
 		}
@@ -23726,10 +23743,13 @@ mod tests {
 			// Another read fails first and clears the loading flag without
 			// touching the generation.
 			model.update(cx, |m, _| {
-				m.show_preview_error(crate::Msg::new(
-					"error_repo_changes",
-					["beta".to_string(), "boom".to_string()],
-				));
+				m.show_preview_error(
+					None,
+					crate::Msg::new(
+						"error_repo_changes",
+						["beta".to_string(), "boom".to_string()],
+					),
+				);
 			});
 			assert!(!model.read_with(cx, |m, _| m.preview_loading));
 			click(cx, "log-filter-repo");
