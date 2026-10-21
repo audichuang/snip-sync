@@ -7113,6 +7113,13 @@ mod tests {
 			let repo = ws.join(name);
 			fs::create_dir(&repo).unwrap();
 			git(&repo, &["init", "-q", "-b", "main"]);
+			// `git commit` starts `git maintenance run --auto --detach`,
+			// which under load packed a fixture's loose objects (a test that
+			// deletes a loose object then found none) and wrote a
+			// multi-pack-index: a fixture's objects stay where they were
+			// written, and nothing repacks them behind a test.
+			git(&repo, &["config", "gc.auto", "0"]);
+			git(&repo, &["config", "maintenance.auto", "false"]);
 			fs::write(repo.join("base.txt"), "base").unwrap();
 			git(&repo, &["add", "."]);
 			git(&repo, &["commit", "-q", "-m", "base"]);
