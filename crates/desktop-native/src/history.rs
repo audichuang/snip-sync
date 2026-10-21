@@ -3182,11 +3182,22 @@ impl WorkbenchModel {
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		// The tree's open file stays open, and is the tab's from here on:
 		// say whose it is, now that no tree lists it.
+		// A working-file read in flight holds the commit view aside, and the
+		// file's selection with it: the owner goes where the file is, so
+		// restoring the held selection brings it back.
 		if let Some(tree) = &self.rev_tree {
+			let sha = tree.sha.clone();
 			if self.selected_commit.is_none()
 				&& self.commit_view.selected_commit_file.is_some()
 			{
-				self.commit_view.rev_file_sha = Some(tree.sha.clone());
+				self.commit_view.rev_file_sha = Some(sha);
+			} else if let Some(held) = self
+				.held_selection
+				.as_mut()
+				.filter(|h| h.commit_file_only.is_none() && h.commit.is_none())
+				.filter(|h| h.view.selected_commit_file.is_some())
+			{
+				held.view.rev_file_sha = Some(sha);
 			}
 		}
 		self.rev_tree = None;

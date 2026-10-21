@@ -4656,6 +4656,10 @@ impl WorkbenchModel {
 			self.commit_view.selected_commit_file =
 				held.view.selected_commit_file;
 			self.commit_view.commit_file_sel = held.view.commit_file_sel;
+			// The owner of a tree file goes with the file it was set for.
+			if self.commit_view.selected_commit_file.is_none() {
+				self.commit_view.rev_file_sha = None;
+			}
 			self.preview_pending_from_log = pending;
 			return;
 		}
