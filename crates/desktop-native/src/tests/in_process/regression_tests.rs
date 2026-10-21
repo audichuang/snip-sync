@@ -1131,3 +1131,88 @@ fn fuzz_regression_a_restored_unchanged_tree_file_keeps_its_owner(
 		assert!(m.commit_view.rev_owner().is_some(), "the owner came back");
 	});
 }
+
+/// Presses Refresh and waits until the reload has landed.
+fn refresh_and_settle(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+) {
+	click_probed(model, cx, "btn-refresh");
+	settle_until(cx, "the refresh to finish", |cx| {
+		model.read_with(cx, |m, _| {
+			!m.is_loading
+				&& !m.refresh_reload
+				&& m.changes_loaded
+				&& !m.preview_loading
+		})
+	});
+}
+
+/// L2/L6: Refresh keeps the shown tree file's tab and its tree, so it keeps
+/// the file's selection with its owner too. It dropped the selection whole
+/// (`drop_commit_selection`) and left the preview, and "Back to Working"
+/// then found a commit file nobody owned. The preview and the selection of
+/// a commit file live and die together.
+#[gpui::test]
+fn fuzz_regression_refresh_keeps_the_owner_of_a_tree_file_no_commit_selects(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let browse = model
+		.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with("btn-browse-tree:"))
+		})
+		.expect("the tree");
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "a tree row", |cx| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.iter()
+				.any(|id| id.starts_with("rev-row:"))
+		})
+	});
+	// The tab closes the selection; the tree stays.
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	let row = model
+		.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with("rev-row:"))
+		})
+		.expect("a tree row");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the tree file", |cx| {
+		model.read_with(cx, |m, _| {
+			m.preview.is_some()
+				&& !m.preview_loading
+				&& m.commit_view.rev_owner().is_some()
+		})
+	});
+	assert!(model.read_with(cx, |m, _| m.selected_commit.is_none()));
+	refresh_and_settle(&model, cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_some(), "Refresh kept the tree");
+		assert!(m.preview.is_some(), "Refresh kept the file's tab");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+		assert!(m.commit_view.rev_owner().is_some(), "the owner stayed");
+	});
+}
