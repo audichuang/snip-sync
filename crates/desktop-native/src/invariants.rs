@@ -470,17 +470,26 @@ pub(crate) fn eval(
 						.into(),
 				);
 			}
-			let from_log = m.preview.as_ref().is_some_and(|p| {
-				matches!(
+			// The one commit preview left legal is the open tree's own file:
+			// a CommitFile of the tree's commit that the tree lists. A
+			// CommitDiff or Compare, or another commit's file, is a
+			// leftover even while a tree is open.
+			let stale = m.preview.as_ref().is_some_and(|p| {
+				let from_log = matches!(
 					p.source,
 					PreviewSource::CommitDiff { .. }
 						| PreviewSource::CommitFile { .. }
 						| PreviewSource::Compare { .. }
-				)
+				);
+				let tree_own = m.rev_tree.as_ref().is_some_and(|tree| {
+					matches!(
+						&p.source,
+						PreviewSource::CommitFile { sha } if *sha == tree.sha
+					) && p.path.is_some()
+				});
+				from_log && !tree_own
 			});
-			// A file of the rev tree is shown from the Log without a selected
-			// row: its tree is the selection.
-			(from_log && m.rev_tree.is_none()).then(|| {
+			stale.then(|| {
 				"no selection, but the preview is a commit's".to_string()
 			})
 		}

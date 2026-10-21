@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::invariants::{self, Invariant::*};
+use crate::PreviewSource;
 use gpui::TestAppContext;
 
 /// D1: a message on screen reads as zh-TW wording. Pasting text that is no
@@ -255,13 +256,17 @@ fn fuzz_regression_hiding_the_log_closes_its_dropdown(cx: &mut TestAppContext) {
 			m.overlays.is_open(OverlayKind::LogMenu(LogMenu::Date))
 		})
 	};
-	for hide in ["alt-9", "button", "paste"] {
+	for hide in ["alt-9", "button", "shift-escape", "paste"] {
 		click_probed(&model, cx, "log-filter-date");
 		assert!(dropdown_open(cx), "{hide}: the dropdown opens");
 		overlays::assert_overlay_panels_match(cx, &model);
 		match hide {
 			"alt-9" => cx.simulate_keystrokes("alt-9"),
 			"button" => click_probed(&model, cx, "btn-log-hide"),
+			"shift-escape" => {
+				model.update_in(cx, |m, window, _| window.focus(&m.log_focus));
+				cx.simulate_keystrokes("shift-escape")
+			}
 			_ => {
 				model.update(cx, |m, _| {
 					m.test_clipboard = Some("// FILE: x.txt\nx\n".into())
@@ -576,6 +581,31 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 		eval(cx, L3).is_some(),
 		"L3 catches a selection the tree does not list"
 	);
+
+	// A commit preview that is not the tree's own file, with a tree open.
+	model.update(cx, |m, _| {
+		m.commit_view.commit_file_sel.clear();
+		m.commit_view.selected_commit_file = None;
+	});
+	assert_eq!(l6(cx), Some(None), "the clean state holds");
+	let own =
+		model.update(cx, |m, _| m.preview.as_ref().unwrap().source.clone());
+	for source in [
+		PreviewSource::CommitDiff {
+			sha: "deadbeef".into(),
+		},
+		PreviewSource::CommitFile {
+			sha: "deadbeef".into(),
+		},
+	] {
+		model.update(cx, |m, _| m.preview.as_mut().unwrap().source = source);
+		assert!(
+			l6(cx).unwrap().is_some(),
+			"a stranger's commit preview is caught with a tree open"
+		);
+	}
+	model.update(cx, |m, _| m.preview.as_mut().unwrap().source = own);
+	assert_eq!(l6(cx), Some(None), "the tree's own file is legal again");
 }
 
 /// A fixture with two commits in the open repo, the Log read.

@@ -16,7 +16,8 @@ set -euo pipefail
 # Which lines are test code is decided by scripts/lib/test_code.sh, shared with
 # check_test_refresh.sh and check_msg_raw.sh.
 #
-# Not covered: a counter of another width (`usize`, `u32`) and a name that
+# Not covered: the reason text (any non-empty one passes, so a wrong reason is
+# not caught), a counter of another width (`usize`, `u32`) and a name that
 # hides the type (a macro). This is a net for a counter declared by accident,
 # not a guard against one written to dodge it.
 #

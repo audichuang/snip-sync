@@ -987,15 +987,15 @@ pub struct WorkbenchModel {
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
-	// U64-NOT-GEN: id, not a landing guard
+	// U64-NOT-GEN: per-action epoch, a landing guard deliberately left untyped: `set_status_msg` compares it only against its own copy
 	pub user_action_seq: u64,
-	// U64-NOT-GEN: id, not a landing guard
+	// U64-NOT-GEN: the epoch of the action whose error is on the status bar (same guard as `user_action_seq`, left untyped)
 	pub status_error_action: Option<u64>,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
-	// U64-NOT-GEN: id, not a landing guard
+	// U64-NOT-GEN: per-toast landing guard deliberately left untyped: its dismiss timer acts only if `toast.0` is still its id
 	pub toast: Option<(u64, bool, Msg)>,
-	// U64-NOT-GEN: id, not a landing guard
+	// U64-NOT-GEN: source of `toast.0` (per-toast landing guard, left untyped)
 	toast_seq: u64,
 	pub is_loading: bool,
 	pub is_copying: bool,
