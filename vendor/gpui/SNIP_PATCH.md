@@ -119,3 +119,12 @@ sight: a second copy of the algorithm drifted from gpui's (it sums the
 characters one by one, so a kerned name such as "Taylor Smith" is cut earlier
 than its shaped width says). The unit tests in `fit.rs` compare it with
 `truncate_line` on real fonts.
+
+`src/window.rs`, `DispatchEventResult`: `pub(crate)` becomes `pub`.
+
+Why: `Window::dispatch_event` is `pub`, but its return type was crate-private, so
+no other crate could call it (rustc: "type `DispatchEventResult` is private").
+The in-process fuzz lanes of #230 press and release the mouse through it
+without the `run_until_parked` that `VisualTestContext::simulate_event` adds,
+so work a press starts is still in flight when the next gesture arrives. The
+visibility is all that changed; nothing in the product calls it.

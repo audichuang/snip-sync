@@ -106,7 +106,7 @@ pub enum PasteRequest {
 		text: String,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		/// Set in a remote workspace: `dest` and `roots` are tree paths
 		/// under its session root, and its worker plans and writes.
 		remote: Option<RemotePaste>,
@@ -117,7 +117,7 @@ pub enum PasteRequest {
 	Retarget {
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	},
 }
 
@@ -189,11 +189,16 @@ pub struct PastePending {
 	/// Captured replay plans still held by selected-row reads, including
 	/// cancelled reads that have not returned from their worker yet.
 	detail_reads: Vec<DetailRead>,
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
 	ui_commit: Option<Weak<CommitReplayPreview>>,
-	seq: u64,
-	input: Option<(u64, usize, Option<Weak<str>>)>,
+	seq: crate::generation::Stamp<crate::generation::PasteLane>,
+	input: Option<(
+		crate::generation::Stamp<crate::generation::PasteLane>,
+		usize,
+		Option<Weak<str>>,
+	)>,
 	latest: Option<PasteRequest>,
 	pub ready: Option<PasteOutcome>,
 }
@@ -327,7 +332,10 @@ impl PastePending {
 		))
 	}
 
-	pub fn invalidate(&mut self, seq: u64) {
+	pub fn invalidate(
+		&mut self,
+		seq: crate::generation::Stamp<crate::generation::PasteLane>,
+	) {
 		self.seq = seq;
 		self.latest = None;
 		self.ready = None;
@@ -436,7 +444,7 @@ enum PasteInput {
 		plan: PastePreviewPlan,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	},
 }
 impl PasteInput {
@@ -459,7 +467,7 @@ pub struct PasteWorker {
 	input: Option<PasteInput>,
 	pool: Arc<Mutex<PastePending>>,
 	cancel: CancelToken,
-	seq: u64,
+	seq: crate::generation::Stamp<crate::generation::PasteLane>,
 }
 impl PasteWorker {
 	pub fn run(mut self, opts: &RunOptions) {
@@ -882,6 +890,7 @@ impl PrefixChoice {
 }
 
 /// 1023 B, 1.5 KB, 2.1 MB (binary units, one decimal).
+// U64-NOT-GEN: a byte count
 pub(crate) fn human_bytes(n: u64) -> String {
 	const K: f64 = 1024.0;
 	if n < 1024 {
@@ -1303,6 +1312,7 @@ fn commit_refusal(
 	}
 }
 
+// U64-NOT-GEN: content digest of the roots, not a counter
 pub(crate) fn roots_digest(roots: &[PathBuf]) -> u64 {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1334,6 +1344,7 @@ pub struct PastePreviewPlan {
 	pub prefix_choices: Vec<PrefixChoice>,
 	/// Digest of the repo roots the candidates were last built from, so a
 	/// landing that brings the same set skips the canonicalize.
+	// U64-NOT-GEN: content digest of the roots, not a counter
 	seen_roots: u64,
 	/// The restore-base suggestion the last plan heard (local engine or the
 	/// worker). Only kept when there are no prefix rows: see `restore_hint`.
@@ -1346,7 +1357,8 @@ pub struct PastePreviewPlan {
 	pub items: Vec<PasteItem>,
 	pub selected_item_idx: usize,
 	pub is_applying: bool,
-	pub generation_snapshot: u64,
+	pub generation_snapshot:
+		crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	pub error: Option<Msg>,
 	/// Shared so a clone for a background rebuild or an apply is cheap.
 	raw_payload: Arc<str>,
@@ -1728,6 +1740,7 @@ pub(crate) struct CommitDiffRequest {
 /// per distinct preview, unless the UI holds that Arc, which the UI's bytes
 /// already count.
 struct DetailRead {
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	id: u64,
 	preview: Weak<CommitReplayPreview>,
 	bytes: usize,
@@ -1746,6 +1759,7 @@ fn ui_holds(
 
 struct DetailReadCharge {
 	pool: Arc<Mutex<PastePending>>,
+	// U64-NOT-GEN: id of a detail read, not a landing guard
 	id: u64,
 }
 
@@ -1980,7 +1994,7 @@ impl PastePreviewPlan {
 	}
 
 	/// The digest of the repo roots this plan last saw.
-	#[cfg(test)]
+	// U64-NOT-GEN: content digest of the roots, not a counter
 	pub(crate) fn seen_roots(&self) -> u64 {
 		self.seen_roots
 	}
@@ -2127,7 +2141,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 	) -> Result<Self, Msg> {
 		Self::build_from_clipboard_text_with(
 			raw_text,
@@ -2144,7 +2158,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 	) -> Result<Self, Msg> {
 		Self::build_with_limit(
@@ -2161,7 +2175,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 	) -> Result<Self, Msg> {
@@ -2181,7 +2195,7 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2207,7 +2221,7 @@ impl PastePreviewPlan {
 		raw: Arc<str>,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2254,7 +2268,7 @@ impl PastePreviewPlan {
 		raw: Arc<str>,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2348,7 +2362,7 @@ impl PastePreviewPlan {
 	fn build_commit(
 		raw: Arc<str>,
 		dest: &Path,
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 		remote: Option<RemotePaste>,
@@ -2667,7 +2681,7 @@ impl PastePreviewPlan {
 		mut self,
 		dest: &Path,
 		known_roots: &[PathBuf],
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		opts: &RunOptions,
 		limit: usize,
 	) -> Result<Self, Msg> {
@@ -3857,6 +3871,45 @@ impl PastePreviewPlan {
 			created_commits: replay_res.created,
 		})
 	}
+
+	/// Makes the plan forget the repo set it last saw (a breaker of R4).
+	#[cfg(test)]
+	pub(crate) fn forget_roots_for_tests(&mut self) {
+		self.seen_roots = !self.seen_roots;
+	}
+
+	/// Whether the cursor stands on a row that is drawn (P5 of
+	/// `invariants`): the one question `normalize_cursor` settles.
+	pub(crate) fn cursor_visible(&self) -> bool {
+		let cursor = self.cursor();
+		self.cursor_rows().iter().any(|(c, ..)| *c == cursor)
+	}
+
+	/// How many folded folders no longer name a row (P6 of `invariants`).
+	/// The set of folders that exist is the one `normalize_cursor` keeps.
+	pub(crate) fn stale_folds(&self) -> usize {
+		if self.whole_commit {
+			return 0;
+		}
+		let mut exists: BTreeSet<DirKey> = self
+			.all_dirs()
+			.into_iter()
+			.map(|(root, path, _)| DirKey {
+				commit: None,
+				root,
+				path,
+			})
+			.collect();
+		exists.extend(self.root_groups().into_iter().map(|g| DirKey {
+			commit: None,
+			root: g.root,
+			path: String::new(),
+		}));
+		self.collapsed_dirs
+			.iter()
+			.filter(|k| !exists.contains(*k))
+			.count()
+	}
 }
 
 #[cfg(test)]
@@ -4156,7 +4209,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -4226,7 +4279,7 @@ pub(crate) mod tests {
 			RESTORE_BASE_PAYLOAD,
 			&dest,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -4255,7 +4308,7 @@ pub(crate) mod tests {
 			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/d/b.ts\ny\n",
 			&dest,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.set_adjust_paths(true).unwrap();
@@ -4284,7 +4337,7 @@ pub(crate) mod tests {
 			.retarget_with(
 				&other,
 				&[],
-				2,
+				crate::generation::Stamp::for_tests(2),
 				&RunOptions::default(),
 				MAX_RETAINED_PREVIEW_BYTES,
 			)
@@ -4304,7 +4357,7 @@ pub(crate) mod tests {
 			RESTORE_BASE_PAYLOAD,
 			&dest,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.set_adjust_paths(true).unwrap();
@@ -4329,7 +4382,7 @@ pub(crate) mod tests {
 			"// clipcode-root: app\n// FILE: src/a.ts\nx\n",
 			&ws,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -4363,9 +4416,13 @@ pub(crate) mod tests {
 				..
 			})
 		));
-		let mut plan =
-			PastePreviewPlan::build_from_clipboard_text(text, &ws, &[], 1)
-				.unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			text,
+			&ws,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 		plan.set_keep_relative("a").unwrap();
 		plan.set_keep_relative("b").unwrap();
 		assert!(plan.restore_hint().is_none());
@@ -4385,7 +4442,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.whole_commit);
@@ -4401,7 +4458,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let root = root_label(&plan);
@@ -4479,7 +4536,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let root = root_label(&plan);
@@ -4569,7 +4626,7 @@ pub(crate) mod tests {
 			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: .git/config\n2\n",
 			&link,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let roots = shape(&plan).iter().filter(|l| l.starts_with("R ")).count();
@@ -4592,7 +4649,7 @@ pub(crate) mod tests {
 			"// clipcode-root: p\n// FILE: p/a.txt\n1\n// FILE: [DELETED] p/gone.txt\n// This file has been deleted in this change\n",
 			&link,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let gone = ix_of(&plan, "p/gone.txt");
@@ -4691,7 +4748,7 @@ pub(crate) mod tests {
 			raw,
 			&dest,
 			&[dest.clone(), sub.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.choose_prefix_destination("p", &sub).unwrap();
@@ -4867,7 +4924,7 @@ pub(crate) mod tests {
 			"// FILE: a/x/1.txt\n1\n// FILE: b/y/2.txt\n2\n",
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		plan.choose_keep_relative("a").unwrap();
@@ -5349,7 +5406,7 @@ pub(crate) mod tests {
 			text,
 			dest: dest.into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		}
 	}
@@ -5366,13 +5423,15 @@ pub(crate) mod tests {
 		let first = PastePending::start(&pool, None, token.clone())
 			.unwrap()
 			.unwrap();
-		let mut life = crate::lifecycle::Lifecycle::new(1);
+		let mut life = crate::lifecycle::Lifecycle::new(
+			crate::generation::Gen::starting_at(1),
+		);
 		let (id, held) = life.register_read(Some(token.clone()));
 		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
 		token.cancel();
 		for n in 1..=100 {
 			let mut pending = lock_pending(&pool);
-			pending.invalidate(n);
+			pending.invalidate(crate::generation::Stamp::for_tests(n));
 			pending
 				.enqueue(captured(
 					format!("// FILE: latest-{n}.txt\ncaptured-{n}"),
@@ -5420,7 +5479,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.disarm_for(other.path().into());
@@ -5431,7 +5490,7 @@ pub(crate) mod tests {
 		let retarget = || PasteRequest::Retarget {
 			dest: other.path().into(),
 			roots: Vec::new(),
-			generation: 2,
+			generation: crate::generation::Stamp::for_tests(2),
 		};
 		// Nothing to plan from: no job.
 		lock_pending(&pool).enqueue(retarget()).unwrap();
@@ -5468,7 +5527,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.clear_file_plan();
@@ -5534,12 +5593,14 @@ pub(crate) mod tests {
 				.unwrap()
 				.unwrap();
 			if invalidate_before {
-				lock_pending(&pool).invalidate(1);
+				lock_pending(&pool)
+					.invalidate(crate::generation::Stamp::for_tests(1));
 			}
 			work.run(&RunOptions::default());
 			assert!(lock_pending(&pool).input.is_none());
 			assert_eq!(lock_pending(&pool).ready.is_none(), invalidate_before);
-			lock_pending(&pool).invalidate(2);
+			lock_pending(&pool)
+				.invalidate(crate::generation::Stamp::for_tests(2));
 			assert!(lock_pending(&pool).ready.is_none());
 		}
 		let pool = Arc::new(Mutex::new(PastePending::default()));
@@ -5666,7 +5727,7 @@ pub(crate) mod tests {
 				raw,
 				dir.path(),
 				&[],
-				1,
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				raw.len() - 1
 			)
@@ -5681,7 +5742,7 @@ pub(crate) mod tests {
 				&raw,
 				dir.path(),
 				&[],
-				1,
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5703,7 +5764,7 @@ pub(crate) mod tests {
 			raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		for item in &mut plan.items {
@@ -5741,7 +5802,10 @@ pub(crate) mod tests {
 			.map(|i| format!("// FILE: prefix-{i}/a.txt\nx\n"))
 			.collect();
 		let full = PastePreviewPlan::build_from_clipboard_text(
-			&raw, &roots[0], &roots, 1,
+			&raw,
+			&roots[0],
+			&roots,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let limit = full.retained_bytes() - 1;
@@ -5752,7 +5816,7 @@ pub(crate) mod tests {
 				&raw,
 				&roots[0],
 				&roots,
-				1,
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5772,7 +5836,7 @@ pub(crate) mod tests {
 			"// FILE: a.txt\nx\n",
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let before = plan.retained_bytes();
@@ -5813,7 +5877,7 @@ pub(crate) mod tests {
 			&raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let ordinary = Preview::new(
@@ -5877,7 +5941,7 @@ pub(crate) mod tests {
 			&raw,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let limit = full.retained_bytes() - 1;
@@ -5887,7 +5951,7 @@ pub(crate) mod tests {
 				&raw,
 				dir.path(),
 				&[],
-				1,
+				crate::generation::Stamp::for_tests(1),
 				&RunOptions::default(),
 				limit
 			)
@@ -5913,9 +5977,13 @@ pub(crate) mod tests {
 		fs::write(&existing_file, "original content").unwrap();
 
 		let payload = "// FILE: hello.txt\nhello modified\n// FILE: new.txt\nnew content\n";
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(payload, dest, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dest,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		assert_eq!(plan.items.len(), 2);
 		let existing =
@@ -5957,7 +6025,7 @@ pub(crate) mod tests {
 			&payload,
 			&dest,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -5982,9 +6050,13 @@ pub(crate) mod tests {
 		assert!(nested_file.exists());
 
 		let payload = "// FILE: [DELETED] /opt/unrelated/gone.txt\n";
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(payload, &dest, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			&dest,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		// The plan has no delete operation for the unresolvable absolute deleted entry
 		assert!(plan.items.iter().all(|i| i.op != PlannedOp::Delete));
@@ -6005,9 +6077,13 @@ pub(crate) mod tests {
 		fs::write(&existing_file, "initial").unwrap();
 
 		let payload = "// FILE: target.txt\nupdated content\n";
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(payload, dest, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dest,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		// Destination changes on disk after preview was generated!
 		std::thread::sleep(std::time::Duration::from_millis(15));
@@ -6033,9 +6109,13 @@ pub(crate) mod tests {
 		fs::write(&file_to_del, "to be deleted").unwrap();
 
 		let payload = "// FILE: [DELETED] old.txt\n// This file has been deleted in this change\n// FILE: add.txt\nadded\n";
-		let mut plan =
-			PastePreviewPlan::build_from_clipboard_text(payload, dest, &[], 1)
-				.unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dest,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		assert_eq!(plan.items.len(), 2);
 		let del_item = plan.items.iter().find(|i| i.path == "old.txt").unwrap();
@@ -6055,9 +6135,13 @@ pub(crate) mod tests {
 		assert!(file_to_del.exists());
 
 		// Rebuild plan reflecting current state on disk (add.txt now exists)
-		let plan2 =
-			PastePreviewPlan::build_from_clipboard_text(payload, dest, &[], 2)
-				.unwrap();
+		let plan2 = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dest,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 		let del_idx2 = plan2
 			.items
 			.iter()
@@ -6091,7 +6175,7 @@ pub(crate) mod tests {
 			payload,
 			&repo_a,
 			&[repo_a.clone(), repo_b.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6250,7 +6334,7 @@ pub(crate) mod tests {
 			&commit_payload_mixed(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -6345,7 +6429,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[repo.clone(), dest.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6377,7 +6461,7 @@ pub(crate) mod tests {
 			payload,
 			&primary,
 			&[primary.clone(), wanted.clone(), same.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -6403,7 +6487,7 @@ pub(crate) mod tests {
 			"// FILE: lib/a.txt\nbody\n",
 			&primary,
 			std::slice::from_ref(&primary),
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let below = blocker.join("lib");
@@ -6447,9 +6531,13 @@ pub(crate) mod tests {
 				files: vec![file("newdir/x.txt"), file("fresh.txt")],
 			}],
 		});
-		let mut plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.expect("the blocked file is planned with layout refusal");
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.expect("the blocked file is planned with layout refusal");
 
 		// Core commit plan records layout conflict and refusal
 		let commit_plan =
@@ -6618,9 +6706,13 @@ pub(crate) mod tests {
 				files: vec![file("blocker/child.txt")],
 			}],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.expect("preview plan builds");
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.expect("preview plan builds");
 
 		// Refusal banner uses commit_no_message instead of empty brackets 「」
 		let banner = plan.error.as_ref().expect("refusal banner present");
@@ -6710,7 +6802,7 @@ pub(crate) mod tests {
 			"// FILE: new.txt\nnew content\n",
 			&repo,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = files.execute().unwrap_err().msg;
@@ -6732,9 +6824,13 @@ pub(crate) mod tests {
 				}],
 			}],
 		});
-		let replay =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.unwrap();
+		let replay = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 		let err = replay.execute().unwrap_err().msg;
 		assert_eq!(err.key, "paste_repo_busy");
 		assert_eq!(
@@ -6777,9 +6873,13 @@ pub(crate) mod tests {
 				files: vec![file("b.txt")],
 			}],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		let blocker = HeavyLockBlocker::fill(&repo);
 		let err = plan.execute().unwrap_err().msg;
@@ -6832,9 +6932,13 @@ pub(crate) mod tests {
 				}],
 			}],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		let blocker = HeavyLockBlocker::fill(&repo);
 		let err = plan.execute().unwrap_err().msg;
@@ -6895,9 +6999,13 @@ pub(crate) mod tests {
 				},
 			],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 
 		// The preview already plans commit 2 after commit 1, so it shows the
 		// refusal Apply will hit: header, summary and banner.
@@ -7016,9 +7124,13 @@ pub(crate) mod tests {
 				),
 			],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 
 		let commit_plans = plan.commit_preview.as_ref().unwrap().plan();
 		assert_eq!(commit_plans.commits[1].refused_by(), None);
@@ -7081,9 +7193,13 @@ pub(crate) mod tests {
 				record("rename", "b.txt", Some("a.txt"), FileChange::Renamed),
 			],
 		});
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 
 		let old = plan
 			.items
@@ -7110,7 +7226,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[trap.clone(), dest.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.prefix_choices.is_empty());
@@ -7134,7 +7250,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			std::slice::from_ref(&dest),
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let primary = plan.destination.clone();
@@ -7169,7 +7285,7 @@ pub(crate) mod tests {
 			payload,
 			&dest,
 			&[dest.clone(), trap.clone(), want.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(!plan.mapping_ready());
@@ -7197,9 +7313,13 @@ pub(crate) mod tests {
 		git_run(&path, &["add", "."]);
 		git_run(&path, &["commit", "-qm", "base"]);
 		let text = commit_payload_modifying_a();
-		let plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
-				.unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&path,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 
 		let asked: BTreeSet<&str> = plan
 			.items
@@ -7227,9 +7347,13 @@ pub(crate) mod tests {
 		git_run(&path, &["commit", "-qm", "base"]);
 		let text = commit_payload_modifying_a();
 
-		let mut unchecked =
-			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
-				.unwrap();
+		let mut unchecked = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&path,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 		assert!(unchecked.items[0].content.contains("incoming"));
 		assert!(!unchecked.items[0].content.contains("Author"));
 		assert_eq!(
@@ -7247,9 +7371,13 @@ pub(crate) mod tests {
 		);
 		assert_eq!(fs::read_to_string(path.join("a.txt")).unwrap(), "base\n");
 
-		let mut stale =
-			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 2)
-				.unwrap();
+		let mut stale = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&path,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 		stale.items[0].overwrite_allowed = true;
 		fs::write(path.join("a.txt"), "external change\n").unwrap();
 		assert_eq!(
@@ -7339,7 +7467,7 @@ pub(crate) mod tests {
 			"// FILE: repo-a/a.txt\nA\n// FILE: repo-b/b.txt\nB\n",
 			&repo_a,
 			&[repo_a.clone(), repo_b.clone()],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let err = plan.execute().unwrap_err();
@@ -7353,7 +7481,7 @@ pub(crate) mod tests {
 			"// FILE: a.txt\nA\n",
 			&dest,
 			std::slice::from_ref(&dest),
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		// stale_created: the file appeared after the preview.
@@ -7374,18 +7502,26 @@ pub(crate) mod tests {
 		git_run(&repo, &["add", "."]);
 		git_run(&repo, &["commit", "-qm", "base"]);
 		let text = commit_payload_modifying_a();
-		let mut plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(1),
+		)
+		.unwrap();
 		let err = plan.execute().unwrap_err();
 		assert_eq!(err.token, ApplyToken::CommitOverwriteRequired);
 		plan.items[0].selected = false;
 		let err = plan.execute().unwrap_err();
 		assert_eq!(err.token, ApplyToken::CommitSubsetRejected);
 		// stale_modified: the file changed after the preview.
-		let mut plan =
-			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
-				.unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&repo,
+			&[],
+			crate::generation::Stamp::for_tests(2),
+		)
+		.unwrap();
 		plan.items[0].overwrite_allowed = true;
 		fs::write(repo.join("a.txt"), "external change\n").unwrap();
 		let err = plan.execute().unwrap_err();
@@ -7474,7 +7610,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(plan.items[0].op, PlannedOp::Skip(SkipCause::NonUtf8Target));
@@ -7509,7 +7645,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(
@@ -7559,7 +7695,7 @@ pub(crate) mod tests {
 			&commits::to_clipboard_text(&nested),
 			&path,
 			&[],
-			2,
+			crate::generation::Stamp::for_tests(2),
 		)
 		.unwrap();
 		let err = nested_plan.execute().unwrap_err().msg;
@@ -7588,7 +7724,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 
@@ -7769,7 +7905,7 @@ pub(crate) mod tests {
 			&commit_payload_modifying_a(),
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert!(plan.whole_commit);
@@ -7897,7 +8033,7 @@ pub(crate) mod tests {
 			&payload,
 			&path,
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let shown: Vec<String> = plan
@@ -7954,7 +8090,7 @@ pub(crate) mod tests {
 			&payload,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		(dir, plan)
@@ -8088,7 +8224,7 @@ pub(crate) mod tests {
 			payload,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		let order: Vec<String> = plan
@@ -8108,7 +8244,7 @@ pub(crate) mod tests {
 			payload,
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		assert_eq!(

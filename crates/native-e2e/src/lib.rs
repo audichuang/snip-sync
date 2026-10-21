@@ -168,6 +168,14 @@ pub fn parse_covered(line: &str) -> Option<(String, String)> {
 	Some((id.to_string(), decode_by(field(fields, "by")?)))
 }
 
+/// Parses a `[APP:INVARIANT_BROKEN: detail=<encoded> id=<label>]` line into
+/// `(label, detail)`: a member of the app's invariant registry that did not
+/// hold in the frame it drew. `detail` is encoded like `by`.
+pub fn parse_invariant_broken(line: &str) -> Option<(String, String)> {
+	let (fields, id) = id_line(line, "INVARIANT_BROKEN")?;
+	Some((id.to_string(), decode_by(field(fields, "detail")?)))
+}
+
 /// `by` as the app wrote it, with its `%XX` escapes undone.
 fn decode_by(encoded: &str) -> String {
 	let mut out = String::with_capacity(encoded.len());
@@ -268,6 +276,33 @@ mod tests {
 			}
 		}
 		out
+	}
+
+	/// An invariant's line: its label is the id, last; its detail is text
+	/// the app wrote, so it travels encoded like a covering id.
+	#[test]
+	fn an_invariant_broken_line_reads_back_whole() {
+		for id in ["L4", "O(O4)", "P10"] {
+			for detail in [
+				"a detail with spaces",
+				"has ] and 100% and\nlines",
+				"ws_tab=2 id=x by=y",
+				"",
+			] {
+				for tag in TAGS {
+					let line = format!(
+						"[APP:INVARIANT_BROKEN: {tag}detail={} id={id}]",
+						encode_by(detail)
+					);
+					assert_eq!(
+						parse_invariant_broken(&line),
+						Some((id.to_string(), detail.to_string())),
+						"{line}"
+					);
+				}
+			}
+		}
+		assert_eq!(parse_invariant_broken("[APP:CTRL_GONE: id=a]"), None);
 	}
 
 	#[test]

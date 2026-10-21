@@ -20,8 +20,9 @@ pub struct PastePreview {
 	/// A read-only preview or mapping rebuild is running; nothing can be applied until it lands.
 	loading: bool,
 	/// Bumped for every paste request, remap and cancel; an older result is dropped.
-	generation: u64,
+	generation: crate::generation::Gen<crate::generation::PasteLane>,
 	pending: Arc<Mutex<PastePending>>,
+	// U64-NOT-GEN: id, not a landing guard
 	worker: Option<(u64, CancelToken)>,
 	cancel: Option<CancelToken>,
 	scroll: gpui::UniformListScrollHandle,
@@ -131,7 +132,7 @@ impl PastePreview {
 			plan: None,
 			detail: None,
 			loading: false,
-			generation: 0,
+			generation: crate::generation::Gen::new(),
 			pending: Arc::new(Mutex::new(PastePending::default())),
 			worker: None,
 			cancel: None,
@@ -185,6 +186,18 @@ impl PastePreview {
 		self.plan.as_mut()
 	}
 
+	/// A test marks a preview as being read.
+	#[cfg(test)]
+	pub fn mark_loading_for_tests(&mut self) {
+		self.loading = true;
+	}
+
+	/// A test drops the destination folder under an open plan.
+	#[cfg(test)]
+	pub fn unset_folder_for_tests(&mut self) {
+		self.folder = None;
+	}
+
 	/// A test holds retained bytes the way a running apply does, so a
 	/// refusal needs neither a worker nor a clock to race.
 	#[cfg(test)]
@@ -216,6 +229,7 @@ impl PastePreview {
 		self.apply_delay
 	}
 
+	// U64-NOT-GEN: id, not a landing guard
 	pub fn worker_id(&self) -> Option<u64> {
 		self.worker.as_ref().map(|(id, _)| *id)
 	}
@@ -248,8 +262,8 @@ impl PastePreview {
 		if let Some(token) = self.cancel.take() {
 			token.cancel();
 		}
-		self.generation = self.generation.wrapping_add(1);
-		lock_pending(&self.pending).invalidate(self.generation);
+		let seq = self.generation.bump();
+		lock_pending(&self.pending).invalidate(seq);
 		self.loading = false;
 	}
 
@@ -365,6 +379,7 @@ impl PastePreview {
 		}
 	}
 
+	// U64-NOT-GEN: id, not a landing guard
 	pub fn bind_job(&mut self, id: u64, cancel: CancelToken) {
 		self.cancel = Some(cancel.clone());
 		self.worker = Some((id, cancel));
@@ -513,7 +528,7 @@ impl PastePreview {
 		&mut self,
 		dest: PathBuf,
 		roots: Vec<PathBuf>,
-		generation: u64,
+		generation: crate::generation::Stamp<crate::generation::RepoLoadLane>,
 		ordinary: Option<&Preview>,
 	) -> Remapped {
 		self.invalidate_job();
@@ -751,21 +766,15 @@ impl PastePreview {
 	/// Hides the Git Log for the paste preview, remembering the prior state once
 	/// (a re-paste over an open preview keeps the first saved value). Returns
 	/// true when the panel was actually hidden by this call.
-	pub fn collapse_log(&mut self, visible: &mut bool) -> bool {
-		self.log_before.get_or_insert(*visible);
-		std::mem::replace(visible, false)
+	pub fn collapse_log(&mut self, visible: bool) -> bool {
+		self.log_before.get_or_insert(visible);
+		visible
 	}
 
 	/// Restores Git Log visibility once the paste preview closes, unless the
 	/// user toggled it themselves while the preview was open.
-	pub fn restore_log(&mut self, visible: &mut bool) -> bool {
-		match self.log_before.take() {
-			Some(true) if !*visible => {
-				*visible = true;
-				true
-			}
-			_ => false,
-		}
+	pub fn restore_log(&mut self, visible: bool) -> bool {
+		matches!(self.log_before.take(), Some(true) if !visible)
 	}
 
 	pub fn forget_log_restore(&mut self) {
@@ -793,7 +802,7 @@ mod tests {
 			text: text.into(),
 			dest: dest.into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -860,9 +869,12 @@ mod tests {
 		for text in ["// FILE: a.txt\nA\n".to_string(), commit_text()] {
 			let mut session = landed(&text, dir.path(), None);
 			assert!(session.plan().unwrap().executable());
-			let Remapped::Ready(request) =
-				session.retarget(other.path().into(), Vec::new(), 2, None)
-			else {
+			let Remapped::Ready(request) = session.retarget(
+				other.path().into(),
+				Vec::new(),
+				crate::generation::Stamp::for_tests(2),
+				None,
+			) else {
 				panic!("a plan is open");
 			};
 			let plan = session.plan().unwrap();
@@ -896,9 +908,12 @@ mod tests {
 			(commit_text(), plain.path().to_path_buf()),
 		] {
 			let mut session = landed(&text, dir.path(), None);
-			let Remapped::Ready(request) =
-				session.retarget(to.clone(), Vec::new(), 2, None)
-			else {
+			let Remapped::Ready(request) = session.retarget(
+				to.clone(),
+				Vec::new(),
+				crate::generation::Stamp::for_tests(2),
+				None,
+			) else {
 				panic!("a plan is open");
 			};
 			run_retarget(&mut session, request);
@@ -917,9 +932,12 @@ mod tests {
 		}
 		let missing_key = {
 			let mut session = landed("// FILE: a.txt\nA\n", dir.path(), None);
-			let Remapped::Ready(request) =
-				session.retarget(missing.clone(), Vec::new(), 2, None)
-			else {
+			let Remapped::Ready(request) = session.retarget(
+				missing.clone(),
+				Vec::new(),
+				crate::generation::Stamp::for_tests(2),
+				None,
+			) else {
 				panic!("a plan is open");
 			};
 			run_retarget(&mut session, request);
@@ -933,12 +951,18 @@ mod tests {
 			"// FILE: a.txt\nA\n",
 			dir.path(),
 			&[],
-			1,
+			crate::generation::Stamp::for_tests(1),
 		)
 		.unwrap();
 		shell.disarm_for(dir.path().into());
 		let err = shell
-			.retarget_with(dir.path(), &[], 2, &RunOptions::default(), 5)
+			.retarget_with(
+				dir.path(),
+				&[],
+				crate::generation::Stamp::for_tests(2),
+				&RunOptions::default(),
+				5,
+			)
 			.expect_err("over the budget");
 		assert_eq!(err.key, "preview_memory_limit");
 	}
@@ -961,9 +985,12 @@ mod tests {
 		let payload = "// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
 		let mut session = landed(payload, &first, None);
 		assert!(session.plan().unwrap().executable());
-		let Remapped::Ready(request) =
-			session.retarget(sub.clone(), Vec::new(), 2, None)
-		else {
+		let Remapped::Ready(request) = session.retarget(
+			sub.clone(),
+			Vec::new(),
+			crate::generation::Stamp::for_tests(2),
+			None,
+		) else {
 			panic!("a plan is open");
 		};
 		run_retarget(&mut session, request);
@@ -1076,7 +1103,7 @@ mod tests {
 			text: "n".repeat(MAX_RETAINED_PREVIEW_BYTES - 1024 * 1024),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 2,
+			generation: crate::generation::Stamp::for_tests(2),
 			remote: None,
 		};
 		assert_eq!(
@@ -1277,6 +1304,8 @@ mod tests {
 		let plan = s.plan().unwrap();
 		assert!(plan.collapsed_dirs.contains(&ax), "the fold survived");
 		assert_eq!(plan.cursor(), PasteCursor::Dir(ax));
+		// P5 of `invariants`: the cursor stands on a drawn row.
+		assert!(plan.cursor_visible());
 		assert!(plan.detail_preview().is_none());
 		assert!(s.detail().is_none());
 	}
@@ -1450,7 +1479,7 @@ mod tests {
 			text: text.into(),
 			dest,
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: Some(remote),
 		})
 		.unwrap();
@@ -1727,7 +1756,7 @@ mod tests {
 			text: text.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		};
 		let req_bytes = req.bytes();
@@ -1772,7 +1801,7 @@ mod tests {
 			text: text1.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -1795,7 +1824,7 @@ mod tests {
 			text: text2.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 2,
+			generation: crate::generation::Stamp::for_tests(2),
 			remote: None,
 		};
 		s.enqueue(req2).unwrap();
@@ -1851,7 +1880,7 @@ mod tests {
 			text: "// FILE: a.txt\nbody\n".into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -1978,7 +2007,7 @@ mod tests {
 			text: "// FILE: a.txt\nbody\n".into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
-			generation: 1,
+			generation: crate::generation::Stamp::for_tests(1),
 			remote: None,
 		})
 		.unwrap();
@@ -2022,41 +2051,55 @@ mod tests {
 
 	#[test]
 	fn paste_log_collapse_and_restore() {
+		// The panel's visibility is the model's (`set_log_visible`); these
+		// mirror what its callers do with the answers.
+		fn collapse(s: &mut PastePreview, vis: &mut bool) -> bool {
+			let was = s.collapse_log(*vis);
+			*vis = false;
+			was
+		}
+		fn restore(s: &mut PastePreview, vis: &mut bool) -> bool {
+			let back = s.restore_log(*vis);
+			if back {
+				*vis = true;
+			}
+			back
+		}
 		// Open then close restores the visible log, exactly once.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		assert!(s.collapse_log(&mut vis));
+		assert!(collapse(&mut s, &mut vis));
 		assert!(!vis);
 		// A re-paste over the open preview keeps the first saved state.
-		assert!(!s.collapse_log(&mut vis));
-		assert!(s.restore_log(&mut vis));
+		assert!(!collapse(&mut s, &mut vis));
+		assert!(restore(&mut s, &mut vis));
 		assert!(vis);
 		vis = false;
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis, "must not restore twice");
 		assert!(s.log_before.is_none());
 
 		// A log that was already hidden stays hidden.
 		let mut s = PastePreview::new(None);
 		let mut vis = false;
-		assert!(!s.collapse_log(&mut vis));
-		assert!(!s.restore_log(&mut vis));
+		assert!(!collapse(&mut s, &mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis);
 
 		// A manual toggle (toggle_log clears the saved state) wins.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		s.collapse_log(&mut vis);
+		collapse(&mut s, &mut vis);
 		s.forget_log_restore();
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis);
 
 		// Reopened by a path that does not clear the saved state: no flip.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		s.collapse_log(&mut vis);
+		collapse(&mut s, &mut vis);
 		vis = true;
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(vis);
 		assert!(s.log_before.is_none());
 	}

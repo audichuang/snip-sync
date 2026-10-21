@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use snip_core::reason::{io_reason, Reason};
 use snip_core::workspace::{DirectoryScan, ScanError, ScanStatus};
 
+use crate::fault::Fault;
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
 	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_MAX, PROTOCOL_VERSION,
@@ -103,6 +104,9 @@ struct State {
 	max_protocol: Option<u32>,
 	git_requests: AtomicUsize,
 	deadlines: Mutex<(Duration, Duration)>,
+	/// How often work says it is alive; [`crate::jobs::HEARTBEAT`] unless a
+	/// test set it.
+	heartbeat: Mutex<Duration>,
 	/// A ListDir reply's entry cap; [`MAX_DIR_ENTRIES`] unless a test
 	/// shrank it.
 	dir_cap: AtomicUsize,
@@ -110,7 +114,6 @@ struct State {
 	repo_cache: Mutex<crate::gitserve::RepoCache>,
 	prepared: crate::prepared::PreparedCache,
 	stop: AtomicBool,
-	scan_faults: Mutex<std::collections::HashMap<String, ScanFault>>,
 	connections: AtomicUsize,
 	open_sequence: AtomicUsize,
 	hello_hold: (Mutex<bool>, Condvar),
@@ -119,14 +122,6 @@ struct State {
 	/// Faults a test injected ([`crate::fault`]); only read while `armed`.
 	faults: Mutex<crate::fault::FaultBook>,
 	armed: AtomicBool,
-}
-
-#[derive(Default)]
-struct ScanFault {
-	eofs: usize,
-	refusal: Option<ErrorCode>,
-	requests: usize,
-	first_open: Option<usize>,
 }
 
 /// One worker's state. `snip serve --stdio` serves a single connection;
@@ -147,11 +142,11 @@ impl Worker {
 					crate::jobs::VIEW_DEADLINE,
 					crate::jobs::SCAN_DEADLINE,
 				)),
+				heartbeat: Mutex::new(crate::jobs::HEARTBEAT),
 				dir_cap: AtomicUsize::new(MAX_DIR_ENTRIES),
 				jobs: crate::jobs::Jobs::new(),
 				repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
 				stop: AtomicBool::new(false),
-				scan_faults: Mutex::default(),
 				connections: AtomicUsize::new(0),
 				open_sequence: AtomicUsize::new(0),
 				hello_hold: (Mutex::new(false), Condvar::new()),
@@ -224,16 +219,19 @@ impl Worker {
 		self.state.armed.store(true, Ordering::SeqCst);
 	}
 
-	/// Drops every injected fault and disarms the book.
+	/// Drops every injected fault and disarms the book. The scan failures of
+	/// [`Self::set_scan_failures_for_tests`] are rules of the same book: they
+	/// go too, and [`Self::scan_requests_for_tests`] stops counting until a
+	/// fault is armed again. Call it before setting them, not after.
 	#[doc(hidden)]
 	pub fn clear_faults_for_tests(&self) {
 		lock(&self.state.faults).clear();
 		self.state.armed.store(false, Ordering::SeqCst);
 	}
 
-	/// Requests of `kind` the dispatch has seen while a fault was armed
+	/// Requests of `kind` the worker has seen while a fault was armed
 	/// (counting starts at the first [`Self::inject_fault_for_tests`]). A
-	/// hello is answered before dispatch and is not counted.
+	/// hello is counted too.
 	#[doc(hidden)]
 	pub fn requests_seen_for_tests(
 		&self,
@@ -247,8 +245,21 @@ impl Worker {
 		*lock(&self.state.deadlines) = (view, scan);
 	}
 
-	/// Inject only scan failures, after a normal hello/open/list. EOF closes
-	/// the actual stream. No failure is enabled unless a test calls this.
+	/// How often work behind a request sends a heartbeat. The grid of faults
+	/// sets it far above any work (no heartbeat is ever heard) or far below
+	/// (one is heard before a quick reply), so the machine's speed does not
+	/// decide which case a cell is.
+	#[doc(hidden)]
+	pub fn set_heartbeat_for_tests(&self, every: Duration) {
+		*lock(&self.state.heartbeat) = every;
+	}
+
+	/// Inject only scan failures, after a normal hello/open/list: the first
+	/// `eofs` scans of `workspace` are cut off (the stream closes), and every
+	/// scan after them is refused with `refusal`, when there is one. A
+	/// wrapper over [`crate::fault::FaultRule`]s; it starts the workspace's
+	/// scan count and its open record over, and arms the book (so counting
+	/// works) until [`Self::clear_faults_for_tests`] drops these rules too.
 	#[doc(hidden)]
 	pub fn set_scan_failures_for_tests(
 		&self,
@@ -256,22 +267,41 @@ impl Worker {
 		eofs: usize,
 		refusal: Option<ErrorCode>,
 	) {
-		lock(&self.state.scan_faults).insert(
-			workspace.into(),
-			ScanFault {
-				eofs,
-				refusal,
-				requests: 0,
-				first_open: None,
-			},
-		);
+		use crate::fault::{Fault, FaultRule, Match, RequestKind};
+		let mut book = lock(&self.state.faults);
+		book.remove_rules(RequestKind::ScanRepos, workspace);
+		book.reset_seen_in(RequestKind::ScanRepos, workspace);
+		book.watch(workspace);
+		// `skip` stays 0 on both: a rule that still has turns decides, and
+		// the later rule only sees the requests the earlier one let by.
+		if eofs > 0 {
+			book.add(FaultRule {
+				on: Match::Kind(RequestKind::ScanRepos),
+				workspace: Some(workspace.into()),
+				skip: 0,
+				times: eofs,
+				fault: Fault::HangUp,
+			});
+		}
+		if let Some(code) = refusal {
+			book.add(FaultRule {
+				on: Match::Kind(RequestKind::ScanRepos),
+				workspace: Some(workspace.into()),
+				skip: 0,
+				times: usize::MAX,
+				fault: Fault::Refuse(code),
+			});
+		}
+		drop(book);
+		self.state.armed.store(true, Ordering::SeqCst);
 	}
 
+	/// Scans of `workspace` the worker has seen since
+	/// [`Self::set_scan_failures_for_tests`] last ran for it.
 	#[doc(hidden)]
 	pub fn scan_requests_for_tests(&self, workspace: &str) -> usize {
-		lock(&self.state.scan_faults)
-			.get(workspace)
-			.map_or(0, |f| f.requests)
+		lock(&self.state.faults)
+			.seen_in(crate::fault::RequestKind::ScanRepos, workspace)
 	}
 
 	#[doc(hidden)]
@@ -283,14 +313,7 @@ impl Worker {
 	/// workspaces. Storage stays bounded by those configured entries.
 	#[doc(hidden)]
 	pub fn opened_workspaces_for_tests(&self) -> Vec<String> {
-		let mut opened: Vec<_> = lock(&self.state.scan_faults)
-			.iter()
-			.filter_map(|(path, fault)| {
-				fault.first_open.map(|order| (order, path.clone()))
-			})
-			.collect();
-		opened.sort_by_key(|(order, _)| *order);
-		opened.into_iter().map(|(_, path)| path).collect()
+		lock(&self.state.faults).opened()
 	}
 
 	/// Holds real hello responses for bounded handshake-admission tests.
@@ -368,6 +391,26 @@ fn serve(
 	let Some(hello) = read_frame::<Request>(&mut reader)? else {
 		return Ok(());
 	};
+	// A hello meets the faults named for it: how a start fails.
+	let hello_fault = if state.armed.load(Ordering::SeqCst) {
+		lock(&state.faults).take(&hello)
+	} else {
+		None
+	};
+	match hello_fault {
+		Some(Fault::HangUp) => return Ok(()),
+		Some(Fault::Garbage) => {
+			writer.write_all(&8u32.to_be_bytes())?;
+			writer.write_all(b"not json")?;
+			writer.flush()?;
+			return Ok(());
+		}
+		Some(Fault::Refuse(code)) => {
+			write_frame(&mut writer, &error(code, "injected fault".into()))?;
+			return Ok(());
+		}
+		_ => {}
+	}
 	let negotiated = match hello {
 		Request::Hello {
 			version,
@@ -531,33 +574,51 @@ fn serve(
 		} else {
 			None
 		};
-		let mut answer = crate::jobs::Answer::new(&mut writer, fault);
+		// Counted before a fault can end the request: a scan that was cut
+		// off still reached the worker.
+		if matches!(
+			request,
+			Request::ScanRepos { .. } | Request::GitView { .. }
+		) {
+			state.git_requests.fetch_add(1, Ordering::SeqCst);
+		}
+		// Dispatch-layer faults act before any work; the reply-layer ones
+		// ride on the `Answer`.
+		match &fault {
+			Some(Fault::Refuse(code)) => {
+				crate::jobs::Answer::new(&mut writer, None)
+					.reply(&error(*code, "injected fault".into()))?;
+				continue;
+			}
+			Some(Fault::HangUp) => return Ok(()),
+			Some(Fault::Garbage) => {
+				writer.write_all(&8u32.to_be_bytes())?;
+				writer.write_all(b"not json")?;
+				writer.flush()?;
+				return Ok(());
+			}
+			Some(Fault::HeartbeatThenHangUp) => {
+				crate::jobs::Answer::new(&mut writer, None).heartbeat()?;
+				return Ok(());
+			}
+			Some(Fault::Stall(d)) => std::thread::sleep(*d),
+			Some(Fault::HeartbeatThenTruncatedReply) => {
+				crate::jobs::Answer::new(&mut writer, None).heartbeat()?;
+			}
+			Some(
+				Fault::Delay(_)
+				| Fault::PageDelay(_)
+				| Fault::RunThenHangUp
+				| Fault::TruncatedReply
+				| Fault::Throttle { .. },
+			)
+			| None => {}
+		}
+		let every = *lock(&state.heartbeat);
+		let mut answer =
+			crate::jobs::Answer::new(&mut writer, fault).with_heartbeat(every);
 		match request {
 			Request::ScanRepos { workspace, under } => {
-				state.git_requests.fetch_add(1, Ordering::SeqCst);
-				let fault = {
-					let mut faults = lock(&state.scan_faults);
-					faults.get_mut(&workspace).map(|fault| {
-						fault.requests = fault.requests.saturating_add(1);
-						if fault.eofs > 0 {
-							fault.eofs -= 1;
-							Err(())
-						} else {
-							Ok(fault.refusal)
-						}
-					})
-				};
-				match fault {
-					Some(Err(())) => return Ok(()),
-					Some(Ok(Some(code))) => {
-						answer.reply(&error(
-							code,
-							"injected scan refusal".into(),
-						))?;
-						continue;
-					}
-					_ => {}
-				}
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					answer.reply(&error(
 						ErrorCode::Unsupported,
@@ -606,7 +667,6 @@ fn serve(
 				profile,
 				query,
 			} => {
-				state.git_requests.fetch_add(1, Ordering::SeqCst);
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					answer.reply(&error(
 						ErrorCode::Unsupported,
@@ -948,6 +1008,9 @@ fn serve(
 				)?;
 			}
 		}
+		if answer.hang_up() {
+			return Ok(());
+		}
 	}
 	Ok(())
 }
@@ -1002,7 +1065,7 @@ fn serve_copy(
 	};
 	crate::jobs::run_job_with(
 		answer,
-		crate::jobs::HEARTBEAT,
+		answer.heartbeat_interval(),
 		deadline,
 		cancel,
 		reply,
@@ -1124,14 +1187,9 @@ impl State {
 				}
 				match SharedRoot::open(&path) {
 					Ok(root) => {
-						if let Some(fault) =
-							lock(&self.scan_faults).get_mut(&root.id)
-						{
-							fault.first_open.get_or_insert_with(|| {
-								self.open_sequence
-									.fetch_add(1, Ordering::SeqCst)
-							});
-						}
+						lock(&self.faults).note_open(&root.id, || {
+							self.open_sequence.fetch_add(1, Ordering::SeqCst)
+						});
 						Response::Workspace(RemoteWorkspace {
 							id: root.id,
 							name: root.name,
@@ -1396,36 +1454,6 @@ mod tests {
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
 	}
 
-	/// Whether `State::handle` does work for this kind, so a job's end must
-	/// reach it. Every kind is named, so a new request has to decide.
-	fn handled_inline(kind: crate::fault::RequestKind) -> bool {
-		use crate::fault::RequestKind as K;
-		match kind {
-			K::OpenWorkspace | K::ListDir | K::Stat | K::Read => true,
-			// Answered at once, with no work behind them, or served as jobs.
-			K::Hello
-			| K::ReplayRead
-			| K::Write
-			| K::Rename
-			| K::ScanRepos
-			| K::GitView
-			| K::Export
-			| K::ExportCommits
-			| K::ExportChanges
-			| K::ImportPlan
-			| K::PrepareImport
-			| K::ApplyPrepared
-			| K::ImportApply
-			| K::ReplayPlan
-			| K::ReplayApply
-			| K::PrepareReplay
-			| K::ApplyPreparedReplay
-			| K::Chunk
-			| K::FrameChunk
-			| K::FrameJoin => false,
-		}
-	}
-
 	/// An op that is handed a cancel and a deadline must use them: a job
 	/// that must stop gets its refusal back, and the work is not started.
 	/// The folder has a file, so a listing that ignored the job would be
@@ -1470,7 +1498,7 @@ mod tests {
 		};
 		let kinds: Vec<K> = crate::fault::ALL_REQUEST_KINDS
 			.into_iter()
-			.filter(|k| handled_inline(*k))
+			.filter(|k| k.class() == crate::fault::Class::Inline)
 			.collect();
 		assert_eq!(kinds.len(), 4, "{kinds:?}");
 		for kind in kinds {

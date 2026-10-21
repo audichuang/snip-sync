@@ -26,6 +26,10 @@ snip-core = { path = "../core", features = ["test-support"] }
 snip-native-e2e = { path = "../native-e2e" }
 # In-process UI tests (TestAppContext, #[gpui::test]); no display needed.
 gpui = { version = "=0.2.2", features = ["test-support"] }
+# The seeded generator `#[gpui::test(iterations = N)]` hands the fuzz lanes
+# (#230): the version gpui itself uses, so `rand::SeedableRng` in the macro's
+# expansion is the one the parameter type implements.
+rand = "0.9"
 
 [lints]
 workspace = true

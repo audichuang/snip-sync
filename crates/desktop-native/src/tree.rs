@@ -51,7 +51,7 @@ pub struct FileTreeNode {
 	scan: Option<DirectoryScan>,
 	held: VecDeque<HeldEntry>,
 	loading: bool,
-	load_epoch: u64,
+	load_epoch: crate::generation::Gen<crate::generation::TreeEpochLane>,
 	selected_paths: Vec<String>,
 	budget_blocked: bool,
 	extra_rows: usize,
@@ -161,7 +161,7 @@ pub enum TreeEffect {
 
 pub struct TreeIo {
 	pub key: NodeKey,
-	pub epoch: u64,
+	pub epoch: crate::generation::Stamp<crate::generation::TreeEpochLane>,
 	pub dir: PathBuf,
 	pub base: PathBuf,
 	pub depth: usize,
@@ -192,7 +192,7 @@ impl TreeIo {
 
 pub struct TreeIoResult {
 	pub key: NodeKey,
-	pub epoch: u64,
+	pub epoch: crate::generation::Stamp<crate::generation::TreeEpochLane>,
 	pub base: PathBuf,
 	pub kind: TreeIoKind,
 	pub children: Vec<FileTreeNode>,
@@ -672,7 +672,7 @@ fn build_node(
 		scan: None,
 		held: VecDeque::new(),
 		loading: false,
-		load_epoch: 0,
+		load_epoch: Default::default(),
 		selected_paths: Vec::new(),
 		budget_blocked: false,
 		extra_rows: 0,
@@ -706,7 +706,7 @@ impl FileTreeNode {
 			scan: None,
 			held: VecDeque::new(),
 			loading: true,
-			load_epoch: 0,
+			load_epoch: Default::default(),
 			selected_paths: Vec::new(),
 			budget_blocked: false,
 			extra_rows: 0,
@@ -733,7 +733,7 @@ impl FileTreeNode {
 	pub fn clear_loading(&mut self) {
 		if self.loading {
 			self.loading = false;
-			self.load_epoch = self.load_epoch.wrapping_add(1);
+			self.load_epoch.invalidate();
 		}
 		if !self.is_loaded {
 			self.is_expanded = false;
@@ -851,7 +851,7 @@ impl FileTreeNode {
 		let key = result.key.clone();
 		{
 			let node = self.find_mut(&key)?;
-			if node.load_epoch != result.epoch {
+			if !node.load_epoch.is_current(result.epoch) {
 				return None;
 			}
 			node.loading = false;
@@ -1020,7 +1020,7 @@ impl FileTreeNode {
 		if !node.is_dir || (!key.is_root() && !node.is_valid_utf8) {
 			return TreeEffect::Idle;
 		}
-		if node.loading && node.load_epoch > 0 {
+		if node.loading && node.load_epoch.has_moved() {
 			return TreeEffect::Idle;
 		}
 		if node.is_expanded && node.is_loaded && !node.loading {
@@ -1066,8 +1066,7 @@ impl FileTreeNode {
 			let Some(node) = self.find_mut(key) else {
 				return TreeEffect::Idle;
 			};
-			node.load_epoch = node.load_epoch.wrapping_add(1);
-			let epoch = node.load_epoch;
+			let epoch = node.load_epoch.bump();
 			let depth = node.depth.saturating_add(1);
 			node.loading = true;
 			node.is_expanded = true;
@@ -1162,7 +1161,7 @@ impl FileTreeNode {
 		self.loading = false;
 		self.budget_blocked = false;
 		self.row_window = DIR_PAGE_ROWS;
-		self.load_epoch = self.load_epoch.wrapping_add(1);
+		self.load_epoch.invalidate();
 	}
 
 	fn toggle_key(&mut self, key: &NodeKey) {
@@ -1387,7 +1386,7 @@ mod tests {
 		let key = NodeKey::root();
 		let io_for = |budget: usize, kind: TreeIoKind| TreeIo {
 			key: key.clone(),
-			epoch: 1,
+			epoch: crate::generation::Stamp::for_tests(1),
 			dir: PathBuf::from("/remote"),
 			base: PathBuf::from("/remote"),
 			depth: 1,

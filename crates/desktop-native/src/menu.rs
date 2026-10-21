@@ -1105,8 +1105,8 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		if self.log_focus.is_focused(window) && self.bottom_visible {
-			self.bottom_visible = false;
+		if self.log_focus.is_focused(window) && self.bottom_visible.get() {
+			self.set_log_visible(false);
 			self.paste.forget_log_restore();
 			app_log!("[APP:LOG_PANEL: visible=false]");
 		} else if self.left_visible {

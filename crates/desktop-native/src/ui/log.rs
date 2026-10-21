@@ -602,8 +602,10 @@ pub struct LogFit {
 	/// The list's width, which its columns are decided from.
 	pub(super) list: StaleWidth,
 	/// [`ListFitParts`] for a fingerprint of everything they read.
-	pub(super) cache:
-		std::cell::RefCell<Option<(u64, std::rc::Rc<ListFitParts>)>>,
+	pub(super) cache: std::cell::RefCell<
+		// U64-NOT-GEN: cache key: a fingerprint of everything the parts read
+		Option<(u64, std::rc::Rc<ListFitParts>)>,
+	>,
 }
 
 /// The cells of a Log row the solver places, left to right.
@@ -2542,6 +2544,7 @@ impl WorkbenchModel {
 			.trim()
 			.to_lowercase();
 		let current = self.log_branch_list_current();
+		self.last_branch_current.set(Some(current.clone()));
 		let mut rows: Vec<AnyElement> = Vec::new();
 		let entry = |id: String,
 		             label: String,

@@ -900,7 +900,8 @@ impl TabsRoot {
 				None,
 				0,
 				lifecycle::GitLoad::current(),
-				0,
+				// No tab is left to be at a generation: the lane's start.
+				crate::generation::Gen::new().current(),
 			);
 			root_log!("[APP:LIFECYCLE: {line}]");
 		}

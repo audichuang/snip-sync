@@ -265,11 +265,13 @@ fn ready_marker(name: &str) {
 }
 
 mod dirtree;
+mod generation;
 mod githost;
 pub mod graph_view;
 mod history;
 pub mod i18n;
 mod icons;
+mod invariants;
 pub mod lifecycle;
 mod menu;
 mod multi_log;
@@ -526,6 +528,11 @@ impl<T: PartialEq> ReadQueue<T> {
 
 	pub fn in_flight(&self) -> usize {
 		self.in_flight
+	}
+
+	/// Nothing is running and nothing waits.
+	pub fn is_idle(&self) -> bool {
+		self.in_flight == 0 && self.pending.is_empty()
 	}
 }
 
@@ -834,7 +841,7 @@ pub struct WorkbenchModel {
 	pub hidden_commits: Vec<String>,
 	/// Snapshot and commit window later graph pages continue from.
 	pub history_walk: Option<crate::history::HistoryWalk>,
-	pub selected_commit: Option<String>,
+	pub selected_commit: history::SelectedCommit,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
 	/// Every selected row id in display order, when more than one is
@@ -884,6 +891,7 @@ pub struct WorkbenchModel {
 	/// The changed-files rows, keyed on a hash of what builds them: the
 	/// tree sorts up to `MAX_COMMIT_FILES` paths, too slow for every frame.
 	pub commit_rows_cache: std::cell::RefCell<
+		// U64-NOT-GEN: cache key: a hash of what builds the rows
 		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
 	>,
 	/// Details pane height under the changed files once dragged; `None`
@@ -893,7 +901,8 @@ pub struct WorkbenchModel {
 	pub log_selection_expanded: bool,
 	/// Commits whose details list every containing branch read.
 	pub log_branches_all: Vec<String>,
-	pub details_generation: u64,
+	pub details_generation:
+		crate::generation::Gen<crate::generation::DetailsLane>,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
 
@@ -928,7 +937,7 @@ pub struct WorkbenchModel {
 	/// that may replace it is in flight. It follows the shown content, not
 	/// one request: a read that supersedes another keeps it, and it ends only
 	/// when the preview is replaced, cleared or its reads are dropped.
-	held_selection: Option<ShownSelection>,
+	held_selection: Option<history::ShownSelection>,
 	/// The latest preview read came from the Log (commit, compare,
 	/// multi-selection, commit file or commit tree). Only a Project/Changes
 	/// read or `clear_commit_selection` resets it, so it outlives
@@ -954,14 +963,16 @@ pub struct WorkbenchModel {
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
 	pub paste_diff_cancel: Option<CancelToken>,
-	pub paste_diff_generation: u64,
+	pub paste_diff_generation:
+		crate::generation::Gen<crate::generation::PasteDiffLane>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, Failure)>,
 	pub discovery_depth_limited: Vec<PathBuf>,
 	pub discovery_error_overflow: usize,
 	pub discovery_depth_overflow: usize,
-	discovery_generation: u64,
+	discovery_generation:
+		crate::generation::Gen<crate::generation::DiscoveryLane>,
 	pinned_repo: Option<(PathBuf, PathBuf)>,
 	/// The open repo kept across a rescan's wipe until the walk finds it
 	/// again; still set when a complete walk ends means it is gone.
@@ -970,7 +981,7 @@ pub struct WorkbenchModel {
 	refresh_reload: bool,
 	manual_repos: Vec<RepoEntry>,
 	tree_queue: VecDeque<TreeIo>,
-	tree_worker: u64,
+	tree_worker: crate::generation::Gen<crate::generation::TreeWorkerLane>,
 	tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
@@ -979,23 +990,30 @@ pub struct WorkbenchModel {
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
+	// U64-NOT-GEN: per-action epoch, a landing guard deliberately left untyped: `set_status_msg` compares it only against its own copy
 	pub user_action_seq: u64,
+	// U64-NOT-GEN: the epoch of the action whose error is on the status bar (same guard as `user_action_seq`, left untyped)
 	pub status_error_action: Option<u64>,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
+	// U64-NOT-GEN: per-toast landing guard deliberately left untyped: its dismiss timer acts only if `toast.0` is still its id
 	pub toast: Option<(u64, bool, Msg)>,
+	// U64-NOT-GEN: source of `toast.0` (per-toast landing guard, left untyped)
 	toast_seq: u64,
 	pub is_loading: bool,
 	pub is_copying: bool,
 	pub locale: Locale,
-	pub generation: u64,
-	pub preview_generation: u64,
-	pub history_generation: u64,
+	pub generation: crate::generation::Gen<crate::generation::RepoLoadLane>,
+	pub preview_generation:
+		crate::generation::Gen<crate::generation::PreviewLane>,
+	pub history_generation:
+		crate::generation::Gen<crate::generation::HistoryLane>,
 	/// Replace loads of the log that got past the discovery wait: a test
 	/// counts how many one repo-set change costs.
 	#[cfg(test)]
+	// U64-NOT-GEN: test counter
 	pub(crate) history_replace_loads: u64,
-	pub tree_generation: u64,
+	pub tree_generation: crate::generation::Gen<crate::generation::TreeLane>,
 	pub mode: String,
 	pub focus_handle: FocusHandle,
 	pub reader_focus: FocusHandle,
@@ -1017,7 +1035,7 @@ pub struct WorkbenchModel {
 	pub left_w: f32,
 	pub bottom_h: f32,
 	pub left_visible: bool,
-	pub bottom_visible: bool,
+	pub bottom_visible: ui::LogPanel,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
 	/// Logical window height, for popups that must fit inside it.
@@ -1048,6 +1066,10 @@ pub struct WorkbenchModel {
 	/// Test-only: the same hold for a paste row's diff read.
 	#[cfg(test)]
 	pub(crate) e2e_paste_diff_hold: Option<std::time::Duration>,
+	/// Test-only: the text a paste reads in place of the OS clipboard, so a
+	/// test or a fuzz lane drives the real `ctrl-v` without display or lock.
+	#[cfg(test)]
+	pub(crate) test_clipboard: Option<String>,
 	pub workspace_open: bool,
 	pub workspace_path_input: Entity<TextInput>,
 	/// The paste panel's typed destination folder. Open or closed is its
@@ -1069,9 +1091,17 @@ pub struct WorkbenchModel {
 	/// Status reads of the repos other than the open one.
 	pub changes_queue: ReadQueue<PathBuf>,
 	pub changes_cancel: Option<CancelToken>,
-	pub changes_generation: u64,
+	pub changes_generation:
+		crate::generation::Gen<crate::generation::ChangesLane>,
 	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
+	/// The current branch the branches pane drew its HEAD marker from this
+	/// frame; `None` when the pane was not drawn (B1 of `invariants`).
+	pub(crate) last_branch_current: std::cell::Cell<Option<Option<String>>>,
+	/// The `Always` members already reported by `[APP:INVARIANT_BROKEN]` and
+	/// still broken: each is printed once per breakage.
+	pub(crate) invariants_logged:
+		std::cell::RefCell<Vec<crate::invariants::Invariant>>,
 	/// Repo of the failed preview load when `preview_error` is Some.
 	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1084,7 +1114,8 @@ pub struct WorkbenchModel {
 	pub log_deferred: bool,
 	/// The `generation` of the repo read whose landing reloads the Log: the
 	/// scope sync leaves the reload to it, so one change reads the Log once.
-	log_reload_for: Option<u64>,
+	log_reload_for:
+		Option<crate::generation::Stamp<crate::generation::RepoLoadLane>>,
 	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
 	pub remote_path_input: Entity<TextInput>,
@@ -1098,28 +1129,6 @@ pub struct WorkbenchModel {
 }
 
 impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
-
-/// Everything a file read takes from the model while it is in flight, so a
-/// refusal by the retained budget can name the still shown preview again.
-/// The commit view goes back whole: the file list and its origins index
-/// `log_selected`, and a compare's list belongs to its endpoints.
-struct ShownSelection {
-	file: Option<String>,
-	source: Option<SourceKind>,
-	root: Option<PathBuf>,
-	commit: Option<String>,
-	view: crate::history::CommitView,
-	log_selected: Vec<String>,
-	range_head: Option<String>,
-	compare: Option<(String, String)>,
-	log_selection_expanded: bool,
-	log_branches_all: Vec<String>,
-	/// Set aside by a read of the commit view's own file list: only the
-	/// file selection (`file`, `source`, `root`, the view's selected file and
-	/// its multi-selection) is held, the rest of the commit state is still
-	/// on the model. `pending_from_log` is the flag that read replaced.
-	commit_file_only: Option<bool>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Splitter {
@@ -1419,7 +1428,7 @@ impl WorkbenchModel {
 			collapsed_merges: Vec::new(),
 			hidden_commits: Vec::new(),
 			history_walk: None,
-			selected_commit: None,
+			selected_commit: history::SelectedCommit::none(),
 			range_head: None,
 			log_selected: Vec::new(),
 			log_scroll: gpui::UniformListScrollHandle::new(),
@@ -1452,10 +1461,10 @@ impl WorkbenchModel {
 			log_details_h: None,
 			log_selection_expanded: false,
 			log_branches_all: Vec::new(),
-			details_generation: 0,
+			details_generation: Default::default(),
 			details_cancel: None,
 			git_user_email: None,
-			commit_view: Default::default(),
+			commit_view: history::CommitView::at_startup(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -1495,20 +1504,20 @@ impl WorkbenchModel {
 			discovery_depth_limited: Vec::new(),
 			discovery_error_overflow: 0,
 			discovery_depth_overflow: 0,
-			discovery_generation: 0,
+			discovery_generation: Default::default(),
 			pinned_repo: None,
 			carried_repo: None,
 			refresh_reload: false,
 			manual_repos: Vec::new(),
 			tree_queue: VecDeque::new(),
-			tree_worker: 0,
+			tree_worker: Default::default(),
 			tree_worker_alive: false,
 			restore_expanded: Vec::new(),
 			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			paste_diff_cancel: None,
-			paste_diff_generation: 0,
+			paste_diff_generation: Default::default(),
 			status: if workspace.is_some() {
 				Msg::new("status_scanning", [])
 			} else {
@@ -1521,12 +1530,12 @@ impl WorkbenchModel {
 			is_loading: workspace.is_some(),
 			is_copying: false,
 			locale: loc,
-			generation: 0,
-			preview_generation: 0,
-			history_generation: 0,
+			generation: Default::default(),
+			preview_generation: Default::default(),
+			history_generation: Default::default(),
 			#[cfg(test)]
 			history_replace_loads: 0,
-			tree_generation: 0,
+			tree_generation: Default::default(),
 			mode,
 			focus_handle: cx.focus_handle(),
 			reader_focus: cx.focus_handle().tab_index(34).tab_stop(true),
@@ -1541,7 +1550,7 @@ impl WorkbenchModel {
 			left_w: theme::LEFT_W_DEFAULT,
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
-			bottom_visible: true,
+			bottom_visible: ui::LogPanel::shown(),
 			dragging: None,
 			last_viewport: (0, 0),
 			viewport_h: 0.,
@@ -1559,11 +1568,15 @@ impl WorkbenchModel {
 			e2e_copy_hold: None,
 			#[cfg(test)]
 			e2e_paste_diff_hold: None,
+			#[cfg(test)]
+			test_clipboard: None,
 			workspace_open: workspace.is_some(),
 			workspace_path_input,
 			paste_dest_input,
 			recent_workspaces: recent::load(),
-			lifecycle: lifecycle::Lifecycle::new(1),
+			lifecycle: lifecycle::Lifecycle::new(
+				crate::generation::Gen::starting_at(1),
+			),
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
@@ -1572,9 +1585,11 @@ impl WorkbenchModel {
 			change_repos: Vec::new(),
 			changes_queue: ReadQueue::new(MAX_CHANGES_READS),
 			changes_cancel: None,
-			changes_generation: 0,
+			changes_generation: Default::default(),
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
+			last_branch_current: std::cell::Cell::new(None),
+			invariants_logged: std::cell::RefCell::new(Vec::new()),
 			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
@@ -1895,7 +1910,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.changes_generation = self.changes_generation.wrapping_add(1);
+		self.changes_generation.invalidate();
 		let _ = arm_cancel(&mut self.changes_cancel);
 		self.changes_queue.clear_pending();
 		let open = self.repo_root();
@@ -1920,7 +1935,7 @@ impl WorkbenchModel {
 			return;
 		};
 		while let Some(root) = self.changes_queue.take() {
-			let generation = self.changes_generation;
+			let generation = self.changes_generation.current();
 			let known = self
 				.repos
 				.iter()
@@ -1945,7 +1960,7 @@ impl WorkbenchModel {
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
 					model.changes_queue.finish();
-					if model.changes_generation == generation {
+					if model.changes_generation.is_current(generation) {
 						model.land_queued_changes(&root, result);
 					}
 					model.pump_changes(cx);
@@ -2153,11 +2168,21 @@ impl WorkbenchModel {
 
 	/// Replace a failed read with its error body, releasing the hidden source.
 	/// Capacity refusal instead keeps the previous preview in `set_preview`.
-	pub(crate) fn show_preview_error(&mut self, error: Msg) {
+	///
+	/// The only way an error page is installed, so it always names the repo
+	/// the failed read was about (`None`: no repo, e.g. a status error before
+	/// any read); no caller can show one and leave `preview_root()` on
+	/// whatever repo is open.
+	pub(crate) fn show_preview_error(
+		&mut self,
+		root: Option<PathBuf>,
+		error: Msg,
+	) {
 		self.clear_preview();
 		self.reader.release_retained();
 		self.preview_loading = false;
 		self.preview_error = Some(error);
+		self.preview_error_root = root;
 	}
 
 	pub(crate) fn can_copy_preview(&self) -> bool {
@@ -2341,6 +2366,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 		cancel: Option<CancelToken>,
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let registered = self.lifecycle.register_read(cancel);
 		self.spawn_registered(cx, registered, fut)
@@ -2352,6 +2378,7 @@ impl WorkbenchModel {
 		&mut self,
 		cx: &mut Context<Self>,
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let registered = self.lifecycle.register_mutating();
 		self.spawn_registered(cx, registered, fut)
@@ -2360,8 +2387,10 @@ impl WorkbenchModel {
 	fn spawn_registered(
 		&mut self,
 		cx: &mut Context<Self>,
+		// U64-NOT-GEN: lifecycle job id
 		(id, flag): (u64, lifecycle::FinishFlag),
 		fut: impl std::future::Future<Output = ()> + 'static,
+		// U64-NOT-GEN: lifecycle job id
 	) -> u64 {
 		let fut = tabs::tagged(self.ws_tab, fut);
 		let task = cx.foreground_executor().spawn(async move {
@@ -2451,14 +2480,8 @@ impl WorkbenchModel {
 			lifecycle::Request::Accepted => {
 				// A workspace open/close is under way: an in-flight remote
 				// open that lands later must not touch it (remote.rs).
-				self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
-				self.generation = self.generation.wrapping_add(1);
-				self.preview_generation =
-					self.preview_generation.wrapping_add(1);
-				self.held_selection = None;
-				self.history_generation =
-					self.history_generation.wrapping_add(1);
-				self.tree_generation = self.tree_generation.wrapping_add(1);
+				self.remote.open_seq.invalidate();
+				self.invalidate_workspace_reads(true);
 				for slot in [
 					&mut self.history_cancel,
 					&mut self.preview_cancel,
@@ -2474,8 +2497,7 @@ impl WorkbenchModel {
 						token.cancel();
 					}
 				}
-				self.changes_generation =
-					self.changes_generation.wrapping_add(1);
+				self.changes_generation.invalidate();
 				self.changes_queue.clear_pending();
 				self.paste.invalidate_job();
 				let name = intent.name();
@@ -2547,7 +2569,7 @@ impl WorkbenchModel {
 		self.tree_cancel = None;
 		self.rev_tree_cancel = None;
 		self.tree_queue.clear();
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker.invalidate();
 		self.tree_worker_alive = false;
 		if let Some(tree) = self.file_tree.as_mut() {
 			tree.clear_loading();
@@ -2615,7 +2637,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.changes_cancel.take() {
 			token.cancel();
 		}
-		self.changes_generation = self.changes_generation.wrapping_add(1);
+		self.changes_generation.invalidate();
 		self.changes_queue.clear_pending();
 		self.preview_error_root = None;
 		self.paste.invalidate_job();
@@ -2653,15 +2675,27 @@ impl WorkbenchModel {
 		self.repos_changed(change, cx);
 	}
 
+	/// Makes every read in flight for the open workspace stale: the repo's
+	/// own, the file preview (and the selection a read holds aside for it),
+	/// the project tree and, when `history` is set, the Log. The three
+	/// places that start a workspace or repo over each do this together, and
+	/// differ only in the Log (a plain repo switch keeps it) and in what
+	/// they cancel besides, which stays with them.
+	fn invalidate_workspace_reads(&mut self, history: bool) {
+		self.generation.invalidate();
+		self.preview_generation.invalidate();
+		self.held_selection = None;
+		if history {
+			self.history_generation.invalidate();
+		}
+		self.tree_generation.invalidate();
+	}
+
 	/// Drops everything that belongs to the open repo and stops its reads, so
 	/// a late result cannot repopulate it.
 	fn release_repo_state(&mut self) {
-		self.generation = self.generation.wrapping_add(1);
-		self.preview_generation = self.preview_generation.wrapping_add(1);
-		self.held_selection = None;
-		self.history_generation = self.history_generation.wrapping_add(1);
-		self.tree_generation = self.tree_generation.wrapping_add(1);
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.invalidate_workspace_reads(true);
+		self.tree_worker.invalidate();
 		for slot in [
 			&mut self.history_cancel,
 			&mut self.preview_cancel,
@@ -2687,11 +2721,9 @@ impl WorkbenchModel {
 		release_vec(&mut self.collapsed_merges);
 		release_vec(&mut self.hidden_commits);
 		self.history_walk = None;
-		self.selected_commit = None;
-		self.range_head = None;
+		self.drop_commit_selection();
 		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
-		self.reset_commit_view();
 		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
@@ -2709,9 +2741,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_reload_for = None;
-		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
-		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
 		self.rev_tree = None;
@@ -2722,6 +2752,9 @@ impl WorkbenchModel {
 		self.selected_list_row = 0;
 		self.clear_preview();
 		self.preview_loading = false;
+		// The selection above is gone, and so is the Log's claim on the
+		// latest preview read (L6 of `invariants`).
+		self.preview_pending_from_log = false;
 		self.preview_error = None;
 		self.reader.release_retained();
 		self.tree_queue = VecDeque::new();
@@ -3052,10 +3085,14 @@ impl WorkbenchModel {
 
 	/// True when this copy may write the clipboard. A cancelled token or a
 	/// generation change drops the text.
-	fn accept_copy_result(&mut self, ws_gen: u64, token: &CancelToken) -> bool {
+	fn accept_copy_result(
+		&mut self,
+		ws_gen: crate::generation::Stamp<crate::generation::WorkspaceLane>,
+		token: &CancelToken,
+	) -> bool {
 		self.is_copying = false;
 		let cancelled = token.is_cancelled();
-		let stale = self.lifecycle.generation() != ws_gen;
+		let stale = !self.lifecycle.is_current(ws_gen);
 		if !cancelled && !stale {
 			return true;
 		}
@@ -3198,8 +3235,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.discovery_generation = self.discovery_generation.wrapping_add(1);
-		let generation = self.discovery_generation;
+		let generation = self.discovery_generation.bump();
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
@@ -3216,7 +3252,7 @@ impl WorkbenchModel {
 				Ok(disc) => disc,
 				Err(err) => {
 					let _ = this.update(&mut async_app, |model, cx| {
-						if model.discovery_generation != generation {
+						if !model.discovery_generation.is_current(generation) {
 							return;
 						}
 						model.discovery = None;
@@ -3251,8 +3287,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.discovery_generation = self.discovery_generation.wrapping_add(1);
-		let generation = self.discovery_generation;
+		let generation = self.discovery_generation.bump();
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
@@ -3676,8 +3711,7 @@ impl WorkbenchModel {
 			self.tree_queue.push_back(io);
 			return;
 		}
-		self.tree_worker = self.tree_worker.wrapping_add(1);
-		let worker = self.tree_worker;
+		let worker = self.tree_worker.bump();
 		self.tree_worker_alive = true;
 		let cancel = arm_cancel(&mut self.tree_cancel);
 		let ws_gen = self.lifecycle.generation();
@@ -3719,8 +3753,8 @@ impl WorkbenchModel {
 					.update(&mut async_app, |model, cx| {
 						// A close or reopen bumps the lifecycle generation;
 						// a repo switch bumps the worker id.
-						if model.lifecycle.generation() != ws_gen
-							|| model.tree_worker != worker
+						if !model.lifecycle.is_current(ws_gen)
+							|| !model.tree_worker.is_current(worker)
 						{
 							if e2e_on() {
 								app_log!(
@@ -3745,7 +3779,7 @@ impl WorkbenchModel {
 			// Not gated on the generation: after a failed drain the
 			// workspace stays open and must be able to read again.
 			let _ = this.update(&mut async_app, |model, _| {
-				if model.tree_worker == worker {
+				if model.tree_worker.is_current(worker) {
 					model.tree_worker_alive = false;
 					model.tree_cancel = None;
 				}
@@ -4013,17 +4047,13 @@ impl WorkbenchModel {
 			self.clear_preview();
 			self.preview_error = None;
 		}
-		self.generation += 1;
-		self.preview_generation += 1;
-		// The reads that could have restored it are dropped.
-		self.held_selection = None;
-		let task_generation = self.generation;
+		// The reads that could have restored the selection are dropped.
+		self.invalidate_workspace_reads(reload_log);
+		let task_generation = self.generation.current();
 		if reload_log {
-			self.history_generation += 1;
 			let _ = arm_cancel(&mut self.history_cancel);
 			self.log_reload_for = Some(task_generation);
 		}
-		self.tree_generation += 1;
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
@@ -4059,7 +4089,13 @@ impl WorkbenchModel {
 
 		// A superseded read of the previously open repo is dropped when it
 		// lands; the queue reads that repo instead of leaving it loading.
-		let previous = self.repo_root();
+		// By index, not `repo_root()`: `select_repo` has pinned the new repo
+		// by now, and a pin that does not match the open entry reads as no
+		// open repo at all (R6 of `invariants`).
+		let previous = self
+			.selected_repo_idx
+			.and_then(|i| self.repos.get(i))
+			.map(|r| r.root.clone());
 		if previous.as_ref() != Some(&self.repos[idx].root) {
 			if let Some(prev) = previous.filter(|prev| {
 				self.change_repos.iter().any(|s| {
@@ -4073,19 +4109,19 @@ impl WorkbenchModel {
 		self.selected_repo_idx = Some(idx);
 		self.selected_file = anchor_file.clone();
 		self.selected_file_root = anchor_file_root;
-		self.selected_commit = anchor_commit.clone();
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
-		// The same commit stays selected while the repo is read again, so
-		// its details and its repository stay (the Log may be pinned to
-		// another repo than the one now open); the rest is read anew.
-		let details = self.commit_view.commit_details.take();
-		let root = self.commit_view.log_commit_root.take();
-		self.reset_commit_view();
-		if self.selected_commit.is_some() {
-			self.commit_view.commit_details = details;
-			self.commit_view.log_commit_root = root;
+		// No selection left: the Log has no claim on the latest preview read,
+		// and the details read of the commit that was selected must not land
+		// (L6 and L8 of `invariants`). The same commit stays selected while
+		// the repo is read again.
+		match anchor_commit.clone() {
+			Some(commit) => self.keep_commit_selection_for_reload(commit),
+			// Only a reload that keeps the shown preview keeps the tree file
+			// it shows; a plain switch clears the preview below, so the
+			// selection and its owner go with it (#230).
+			None if preserve_anchors => {
+				self.drop_commit_selection_keeping_tree_file()
+			}
+			None => self.drop_commit_selection(),
 		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
@@ -4141,19 +4177,22 @@ impl WorkbenchModel {
 			&& anchor_file.is_some();
 		if !is_file_anchor {
 			if let Err(e) = &self.repos[idx].summary {
-				self.show_preview_error(Msg::with_msg_arg(
-					"error_repo_status",
-					[String::new()],
-					0,
-					crate::reason::failure_msg(e),
-				));
+				self.show_preview_error(
+					Some(repo_root.clone()),
+					Msg::with_msg_arg(
+						"error_repo_status",
+						[String::new()],
+						0,
+						crate::reason::failure_msg(e),
+					),
+				);
 			}
 		}
 
 		self.keep_tree_selections();
 		let saved_files = self.kept_tree_selection(&repo_root);
 		self.tree_queue.clear();
-		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker.invalidate();
 		self.tree_worker_alive = false;
 		let _ = arm_cancel(&mut self.tree_cancel);
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
@@ -4218,7 +4257,7 @@ impl WorkbenchModel {
 				.await;
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.generation != task_generation {
+				if !model.generation.is_current(task_generation) {
 					return;
 				}
 				match working_res {
@@ -4344,12 +4383,15 @@ impl WorkbenchModel {
 								cx,
 							);
 						} else {
-							model.show_preview_error(Msg::with_msg_arg(
-								"error_repo_changes",
-								[repo_name.clone(), String::new()],
-								1,
-								err,
-							));
+							model.show_preview_error(
+								Some(repo_root_for_update.clone()),
+								Msg::with_msg_arg(
+									"error_repo_changes",
+									[repo_name.clone(), String::new()],
+									1,
+									err,
+								),
+							);
 						}
 					}
 				}
@@ -4413,8 +4455,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		self.preview_generation += 1;
-		let task_generation = self.preview_generation;
+		let task_generation = self.preview_generation.bump();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
@@ -4483,7 +4524,7 @@ impl WorkbenchModel {
 			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.preview_generation != task_generation {
+				if !model.preview_generation.is_current(task_generation) {
 					if e2e_on() {
 						app_log!(
 							"[APP:PREVIEW_DISCARDED: stale path={file_path}]"
@@ -4507,124 +4548,10 @@ impl WorkbenchModel {
 					// Refused by the retained budget: the previous text is
 					// still shown, so the selection must name it again.
 					model.restore_shown_selection();
-				} else {
-					model.preview_error_root = Some(shown_root);
 				}
 				cx.notify();
 			});
 		});
-	}
-
-	/// Names `path` as the selection and sets aside what the shown preview's
-	/// selection was, unless an earlier read already did: its snapshot still
-	/// describes the shown preview, while what is on the model now is only
-	/// what that read left behind.
-	fn hold_shown_selection(&mut self, path: &str, source: &SourceKind) {
-		let file = self.selected_file.replace(path.to_string());
-		let file_source = self.selected_file_source.replace(source.clone());
-		let shown = self.preview.is_some() && self.preview_error.is_none();
-		// A commit file read left the commit state on the model: this read
-		// takes it, and the snapshot keeps that read's file selection.
-		let partial = match self.held_selection.take() {
-			Some(h) if h.commit_file_only.is_some() => Some(h),
-			other => {
-				self.held_selection = other;
-				None
-			}
-		};
-		if self.held_selection.is_some() {
-			// The earlier read took the rest already.
-			return;
-		}
-		let mut held = ShownSelection {
-			file,
-			source: file_source,
-			root: self.selected_file_root.clone(),
-			commit: self.selected_commit.take(),
-			// Taking the view resets it.
-			view: std::mem::take(&mut self.commit_view),
-			log_selected: std::mem::take(&mut self.log_selected),
-			range_head: self.range_head.take(),
-			compare: self.compare.take(),
-			log_selection_expanded: std::mem::take(
-				&mut self.log_selection_expanded,
-			),
-			log_branches_all: std::mem::take(&mut self.log_branches_all),
-			commit_file_only: None,
-		};
-		if let Some(early) = partial {
-			held.file = early.file;
-			held.source = early.source;
-			held.root = early.root;
-			held.view.selected_commit_file = early.view.selected_commit_file;
-			held.view.commit_file_sel = early.view.commit_file_sel;
-		}
-		self.held_selection = shown.then_some(held);
-	}
-
-	/// Names `path` as the commit view's file and sets aside what the shown
-	/// preview's file selection was, unless an earlier read already did.
-	/// `clear_file` is for a read that leaves the working-file selection
-	/// (a commit tree's file). The commit, its list and its details stay: a
-	/// refusal puts the file selection back, a landed read releases it.
-	pub(crate) fn hold_shown_commit_file(
-		&mut self,
-		path: &str,
-		clear_file: bool,
-	) {
-		let shown = self.preview.is_some() && self.preview_error.is_none();
-		if shown && self.held_selection.is_none() {
-			self.held_selection = Some(ShownSelection {
-				file: self.selected_file.clone(),
-				source: self.selected_file_source.clone(),
-				root: self.selected_file_root.clone(),
-				commit: None,
-				view: crate::history::CommitView {
-					selected_commit_file: self
-						.commit_view
-						.selected_commit_file
-						.clone(),
-					commit_file_sel: self.commit_view.commit_file_sel.clone(),
-					..Default::default()
-				},
-				log_selected: Vec::new(),
-				range_head: None,
-				compare: None,
-				log_selection_expanded: false,
-				log_branches_all: Vec::new(),
-				commit_file_only: Some(self.preview_pending_from_log),
-			});
-		}
-		if clear_file {
-			self.selected_file = None;
-			self.selected_file_root = None;
-		}
-		self.commit_view.selected_commit_file = Some(path.to_string());
-		self.commit_view.commit_file_sel.clear();
-	}
-
-	/// Puts the held selection back; the shown preview is still its own.
-	fn restore_shown_selection(&mut self) {
-		let Some(held) = self.held_selection.take() else {
-			return;
-		};
-		self.selected_file = held.file;
-		self.selected_file_source = held.source;
-		self.selected_file_root = held.root;
-		if let Some(pending) = held.commit_file_only {
-			self.commit_view.selected_commit_file =
-				held.view.selected_commit_file;
-			self.commit_view.commit_file_sel = held.view.commit_file_sel;
-			self.preview_pending_from_log = pending;
-			return;
-		}
-		self.selected_commit = held.commit;
-		self.commit_view = held.view;
-		self.log_selected = held.log_selected;
-		self.range_head = held.range_head;
-		self.compare = held.compare;
-		self.log_selection_expanded = held.log_selection_expanded;
-		self.log_branches_all = held.log_branches_all;
 	}
 
 	/// Turns a core `SourcePreview` into the single retained preview.
@@ -4654,12 +4581,15 @@ impl WorkbenchModel {
 							.with_root(Some(root)),
 					)
 				} else {
-					self.show_preview_error(Msg::new("error_binary", [path]));
+					self.show_preview_error(
+						Some(root),
+						Msg::new("error_binary", [path]),
+					);
 					false
 				}
 			}
 			Err(e) => {
-				self.show_preview_error(e.msg(path));
+				self.show_preview_error(Some(root), e.msg(path));
 				false
 			}
 		}
@@ -4896,7 +4826,7 @@ impl WorkbenchModel {
 	/// reports it.
 	fn finish_copy(
 		&mut self,
-		ws_gen: u64,
+		ws_gen: crate::generation::Stamp<crate::generation::WorkspaceLane>,
 		cancel: &CancelToken,
 		result: Result<(String, usize, Msg), Msg>,
 		cx: &mut Context<Self>,
@@ -5364,7 +5294,8 @@ impl WorkbenchModel {
 			None => self
 				.set_status("status_paste_preview", [items_count.to_string()]),
 		}
-		if self.paste.collapse_log(&mut self.bottom_visible) {
+		if self.paste.collapse_log(self.bottom_visible.get()) {
+			self.set_log_visible(false);
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
 		// A plan landing under the open destination field (a prefix chosen
@@ -5386,6 +5317,15 @@ impl WorkbenchModel {
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		self.trigger_paste_preview_into(None, cx);
+	}
+
+	/// What a paste reads: the OS clipboard, or in a test the text it set.
+	fn clipboard_text(&self) -> snip_core::clip::Result<String> {
+		#[cfg(test)]
+		if let Some(text) = &self.test_clipboard {
+			return Ok(text.clone());
+		}
+		clip::read_text()
 	}
 
 	/// Opens the paste preview from the clipboard: into `folder`, or, when
@@ -5416,7 +5356,7 @@ impl WorkbenchModel {
 		}
 		self.paste.clear(self.preview.as_ref());
 		self.drop_paste_dest_edit();
-		let text = match clip::read_text() {
+		let text = match self.clipboard_text() {
 			Ok(t) => t,
 			Err(e) => {
 				app_log!("[APP:PASTE_ERR: clipboard]");
@@ -5450,7 +5390,7 @@ impl WorkbenchModel {
 				text,
 				dest: target_dest,
 				roots: known_roots,
-				generation: self.generation,
+				generation: self.generation.current(),
 				remote: self
 					.remote
 					.session
@@ -5663,7 +5603,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.paste_diff_cancel.take() {
 			token.cancel();
 		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.paste_diff_generation.invalidate();
 	}
 
 	/// A click on a folder or root row puts the cursor on it.
@@ -5805,7 +5745,7 @@ impl WorkbenchModel {
 		};
 
 		let cancel = arm_cancel(&mut self.paste_diff_cancel);
-		let task_gen = self.paste_diff_generation;
+		let task_gen = self.paste_diff_generation.current();
 		let selected_idx = idx;
 		let item_path = item.path.clone();
 		// Commit reads already own a charged core preview. Their unused UI
@@ -5937,7 +5877,7 @@ impl WorkbenchModel {
 			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
-				if model.paste_diff_generation != task_gen {
+				if !model.paste_diff_generation.is_current(task_gen) {
 					return;
 				}
 				let Some(plan) = model.paste.plan() else {
@@ -6127,7 +6067,7 @@ impl WorkbenchModel {
 							if let Some(token) = model.paste_diff_cancel.take() {
 								token.cancel();
 							}
-							model.paste_diff_generation = model.paste_diff_generation.wrapping_add(1);
+							model.paste_diff_generation.invalidate();
 							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
@@ -6170,7 +6110,8 @@ impl WorkbenchModel {
 	fn restore_log_after_paste(&mut self) {
 		// The typed destination belongs to the preview that is closing.
 		self.drop_paste_dest_edit();
-		if self.paste.restore_log(&mut self.bottom_visible) {
+		if self.paste.restore_log(self.bottom_visible.get()) {
+			self.set_log_visible(true);
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
 	}
@@ -6197,7 +6138,7 @@ impl WorkbenchModel {
 			return;
 		}
 		// Drop in-flight reads for the closed tab.
-		self.preview_generation += 1;
+		self.preview_generation.invalidate();
 		let _ = arm_cancel(&mut self.preview_cancel);
 		self.clear_preview();
 		self.reader.release_retained();
@@ -6206,11 +6147,10 @@ impl WorkbenchModel {
 		self.selected_file = None;
 		self.selected_file_source = None;
 		self.selected_file_root = None;
-		self.selected_commit = None;
-		self.range_head = None;
-		self.log_selected.clear();
-		self.compare = None;
-		self.reset_commit_view();
+		// The one place the Log's selection is dropped: the commit view, the
+		// details read still in flight and the preview's owner go with it
+		// (L6 and L8 of `invariants`).
+		self.clear_commit_selection();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
 	}
@@ -6234,7 +6174,7 @@ impl WorkbenchModel {
 		if let Some(token) = self.paste_diff_cancel.take() {
 			token.cancel();
 		}
-		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+		self.paste_diff_generation.invalidate();
 		self.paste.invalidate_job();
 		if self.paste.plan().is_none() && !was_loading {
 			return;
@@ -6326,14 +6266,14 @@ async fn drive_discovery(
 	this: gpui::WeakEntity<WorkbenchModel>,
 	cx: &mut gpui::AsyncApp,
 	mut disc: Discovery,
-	generation: u64,
+	generation: crate::generation::Stamp<crate::generation::DiscoveryLane>,
 	cancel: CancelToken,
 	mut wipe: bool,
 ) {
 	loop {
 		if cancel.is_cancelled() {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -6359,7 +6299,7 @@ async fn drive_discovery(
 		disc = returned;
 		let Some(page) = page else {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -6387,7 +6327,7 @@ async fn drive_discovery(
 			.await;
 		let stop = !matches!(status, ScanStatus::More);
 		let done = this.update(cx, |model, cx| {
-			if model.discovery_generation != generation {
+			if !model.discovery_generation.is_current(generation) {
 				return true;
 			}
 			model.apply_scan_page(wipe, processed.0, cx);
@@ -6412,7 +6352,7 @@ async fn drive_discovery(
 		});
 		if done.unwrap_or(true) {
 			let _ = this.update(cx, |model, cx| {
-				if model.discovery_generation != generation {
+				if !model.discovery_generation.is_current(generation) {
 					return;
 				}
 				model.discovery = Some(disc);
@@ -7190,6 +7130,13 @@ mod tests {
 			let repo = ws.join(name);
 			fs::create_dir(&repo).unwrap();
 			git(&repo, &["init", "-q", "-b", "main"]);
+			// `git commit` starts `git maintenance run --auto --detach`,
+			// which under load packed a fixture's loose objects (a test that
+			// deletes a loose object then found none) and wrote a
+			// multi-pack-index: a fixture's objects stay where they were
+			// written, and nothing repacks them behind a test.
+			git(&repo, &["config", "gc.auto", "0"]);
+			git(&repo, &["config", "maintenance.auto", "false"]);
 			fs::write(repo.join("base.txt"), "base").unwrap();
 			git(&repo, &["add", "."]);
 			git(&repo, &["commit", "-q", "-m", "base"]);
@@ -7601,7 +7548,7 @@ mod tests {
 			let probe = listed_tree_result(
 				TreeIo {
 					key: NodeKey::root(),
-					epoch: 0,
+					epoch: crate::generation::Stamp::for_tests(0),
 					dir: root.clone(),
 					base: root.clone(),
 					depth: 1,
@@ -8106,12 +8053,20 @@ mod tests {
 						&& matches!(m.remote.message, Some((false, _)))
 				})
 			});
-			model.read_with(cx, |m, _| {
+			model.read_with(cx, |m, cx| {
 				assert!(m.remote.session.is_none());
 				assert!(
 					m.overlays
 						.is_open(crate::overlay::OverlayKind::WorkspaceMenu),
 					"the menu stays open"
+				);
+				// M2 of `invariants`: a listed host browse keeps its client.
+				// A lane cannot reach this path (opening a workspace is out of
+				// its scope), so the invariant is held here.
+				crate::invariants::assert_holds(
+					m,
+					cx,
+					&[crate::invariants::Invariant::M2],
 				);
 				let back =
 					client_of(m).expect("the browse got its client back");
@@ -8630,7 +8585,9 @@ mod tests {
 			model.update(cx, |m, cx| {
 				let seq = m.remote.browse.as_ref().unwrap().seq();
 				m.remote_listing_landed(
-					seq.wrapping_sub(1),
+					crate::generation::Stamp::for_tests(
+						seq.raw_for_tests().wrapping_sub(1),
+					),
 					Ok(crate::remote::FolderListing {
 						path: "/elsewhere".into(),
 						folders: vec!["zzz".into()],
@@ -11030,11 +10987,11 @@ mod tests {
 					Some(snip_core::workspace::ScanStatus::TimedOut);
 				m.discovery_depth_limited.clear();
 				m.is_loading = false;
-				let gen_before = m.discovery_generation;
+				let gen_before = m.discovery_generation.current();
 				m.continue_discovery(cx);
 				assert_eq!(m.status.key, "remote_scan_incomplete");
 				assert!(!m.is_loading);
-				assert_eq!(m.discovery_generation, gen_before);
+				assert!(m.discovery_generation.is_current(gen_before));
 			});
 		}
 
@@ -11501,7 +11458,9 @@ mod tests {
 			);
 			assert_eq!(load_after, crate::lifecycle::GitLoad::idle());
 
-			let mut lc = crate::lifecycle::Lifecycle::new(1);
+			let mut lc = crate::lifecycle::Lifecycle::new(
+				crate::generation::Gen::starting_at(1),
+			);
 			let now = std::time::Instant::now();
 			let req = lc.request(crate::lifecycle::Intent::CloseWorkspace, now);
 			assert_eq!(req, crate::lifecycle::Request::Accepted);
@@ -12034,7 +11993,7 @@ mod tests {
 			model.update(cx, |m, cx| {
 				m.commit_view.commit_files =
 					files.iter().map(|f| (f.to_string(), None)).collect();
-				m.commit_view.selected_commit_file = Some("b.txt".into());
+				m.set_commit_file_selection(Some("b.txt".into()));
 				m.toggle_commit_file("d.txt", cx);
 				assert_eq!(m.commit_view.commit_file_sel, ["b.txt", "d.txt"]);
 				m.toggle_commit_file("b.txt", cx);
@@ -12069,7 +12028,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file = Some("src/a.rs".into());
+				m.set_commit_file_selection(Some("src/a.rs".into()));
 				m.toggle_commit_file("src/", cx);
 				m.toggle_commit_file("pom.xml", cx);
 				let menu = m.commit_file_menu("src", true);
@@ -12124,7 +12083,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file = Some("emoji.txt".into());
+				m.set_commit_file_selection(Some("emoji.txt".into()));
 				m.toggle_commit_file("common.txt", cx);
 				let menu = m.commit_file_menu("common.txt", false);
 				menu.into_iter()
@@ -12174,7 +12133,7 @@ mod tests {
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
 				// Click order: b.txt, a/x.txt, z.txt.
-				m.commit_view.selected_commit_file = Some("b.txt".into());
+				m.set_commit_file_selection(Some("b.txt".into()));
 				m.toggle_commit_file("a/x.txt", cx);
 				m.toggle_commit_file("z.txt", cx);
 				let menu = m.commit_file_menu("z.txt", false);
@@ -12228,8 +12187,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file =
-					Some("dir/keep.txt".into());
+				m.set_commit_file_selection(Some("dir/keep.txt".into()));
 				m.toggle_commit_file("dir/", cx);
 				let menu = m.commit_file_menu("dir", true);
 				menu.into_iter()
@@ -12332,13 +12290,19 @@ mod tests {
 			cx.update(|window, cx| {
 				window.focus(&model.read(cx).focus_handle.clone())
 			});
-			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			let before = model.read_with(cx, |m, _| m.bottom_visible.get());
 			cx.simulate_keystrokes("alt-9");
 			cx.run_until_parked();
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), !before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				!before
+			);
 			cx.simulate_keystrokes("alt-9");
 			cx.run_until_parked();
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				before
+			);
 		}
 
 		/// With no file open the reader is never drawn, yet Esc in the
@@ -12365,15 +12329,18 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			// Alt+9 still toggles the log…
-			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			let before = model.read_with(cx, |m, _| m.bottom_visible.get());
 			cx.simulate_keystrokes("alt-9");
 			assert_eq!(
-				model.read_with(cx, |m, _| m.bottom_visible),
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
 				!before,
 				"Alt+9 must work after Esc in the tree",
 			);
 			cx.simulate_keystrokes("alt-9");
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				before
+			);
 			// …and Alt+1 still opens the Project tool window.
 			cx.simulate_keystrokes("alt-1");
 			model.read_with(cx, |m, _| {
@@ -12396,19 +12363,19 @@ mod tests {
 			// The log starts open without the focus: close, then open the
 			// way Alt+9 does, with the focus on the log.
 			cx.simulate_keystrokes("alt-9");
-			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.simulate_keystrokes("alt-9");
-			assert!(model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.update(|window, cx| {
 				assert!(model.read(cx).log_focus.is_focused(window));
 			});
 			// Closing it while it holds the focus must not strand the
 			// keyboard on the hidden list.
 			cx.simulate_keystrokes("alt-9");
-			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.simulate_keystrokes("alt-9");
 			assert!(
-				model.read_with(cx, |m, _| m.bottom_visible),
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
 				"Alt+9 must reopen the log",
 			);
 		}
@@ -20069,8 +20036,9 @@ mod tests {
 		/// and leaves the consumers settled: a scan page and a rescan, a repo
 		/// added by hand, a vanished repo dropped, the workspace released.
 		/// A remote scan's failure (`Clear`) needs a fault injected into the
-		/// worker, and is covered by the type: a change that is not handed
-		/// to `repos_changed` does not build, and panics when dropped.
+		/// worker: `a_refused_remote_scan_clears_the_repo_set_and_its_consumers`.
+		/// The type covers the rest: a change that is not handed to
+		/// `repos_changed` does not build, and panics when dropped.
 		#[gpui::test]
 		fn every_repo_set_source_fans_out(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
@@ -20078,47 +20046,112 @@ mod tests {
 			let (_ext_tmp, ext) = external_repo("ext");
 			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
 			repos_settled(&model, cx, 1);
+			// A paste preview with a mapping row stays open through every
+			// change, so R4 (it has seen every repo) is not vacuous.
+			model.update(cx, |m, _| {
+				m.test_clipboard = Some("// FILE: zzz/one.txt\n1\n".into())
+			});
+			cx.simulate_keystrokes("ctrl-v");
+			settle_until(cx, "the preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(
+					!m.paste.plan().unwrap().prefix_choices.is_empty(),
+					"the preview offers a mapping row"
+				)
+			});
 			let b = scanned_entry(&repo(ws.path(), "b", &[]));
 			let c = scanned_entry(&repo(ws.path(), "c", &[]));
 			let c_key = crate::repo_key(&c);
 			let ext_entry = scanned_entry(&ext);
+			use crate::invariants::Invariant::{R1, R2, R4};
+			const SETTLED: &[crate::invariants::Invariant] = &[R1, R2, R4];
 			let rev = |m: &WorkbenchModel| m.repos.rev();
 			let mut last = model.read_with(cx, |m, _| rev(m));
 			let mut advanced = |cx: &mut VisualTestContext, what: &str| {
 				settle(cx);
-				model.read_with(cx, |m, _| {
+				model.read_with(cx, |m, cx| {
 					assert!(rev(m) > last, "{what} advances the revision");
 					last = rev(m);
 					assert!(!m.is_loading);
-					m.assert_repo_consumers_settled();
+					crate::invariants::assert_holds(m, cx, SETTLED);
 				});
 			};
 
 			model.update_in(cx, |m, _, cx| {
 				m.apply_scan_page(false, vec![b], cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a scan page");
 			model.update_in(cx, |m, _, cx| {
 				m.apply_scan_page(true, vec![c], cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a rescan");
 			model.update_in(cx, |m, _, cx| {
 				m.install_added_repo(Ok(ext_entry), cx);
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a repo added by hand");
 			model.update_in(cx, |m, _, cx| {
 				assert!(m.drop_vanished_repo(&c_key, cx).is_none());
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
 			});
 			advanced(cx, "a vanished repo");
 			model.update_in(cx, |m, _, cx| m.release_workspace_state(cx));
-			model.read_with(cx, |m, _| {
+			model.read_with(cx, |m, cx| {
 				assert!(rev(m) > last, "the release advances the revision");
 				assert!(m.repos.is_empty());
-				m.assert_repo_consumers_settled();
+				crate::invariants::assert_holds(m, cx, SETTLED);
+			});
+		}
+
+		/// The source `every_repo_set_source_fans_out` could not reach
+		/// without a fault: a remote scan the worker refuses clears the repo
+		/// set, and every consumer follows it (#227, #230).
+		#[gpui::test]
+		fn a_refused_remote_scan_clears_the_repo_set_and_its_consumers(
+			cx: &mut TestAppContext,
+		) {
+			use crate::invariants::Invariant::{R1, R2, R4};
+			let _remote = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			repo(tmp.path(), "a", &[]);
+			let path = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx, worker) = open_remote(
+				cx,
+				tmp.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			wait_remote_repo_loaded(&model, cx);
+			let before = model.read_with(cx, |m, cx| {
+				crate::invariants::assert_holds(m, cx, &[R1, R2, R4]);
+				m.repos.rev()
+			});
+			worker.set_scan_failures_for_tests(
+				&path,
+				0,
+				Some(snip_remote::proto::ErrorCode::Forbidden),
+			);
+			model.update_in(cx, |m, _, cx| m.reload_repos(cx));
+			settle_until(cx, "the refused scan", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote.scan_error.is_some() && !m.is_loading
+				})
+			});
+			model.read_with(cx, |m, cx| {
+				assert!(
+					m.repos.rev() > before,
+					"the refusal advances the revision"
+				);
+				assert!(m.repos.is_empty(), "the refused scan left repos");
+				crate::invariants::assert_holds(m, cx, &[R1, R2, R4]);
 			});
 		}
 
@@ -22916,7 +22949,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: 0,
+						generation: crate::generation::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");
@@ -23331,7 +23364,7 @@ mod tests {
 			});
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the first listed file is shown",
 				);
@@ -23362,7 +23395,7 @@ mod tests {
 					Some("a_small.txt"),
 				);
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the selection names a file nothing shows",
 				);
@@ -23403,7 +23436,7 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(commit_preview_shown(m), "the shown diff stays");
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the selection names a file nothing shows",
 				);
@@ -23524,7 +23557,7 @@ mod tests {
 						),
 						dest: PathBuf::new(),
 						roots: Vec::new(),
-						generation: 0,
+						generation: crate::generation::Stamp::for_tests(0),
 						remote: None,
 					})
 					.expect("the queued paste fits");
@@ -23710,10 +23743,13 @@ mod tests {
 			// Another read fails first and clears the loading flag without
 			// touching the generation.
 			model.update(cx, |m, _| {
-				m.show_preview_error(crate::Msg::new(
-					"error_repo_changes",
-					["beta".to_string(), "boom".to_string()],
-				));
+				m.show_preview_error(
+					None,
+					crate::Msg::new(
+						"error_repo_changes",
+						["beta".to_string(), "boom".to_string()],
+					),
+				);
 			});
 			assert!(!model.read_with(cx, |m, _| m.preview_loading));
 			click(cx, "log-filter-repo");
@@ -24405,8 +24441,9 @@ mod tests {
 				let (_tmp, shared, root, cx) = three_tabs_with_remote(cx);
 				let remote =
 					complete_remote_paste_in_background(&root, cx, &shared);
-				let before =
-					remote.read_with(cx, |m, _| m.discovery_generation);
+				let before = remote.read_with(cx, |m, _| {
+					m.discovery_generation.raw_for_tests()
+				});
 				// Consecutive real key events, with GPUI's normal event-loop
 				// turn between them; no click or test-only redraw.
 				cx.simulate_keystrokes("cmd-3");
@@ -24419,7 +24456,8 @@ mod tests {
 				);
 				wait_scaled(cx, "Cmd+R refresh on the remote tab", |cx| {
 					remote.read_with(cx, |m, _| {
-						m.discovery_generation > before && !m.is_loading
+						m.discovery_generation.raw_for_tests() > before
+							&& !m.is_loading
 					})
 				});
 				assert_eq!(active(&root, cx), Some(2));
@@ -24811,7 +24849,7 @@ mod tests {
 							!m.preview_loading,
 							"a click on {id} ({mods:?}) during a drain left a load flag"
 						);
-						assert_eq!(m.selected_commit, anchor, "{id} {mods:?}");
+						assert_eq!(*m.selected_commit, anchor, "{id} {mods:?}");
 						assert_eq!(m.log_selected, selected, "{id} {mods:?}");
 					});
 				}
@@ -25130,8 +25168,8 @@ mod tests {
 				let before = ta.read_with(cx, |m, _| {
 					(
 						m.lifecycle.generation(),
-						m.history_generation,
-						m.tree_generation,
+						m.history_generation.raw_for_tests(),
+						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,
 					)
@@ -25141,8 +25179,8 @@ mod tests {
 				let after = ta.read_with(cx, |m, _| {
 					(
 						m.lifecycle.generation(),
-						m.history_generation,
-						m.tree_generation,
+						m.history_generation.raw_for_tests(),
+						m.tree_generation.raw_for_tests(),
 						m.files.len(),
 						m.selected_repo_idx,
 					)
@@ -26180,9 +26218,11 @@ mod tests {
 				);
 				let (root, cx) = fixture.launch(cx);
 				let models = initial_scan_failures(&root, cx);
-				let generations = models
-					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+				let generations = models.each_ref().map(|m| {
+					m.read_with(cx, |m, _| {
+						m.discovery_generation.raw_for_tests()
+					})
+				});
 				cx.executor().advance_clock(Duration::from_secs(60));
 				cx.run_until_parked();
 				for (ix, model) in models.iter().enumerate() {
@@ -26193,7 +26233,10 @@ mod tests {
 						1
 					);
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation, generations[ix]);
+						assert_eq!(
+							m.discovery_generation.raw_for_tests(),
+							generations[ix]
+						);
 						assert!(
 							m.remote.scan_error.is_some()
 								&& m.remote.scan_recovery.is_none()
@@ -26217,9 +26260,11 @@ mod tests {
 				);
 				let (root, cx) = fixture.launch(cx);
 				let models = initial_scan_failures(&root, cx);
-				let generations = models
-					.each_ref()
-					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+				let generations = models.each_ref().map(|m| {
+					m.read_with(cx, |m, _| {
+						m.discovery_generation.raw_for_tests()
+					})
+				});
 				let connections =
 					fixture.worker.started_connections_for_tests();
 				cx.executor().advance_clock(Duration::from_secs(60));
@@ -26230,7 +26275,10 @@ mod tests {
 				);
 				for (ix, model) in models.iter().enumerate() {
 					model.read_with(cx, |m, _| {
-						assert_eq!(m.discovery_generation, generations[ix]);
+						assert_eq!(
+							m.discovery_generation.raw_for_tests(),
+							generations[ix]
+						);
 						assert_eq!(
 							m.remote.scan_error.as_ref().unwrap().key,
 							"remote_worker_too_old"
@@ -27632,22 +27680,32 @@ mod tests {
 				assert_focus_not_in_closed_layer(cx, model);
 			}
 
-			/// A layer is open exactly when its panel is drawn. The add-repo
-			/// field belongs to the Project pane: drawn only while it shows.
+			/// A layer is open exactly when its panel is drawn. An inline layer
+			/// belongs to its pane and is drawn only while the pane is: the
+			/// add-repo field to the Project pane (its tab in use, the tool
+			/// window not hidden), the find bar to the reader (not replaced by
+			/// the paste preview), the destination field to the paste panel.
+			/// A hidden pane keeps its layer open and brings it back as it was.
 			pub(crate) fn assert_overlay_panels_match(
 				cx: &mut VisualTestContext,
 				model: &Entity<WorkbenchModel>,
 			) {
 				use crate::overlay::OverlayKind;
-				let (open, project) = model.read_with(cx, |m, _| {
-					(
-						OverlayKind::ALL
-							.into_iter()
-							.filter(|k| m.overlays.is_open(*k))
-							.collect::<Vec<_>>(),
-						m.active_tab == crate::WorkbenchTab::FileExplorer,
-					)
-				});
+				let (open, project, reader, paste) =
+					model.read_with(cx, |m, _| {
+						(
+							OverlayKind::ALL
+								.into_iter()
+								.filter(|k| m.overlays.is_open(*k))
+								.collect::<Vec<_>>(),
+							m.active_tab == crate::WorkbenchTab::FileExplorer
+								&& m.left_visible,
+							m.workspace_open
+								&& m.paste.plan().is_none()
+								&& !m.paste.is_loading(),
+							m.paste.plan().is_some(),
+						)
+					});
 				let mut selectors: Vec<&'static str> = OverlayKind::ALL
 					.iter()
 					.map(|k| k.panel_selector())
@@ -27656,9 +27714,14 @@ mod tests {
 				selectors.sort_unstable();
 				selectors.dedup();
 				for sel in selectors {
-					if sel == OverlayKind::AddRepoField.panel_selector()
-						&& !project
-					{
+					let pane_hidden = (sel
+						== OverlayKind::AddRepoField.panel_selector()
+						&& !project) || (sel
+						== OverlayKind::FindBar.panel_selector()
+						&& !reader) || (sel
+						== OverlayKind::PasteDestField.panel_selector()
+						&& !paste);
+					if pane_hidden {
 						continue;
 					}
 					let want = open.iter().any(|k| k.panel_selector() == sel);
@@ -30305,6 +30368,13 @@ mod tests {
 				})
 			}
 		}
+
+		/// The invariant registry's tests and the random-gesture lanes that
+		/// drive it (#230): `src/tests/in_process/invariant_tests.rs`, a file
+		/// of its own as `paste/zh_leaks_tests.rs` is.
+		mod invariant_tests;
+		/// What the lanes found, rebuilt by hand (`fuzz_regression_*`).
+		mod regression_tests;
 	}
 
 	mod folder_copy {

@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::i18n::Locale;
+use crate::invariants::{english_run, has_cjk};
 use crate::reason::reason_msg;
 use crate::PreviewErr;
 use snip_core::commits::CommitError;
@@ -432,21 +433,6 @@ fn scrub(text: &str) -> String {
 		out = out.replace(lit, "");
 	}
 	out
-}
-
-fn has_cjk(text: &str) -> bool {
-	text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-}
-
-/// The first run of two ASCII words in `text`, if any. A word is letters,
-/// digits and hyphens that starts with a letter, so `snip-sync` and `ssh`
-/// are words, and a lone product term between Chinese is not a run.
-fn english_run(text: &str) -> Option<String> {
-	let re = regex::Regex::new(
-		r"[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z][A-Za-z0-9-]*)+",
-	)
-	.unwrap();
-	re.find(text).map(|m| m.as_str().to_string())
 }
 
 /// An empty slot in a rendering: an empty quote pair or bracket pair, a

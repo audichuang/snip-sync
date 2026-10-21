@@ -1048,6 +1048,30 @@ fn placed_repos(
 	out
 }
 
+/// Whether the Log panel is shown. Readable everywhere; only `ui` writes it
+/// (`WorkbenchModel::set_log_visible`), which closes the dropdowns a hidden
+/// panel leaves behind (O7 of `invariants`). The compiler enforces that:
+/// the value and its setter are private to this module. Neither `Copy` nor
+/// `Clone` nor `Default`: an old value cannot be kept and written back over
+/// the live one, and the only constructor makes a shown panel (a hidden one
+/// is made through `set_log_visible` alone).
+#[derive(Debug)]
+pub struct LogPanel(bool);
+
+impl LogPanel {
+	pub const fn shown() -> Self {
+		Self(true)
+	}
+
+	pub fn get(&self) -> bool {
+		self.0
+	}
+
+	fn set(&mut self, visible: bool) {
+		self.0 = visible;
+	}
+}
+
 impl WorkbenchModel {
 	/// Highlighted Project rows, in both trees.
 	pub fn selected_count(&self) -> usize {
@@ -1094,11 +1118,22 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// The one place the Log panel is shown or hidden: `LogPanel::set` is
+	/// private to this module, so no other code compiles a write. Hiding it takes
+	/// the dropdowns it opened along, since nothing is left to draw them
+	/// (O7 of `invariants`).
+	pub(crate) fn set_log_visible(&mut self, visible: bool) {
+		self.bottom_visible.set(visible);
+		if !visible {
+			self.drop_overlays(crate::overlay::DropScope::AnyLogMenu);
+		}
+	}
+
 	fn toggle_log(&mut self, cx: &mut Context<Self>) {
-		self.bottom_visible = !self.bottom_visible;
+		self.set_log_visible(!self.bottom_visible.get());
 		// A manual toggle wins over the paste preview's auto-restore.
 		self.paste.forget_log_restore();
-		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible);
+		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible.get());
 		cx.notify();
 	}
 
@@ -1757,6 +1792,8 @@ impl Render for WorkbenchModel {
 		self.publish_gate(window, cx);
 		// Triggers are written again as this frame draws them.
 		self.overlays.clear_trigger_slots();
+		// Written again by the branches pane if this frame draws it.
+		self.last_branch_current.set(None);
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}
@@ -1846,7 +1883,7 @@ impl Render for WorkbenchModel {
 			}
 		};
 
-		div()
+		let frame = div()
 			.track_focus(&self.focus_handle)
 			.key_context("Workbench")
 			.on_action(cx.listener(|this, _: &Quit, _, cx| {
@@ -1960,7 +1997,7 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &ToggleLog, window, cx| {
 				this.toggle_log(cx);
-				if this.bottom_visible {
+				if this.bottom_visible.get() {
 					window.focus(&this.log_focus);
 				}
 			}))
@@ -2083,7 +2120,7 @@ impl Render for WorkbenchModel {
 									})
 									.child(center),
 							)
-							.when(self.bottom_visible, |d| {
+							.when(self.bottom_visible.get(), |d| {
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(
 										self.render_log(bottom_h, window, cx),
@@ -2094,7 +2131,13 @@ impl Render for WorkbenchModel {
 			.child(self.render_status(cx))
 			.children(self.render_toast())
 			.children(self.render_context_menu(cx))
-			.children(probe_frame_end(&self.probes))
+			.children(probe_frame_end(&self.probes));
+		// A driver's run reads the registry's verdict on every frame it
+		// draws; a normal launch never evaluates it.
+		if self.probes.is_some() {
+			self.log_broken_invariants(cx);
+		}
+		frame
 	}
 }
 

@@ -172,6 +172,24 @@ impl Msg {
 	}
 
 	pub fn render(&self, loc: Locale) -> String {
+		self.render_with(loc, &|s| s.to_string())
+	}
+
+	/// This message's wording alone, as `loc` draws it: every plain argument
+	/// (a path, a name, a number, the datum of [`Self::detail`]) is `◇`, so
+	/// only the dictionary's words are left to read. Arguments that are keys
+	/// are worded and nested messages and lists recurse, as `render` does.
+	/// A message that puts an English sentence in a plain argument is read
+	/// as data here: `check_msg_raw.sh` is what keeps those out.
+	pub fn render_shape(&self, loc: Locale) -> String {
+		self.render_with(loc, &|_| "\u{25c7}".to_string())
+	}
+
+	fn render_with(
+		&self,
+		loc: Locale,
+		plain: &dyn Fn(&str) -> String,
+	) -> String {
 		let arg_strs: Vec<String> = self
 			.args
 			.iter()
@@ -180,7 +198,7 @@ impl Msg {
 				if let Some((_, inner)) =
 					self.inner.as_deref().filter(|(at, _)| *at == i)
 				{
-					inner.render(loc)
+					inner.render_with(loc, plain)
 				} else if let Some((_, list)) =
 					self.list.as_deref().filter(|(at, _)| *at == i)
 				{
@@ -191,7 +209,7 @@ impl Msg {
 						.map_or("; ", |(sep, _)| sep)
 						.to_string();
 					list.iter()
-						.map(|m| m.render(loc))
+						.map(|m| m.render_with(loc, plain))
 						.collect::<Vec<_>>()
 						.join(&sep)
 				} else if self.key_args.contains(&i) {
@@ -202,7 +220,7 @@ impl Msg {
 						s.clone()
 					}
 				} else {
-					s.clone()
+					plain(s)
 				}
 			})
 			.collect();
@@ -398,7 +416,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_branch_placeholder" => "分支或標籤",
 			"log_head_current" => "HEAD（目前分支）",
 			"branch_repo_count" => "×{}",
-			"merge_file_same_first_parent" => "與 first parent 相同（只在其他 parent 有變更）",
+			"merge_file_same_first_parent" => "與第一個 parent 相同（只在其他 parent 有變更）",
 			"log_clear_filter" => "清除篩選",
 			"tip_log_refresh" => "重新整理",
 			"tip_log_more" => "更多",
@@ -499,7 +517,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"commit_empty_note" => "無檔案異動，仍會建立空 commit",
 			"commit_header_counts" => "{} 個檔案，{} 個不寫入",
 			"reason_skip_generic" => "此檔案不會寫入",
-            "reason_skip_git_metadata" => "受保護的 Git metadata，不寫入也不刪除",
+            "reason_skip_git_metadata" => "受保護的 Git 中繼資料，不寫入也不刪除",
             "reason_skip_unresolved" => "無法安全解析目的路徑，不寫入",
             "reason_skip_ambiguous" => "目的路徑不唯一，不寫入",
             "reason_skip_placeholder" => "內容是未複製提示，不寫入",
@@ -543,7 +561,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_copied_limit" => "已從 {} 複製 {} 個檔案（{} 字元、{} 行、{} 字、{} 個 token，略過 {} 個）至剪貼簿；已達 {} 個檔案上限，其餘檔案未複製",
 			"status_copy_nothing_skipped" => "沒有可複製的檔案內容：所選資料夾內的檔案都無法複製，已略過",
 			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
-			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
+			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync 內容",
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
 			"paste_err_plan" => "無法建立貼上計畫: {}",
 			"paste_err_destination" => "無法使用貼上目的地「{}」: {}",
@@ -686,7 +704,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"tip_find_next" => "下一處相符項目 (Enter / F3)",
 			"tip_find_prev" => "上一處相符項目 (Shift+Enter / Shift+F3)",
 			"tip_git_log" => "Git 記錄工具視窗 (Alt+9)",
-			"tip_head" => "跳至 HEAD commit",
+			"tip_head" => "跳至 HEAD 的 commit",
 			"tip_project" => "專案工具視窗 (Alt+1)",
 			"tip_repo_selector" => "切換儲存庫 (Alt+Shift+R)",
 			"mapping_required" => "請先為每個來源前綴選擇目的地，套用前不會寫入",
@@ -1393,6 +1411,47 @@ mod tests {
 			assert!(!s.starts_with("paste_err_"), "raw key leaked: {s}");
 			assert!(s.contains("/t/newdir/x") && s.contains("Not a directory"));
 		}
+	}
+
+	/// `render_shape` keeps the dictionary's words and replaces everything
+	/// the caller passed in, however deep it sits: plain arguments and the
+	/// datum of a detail, but not key arguments, which are words.
+	#[test]
+	fn render_shape_keeps_the_words_and_hides_the_data() {
+		let plain = Msg::new(
+			"paste_err_destination",
+			["/a b/newdir".to_string(), "Not a directory".to_string()],
+		);
+		for loc in [Locale::ZhTw, Locale::En] {
+			let shape = plain.render_shape(loc);
+			assert!(!shape.contains("newdir"), "{shape}");
+			assert!(!shape.contains("Not a directory"), "{shape}");
+			assert!(shape.contains('\u{25c7}'), "{shape}");
+		}
+		// A detail: the headline is worded, the datum is hidden.
+		let detail = Msg::detail(
+			Msg::new("status_history_loaded", ["4".to_string()]),
+			"some user path",
+		);
+		let shape = detail.render_shape(Locale::ZhTw);
+		assert!(!shape.contains("some user path"), "{shape}");
+		assert!(!shape.contains('4'), "{shape}");
+		assert!(shape.contains("已載入"), "{shape}");
+		// A key argument is still worded.
+		let keyed = Msg::with_key_arg(
+			"reason_detail",
+			["status_history_loaded".to_string(), "data".to_string()],
+			0,
+		);
+		assert_eq!(
+			keyed.render_shape(Locale::ZhTw),
+			format!("{}：\u{25c7}", t("status_history_loaded", Locale::ZhTw))
+		);
+		// What `render` shows is unchanged.
+		assert_eq!(
+			keyed.render(Locale::En),
+			format!("{}: data", t("status_history_loaded", Locale::En))
+		);
 	}
 
 	/// Every `Msg::new("key", ..)` in this crate must have both translations,
