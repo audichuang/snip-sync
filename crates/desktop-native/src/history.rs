@@ -3182,7 +3182,7 @@ impl WorkbenchModel {
 			return;
 		};
 		let task_generation = self.preview_generation.bump();
-		self.hold_shown_commit_file(path, false, None, self.repo_root());
+		self.hold_shown_commit_file(path, false, None, Some(root.clone()));
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
