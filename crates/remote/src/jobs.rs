@@ -321,6 +321,7 @@ impl<'w, W: Write> Answer<'w, W> {
 			| crate::fault::Fault::Stall(_)
 			| crate::fault::Fault::RunThenHangUp
 			| crate::fault::Fault::TruncatedReply
+			| crate::fault::Fault::HeartbeatThenTruncatedReply
 			| crate::fault::Fault::Throttle { .. } => None,
 		}
 	}
@@ -337,6 +338,7 @@ impl<'w, W: Write> Answer<'w, W> {
 			| crate::fault::Fault::Stall(_)
 			| crate::fault::Fault::RunThenHangUp
 			| crate::fault::Fault::TruncatedReply
+			| crate::fault::Fault::HeartbeatThenTruncatedReply
 			| crate::fault::Fault::Throttle { .. } => None,
 		}
 	}

@@ -237,6 +237,11 @@ pub enum Fault {
 	/// Reply layer: writes the first half of the answer's bytes, then hangs
 	/// up.
 	TruncatedReply,
+	/// Dispatch and reply layer: sends one heartbeat before the work, then
+	/// is a [`Self::TruncatedReply`]. The heartbeat is certain, as a slow
+	/// machine's would be: a master that heard it must not send the call
+	/// again.
+	HeartbeatThenTruncatedReply,
 	/// Reply layer: writes the answer whole, `chunk` bytes at a time, with a
 	/// real pause between pieces.
 	Throttle { chunk: usize, pause: Duration },
@@ -247,7 +252,9 @@ impl Fault {
 	pub(crate) fn reply_writer(&self) -> Option<FaultWriter> {
 		match self {
 			Self::RunThenHangUp => Some(FaultWriter::Discard),
-			Self::TruncatedReply => Some(FaultWriter::Truncate),
+			Self::TruncatedReply | Self::HeartbeatThenTruncatedReply => {
+				Some(FaultWriter::Truncate)
+			}
 			Self::Throttle { chunk, pause } => Some(FaultWriter::Throttle {
 				chunk: (*chunk).max(1),
 				pause: *pause,
@@ -273,6 +280,7 @@ impl Fault {
 			| Self::Stall(_)
 			| Self::RunThenHangUp
 			| Self::TruncatedReply
+			| Self::HeartbeatThenTruncatedReply
 			| Self::Throttle { .. } => false,
 		}
 	}
@@ -630,6 +638,11 @@ mod tests {
 			(Fault::RunThenHangUp, Vec::new(), true),
 			(
 				Fault::TruncatedReply,
+				reply[..reply.len() / 2].to_vec(),
+				true,
+			),
+			(
+				Fault::HeartbeatThenTruncatedReply,
 				reply[..reply.len() / 2].to_vec(),
 				true,
 			),

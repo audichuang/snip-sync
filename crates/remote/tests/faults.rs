@@ -341,7 +341,13 @@ enum Expect {
 fn expect(fault: &Fault, reused: bool) -> Expect {
 	match fault {
 		Fault::Refuse(code) => Expect::Refused(*code),
-		Fault::HeartbeatThenHangUp => Expect::IoError { seen: 1 },
+		// A heartbeat was heard before the connection broke: the call may
+		// have run, so it is not sent again, reused or not.
+		Fault::HeartbeatThenHangUp | Fault::HeartbeatThenTruncatedReply => {
+			Expect::IoError { seen: 1 }
+		}
+		// Nothing was heard: a reused connection may simply have gone
+		// stale, so the call is sent again once.
 		Fault::HangUp | Fault::Garbage | Fault::TruncatedReply => {
 			if reused {
 				Expect::Resent
@@ -357,9 +363,12 @@ fn expect(fault: &Fault, reused: bool) -> Expect {
 fn every_read_survives_every_fault_and_the_client_stays_usable() {
 	let fx = Fixture::new();
 	let limit = scaled(Duration::from_secs(10));
-	// A worker slow enough that a heartbeat precedes the work's reply (a
-	// loaded machine, reproduced: work past the one-second heartbeat).
-	fx.worker.set_heartbeat_for_tests(Duration::from_millis(1));
+	// No heartbeat but the ones a fault sends: work that outlasts the
+	// one-second beat on a loaded machine would otherwise turn a cell that
+	// expects a resend into one that heard a frame (reproduced with a 1 ms
+	// beat: UnexpectedEof on a reused connection).
+	fx.worker
+		.set_heartbeat_for_tests(scaled(Duration::from_secs(3600)));
 	let faults = [
 		Fault::Refuse(ErrorCode::Busy),
 		Fault::Refuse(ErrorCode::NotFound),
@@ -367,6 +376,7 @@ fn every_read_survives_every_fault_and_the_client_stays_usable() {
 		Fault::Garbage,
 		Fault::TruncatedReply,
 		Fault::HeartbeatThenHangUp,
+		Fault::HeartbeatThenTruncatedReply,
 	];
 	let mut cells = 0;
 	for kind in reads() {

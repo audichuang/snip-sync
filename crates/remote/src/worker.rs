@@ -602,6 +602,9 @@ fn serve(
 				return Ok(());
 			}
 			Some(Fault::Stall(d)) => std::thread::sleep(*d),
+			Some(Fault::HeartbeatThenTruncatedReply) => {
+				crate::jobs::Answer::new(&mut writer, None).heartbeat()?;
+			}
 			Some(
 				Fault::Delay(_)
 				| Fault::PageDelay(_)
