@@ -4648,10 +4648,16 @@ impl WorkbenchModel {
 			self.selected_file = None;
 			self.selected_file_root = None;
 		}
-		self.set_commit_file_selection(Some(match tree_sha {
-			Some(sha) => crate::history::CommitFileSel::from_tree(path, sha),
-			None => path.into(),
-		}));
+		let root = self.repo_root();
+		self.set_commit_file_selection(Some(
+			match tree_sha {
+				Some(sha) => {
+					crate::history::CommitFileSel::from_tree(path, sha)
+				}
+				None => path.into(),
+			}
+			.with_root(root),
+		));
 		self.commit_view.commit_file_sel.clear();
 	}
 

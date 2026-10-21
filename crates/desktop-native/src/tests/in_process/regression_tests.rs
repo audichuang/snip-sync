@@ -1289,6 +1289,43 @@ fn fuzz_regression_a_repo_switch_to_an_unreadable_repo_keeps_no_tree_file(
 	});
 }
 
+/// L10 compares the repo a selection was made in with the repo of the error
+/// page, each on its own. Alpha's tree-file selection left over beside beta's
+/// error page is a selection of a file no preview shows, and the current repo
+/// being beta must not make it look like beta's (#230).
+#[gpui::test]
+fn l10_rejects_a_selection_of_another_repo_beside_an_error_page(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = commit_shown_with(cx, true);
+	open_unchanged_tree_file(&model, cx);
+	let (sha, alpha_root) = model.read_with(cx, |m, _| {
+		(
+			m.commit_view.rev_owner().expect("an owned file").to_string(),
+			m.repo_root().expect("alpha"),
+		)
+	});
+	fs::remove_dir_all(ws.path().join("beta").join(".git")).unwrap();
+	click_probed(&model, cx, "btn-repo-selector");
+	click_probed(&model, cx, "pick-repo:beta");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview_error.is_some(), "beta's error page is shown");
+		assert_ne!(m.repo_root(), Some(alpha_root.clone()), "beta is current");
+		invariants::assert_holds(m, cx, &[L10]);
+	});
+	model.update(cx, |m, cx| {
+		m.set_commit_file_selection(Some(
+			crate::history::CommitFileSel::from_tree("a.txt", &sha)
+				.with_root(Some(alpha_root)),
+		));
+		assert!(
+			invariants::eval(L10, m, cx).is_some(),
+			"alpha's selection beside beta's error page must be caught"
+		);
+	});
+}
+
 /// Opens `name` from the tree the commit's Browse Tree button opens and waits
 /// until its read has ended, whatever it ended in.
 fn open_tree_file_any_result(

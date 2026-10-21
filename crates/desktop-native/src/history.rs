@@ -200,6 +200,10 @@ impl CommitView {
 pub struct CommitFileSel {
 	pub path: String,
 	pub rev_owner: Option<String>,
+	/// The repo the file was selected in, fixed at the selection (a tree
+	/// file: the repo the tree was open in; a Log file: the repo of the
+	/// commit it was read from). An error page of the file is that repo's.
+	pub root: Option<PathBuf>,
 }
 
 impl CommitFileSel {
@@ -207,7 +211,14 @@ impl CommitFileSel {
 		Self {
 			path: path.into(),
 			rev_owner: None,
+			root: None,
 		}
+	}
+
+	/// The same selection, made in the repo `root`.
+	pub fn with_root(mut self, root: Option<PathBuf>) -> Self {
+		self.root = root;
+		self
 	}
 
 	/// A file opened from the tree of commit `sha`.
@@ -215,6 +226,7 @@ impl CommitFileSel {
 		Self {
 			path: path.into(),
 			rev_owner: Some(sha.to_string()),
+			root: None,
 		}
 	}
 }
@@ -2977,7 +2989,8 @@ impl WorkbenchModel {
 						match first {
 							Some((path, p)) => {
 								model.set_commit_file_selection(Some(
-									path.clone().into(),
+									CommitFileSel::new(path.clone())
+										.with_root(Some(shown_root.clone())),
 								));
 								model.commit_view.commit_file_sel.clear();
 								model.apply_source_preview(
