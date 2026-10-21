@@ -5398,8 +5398,8 @@ impl WorkbenchModel {
 			None => self
 				.set_status("status_paste_preview", [items_count.to_string()]),
 		}
-		if self.paste.collapse_log(&mut self.bottom_visible) {
-			self.log_panel_hidden();
+		if self.paste.collapse_log(self.bottom_visible) {
+			self.set_log_visible(false);
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
 		// A plan landing under the open destination field (a prefix chosen
@@ -6214,7 +6214,8 @@ impl WorkbenchModel {
 	fn restore_log_after_paste(&mut self) {
 		// The typed destination belongs to the preview that is closing.
 		self.drop_paste_dest_edit();
-		if self.paste.restore_log(&mut self.bottom_visible) {
+		if self.paste.restore_log(self.bottom_visible) {
+			self.set_log_visible(true);
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
 	}

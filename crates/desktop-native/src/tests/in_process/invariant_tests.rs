@@ -2726,3 +2726,45 @@ fn a_commit_selection_is_dropped_in_one_place() {
 	);
 	assert!(hits[0].contains("history.rs"), "{hits:?}");
 }
+
+/// O7: the Log panel is shown or hidden in `set_log_visible` alone, which
+/// closes the dropdowns it opened. A path that wrote `bottom_visible`
+/// itself (or lent it as `&mut`) would hide the panel and leave them open.
+#[test]
+fn the_log_panel_is_hidden_in_one_place() {
+	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+		for entry in std::fs::read_dir(dir).expect("the source dir") {
+			let path = entry.expect("an entry").path();
+			if path.is_dir() {
+				if path.file_name().is_some_and(|n| n == "tests") {
+					continue;
+				}
+				walk(&path, hits);
+			} else if path.extension().is_some_and(|e| e == "rs")
+				&& !path
+					.file_name()
+					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
+			{
+				let text = std::fs::read_to_string(&path).expect("a source");
+				for (i, line) in text.lines().enumerate() {
+					let code = line.split("//").next().unwrap_or("");
+					let writes = code.contains("bottom_visible = ");
+					if writes || code.contains("&mut self.bottom_visible") {
+						hits.push(format!("{}:{}", path.display(), i + 1));
+					}
+				}
+			}
+		}
+	}
+	let mut hits = Vec::new();
+	walk(
+		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+		&mut hits,
+	);
+	assert_eq!(
+		hits.len(),
+		1,
+		"`bottom_visible` is written only in set_log_visible: {hits:#?}"
+	);
+	assert!(hits[0].contains("ui/mod.rs"), "{hits:?}");
+}

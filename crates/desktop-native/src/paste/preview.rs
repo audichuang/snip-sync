@@ -766,21 +766,15 @@ impl PastePreview {
 	/// Hides the Git Log for the paste preview, remembering the prior state once
 	/// (a re-paste over an open preview keeps the first saved value). Returns
 	/// true when the panel was actually hidden by this call.
-	pub fn collapse_log(&mut self, visible: &mut bool) -> bool {
-		self.log_before.get_or_insert(*visible);
-		std::mem::replace(visible, false)
+	pub fn collapse_log(&mut self, visible: bool) -> bool {
+		self.log_before.get_or_insert(visible);
+		visible
 	}
 
 	/// Restores Git Log visibility once the paste preview closes, unless the
 	/// user toggled it themselves while the preview was open.
-	pub fn restore_log(&mut self, visible: &mut bool) -> bool {
-		match self.log_before.take() {
-			Some(true) if !*visible => {
-				*visible = true;
-				true
-			}
-			_ => false,
-		}
+	pub fn restore_log(&mut self, visible: bool) -> bool {
+		matches!(self.log_before.take(), Some(true) if !visible)
 	}
 
 	pub fn forget_log_restore(&mut self) {
@@ -2057,41 +2051,55 @@ mod tests {
 
 	#[test]
 	fn paste_log_collapse_and_restore() {
+		// The panel's visibility is the model's (`set_log_visible`); these
+		// mirror what its callers do with the answers.
+		fn collapse(s: &mut PastePreview, vis: &mut bool) -> bool {
+			let was = s.collapse_log(*vis);
+			*vis = false;
+			was
+		}
+		fn restore(s: &mut PastePreview, vis: &mut bool) -> bool {
+			let back = s.restore_log(*vis);
+			if back {
+				*vis = true;
+			}
+			back
+		}
 		// Open then close restores the visible log, exactly once.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		assert!(s.collapse_log(&mut vis));
+		assert!(collapse(&mut s, &mut vis));
 		assert!(!vis);
 		// A re-paste over the open preview keeps the first saved state.
-		assert!(!s.collapse_log(&mut vis));
-		assert!(s.restore_log(&mut vis));
+		assert!(!collapse(&mut s, &mut vis));
+		assert!(restore(&mut s, &mut vis));
 		assert!(vis);
 		vis = false;
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis, "must not restore twice");
 		assert!(s.log_before.is_none());
 
 		// A log that was already hidden stays hidden.
 		let mut s = PastePreview::new(None);
 		let mut vis = false;
-		assert!(!s.collapse_log(&mut vis));
-		assert!(!s.restore_log(&mut vis));
+		assert!(!collapse(&mut s, &mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis);
 
 		// A manual toggle (toggle_log clears the saved state) wins.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		s.collapse_log(&mut vis);
+		collapse(&mut s, &mut vis);
 		s.forget_log_restore();
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(!vis);
 
 		// Reopened by a path that does not clear the saved state: no flip.
 		let mut s = PastePreview::new(None);
 		let mut vis = true;
-		s.collapse_log(&mut vis);
+		collapse(&mut s, &mut vis);
 		vis = true;
-		assert!(!s.restore_log(&mut vis));
+		assert!(!restore(&mut s, &mut vis));
 		assert!(vis);
 		assert!(s.log_before.is_none());
 	}
