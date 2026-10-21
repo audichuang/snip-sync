@@ -502,6 +502,25 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 		assert!(m.commit_view.selected_commit_file.is_some());
 		invariants::assert_holds(m, cx, &[L2, L6]);
 	});
+	// "Back to Working" leaves the tree, not the editor tab: the file stays
+	// open (the tab and the tree are independent, as closing the tab above
+	// leaves the tree), and the view still accounts for it.
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		assert!(m.selected_commit.is_none());
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+	// The tab is what owns the file now: closing it takes the selection.
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview.is_none());
+		assert!(m.commit_view.selected_commit_file.is_none());
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
 }
 
 /// L6: an open rev tree excuses only its own file. The selection a manual
