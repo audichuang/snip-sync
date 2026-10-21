@@ -1216,3 +1216,59 @@ fn fuzz_regression_refresh_keeps_the_owner_of_a_tree_file_no_commit_selects(
 		assert!(m.commit_view.rev_owner().is_some(), "the owner stayed");
 	});
 }
+
+/// A plain repo switch ends the tree file's preview and tree, so it ends the
+/// file's selection and its owner too: a selection of a file no preview
+/// shows is what the other direction of L9 (L10) catches. The helper that
+/// keeps a tree file's selection was also used by a plain switch, which
+/// cleared the preview and the tree after it (#230).
+#[gpui::test]
+fn fuzz_regression_a_repo_switch_drops_the_tree_file_selection_with_its_preview(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown_with(cx, true);
+	open_unchanged_tree_file(&model, cx);
+	model.read_with(cx, |m, cx| {
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+	click_probed(&model, cx, "btn-repo-selector");
+	click_probed(&model, cx, "pick-repo:beta");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+		assert!(m.rev_tree.is_none(), "the switch closed the tree");
+		assert!(m.preview.is_none(), "the switch cleared the preview");
+		assert_eq!(
+			m.commit_view.selected_path(),
+			None,
+			"no file is selected of a preview that is gone"
+		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}
+
+/// The same switch to a repo that cannot be read: the error page is beta's
+/// and names no file of alpha's tree (it was labelled "beta > a.txt").
+#[gpui::test]
+fn fuzz_regression_a_repo_switch_to_an_unreadable_repo_keeps_no_tree_file(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = commit_shown_with(cx, true);
+	open_unchanged_tree_file(&model, cx);
+	// beta stops being a repository after the scan listed it.
+	fs::remove_dir_all(ws.path().join("beta").join(".git")).unwrap();
+	click_probed(&model, cx, "btn-repo-selector");
+	click_probed(&model, cx, "pick-repo:beta");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+		assert!(m.preview_error.is_some(), "beta's error page is shown");
+		assert_eq!(m.commit_view.selected_path(), None);
+		let (_, crumbs, _) = m.source_labels();
+		assert!(
+			!crumbs.contains("a.txt"),
+			"the error page is labelled {crumbs:?}"
+		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}

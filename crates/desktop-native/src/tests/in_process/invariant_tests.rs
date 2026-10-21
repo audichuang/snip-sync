@@ -180,6 +180,13 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 				crate::syntax::Language::Plain,
 			));
 		},
+		L10 => |m| {
+			m.held_selection = None;
+			m.commit_view.selected_commit_file = Some("f.txt".into());
+			m.preview = None;
+			m.preview_error = None;
+			m.preview_loading = false;
+		},
 		P1 => |m| {
 			m.preview_loading = true;
 			m.preview_cancel = None;
@@ -2779,13 +2786,28 @@ fn a_commit_file_selection_is_written_in_one_place() {
 					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
 			{
 				let text = std::fs::read_to_string(&path).expect("a source");
+				// Test code is excluded by scope, never by what the receiver
+				// is called: a `#[cfg(test)] mod ... {` at column 0 is skipped
+				// to its closing `}`, and `tests/` and `*_tests.rs` are
+				// skipped above. A direct write inside a production callback
+				// (an async landing) is a hit whatever its receiver's name.
+				let mut in_test_mod = false;
+				let mut prev = "";
 				for (i, line) in text.lines().enumerate() {
+					if in_test_mod {
+						in_test_mod = line != "}";
+						prev = line;
+						continue;
+					}
+					if prev == "#[cfg(test)]" && line.starts_with("mod ") {
+						in_test_mod = true;
+						prev = line;
+						continue;
+					}
+					prev = line;
 					let code = line.split("//").next().unwrap_or("");
 					if code.contains("commit_view.selected_commit_file =")
 						&& !code.contains("commit_view.selected_commit_file ==")
-						&& !code.trim_start().starts_with("m.")
-						&& !code.contains("model.commit_view")
-						&& !code.contains(" m.commit_view")
 					{
 						hits.push(format!("{}:{}", path.display(), i + 1));
 					}

@@ -77,6 +77,14 @@ pub(crate) enum Invariant {
 	/// preview's path is the selected one. Guard: #230 (Refresh kept a tree
 	/// file's preview and dropped its selection, owner included).
 	L9,
+	/// The other direction of L9: a live commit-file selection has its file
+	/// shown (a commit's file or diff of that path), or its read is in flight
+	/// (`preview_loading`), or an error page stands for it in the repo the
+	/// selection lives in (the log's commit root, or the open repo while the
+	/// rev tree it was opened from is open). Not checked while a selection is
+	/// held aside (the L members' premise). Guard: #230 (a plain repo switch
+	/// kept a tree file's selection and cleared its preview).
+	L10,
 	// Preview and paste preview.
 	/// A running preview read can be cancelled: its token is alive while the
 	/// workspace accepts work. Guard: #230 PR-0 (a Log click during a drain).
@@ -215,9 +223,9 @@ pub(crate) enum Family {
 pub(crate) fn all() -> Vec<Invariant> {
 	use Invariant::*;
 	let mut all = vec![
-		L1, L2, L3, L4, L5, L6, L7, L8, L9, P1, P2, P3, P4, P5, P6, P7, P8, P9,
-		P10, R1, R2, R3, R4, R5, R6, B1, Q1, Q2, Q3, Q4, Q5, Q6, Q7, M2, M3,
-		D1, O7, O8,
+		L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, P1, P2, P3, P4, P5, P6, P7,
+		P8, P9, P10, R1, R2, R3, R4, R5, R6, B1, Q1, Q2, Q3, Q4, Q5, Q6, Q7,
+		M2, M3, D1, O7, O8,
 	];
 	all.extend(OverlayInvariant::ALL.iter().copied().map(O));
 	all
@@ -231,8 +239,8 @@ impl Invariant {
 			| Q4 | Q5 | Q6 | Q7 | M2 | D1 | O7 | O8 => When::Quiescent,
 			// M3 holds at any time, but only the driver knows the history it
 			// needs.
-			L1 | L2 | L3 | L4 | L5 | L6 | L8 | L9 | P1 | P3 | P5 | P7 | P8
-			| P9 | P10 | B1 | M3 => When::Always,
+			L1 | L2 | L3 | L4 | L5 | L6 | L8 | L9 | L10 | P1 | P3 | P5 | P7
+			| P8 | P9 | P10 | B1 | M3 => When::Always,
 			O(o) if o.quiescent_only() => When::Quiescent,
 			O(_) => When::Always,
 		}
@@ -241,10 +249,10 @@ impl Invariant {
 	pub(crate) fn status(self) -> Status {
 		use Invariant::*;
 		match self {
-			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | P1 | P2 | P3 | P4
-			| P5 | P6 | P7 | P8 | P9 | P10 | R1 | R2 | R3 | R4 | R5 | R6
-			| B1 | Q1 | Q2 | Q3 | Q4 | Q5 | Q6 | Q7 | M2 | M3 | D1 | O(_)
-			| O7 | O8 => Status::Active,
+			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | P1 | P2 | P3
+			| P4 | P5 | P6 | P7 | P8 | P9 | P10 | R1 | R2 | R3 | R4 | R5
+			| R6 | B1 | Q1 | Q2 | Q3 | Q4 | Q5 | Q6 | Q7 | M2 | M3 | D1
+			| O(_) | O7 | O8 => Status::Active,
 		}
 	}
 
@@ -258,7 +266,9 @@ impl Invariant {
 	pub(crate) fn family(self) -> Family {
 		use Invariant::*;
 		match self {
-			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 => Family::LogSelection,
+			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 => {
+				Family::LogSelection
+			}
 			P1 | P2 | P3 | P4 => Family::Preview,
 			P5 | P6 | P7 | P8 | P9 | P10 | R4 => Family::PastePanel,
 			R1 | R2 | R5 | R6 => Family::RepoSet,
@@ -390,7 +400,7 @@ pub(crate) fn eval(
 	use Invariant::*;
 	// The selection a read holds aside is not on the model: the L members
 	// say nothing then (see the module doc).
-	if matches!(id, L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9)
+	if matches!(id, L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10)
 		&& m.held_selection.is_some()
 	{
 		return None;
@@ -542,6 +552,40 @@ pub(crate) fn eval(
 				format!(
 					"the preview shows commit file {shown:?}, the selection is {:?}",
 					view.selected_path()
+				)
+			})
+		}
+		L10 => {
+			let sel = view.selected_commit_file.as_ref()?;
+			if m.preview_loading {
+				return None;
+			}
+			let shown = m.preview.as_ref().is_some_and(|p| {
+				m.preview_error.is_none()
+					&& p.path.as_deref() == Some(sel.path.as_str())
+					&& matches!(
+						p.source,
+						PreviewSource::CommitDiff { .. }
+							| PreviewSource::CommitFile { .. }
+							| PreviewSource::Compare { .. }
+					)
+			});
+			// An error page names the selection's own file (its label is
+			// built from the selection); only its repo can be wrong.
+			let error_page =
+				m.preview.is_none() && m.preview_error.is_some() && {
+					let home = if sel.rev_owner.is_some() {
+						m.rev_tree.as_ref().and_then(|_| m.repo_root())
+					} else {
+						view.log_commit_root.clone()
+					};
+					home.is_some() && home == m.preview_root()
+				};
+			(!(shown || error_page)).then(|| {
+				format!(
+					"the commit file {:?} is selected, and the preview is neither it, \
+					 its read, nor its error page",
+					sel.path
 				)
 			})
 		}
