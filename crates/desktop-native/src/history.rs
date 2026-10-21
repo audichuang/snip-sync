@@ -117,6 +117,12 @@ pub struct CommitView {
 	pub selection_details: Vec<CommitDetails>,
 	/// Repository of the commit or compare the reader shows from the log.
 	pub log_commit_root: Option<PathBuf>,
+	/// The commit whose tree `selected_commit_file` was opened from, once
+	/// "Back to Working" left the tree: the file's tab stays open (the tab
+	/// and the tree are independent, as closing the tab leaves the tree), and
+	/// this says whose file it is while no tree lists it. Dropped with the
+	/// view, so closing the tab or selecting a commit takes it.
+	pub rev_file_sha: Option<String>,
 }
 
 impl CommitView {
@@ -134,8 +140,10 @@ impl CommitView {
 			commit_details,
 			selection_details,
 			log_commit_root,
+			rev_file_sha,
 		} = self;
 		commit_files.is_empty()
+			&& rev_file_sha.is_none()
 			&& commit_file_origin.is_empty()
 			&& commit_file_gitlinks.is_empty()
 			&& !commit_files_truncated
@@ -166,6 +174,7 @@ impl CommitView {
 			commit_details,
 			selection_details,
 			log_commit_root,
+			rev_file_sha: _,
 		} = self;
 		commit_files.is_empty()
 			&& commit_file_origin.is_empty()
@@ -3171,6 +3180,15 @@ impl WorkbenchModel {
 	pub fn leave_rev_tree(&mut self, cx: &mut Context<Self>) {
 		self.tree_generation.invalidate();
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
+		// The tree's open file stays open, and is the tab's from here on:
+		// say whose it is, now that no tree lists it.
+		if let Some(tree) = &self.rev_tree {
+			if self.selected_commit.is_none()
+				&& self.commit_view.selected_commit_file.is_some()
+			{
+				self.commit_view.rev_file_sha = Some(tree.sha.clone());
+			}
+		}
 		self.rev_tree = None;
 		self.tree_cursor = 0;
 		app_log!("[APP:REV_TREE: off]");

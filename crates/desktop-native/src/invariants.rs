@@ -349,20 +349,36 @@ fn roots_text(m: &WorkbenchModel) -> String {
 	format!("{roots:?} + {:?} + {:?}", m.workspace_root, m.ws_home)
 }
 
-/// Whether `path` is a file the open rev tree owns: it lists it, or the
-/// preview shows it as a file of the tree's commit. Only then may a commit
-/// view name it with no row of the Log's list behind it.
+/// The commit a rev-tree file belongs to: the open tree's, or, once "Back to
+/// Working" left the tree, the one the file's tab remembers
+/// (`CommitView::rev_file_sha`). The tab and the tree are independent, so the
+/// file's ownership does not end with the tree.
+fn rev_owner(m: &WorkbenchModel) -> Option<&str> {
+	m.rev_tree
+		.as_ref()
+		.map(|tree| tree.sha.as_str())
+		.or(m.commit_view.rev_file_sha.as_deref())
+}
+
+/// Whether `path` is a file a rev tree owns: the open tree lists it, or the
+/// preview shows it as a file of the owning commit, or the tab kept it after
+/// the tree was left. Only then may a commit view name it with no row of the
+/// Log's list behind it.
 fn tree_owns_file(m: &WorkbenchModel, path: &str) -> bool {
-	m.rev_tree.as_ref().is_some_and(|tree| {
-		tree.lists_file(path)
-			|| m.preview.as_ref().is_some_and(|p| {
-				p.path.as_deref() == Some(path)
-					&& matches!(
-						&p.source,
-						PreviewSource::CommitFile { sha } if *sha == tree.sha
-					)
-			})
-	})
+	let Some(owner) = rev_owner(m) else {
+		return false;
+	};
+	m.rev_tree
+		.as_ref()
+		.is_some_and(|tree| tree.lists_file(path))
+		|| m.preview.as_ref().is_some_and(|p| {
+			p.path.as_deref() == Some(path)
+				&& matches!(
+					&p.source,
+					PreviewSource::CommitFile { sha } if sha == owner
+				)
+		}) || (m.rev_tree.is_none()
+		&& m.commit_view.selected_commit_file.as_deref() == Some(path))
 }
 
 /// One member; `None` means it holds. A member the driver evaluates
@@ -481,14 +497,17 @@ pub(crate) fn eval(
 						| PreviewSource::CommitFile { .. }
 						| PreviewSource::Compare { .. }
 				);
-				let tree_own = m.rev_tree.as_ref().is_some_and(|tree| {
+				let tree_own = rev_owner(m).is_some_and(|owner| {
 					matches!(
 						&p.source,
-						PreviewSource::CommitFile { sha } if *sha == tree.sha
+						PreviewSource::CommitFile { sha } if sha == owner
 					) && p.path.as_deref().is_some_and(|path| {
 						// Listed by the tree, or the file the tree opened
-						// (a listing the budget evicted does not answer).
-						tree.lists_file(path)
+						// (a listing the budget evicted does not answer), or
+						// the one its tab kept after the tree was left.
+						m.rev_tree
+							.as_ref()
+							.is_some_and(|tree| tree.lists_file(path))
 							|| view.selected_commit_file.as_deref()
 								== Some(path)
 					})

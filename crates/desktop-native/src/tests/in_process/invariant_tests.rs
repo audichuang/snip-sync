@@ -2401,9 +2401,9 @@ fn remote_tour(cx: &mut TestAppContext, reach: &mut Reach) {
 	model.update(cx, |m, cx| m.browse_remote_folder(1, shared_path, cx));
 	settle_until(cx, "the fixture folder's listing", |cx| {
 		model.read_with(cx, |m, _| {
-			m.remote.browse.as_ref().is_some_and(|b| {
-				matches!(&b.listing, Some(Ok(l)) if !l.folders.is_empty())
-			})
+			m.remote.browse.as_ref().is_some_and(
+				|b| matches!(&b.listing, Some(Ok(l)) if !l.folders.is_empty()),
+			)
 		})
 	});
 	tour(

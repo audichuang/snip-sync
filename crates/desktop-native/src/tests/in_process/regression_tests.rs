@@ -523,6 +523,72 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 	});
 }
 
+/// L2/L6: the file a left rev tree kept is the tab's, and the tab alone
+/// excuses it: another commit takes it with the rest of the view, and a view
+/// that lost its owner but kept the preview is still caught.
+#[gpui::test]
+fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let drawn_with = |cx: &mut VisualTestContext, prefix: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with(prefix))
+		})
+	};
+	// The commit's tree, a file of it open in the tab, then "Back to Working".
+	let tree_file_then_leave = |cx: &mut VisualTestContext| {
+		let browse = drawn_with(cx, "btn-browse-tree:").expect("the tree");
+		click_probed(&model, cx, &browse);
+		settle_until(cx, "the tree", |cx| drawn_with(cx, "rev-row:").is_some());
+		model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+		settle(cx);
+		let row = drawn_with(cx, "rev-row:").expect("a file of the tree");
+		click_probed(&model, cx, &row);
+		settle_until(cx, "the file", |cx| {
+			model
+				.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+		});
+		click_probed(&model, cx, "btn-leave-tree");
+		settle(cx);
+	};
+	tree_file_then_leave(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none() && m.selected_commit.is_none());
+		assert!(m.commit_view.rev_file_sha.is_some(), "the tab is the owner");
+		invariants::assert_holds(m, cx, &[L1, L2, L3, L4, L5, L6]);
+	});
+	// A view that lost its owner but kept a commit's preview is a leftover.
+	model.update(cx, |m, _| m.commit_view.rev_file_sha = None);
+	model.read_with(cx, |m, cx| {
+		let broken = invariants::check(m, cx, crate::invariants::When::Always);
+		assert!(
+			broken.iter().any(|v| v.id == L6),
+			"a kept preview with no owner is caught"
+		);
+	});
+	// Another commit takes the file's selection with the rest of the view.
+	model.update(cx, |m, _| {
+		m.commit_view.rev_file_sha = Some(m.commits[0].sha.clone())
+	});
+	model.update_in(cx, |m, _, cx| {
+		let sha = m.commits[0].sha.clone();
+		m.select_commit(&sha, cx)
+	});
+	settle_until(cx, "the commit", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	model.read_with(cx, |m, cx| {
+		assert!(m.commit_view.rev_file_sha.is_none(), "the owner went");
+		invariants::assert_holds(m, cx, &[L1, L2, L3, L4, L5, L6]);
+	});
+}
+
 /// L6: an open rev tree excuses only its own file. The selection a manual
 /// reset leaves behind (a Log commit file, a file selection, the Log's
 /// preview flag with no tree file selected) is still a violation while the
