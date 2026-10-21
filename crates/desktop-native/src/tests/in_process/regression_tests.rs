@@ -879,3 +879,120 @@ fn fuzz_regression_details_landing_on_a_held_selection_survive_its_restore(
 		);
 	});
 }
+
+#[gpui::test]
+fn fuzz_regression_a_live_tree_file_selection_does_not_hide_the_held_owner(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let drawn_with = |cx: &mut VisualTestContext, prefix: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with(prefix))
+		})
+	};
+	let browse = drawn_with(cx, "btn-browse-tree:").expect("the tree");
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "the tree", |cx| drawn_with(cx, "rev-row:").is_some());
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	let row = drawn_with(cx, "rev-row:").expect("a file of the tree");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	// A working-file read starts and is held: it sets the selection aside.
+	model.update(cx, |m, _| {
+		m.e2e_read_delay = Some(std::time::Duration::from_secs(60))
+	});
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.held_selection.is_some(), "the selection is held");
+		assert!(m.commit_view.selected_commit_file.is_none());
+		// The selection phase of another rev-file read. No I/O is run so
+		// leaving the tree deterministically happens before it lands.
+		m.hold_shown_commit_file("a.txt", true);
+		m.preview_pending_from_log = true;
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	// The read is refused by the retained budget and gives the selection back.
+	model.update(cx, |m, _| m.restore_shown_selection());
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+}
+
+#[gpui::test]
+fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let drawn_with = |cx: &mut VisualTestContext, prefix: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with(prefix))
+		})
+	};
+	let browse = drawn_with(cx, "btn-browse-tree:").expect("the tree");
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "the tree", |cx| drawn_with(cx, "rev-row:").is_some());
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	let row = drawn_with(cx, "rev-row:").expect("a file of the tree");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	// Land a working preview while the tree stays open, with no commit.
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+	});
+	settle_until(cx, "working file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	model.update(cx, |m, _| {
+		assert!(m.selected_commit.is_none());
+		assert!(m.commit_view.selected_commit_file.is_none());
+		// Selection phase of a pending rev-file read, before its I/O lands.
+		m.hold_shown_commit_file("a.txt", true);
+		m.preview_pending_from_log = true;
+		m.preview_loading = true;
+		assert!(m
+			.held_selection
+			.as_ref()
+			.unwrap()
+			.commit_file_only
+			.is_some());
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.update(cx, |m, _| {
+		m.e2e_read_delay = Some(std::time::Duration::from_secs(60));
+	});
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m
+			.held_selection
+			.as_ref()
+			.unwrap()
+			.commit_file_only
+			.is_none());
+	});
+	// The full restore must not retain the pending rev file's ownership.
+	model.update(cx, |m, _| m.restore_shown_selection());
+	model.read_with(cx, |m, cx| {
+		assert!(m.commit_view.selected_commit_file.is_none());
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+}
