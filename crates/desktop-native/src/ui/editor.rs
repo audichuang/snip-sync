@@ -165,7 +165,7 @@ impl WorkbenchModel {
 					return (name, crumbs, String::new());
 				}
 			}
-			let tab = match (&self.selected_commit, &self.compare) {
+			let tab = match (&*self.selected_commit, &self.compare) {
 				(_, Some((a, b))) => format!("{}..{}", short(a), short(b)),
 				(Some(s), None) => format!("commit {}", short(s)),
 				_ => t("no_file", loc).to_string(),

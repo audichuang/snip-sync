@@ -80,7 +80,7 @@ impl WorkbenchModel {
 				rail_button(
 					"rail-log",
 					Icon::GitLog,
-					self.bottom_visible,
+					self.bottom_visible.get(),
 					t("tip_git_log", loc),
 					12,
 				)

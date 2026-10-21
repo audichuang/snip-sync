@@ -841,7 +841,7 @@ pub struct WorkbenchModel {
 	pub hidden_commits: Vec<String>,
 	/// Snapshot and commit window later graph pages continue from.
 	pub history_walk: Option<crate::history::HistoryWalk>,
-	pub selected_commit: Option<String>,
+	pub selected_commit: history::SelectedCommit,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
 	/// Every selected row id in display order, when more than one is
@@ -1035,7 +1035,7 @@ pub struct WorkbenchModel {
 	pub left_w: f32,
 	pub bottom_h: f32,
 	pub left_visible: bool,
-	pub bottom_visible: bool,
+	pub bottom_visible: ui::LogPanel,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
 	/// Logical window height, for popups that must fit inside it.
@@ -1450,7 +1450,7 @@ impl WorkbenchModel {
 			collapsed_merges: Vec::new(),
 			hidden_commits: Vec::new(),
 			history_walk: None,
-			selected_commit: None,
+			selected_commit: Default::default(),
 			range_head: None,
 			log_selected: Vec::new(),
 			log_scroll: gpui::UniformListScrollHandle::new(),
@@ -1572,7 +1572,7 @@ impl WorkbenchModel {
 			left_w: theme::LEFT_W_DEFAULT,
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
-			bottom_visible: true,
+			bottom_visible: ui::LogPanel::shown(),
 			dragging: None,
 			last_viewport: (0, 0),
 			viewport_h: 0.,
@@ -4587,7 +4587,7 @@ impl WorkbenchModel {
 			file,
 			source: file_source,
 			root: self.selected_file_root.clone(),
-			commit: self.selected_commit.take(),
+			commit: self.take_selected_commit(),
 			// Taking the view resets it.
 			view: std::mem::take(&mut self.commit_view),
 			log_selected: std::mem::take(&mut self.log_selected),
@@ -4603,8 +4603,7 @@ impl WorkbenchModel {
 			held.file = early.file;
 			held.source = early.source;
 			held.root = early.root;
-			held.view.selected_commit_file = early.view.selected_commit_file;
-			held.view.commit_file_sel = early.view.commit_file_sel;
+			held.view.adopt_file_selection_of(early.view);
 		}
 		self.held_selection = shown.then_some(held);
 	}
@@ -4628,14 +4627,7 @@ impl WorkbenchModel {
 				source: self.selected_file_source.clone(),
 				root: self.selected_file_root.clone(),
 				commit: None,
-				view: crate::history::CommitView {
-					selected_commit_file: self
-						.commit_view
-						.selected_commit_file
-						.clone(),
-					commit_file_sel: self.commit_view.commit_file_sel.clone(),
-					..Default::default()
-				},
+				view: self.commit_view.file_selection_only(),
 				log_selected: Vec::new(),
 				range_head: None,
 				compare: None,
@@ -4663,19 +4655,20 @@ impl WorkbenchModel {
 
 	/// Puts the held selection back; the shown preview is still its own.
 	fn restore_shown_selection(&mut self) {
-		let Some(held) = self.held_selection.take() else {
+		let Some(mut held) = self.held_selection.take() else {
 			return;
 		};
 		self.selected_file = held.file;
 		self.selected_file_source = held.source;
 		self.selected_file_root = held.root;
 		if let Some(pending) = held.commit_file_only {
-			self.set_commit_file_selection(held.view.selected_commit_file);
-			self.commit_view.commit_file_sel = held.view.commit_file_sel;
+			self.commit_view.commit_file_sel =
+				std::mem::take(&mut held.view.commit_file_sel);
+			self.set_commit_file_selection(held.view.into_file_selection());
 			self.preview_pending_from_log = pending;
 			return;
 		}
-		self.selected_commit = held.commit;
+		self.restore_selected_commit(held.commit);
 		self.commit_view = held.view;
 		self.log_selected = held.log_selected;
 		self.range_head = held.range_head;
@@ -5421,7 +5414,7 @@ impl WorkbenchModel {
 			None => self
 				.set_status("status_paste_preview", [items_count.to_string()]),
 		}
-		if self.paste.collapse_log(self.bottom_visible) {
+		if self.paste.collapse_log(self.bottom_visible.get()) {
 			self.set_log_visible(false);
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
@@ -6237,7 +6230,7 @@ impl WorkbenchModel {
 	fn restore_log_after_paste(&mut self) {
 		// The typed destination belongs to the preview that is closing.
 		self.drop_paste_dest_edit();
-		if self.paste.restore_log(self.bottom_visible) {
+		if self.paste.restore_log(self.bottom_visible.get()) {
 			self.set_log_visible(true);
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
@@ -12113,7 +12106,7 @@ mod tests {
 			model.update(cx, |m, cx| {
 				m.commit_view.commit_files =
 					files.iter().map(|f| (f.to_string(), None)).collect();
-				m.commit_view.selected_commit_file = Some("b.txt".into());
+				m.set_commit_file_selection(Some("b.txt".into()));
 				m.toggle_commit_file("d.txt", cx);
 				assert_eq!(m.commit_view.commit_file_sel, ["b.txt", "d.txt"]);
 				m.toggle_commit_file("b.txt", cx);
@@ -12148,7 +12141,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file = Some("src/a.rs".into());
+				m.set_commit_file_selection(Some("src/a.rs".into()));
 				m.toggle_commit_file("src/", cx);
 				m.toggle_commit_file("pom.xml", cx);
 				let menu = m.commit_file_menu("src", true);
@@ -12203,7 +12196,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file = Some("emoji.txt".into());
+				m.set_commit_file_selection(Some("emoji.txt".into()));
 				m.toggle_commit_file("common.txt", cx);
 				let menu = m.commit_file_menu("common.txt", false);
 				menu.into_iter()
@@ -12253,7 +12246,7 @@ mod tests {
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
 				// Click order: b.txt, a/x.txt, z.txt.
-				m.commit_view.selected_commit_file = Some("b.txt".into());
+				m.set_commit_file_selection(Some("b.txt".into()));
 				m.toggle_commit_file("a/x.txt", cx);
 				m.toggle_commit_file("z.txt", cx);
 				let menu = m.commit_file_menu("z.txt", false);
@@ -12307,8 +12300,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				m.commit_view.selected_commit_file =
-					Some("dir/keep.txt".into());
+				m.set_commit_file_selection(Some("dir/keep.txt".into()));
 				m.toggle_commit_file("dir/", cx);
 				let menu = m.commit_file_menu("dir", true);
 				menu.into_iter()
@@ -12411,13 +12403,19 @@ mod tests {
 			cx.update(|window, cx| {
 				window.focus(&model.read(cx).focus_handle.clone())
 			});
-			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			let before = model.read_with(cx, |m, _| m.bottom_visible.get());
 			cx.simulate_keystrokes("alt-9");
 			cx.run_until_parked();
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), !before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				!before
+			);
 			cx.simulate_keystrokes("alt-9");
 			cx.run_until_parked();
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				before
+			);
 		}
 
 		/// With no file open the reader is never drawn, yet Esc in the
@@ -12444,15 +12442,18 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			// Alt+9 still toggles the log…
-			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			let before = model.read_with(cx, |m, _| m.bottom_visible.get());
 			cx.simulate_keystrokes("alt-9");
 			assert_eq!(
-				model.read_with(cx, |m, _| m.bottom_visible),
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
 				!before,
 				"Alt+9 must work after Esc in the tree",
 			);
 			cx.simulate_keystrokes("alt-9");
-			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
+				before
+			);
 			// …and Alt+1 still opens the Project tool window.
 			cx.simulate_keystrokes("alt-1");
 			model.read_with(cx, |m, _| {
@@ -12475,19 +12476,19 @@ mod tests {
 			// The log starts open without the focus: close, then open the
 			// way Alt+9 does, with the focus on the log.
 			cx.simulate_keystrokes("alt-9");
-			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.simulate_keystrokes("alt-9");
-			assert!(model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.update(|window, cx| {
 				assert!(model.read(cx).log_focus.is_focused(window));
 			});
 			// Closing it while it holds the focus must not strand the
 			// keyboard on the hidden list.
 			cx.simulate_keystrokes("alt-9");
-			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible.get()));
 			cx.simulate_keystrokes("alt-9");
 			assert!(
-				model.read_with(cx, |m, _| m.bottom_visible),
+				model.read_with(cx, |m, _| m.bottom_visible.get()),
 				"Alt+9 must reopen the log",
 			);
 		}
@@ -24958,7 +24959,7 @@ mod tests {
 							!m.preview_loading,
 							"a click on {id} ({mods:?}) during a drain left a load flag"
 						);
-						assert_eq!(m.selected_commit, anchor, "{id} {mods:?}");
+						assert_eq!(*m.selected_commit, anchor, "{id} {mods:?}");
 						assert_eq!(m.log_selected, selected, "{id} {mods:?}");
 					});
 				}

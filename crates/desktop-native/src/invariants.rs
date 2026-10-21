@@ -556,7 +556,7 @@ pub(crate) fn eval(
 			})
 		}
 		L10 => {
-			let sel = view.selected_commit_file.as_ref()?;
+			let sel = view.selection()?;
 			if m.preview_loading {
 				return None;
 			}

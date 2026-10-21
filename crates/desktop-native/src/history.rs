@@ -111,8 +111,11 @@ pub struct CommitView {
 	/// The file open in the reader, with the owner a rev tree's file has once
 	/// "Back to Working" left the tree. One value: the owner cannot outlive
 	/// the selection, and moving the selection (hold, promote, restore,
-	/// drop) moves the owner with it.
-	pub selected_commit_file: Option<CommitFileSel>,
+	/// drop) moves the owner with it. Private: only this module writes it,
+	/// through `WorkbenchModel::set_commit_file_selection` (the live one) and
+	/// the whole-view moves below. The compiler, not a scan of the source,
+	/// keeps every other module out.
+	selected_commit_file: Option<CommitFileSel>,
 	/// Cmd/Shift multi-selection in the changed files; empty means just
 	/// `selected_commit_file`. Cleared with every change of that one.
 	pub commit_file_sel: Vec<String>,
@@ -244,6 +247,33 @@ impl From<String> for CommitFileSel {
 }
 
 impl CommitView {
+	/// The selected file, with its owner and repo.
+	pub fn selection(&self) -> Option<&CommitFileSel> {
+		self.selected_commit_file.as_ref()
+	}
+
+	/// A view holding only this one's file selection (what a read in flight
+	/// sets aside, `ShownSelection::commit_file_only`).
+	pub(crate) fn file_selection_only(&self) -> CommitView {
+		CommitView {
+			selected_commit_file: self.selected_commit_file.clone(),
+			commit_file_sel: self.commit_file_sel.clone(),
+			..Default::default()
+		}
+	}
+
+	/// Takes the file selection of `from`, a view that is being moved, not
+	/// written: the live selection is set through the model alone.
+	pub(crate) fn adopt_file_selection_of(&mut self, from: CommitView) {
+		self.selected_commit_file = from.selected_commit_file;
+		self.commit_file_sel = from.commit_file_sel;
+	}
+
+	/// The file selection of a view that is being consumed.
+	pub(crate) fn into_file_selection(self) -> Option<CommitFileSel> {
+		self.selected_commit_file
+	}
+
 	/// Path of the selected file.
 	pub fn selected_path(&self) -> Option<&str> {
 		self.selected_commit_file.as_ref().map(|s| s.path.as_str())
@@ -255,6 +285,22 @@ impl CommitView {
 		self.selected_commit_file
 			.as_ref()
 			.and_then(|s| s.rev_owner.as_deref())
+	}
+}
+
+/// The lead commit of the Log selection. Readable everywhere (it derefs to
+/// `Option<String>`), writable in this module alone: the inner value is
+/// private and so are its mutators. The selection is dropped in
+/// `drop_commit_selection` and set where a read selects a commit, and a
+/// hand-written `= None` elsewhere that left out one member of the selection
+/// is what Bugs 3, 4, 5 and 7 of #230 were; here it does not compile.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SelectedCommit(Option<String>);
+
+impl std::ops::Deref for SelectedCommit {
+	type Target = Option<String>;
+	fn deref(&self) -> &Option<String> {
+		&self.0
 	}
 }
 
@@ -1750,7 +1796,8 @@ impl WorkbenchModel {
 	/// [`Self::clear_commit_selection`] without touching the shown preview:
 	/// for a caller that decides what the preview becomes itself (a repo
 	/// switch). It is the only place that sets `selected_commit` to `None`
-	/// (`a_commit_selection_is_dropped_in_one_place` keeps it so), so a new
+	/// (`SelectedCommit` is writable in this module alone, and the rest of
+	/// the module sets it, never clears it), so a new
 	/// member of the selection is added here once.
 	pub(crate) fn drop_commit_selection(&mut self) {
 		// `preview_pending_from_log` names the owner of the latest read and
@@ -1765,7 +1812,7 @@ impl WorkbenchModel {
 		}
 		self.details_generation.invalidate();
 		let _ = arm_cancel(&mut self.details_cancel);
-		self.selected_commit = None;
+		self.selected_commit = SelectedCommit(None);
 		self.range_head = None;
 		self.log_selected.clear();
 		self.reset_commit_view();
@@ -1773,11 +1820,31 @@ impl WorkbenchModel {
 		self.compare = None;
 	}
 
+	/// Moves the lead commit out for a selection that is set aside while a
+	/// read is in flight (`hold_shown_selection`).
+	pub(crate) fn take_selected_commit(&mut self) -> Option<String> {
+		self.selected_commit.0.take()
+	}
+
+	/// Puts back the lead commit `take_selected_commit` moved out.
+	pub(crate) fn restore_selected_commit(&mut self, commit: Option<String>) {
+		self.selected_commit = SelectedCommit(commit);
+	}
+
+	/// For a test that builds a state the product cannot reach.
+	#[cfg(test)]
+	pub(crate) fn set_selected_commit_for_tests(
+		&mut self,
+		commit: Option<&str>,
+	) {
+		self.selected_commit = SelectedCommit(commit.map(String::from));
+	}
+
 	/// A repo reload that keeps `commit` selected: its details and its
 	/// repository stay (the Log may be pinned to another repo than the one
 	/// now open), the rest of the Log selection and the view is read anew.
 	pub(crate) fn keep_commit_selection_for_reload(&mut self, commit: String) {
-		self.selected_commit = Some(commit);
+		self.selected_commit = SelectedCommit(Some(commit));
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
@@ -1796,8 +1863,8 @@ impl WorkbenchModel {
 		self.commit_view = CommitView::default();
 	}
 
-	/// The one place the live file selection is written (`a_commit_file_
-	/// selection_is_written_in_one_place` keeps it so). The selection and the
+	/// The one place the live file selection is written: the field is
+	/// private to this module, so nothing else compiles a write. The selection and the
 	/// commit-file preview it names are one thing: a path that keeps the
 	/// preview keeps this value whole, owner included
 	/// (`drop_commit_selection_keeping_tree_file`), and a path that drops the
@@ -2309,7 +2376,7 @@ impl WorkbenchModel {
 		self.user_action();
 		let task_generation = self.preview_generation.bump();
 		self.selected_commit =
-			Some(Box::<str>::from(id.as_str()).into_string());
+			SelectedCommit(Some(Box::<str>::from(id.as_str()).into_string()));
 		self.range_head = None;
 		self.log_selected.clear();
 		self.reset_selection_details();
@@ -2619,7 +2686,7 @@ impl WorkbenchModel {
 				} else {
 					next[0].clone()
 				};
-				self.selected_commit = Some(lead);
+				self.selected_commit = SelectedCommit(Some(lead));
 				self.range_head = None;
 				self.log_selected = next;
 				self.load_selection(cx);
@@ -3057,7 +3124,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let (source, psource, root, parents) =
-			match (&self.compare, &self.selected_commit) {
+			match (&self.compare, &*self.selected_commit) {
 				(Some((a, b)), _) => (
 					GitSource::Range(a.clone(), b.clone()),
 					PreviewSource::Compare {
@@ -3991,7 +4058,7 @@ impl WorkbenchModel {
 	pub fn commit_copy_target(
 		&self,
 	) -> Result<(PathBuf, String, String, Vec<String>), &'static str> {
-		let ids = match (self.range_rows(), &self.selected_commit) {
+		let ids = match (self.range_rows(), &*self.selected_commit) {
 			// A Cmd/Ctrl-click selection may have gaps: core refuses it
 			// as not contiguous.
 			_ if self.log_selected.len() > 1 => self.log_selected.clone(),

@@ -105,7 +105,7 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 	}
 	fn no_selection(m: &mut WorkbenchModel) {
 		m.held_selection = None;
-		m.selected_commit = None;
+		m.set_selected_commit_for_tests(None);
 		m.log_selected.clear();
 		m.compare = None;
 		m.range_head = None;
@@ -116,14 +116,14 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 	Some(match id {
 		L1 => |m| {
 			m.held_selection = None;
-			m.selected_commit = None;
+			m.set_selected_commit_for_tests(None);
 			m.range_head = Some("abc".into());
 		},
 		L2 => |m| {
 			m.held_selection = None;
 			m.rev_tree = None;
 			m.commit_view.commit_files.clear();
-			m.commit_view.selected_commit_file = Some("no/such/file".into());
+			m.set_commit_file_selection(Some("no/such/file".into()));
 		},
 		L3 => |m| {
 			m.held_selection = None;
@@ -149,11 +149,11 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 			m.held_selection = None;
 			m.commits.clear();
 			m.log_deferred = false;
-			m.selected_commit = Some("abc".into());
+			m.set_selected_commit_for_tests(Some("abc"));
 		},
 		L8 => |m| {
 			m.held_selection = None;
-			m.selected_commit = Some("bbb".into());
+			m.set_selected_commit_for_tests(Some("bbb"));
 			m.commit_view.commit_details =
 				Some(crate::history::CommitDetails {
 					sha: "aaa".into(),
@@ -171,7 +171,7 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 		},
 		L9 => |m| {
 			m.held_selection = None;
-			m.commit_view.selected_commit_file = None;
+			m.set_commit_file_selection(None);
 			m.preview = Some(crate::reader::Preview::new(
 				crate::reader::PreviewSource::CommitFile { sha: "abc".into() },
 				Some("f.txt".into()),
@@ -182,7 +182,7 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 		},
 		L10 => |m| {
 			m.held_selection = None;
-			m.commit_view.selected_commit_file = Some("f.txt".into());
+			m.set_commit_file_selection(Some("f.txt".into()));
 			m.preview = None;
 			m.preview_error = None;
 			m.preview_loading = false;
@@ -2720,181 +2720,4 @@ fn a_refused_remote_reload_drops_the_selection_it_hid(cx: &mut TestAppContext) {
 		assert!(m.commit_view.is_reset());
 		invariants::assert_holds(m, cx, &[L6, L7]);
 	});
-}
-
-/// The Log selection is dropped in one place (`drop_commit_selection`): a
-/// hand-written `selected_commit = None` elsewhere leaves out whatever the
-/// next member of the selection is (Bugs 3, 4, 5 and 7 of #230 were each a
-/// copy that missed one).
-#[test]
-fn a_commit_selection_is_dropped_in_one_place() {
-	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
-		for entry in std::fs::read_dir(dir).expect("the source dir") {
-			let path = entry.expect("an entry").path();
-			if path.is_dir() {
-				if path.file_name().is_some_and(|n| n == "tests") {
-					continue;
-				}
-				walk(&path, hits);
-			} else if path.extension().is_some_and(|e| e == "rs")
-				&& !path
-					.file_name()
-					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
-			{
-				let text = std::fs::read_to_string(&path).expect("a source");
-				for (i, line) in text.lines().enumerate() {
-					if line.contains("selected_commit = None") {
-						hits.push(format!("{}:{}", path.display(), i + 1));
-					}
-				}
-			}
-		}
-	}
-	let mut hits = Vec::new();
-	walk(
-		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-		&mut hits,
-	);
-	assert_eq!(
-		hits.len(),
-		1,
-		"`selected_commit = None` only in drop_commit_selection: {hits:#?}"
-	);
-	assert!(hits[0].contains("history.rs"), "{hits:?}");
-}
-
-/// The lines of one source file that assign `commit_view.selected_commit_file`
-/// outside test code. Test code is excluded by scope, never by what the
-/// receiver is called: a `#[cfg(test)] mod name {` at column 0 is skipped to
-/// its closing `}`. An external `#[cfg(test)] mod name;` has no body here, so
-/// it skips nothing and the production code after it is still scanned.
-fn selection_writes_outside_tests(text: &str) -> Vec<usize> {
-	let mut hits = Vec::new();
-	let mut in_test_mod = false;
-	let mut prev = "";
-	for (i, line) in text.lines().enumerate() {
-		if in_test_mod {
-			in_test_mod = line != "}";
-			prev = line;
-			continue;
-		}
-		if prev == "#[cfg(test)]"
-			&& line.starts_with("mod ")
-			&& line.trim_end().ends_with('{')
-		{
-			in_test_mod = true;
-			prev = line;
-			continue;
-		}
-		prev = line;
-		let code = line.split("//").next().unwrap_or("");
-		if code.contains("commit_view.selected_commit_file =")
-			&& !code.contains("commit_view.selected_commit_file ==")
-		{
-			hits.push(i + 1);
-		}
-	}
-	hits
-}
-
-#[test]
-fn the_selection_write_scanner_reads_only_real_test_module_bodies() {
-	let write = "\tm.commit_view.selected_commit_file = None;\n";
-	// An external test module declaration has no body to skip.
-	let external = format!("#[cfg(test)]\nmod helper;\nfn f() {{\n{write}}}\n");
-	assert_eq!(selection_writes_outside_tests(&external), vec![4]);
-	// An inline test module's writes are test code.
-	let inline = format!(
-		"#[cfg(test)]\nmod tests {{\n{write}}}\nfn f() {{\n{write}}}\n"
-	);
-	assert_eq!(selection_writes_outside_tests(&inline), vec![6]);
-	// A write before any test module counts, a comparison does not.
-	let plain = format!(
-		"fn f() {{\n{write}\tif m.commit_view.selected_commit_file == None {{}}\n}}\n"
-	);
-	assert_eq!(selection_writes_outside_tests(&plain), vec![2]);
-}
-
-/// L9: the live file selection of the commit view is written in
-/// `set_commit_file_selection` alone. The selection and the commit-file
-/// preview it names live and die together, and a write that went around that
-/// function (a reload that reset the view and kept the preview) is how Refresh
-/// once left a tree file's preview with no selection (#230). Whole-view moves
-/// (`reset_commit_view`, hold and restore of a `CommitView`) stay with their
-/// own functions; this counts only the field's own assignments.
-#[test]
-fn a_commit_file_selection_is_written_in_one_place() {
-	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
-		for entry in std::fs::read_dir(dir).expect("the source dir") {
-			let path = entry.expect("an entry").path();
-			if path.is_dir() {
-				if path.file_name().is_some_and(|n| n == "tests") {
-					continue;
-				}
-				walk(&path, hits);
-			} else if path.extension().is_some_and(|e| e == "rs")
-				&& !path
-					.file_name()
-					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
-			{
-				let text = std::fs::read_to_string(&path).expect("a source");
-				for line in selection_writes_outside_tests(&text) {
-					hits.push(format!("{}:{}", path.display(), line));
-				}
-			}
-		}
-	}
-	let mut hits = Vec::new();
-	walk(
-		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-		&mut hits,
-	);
-	assert_eq!(
-		hits.len(),
-		1,
-		"`commit_view.selected_commit_file =` only in set_commit_file_selection: {hits:#?}"
-	);
-	assert!(hits[0].contains("history.rs"), "{hits:?}");
-}
-
-/// O7: the Log panel is shown or hidden in `set_log_visible` alone, which
-/// closes the dropdowns it opened. A path that wrote `bottom_visible`
-/// itself (or lent it as `&mut`) would hide the panel and leave them open.
-#[test]
-fn the_log_panel_is_hidden_in_one_place() {
-	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
-		for entry in std::fs::read_dir(dir).expect("the source dir") {
-			let path = entry.expect("an entry").path();
-			if path.is_dir() {
-				if path.file_name().is_some_and(|n| n == "tests") {
-					continue;
-				}
-				walk(&path, hits);
-			} else if path.extension().is_some_and(|e| e == "rs")
-				&& !path
-					.file_name()
-					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
-			{
-				let text = std::fs::read_to_string(&path).expect("a source");
-				for (i, line) in text.lines().enumerate() {
-					let code = line.split("//").next().unwrap_or("");
-					let writes = code.contains("bottom_visible = ");
-					if writes || code.contains("&mut self.bottom_visible") {
-						hits.push(format!("{}:{}", path.display(), i + 1));
-					}
-				}
-			}
-		}
-	}
-	let mut hits = Vec::new();
-	walk(
-		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-		&mut hits,
-	);
-	assert_eq!(
-		hits.len(),
-		1,
-		"`bottom_visible` is written only in set_log_visible: {hits:#?}"
-	);
-	assert!(hits[0].contains("ui/mod.rs"), "{hits:?}");
 }

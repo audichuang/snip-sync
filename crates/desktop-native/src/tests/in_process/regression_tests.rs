@@ -320,14 +320,14 @@ fn fuzz_regression_hiding_the_log_closes_its_dropdown(cx: &mut TestAppContext) {
 		}
 		settle(cx);
 		model.read_with(cx, |m, _| {
-			assert!(!m.bottom_visible, "{hide}: the Log is hidden")
+			assert!(!m.bottom_visible.get(), "{hide}: the Log is hidden")
 		});
 		assert!(!dropdown_open(cx), "{hide}: its dropdown went with it");
 		overlays::assert_overlay_panels_match(cx, &model);
 		// Back to a bare state for the next way to hide it.
 		model.update_in(cx, |m, _, cx| m.cancel_paste_preview(cx));
 		model.update_in(cx, |m, _, cx| {
-			m.bottom_visible = true;
+			m.set_log_visible(true);
 			cx.notify();
 		});
 		settle(cx);
@@ -543,7 +543,7 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 	});
 	model.read_with(cx, |m, cx| {
 		assert!(m.selected_commit.is_none());
-		assert!(m.commit_view.selected_commit_file.is_some());
+		assert!(m.commit_view.selection().is_some());
 		invariants::assert_holds(m, cx, &[L2, L6]);
 	});
 	// "Back to Working" leaves the tree, not the editor tab: the file stays
@@ -562,7 +562,7 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 	settle(cx);
 	model.read_with(cx, |m, cx| {
 		assert!(m.preview.is_none());
-		assert!(m.commit_view.selected_commit_file.is_none());
+		assert!(m.commit_view.selection().is_none());
 		invariants::assert_holds(m, cx, &[L2, L3, L6]);
 	});
 }
@@ -604,7 +604,7 @@ fn fuzz_regression_leaving_a_rev_tree_while_its_file_is_held_keeps_the_owner(
 	model.update_in(cx, |m, _, cx| {
 		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
 		assert!(m.held_selection.is_some(), "the selection is held");
-		assert!(m.commit_view.selected_commit_file.is_none());
+		assert!(m.commit_view.selection().is_none());
 	});
 	click_probed(&model, cx, "btn-leave-tree");
 	settle(cx);
@@ -659,11 +659,9 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 	});
 	// A view that lost its owner but kept a commit's preview is a leftover.
 	model.update(cx, |m, _| {
-		m.commit_view
-			.selected_commit_file
-			.as_mut()
-			.unwrap()
-			.rev_owner = None
+		let mut sel = m.commit_view.selection().cloned().unwrap();
+		sel.rev_owner = None;
+		m.set_commit_file_selection(Some(sel));
 	});
 	model.read_with(cx, |m, cx| {
 		let broken = invariants::check(m, cx, crate::invariants::When::Always);
@@ -675,8 +673,9 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 	// Another commit takes the file's selection with the rest of the view.
 	model.update(cx, |m, _| {
 		let sha = m.commits[0].sha.clone();
-		m.commit_view.selected_commit_file =
-			Some(crate::history::CommitFileSel::from_tree("a.txt", &sha));
+		m.set_commit_file_selection(Some(
+			crate::history::CommitFileSel::from_tree("a.txt", &sha),
+		));
 	});
 	model.update_in(cx, |m, _, cx| {
 		let sha = m.commits[0].sha.clone();
@@ -741,7 +740,9 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 
 	// The flag with no tree file selected.
 	let file = model.update(cx, |m, _| {
-		m.commit_view.selected_commit_file.take().expect("a file")
+		let file = m.commit_view.selection().cloned().expect("a file");
+		m.set_commit_file_selection(None);
+		file
 	});
 	assert!(l6(cx).unwrap().is_some(), "a leftover flag is caught");
 	model.update(cx, |m, _| {
@@ -751,12 +752,12 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 
 	// A selected file the tree does not list and the preview is not.
 	model.update(cx, |m, _| {
-		m.commit_view.selected_commit_file = Some("no/such/file".into());
+		m.set_commit_file_selection(Some("no/such/file".into()));
 	});
 	assert!(l6(cx).unwrap().is_some(), "a stranger's file is caught");
 	assert!(eval(cx, L2).is_some(), "L2 catches a stranger's file too");
 	model.update(cx, |m, _| {
-		m.commit_view.selected_commit_file = Some(file);
+		m.set_commit_file_selection(Some(file));
 		m.commit_view.commit_file_sel = vec!["other".into()];
 	});
 	assert!(
@@ -771,7 +772,7 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 	// A commit preview that is not the tree's own file, with a tree open.
 	model.update(cx, |m, _| {
 		m.commit_view.commit_file_sel.clear();
-		m.commit_view.selected_commit_file = None;
+		m.set_commit_file_selection(None);
 	});
 	assert_eq!(l6(cx), Some(None), "the clean state holds");
 	let own =
@@ -964,7 +965,7 @@ fn fuzz_regression_a_live_tree_file_selection_does_not_hide_the_held_owner(
 	model.update_in(cx, |m, _, cx| {
 		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
 		assert!(m.held_selection.is_some(), "the selection is held");
-		assert!(m.commit_view.selected_commit_file.is_none());
+		assert!(m.commit_view.selection().is_none());
 		// The selection phase of another rev-file read. No I/O is run so
 		// leaving the tree deterministically happens before it lands.
 		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
@@ -1016,7 +1017,7 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 	});
 	model.update(cx, |m, _| {
 		assert!(m.selected_commit.is_none());
-		assert!(m.commit_view.selected_commit_file.is_none());
+		assert!(m.commit_view.selection().is_none());
 		// Selection phase of a pending rev-file read, before its I/O lands.
 		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
 		m.hold_shown_commit_file("a.txt", true, Some(&sha));
@@ -1046,7 +1047,7 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 	// The full restore must not retain the pending rev file's ownership.
 	model.update(cx, |m, _| m.restore_shown_selection());
 	model.read_with(cx, |m, cx| {
-		assert!(m.commit_view.selected_commit_file.is_none());
+		assert!(m.commit_view.selection().is_none());
 		invariants::assert_holds(m, cx, &[L2, L3, L6]);
 	});
 }
@@ -1301,7 +1302,10 @@ fn l10_rejects_a_selection_of_another_repo_beside_an_error_page(
 	open_unchanged_tree_file(&model, cx);
 	let (sha, alpha_root) = model.read_with(cx, |m, _| {
 		(
-			m.commit_view.rev_owner().expect("an owned file").to_string(),
+			m.commit_view
+				.rev_owner()
+				.expect("an owned file")
+				.to_string(),
 			m.repo_root().expect("alpha"),
 		)
 	});

@@ -1048,6 +1048,27 @@ fn placed_repos(
 	out
 }
 
+/// Whether the Log panel is shown. Readable everywhere; only `ui` writes it
+/// (`WorkbenchModel::set_log_visible`), which closes the dropdowns a hidden
+/// panel leaves behind (O7 of `invariants`). The compiler enforces that:
+/// the value and its setter are private to this module.
+#[derive(Clone, Copy, Debug)]
+pub struct LogPanel(bool);
+
+impl LogPanel {
+	pub const fn shown() -> Self {
+		Self(true)
+	}
+
+	pub fn get(self) -> bool {
+		self.0
+	}
+
+	fn set(&mut self, visible: bool) {
+		self.0 = visible;
+	}
+}
+
 impl WorkbenchModel {
 	/// Highlighted Project rows, in both trees.
 	pub fn selected_count(&self) -> usize {
@@ -1094,22 +1115,22 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
-	/// The one place the Log panel is shown or hidden (the guard
-	/// `the_log_panel_is_hidden_in_one_place` keeps it so). Hiding it takes
+	/// The one place the Log panel is shown or hidden: `LogPanel::set` is
+	/// private to this module, so no other code compiles a write. Hiding it takes
 	/// the dropdowns it opened along, since nothing is left to draw them
 	/// (O7 of `invariants`).
 	pub(crate) fn set_log_visible(&mut self, visible: bool) {
-		self.bottom_visible = visible;
+		self.bottom_visible.set(visible);
 		if !visible {
 			self.drop_overlays(crate::overlay::DropScope::AnyLogMenu);
 		}
 	}
 
 	fn toggle_log(&mut self, cx: &mut Context<Self>) {
-		self.set_log_visible(!self.bottom_visible);
+		self.set_log_visible(!self.bottom_visible.get());
 		// A manual toggle wins over the paste preview's auto-restore.
 		self.paste.forget_log_restore();
-		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible);
+		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible.get());
 		cx.notify();
 	}
 
@@ -1973,7 +1994,7 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &ToggleLog, window, cx| {
 				this.toggle_log(cx);
-				if this.bottom_visible {
+				if this.bottom_visible.get() {
 					window.focus(&this.log_focus);
 				}
 			}))
@@ -2096,7 +2117,7 @@ impl Render for WorkbenchModel {
 									})
 									.child(center),
 							)
-							.when(self.bottom_visible, |d| {
+							.when(self.bottom_visible.get(), |d| {
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(
 										self.render_log(bottom_h, window, cx),
