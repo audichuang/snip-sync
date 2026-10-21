@@ -571,19 +571,13 @@ pub(crate) fn eval(
 					)
 			});
 			// An error page names the selection's own file (its label is
-			// built from the selection); only its repo can be wrong.
-			let error_page =
-				m.preview.is_none() && m.preview_error.is_some() && {
-					// A tree file was opened in the current repo and a
-					// repo switch ends its selection, so the tree being
-					// open or left does not matter.
-					let home = if sel.rev_owner.is_some() {
-						m.repo_root()
-					} else {
-						view.log_commit_root.clone()
-					};
-					home.is_some() && home == m.preview_root()
-				};
+			// built from the selection); only its repo can be wrong. Each
+			// side says its own repo: the selection where it was made, the
+			// page where it was read. The current repo says neither.
+			let error_page = m.preview.is_none()
+				&& m.preview_error.is_some()
+				&& sel.root.is_some()
+				&& sel.root == m.preview_root();
 			(!(shown || error_page)).then(|| {
 				format!(
 					"the commit file {:?} is selected, and the preview is neither it, \
