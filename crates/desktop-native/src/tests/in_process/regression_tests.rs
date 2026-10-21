@@ -132,9 +132,25 @@ fn commit_shown_with(
 	Entity<WorkbenchModel>,
 	&mut VisualTestContext,
 ) {
+	commit_shown_with_files(cx, b_on_top, &[])
+}
+
+/// `commit_shown_with`, and `extra` files (name, bytes) committed with `a.txt`.
+fn commit_shown_with_files<'a>(
+	cx: &'a mut TestAppContext,
+	b_on_top: bool,
+	extra: &[(&str, &[u8])],
+) -> (
+	tempfile::TempDir,
+	Entity<WorkbenchModel>,
+	&'a mut VisualTestContext,
+) {
 	let ws = tempfile::tempdir().unwrap();
 	let alpha = repo(ws.path(), "alpha", &[]);
 	fs::write(alpha.join("a.txt"), "one").unwrap();
+	for (name, bytes) in extra {
+		fs::write(alpha.join(name), bytes).unwrap();
+	}
 	git(&alpha, &["add", "."]);
 	git(&alpha, &["commit", "-q", "-m", "add a"]);
 	if b_on_top {
@@ -1269,6 +1285,102 @@ fn fuzz_regression_a_repo_switch_to_an_unreadable_repo_keeps_no_tree_file(
 			!crumbs.contains("a.txt"),
 			"the error page is labelled {crumbs:?}"
 		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}
+
+/// Opens `name` from the tree the commit's Browse Tree button opens and waits
+/// until its read has ended, whatever it ended in.
+fn open_tree_file_any_result(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	name: &str,
+) {
+	let drawn = |cx: &mut VisualTestContext, wanted: &dyn Fn(&str) -> bool| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|d| wanted(d))
+		})
+	};
+	let browse =
+		drawn(cx, &|id| id.starts_with("btn-browse-tree:")).expect("the tree");
+	click_probed(model, cx, &browse);
+	let row = format!("rev-row:{name}");
+	settle_until(cx, "the file in the tree", |cx| {
+		drawn(cx, &|id| id == row).is_some()
+	});
+	click_probed(model, cx, &row);
+	settle_until(cx, "the file's read to end", |cx| {
+		model.read_with(cx, |m, _| {
+			!m.preview_loading && m.commit_view.selected_path() == Some(name)
+		})
+	});
+}
+
+/// L10: a tree file whose read ends in an error page (a binary file here)
+/// keeps its selection, owner included, when "Back to Working" closes the
+/// tree. The error page belongs to the repo the file was opened in, which the
+/// closed tree no longer says (#230).
+#[gpui::test]
+fn fuzz_regression_a_tree_file_error_page_survives_back_to_working(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) =
+		commit_shown_with_files(cx, true, &[("bin.dat", b"\0\x01\x02\0")]);
+	open_tree_file_any_result(&model, cx, "bin.dat");
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview_error.is_some(), "a binary file is an error page");
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview_error.is_some(), "the error page stays");
+		assert!(m.commit_view.rev_owner().is_some(), "the owner stays");
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}
+
+/// The same when the file cannot be read at all (its object is gone).
+#[gpui::test]
+fn fuzz_regression_an_unreadable_tree_file_survives_back_to_working(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) =
+		commit_shown_with_files(cx, true, &[("c.txt", b"gone")]);
+	let alpha = ws.path().join("alpha");
+	let out = std::process::Command::new("git")
+		.current_dir(&alpha)
+		.args(["rev-parse", "HEAD~1:c.txt"])
+		.output()
+		.expect("git must run");
+	let blob = String::from_utf8(out.stdout).unwrap();
+	let blob = blob.trim();
+	let object = alpha
+		.join(".git")
+		.join("objects")
+		.join(&blob[..2])
+		.join(&blob[2..]);
+	let mut perms = fs::metadata(&object).unwrap().permissions();
+	#[allow(clippy::permissions_set_readonly_false)]
+	perms.set_readonly(false);
+	fs::set_permissions(&object, perms).unwrap();
+	fs::remove_file(&object).unwrap();
+	open_tree_file_any_result(&model, cx, "c.txt");
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview_error.is_some(), "the read failed");
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview_error.is_some(), "the error page stays");
 		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
 	});
 }
