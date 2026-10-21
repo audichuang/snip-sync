@@ -2391,9 +2391,26 @@ fn remote_tour(cx: &mut TestAppContext, reach: &mut Reach) {
 		&model,
 		cx,
 		&mut env,
+		&[tap("btn-workspace-menu"), tap_nth("remote-host:", 1)],
+		reach,
+	);
+	// A host lists its home first, and what a home holds is the machine's
+	// (an empty one on a CI box has no folder to press): list the fixture's
+	// folder, which has the repos, and wait for it.
+	let shared_path = shared.path().display().to_string();
+	model.update(cx, |m, cx| m.browse_remote_folder(1, shared_path, cx));
+	settle_until(cx, "the fixture folder's listing", |cx| {
+		model.read_with(cx, |m, _| {
+			m.remote.browse.as_ref().is_some_and(|b| {
+				matches!(&b.listing, Some(Ok(l)) if !l.folders.is_empty())
+			})
+		})
+	});
+	tour(
+		&model,
+		cx,
+		&mut env,
 		&[
-			tap("btn-workspace-menu"),
-			tap_nth("remote-host:", 1),
 			tap("remote-folder:"),
 			Move::Key("escape"),
 			Move::Key("alt-1"),
