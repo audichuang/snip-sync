@@ -1503,6 +1503,104 @@ fn fuzz_regression_a_multi_selection_file_of_another_repo_records_its_repo(
 	});
 }
 
+/// The merged Log over alpha (the Project) and beta, whose newest commit
+/// adds `big.txt` over the preview limit, listed before `z.txt`.
+fn merged_log_with_oversized_beta_commit(
+	cx: &mut TestAppContext,
+) -> (
+	tempfile::TempDir,
+	Entity<WorkbenchModel>,
+	&mut VisualTestContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	repo(ws.path(), "alpha", &[]);
+	let beta = repo(ws.path(), "beta", &[]);
+	fs::write(beta.join("x.txt"), "x").unwrap();
+	git(&beta, &["add", "."]);
+	git(&beta, &["commit", "-q", "-m", "add x"]);
+	fs::write(
+		beta.join("big.txt"),
+		"x".repeat(snip_core::browser::PREVIEW_LIMIT + 10) + "\n",
+	)
+	.unwrap();
+	fs::write(beta.join("z.txt"), "z").unwrap();
+	git(&beta, &["add", "."]);
+	git(&beta, &["commit", "-q", "-m", "add big"]);
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the merged Log", |cx| {
+		model.read_with(cx, |m, _| {
+			m.repos.len() == 2
+				&& !m.is_loading
+				&& m.commits.iter().any(|c| c.subject == "add big")
+		})
+	});
+	click_probed(&model, cx, "btn-log-refresh");
+	(ws, model, cx)
+}
+
+/// An error page of a first file read in beta, while the Project is alpha,
+/// names beta: the preview root, the breadcrumb and L10 agree (#230).
+fn assert_error_page_is_beta_s(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	beta_root: &Path,
+) {
+	settle_until(cx, "the first file's error page", |cx| {
+		model.read_with(cx, |m, _| {
+			!m.preview_loading && m.preview_error.is_some()
+		})
+	});
+	model.read_with(cx, |m, cx| {
+		assert_ne!(
+			m.repo_root().map(|r| fs::canonicalize(r).unwrap()),
+			Some(beta_root.to_path_buf()),
+			"the Project stays on alpha"
+		);
+		assert_eq!(
+			m.preview_root().map(|r| fs::canonicalize(r).unwrap()),
+			Some(beta_root.to_path_buf()),
+			"the error page names the repo it was read in"
+		);
+		let crumbs = m.source_labels().1;
+		assert!(
+			crumbs.contains("beta") && !crumbs.contains("alpha"),
+			"the breadcrumb names the wrong repo: {crumbs}"
+		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}
+
+/// The first changed file of a beta commit is over the preview limit while
+/// the Project is alpha: its error page is beta's, not the Project's (#230).
+#[gpui::test]
+fn fuzz_regression_an_oversized_first_file_of_another_repo_names_that_repo(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = merged_log_with_oversized_beta_commit(cx);
+	let beta_root = fs::canonicalize(ws.path().join("beta")).unwrap();
+	let row = beta_row(&model, cx, "add big");
+	click_probed(&model, cx, &row);
+	assert_error_page_is_beta_s(&model, cx, &beta_root);
+}
+
+/// The same for a Compare of two beta commits.
+#[gpui::test]
+fn fuzz_regression_an_oversized_first_compare_file_of_another_repo_names_that_repo(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = merged_log_with_oversized_beta_commit(cx);
+	let beta_root = fs::canonicalize(ws.path().join("beta")).unwrap();
+	let newest = beta_row(&model, cx, "add big");
+	let oldest = beta_row(&model, cx, "add x");
+	click_probed(&model, cx, &newest);
+	click_probed_with(&model, cx, &oldest, gpui::Modifiers::shift());
+	settle(cx);
+	click_probed(&model, cx, "btn-compare");
+	model.read_with(cx, |m, _| assert!(m.compare.is_some(), "Compare ran"));
+	assert_error_page_is_beta_s(&model, cx, &beta_root);
+}
+
 /// Opens `name` from the tree the commit's Browse Tree button opens and waits
 /// until its read has ended, whatever it ended in.
 fn open_tree_file_any_result(
