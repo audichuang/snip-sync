@@ -1560,6 +1560,26 @@ fn fuzz_regression_a_tree_file_error_page_survives_back_to_working(
 	});
 }
 
+/// A fixture repo is never repacked behind a test: `git commit` starts
+/// `git maintenance run --auto --detach`, and under load it packed the loose
+/// objects of a repo whose test then deleted one by its loose path (a
+/// multi-pack-index and one pack were all that was left, #230).
+#[test]
+fn a_fixture_repo_is_not_repacked_behind_a_test() {
+	let ws = tempfile::tempdir().unwrap();
+	let alpha = repo(ws.path(), "alpha", &[]);
+	let get = |key: &str| {
+		let out = std::process::Command::new("git")
+			.current_dir(&alpha)
+			.args(["config", "--get", key])
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	};
+	assert_eq!(get("gc.auto"), "0");
+	assert_eq!(get("maintenance.auto"), "false");
+}
+
 /// The same when the file cannot be read at all (its object is gone).
 #[gpui::test]
 fn fuzz_regression_an_unreadable_tree_file_survives_back_to_working(
