@@ -1395,8 +1395,7 @@ impl WorkbenchModel {
 				let deleted = ct == Some(ChangeType::Deleted);
 				let sel = self.rev_tree.is_none()
 					&& if self.commit_view.commit_file_sel.is_empty() {
-						self.commit_view.selected_commit_file.as_deref()
-							== Some(&path)
+						self.commit_view.selected_path() == Some(&path)
 					} else {
 						self.commit_view.commit_file_sel.contains(&path)
 					};

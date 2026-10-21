@@ -610,11 +610,17 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 	tree_file_then_leave(cx);
 	model.read_with(cx, |m, cx| {
 		assert!(m.rev_tree.is_none() && m.selected_commit.is_none());
-		assert!(m.commit_view.rev_file_sha.is_some(), "the tab is the owner");
+		assert!(m.commit_view.rev_owner().is_some(), "the tab is the owner");
 		invariants::assert_holds(m, cx, &[L1, L2, L3, L4, L5, L6]);
 	});
 	// A view that lost its owner but kept a commit's preview is a leftover.
-	model.update(cx, |m, _| m.commit_view.rev_file_sha = None);
+	model.update(cx, |m, _| {
+		m.commit_view
+			.selected_commit_file
+			.as_mut()
+			.unwrap()
+			.rev_owner = None
+	});
 	model.read_with(cx, |m, cx| {
 		let broken = invariants::check(m, cx, crate::invariants::When::Always);
 		assert!(
@@ -624,7 +630,8 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 	});
 	// Another commit takes the file's selection with the rest of the view.
 	model.update(cx, |m, _| {
-		m.commit_view.rev_file_sha = Some(m.commits[0].sha.clone())
+		let sha = m.commits[0].sha.clone();
+		m.commit_view.own_selected_file(&sha)
 	});
 	model.update_in(cx, |m, _, cx| {
 		let sha = m.commits[0].sha.clone();
@@ -634,7 +641,7 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
 	});
 	model.read_with(cx, |m, cx| {
-		assert!(m.commit_view.rev_file_sha.is_none(), "the owner went");
+		assert!(m.commit_view.rev_owner().is_none(), "the owner went");
 		invariants::assert_holds(m, cx, &[L1, L2, L3, L4, L5, L6]);
 	});
 }

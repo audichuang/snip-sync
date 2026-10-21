@@ -4640,7 +4640,7 @@ impl WorkbenchModel {
 			self.selected_file = None;
 			self.selected_file_root = None;
 		}
-		self.commit_view.selected_commit_file = Some(path.to_string());
+		self.commit_view.selected_commit_file = Some(path.into());
 		self.commit_view.commit_file_sel.clear();
 	}
 
@@ -4656,10 +4656,6 @@ impl WorkbenchModel {
 			self.commit_view.selected_commit_file =
 				held.view.selected_commit_file;
 			self.commit_view.commit_file_sel = held.view.commit_file_sel;
-			// The owner of a tree file goes with the file it was set for.
-			if self.commit_view.selected_commit_file.is_none() {
-				self.commit_view.rev_file_sha = None;
-			}
 			self.preview_pending_from_log = pending;
 			return;
 		}
@@ -23464,7 +23460,7 @@ mod tests {
 			});
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the first listed file is shown",
 				);
@@ -23495,7 +23491,7 @@ mod tests {
 					Some("a_small.txt"),
 				);
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the selection names a file nothing shows",
 				);
@@ -23536,7 +23532,7 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(commit_preview_shown(m), "the shown diff stays");
 				assert_eq!(
-					m.commit_view.selected_commit_file.as_deref(),
+					m.commit_view.selected_path(),
 					Some("a_small.txt"),
 					"the selection names a file nothing shows",
 				);

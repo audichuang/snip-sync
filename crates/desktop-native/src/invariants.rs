@@ -351,13 +351,13 @@ fn roots_text(m: &WorkbenchModel) -> String {
 
 /// The commit a rev-tree file belongs to: the open tree's, or, once "Back to
 /// Working" left the tree, the one the file's tab remembers
-/// (`CommitView::rev_file_sha`). The tab and the tree are independent, so the
+/// (`CommitFileSel::rev_owner`, kept with the selection). The tab and the tree are independent, so the
 /// file's ownership does not end with the tree.
 fn rev_owner(m: &WorkbenchModel) -> Option<&str> {
 	m.rev_tree
 		.as_ref()
 		.map(|tree| tree.sha.as_str())
-		.or(m.commit_view.rev_file_sha.as_deref())
+		.or(m.commit_view.rev_owner())
 }
 
 /// Whether `path` is a file a rev tree owns: the open tree lists it, or the
@@ -377,8 +377,7 @@ fn tree_owns_file(m: &WorkbenchModel, path: &str) -> bool {
 					&p.source,
 					PreviewSource::CommitFile { sha } if sha == owner
 				)
-		}) || (m.rev_tree.is_none()
-		&& m.commit_view.selected_commit_file.as_deref() == Some(path))
+		}) || (m.rev_tree.is_none() && m.commit_view.selected_path() == Some(path))
 }
 
 /// One member; `None` means it holds. A member the driver evaluates
@@ -401,7 +400,7 @@ pub(crate) fn eval(
 		L1 => (m.range_head.is_some() && m.selected_commit.is_none())
 			.then(|| "a range endpoint without a selected commit".to_string()),
 		L2 => {
-			let open = view.selected_commit_file.as_ref()?;
+			let open = view.selected_path()?;
 			let listed = view.commit_files.iter().any(|(p, _)| p == open)
 				|| tree_owns_file(m, open);
 			(!listed).then(|| {
@@ -469,8 +468,7 @@ pub(crate) fn eval(
 			// allowed: no commit file selection of the Log, and the Log's
 			// preview flag is the tree file's.
 			let tree_file = view
-				.selected_commit_file
-				.as_deref()
+				.selected_path()
 				.is_some_and(|path| tree_owns_file(m, path));
 			let reset = if tree_file {
 				view.is_reset_but_for_tree_file()
@@ -508,8 +506,7 @@ pub(crate) fn eval(
 						m.rev_tree
 							.as_ref()
 							.is_some_and(|tree| tree.lists_file(path))
-							|| view.selected_commit_file.as_deref()
-								== Some(path)
+							|| view.selected_path() == Some(path)
 					})
 				});
 				from_log && !tree_own
