@@ -349,25 +349,20 @@ fn roots_text(m: &WorkbenchModel) -> String {
 	format!("{roots:?} + {:?} + {:?}", m.workspace_root, m.ws_home)
 }
 
-/// The commit a rev-tree file belongs to: the open tree's, or, once "Back to
-/// Working" left the tree, the one the file's tab remembers
-/// (`CommitFileSel::rev_owner`, kept with the selection). The tab and the tree are independent, so the
-/// file's ownership does not end with the tree.
-fn rev_owner(m: &WorkbenchModel) -> Option<&str> {
-	m.rev_tree
-		.as_ref()
-		.map(|tree| tree.sha.as_str())
-		.or(m.commit_view.rev_owner())
+/// Whether `sha` is a commit a rev-tree file may belong to: the open tree's,
+/// or the one the selected file was opened from (`CommitFileSel::rev_owner`,
+/// fixed at the open and kept with the selection). The tab and the tree are
+/// independent, so the file's ownership does not end with the tree.
+fn is_rev_owner(m: &WorkbenchModel, sha: &str) -> bool {
+	m.rev_tree.as_ref().is_some_and(|tree| tree.sha == sha)
+		|| m.commit_view.rev_owner() == Some(sha)
 }
 
-/// Whether `path` is a file a rev tree owns: the open tree lists it, or the
-/// preview shows it as a file of the owning commit, or the tab kept it after
-/// the tree was left. Only then may a commit view name it with no row of the
-/// Log's list behind it.
+/// Whether `path` is a file a rev tree owns: the open tree lists it, the
+/// preview shows it as a file of an owning commit, or the selection was
+/// opened from a tree (it has an owner) and names it. Only then may a commit
+/// view name it with no row of the Log's list behind it.
 fn tree_owns_file(m: &WorkbenchModel, path: &str) -> bool {
-	let Some(owner) = rev_owner(m) else {
-		return false;
-	};
 	m.rev_tree
 		.as_ref()
 		.is_some_and(|tree| tree.lists_file(path))
@@ -375,9 +370,10 @@ fn tree_owns_file(m: &WorkbenchModel, path: &str) -> bool {
 			p.path.as_deref() == Some(path)
 				&& matches!(
 					&p.source,
-					PreviewSource::CommitFile { sha } if sha == owner
+					PreviewSource::CommitFile { sha } if is_rev_owner(m, sha)
 				)
-		}) || (m.rev_tree.is_none() && m.commit_view.selected_path() == Some(path))
+		}) || (m.commit_view.rev_owner().is_some()
+		&& m.commit_view.selected_path() == Some(path))
 }
 
 /// One member; `None` means it holds. A member the driver evaluates
@@ -495,19 +491,18 @@ pub(crate) fn eval(
 						| PreviewSource::CommitFile { .. }
 						| PreviewSource::Compare { .. }
 				);
-				let tree_own = rev_owner(m).is_some_and(|owner| {
-					matches!(
-						&p.source,
-						PreviewSource::CommitFile { sha } if sha == owner
-					) && p.path.as_deref().is_some_and(|path| {
-						// Listed by the tree, or the file the tree opened
-						// (a listing the budget evicted does not answer), or
-						// the one its tab kept after the tree was left.
-						m.rev_tree
-							.as_ref()
-							.is_some_and(|tree| tree.lists_file(path))
-							|| view.selected_path() == Some(path)
-					})
+				let tree_own = matches!(
+					&p.source,
+					PreviewSource::CommitFile { sha } if is_rev_owner(m, sha)
+				) && p.path.as_deref().is_some_and(|path| {
+					// Listed by the tree, or the file the tree opened (a
+					// listing the budget evicted does not answer) and its
+					// tab kept after the tree was left: an owned selection.
+					m.rev_tree
+						.as_ref()
+						.is_some_and(|tree| tree.lists_file(path))
+						|| (view.rev_owner().is_some()
+							&& view.selected_path() == Some(path))
 				});
 				from_log && !tree_own
 			});

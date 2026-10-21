@@ -4606,12 +4606,14 @@ impl WorkbenchModel {
 	/// Names `path` as the commit view's file and sets aside what the shown
 	/// preview's file selection was, unless an earlier read already did.
 	/// `clear_file` is for a read that leaves the working-file selection
-	/// (a commit tree's file). The commit, its list and its details stay: a
+	/// (a commit tree's file); `tree_sha` is that tree's commit, which owns
+	/// the file from here on. The commit, its list and its details stay: a
 	/// refusal puts the file selection back, a landed read releases it.
 	pub(crate) fn hold_shown_commit_file(
 		&mut self,
 		path: &str,
 		clear_file: bool,
+		tree_sha: Option<&str>,
 	) {
 		let shown = self.preview.is_some() && self.preview_error.is_none();
 		if shown && self.held_selection.is_none() {
@@ -4640,7 +4642,10 @@ impl WorkbenchModel {
 			self.selected_file = None;
 			self.selected_file_root = None;
 		}
-		self.commit_view.selected_commit_file = Some(path.into());
+		self.commit_view.selected_commit_file = Some(match tree_sha {
+			Some(sha) => crate::history::CommitFileSel::from_tree(path, sha),
+			None => path.into(),
+		});
 		self.commit_view.commit_file_sel.clear();
 	}
 

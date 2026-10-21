@@ -186,11 +186,16 @@ impl CommitView {
 /// A file selected in the commit view, and whose it is.
 ///
 /// `rev_owner` is the SHA of the commit whose tree the file was opened from,
-/// set once "Back to Working" left that tree: the file's tab stays open (the
-/// tab and the tree are independent), and this says whose file it is while no
-/// tree lists it. It lives here, not beside the selection, so that no
-/// selection means no owner by construction, and a selection that is held,
-/// promoted, restored or dropped takes its owner along.
+/// fixed when it is opened (`CommitFileSel::from_tree`). A file picked from
+/// the commit's change list has none: the list says it belongs. The file's tab
+/// stays open after "Back to Working" (the tab and the tree are independent),
+/// and the owner says whose file it is while no tree lists it; opening
+/// the file from a tree of a commit that did not change it is the case that
+/// no list can answer for, which is why the owner is recorded at the open
+/// rather than reconstructed when the tree is left. It lives here, not beside
+/// the selection, so that no selection means no owner by construction, and a
+/// selection that is held, promoted, restored or dropped takes its owner
+/// along whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitFileSel {
 	pub path: String,
@@ -202,6 +207,14 @@ impl CommitFileSel {
 		Self {
 			path: path.into(),
 			rev_owner: None,
+		}
+	}
+
+	/// A file opened from the tree of commit `sha`.
+	pub fn from_tree(path: impl Into<String>, sha: &str) -> Self {
+		Self {
+			path: path.into(),
+			rev_owner: Some(sha.to_string()),
 		}
 	}
 }
@@ -224,19 +237,12 @@ impl CommitView {
 		self.selected_commit_file.as_ref().map(|s| s.path.as_str())
 	}
 
-	/// The commit whose tree the selected file was opened from, once the
-	/// tree was left. None without a selection.
+	/// The commit whose tree the selected file was opened from. None without
+	/// a selection, and for a file of the change list.
 	pub fn rev_owner(&self) -> Option<&str> {
 		self.selected_commit_file
 			.as_ref()
 			.and_then(|s| s.rev_owner.as_deref())
-	}
-
-	/// Records `sha` as the owner of the selected file, if there is one.
-	pub fn own_selected_file(&mut self, sha: &str) {
-		if let Some(sel) = &mut self.selected_commit_file {
-			sel.rev_owner = Some(sha.to_string());
-		}
 	}
 }
 
@@ -3035,7 +3041,7 @@ impl WorkbenchModel {
 			return;
 		};
 		let task_generation = self.preview_generation.bump();
-		self.hold_shown_commit_file(path, false);
+		self.hold_shown_commit_file(path, false, None);
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -3229,29 +3235,10 @@ impl WorkbenchModel {
 	pub fn leave_rev_tree(&mut self, cx: &mut Context<Self>) {
 		self.tree_generation.invalidate();
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
-		// The tree's open file stays open, and is the tab's from here on:
-		// say whose it is, now that no tree lists it. Every selection that
-		// names a file of the tree takes the owner: the live one, and the
-		// held one (a working-file read in flight sets the file's selection
-		// aside, whole or only the file part), so restoring brings it back.
-		if let Some(tree) = &self.rev_tree {
-			let sha = tree.sha.as_str();
-			if self.selected_commit.is_none() {
-				self.commit_view.own_selected_file(sha);
-			}
-			if let Some(held) = self.held_selection.as_mut() {
-				// A partial hold is a file selection of the live commit
-				// state; a full one has its own commit.
-				let no_commit = if held.commit_file_only.is_some() {
-					self.selected_commit.is_none()
-				} else {
-					held.commit.is_none()
-				};
-				if no_commit {
-					held.view.own_selected_file(sha);
-				}
-			}
-		}
+		// The tree's open file stays open and is the tab's from here on. Its
+		// selection already names the commit it came from (`from_tree`), so
+		// there is nothing to record: wherever that selection was moved to
+		// (held, promoted, restored), the owner went with it.
 		self.rev_tree = None;
 		self.tree_cursor = 0;
 		app_log!("[APP:REV_TREE: off]");
@@ -3367,7 +3354,7 @@ impl WorkbenchModel {
 		let host = self.git_host();
 		let identity = self.identity_for(&root);
 
-		self.hold_shown_commit_file(&path, true);
+		self.hold_shown_commit_file(&path, true, Some(&sha));
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -4298,17 +4285,17 @@ impl WorkbenchModel {
 mod tests {
 	/// The owner of a tree file is a part of the selection value: with no
 	/// selection there is no owner (the field does not exist apart from it),
-	/// a selection with one is not a reset view, and taking the selection
-	/// takes the owner.
+	/// a file of the change list has none, a tree file has its tree's commit
+	/// from the open, and taking the selection takes the owner.
 	#[test]
 	fn no_selection_means_no_owner() {
 		let mut view = CommitView::default();
-		view.own_selected_file("deadbeef");
 		assert_eq!(view.rev_owner(), None, "nothing selected, nothing owned");
 		assert!(view.is_reset());
 		view.selected_commit_file = Some("a.txt".into());
-		assert_eq!(view.rev_owner(), None, "a new selection is unowned");
-		view.own_selected_file("deadbeef");
+		assert_eq!(view.rev_owner(), None, "a listed file is unowned");
+		view.selected_commit_file =
+			Some(CommitFileSel::from_tree("a.txt", "deadbeef"));
 		assert_eq!(view.rev_owner(), Some("deadbeef"));
 		assert!(!view.is_reset());
 		let moved = view.selected_commit_file.take();

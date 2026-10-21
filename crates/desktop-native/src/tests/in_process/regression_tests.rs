@@ -659,7 +659,8 @@ fn fuzz_regression_a_left_rev_tree_file_ends_with_the_next_selection(
 	// Another commit takes the file's selection with the rest of the view.
 	model.update(cx, |m, _| {
 		let sha = m.commits[0].sha.clone();
-		m.commit_view.own_selected_file(&sha)
+		m.commit_view.selected_commit_file =
+			Some(crate::history::CommitFileSel::from_tree("a.txt", &sha));
 	});
 	model.update_in(cx, |m, _, cx| {
 		let sha = m.commits[0].sha.clone();
@@ -950,7 +951,8 @@ fn fuzz_regression_a_live_tree_file_selection_does_not_hide_the_held_owner(
 		assert!(m.commit_view.selected_commit_file.is_none());
 		// The selection phase of another rev-file read. No I/O is run so
 		// leaving the tree deterministically happens before it lands.
-		m.hold_shown_commit_file("a.txt", true);
+		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
+		m.hold_shown_commit_file("a.txt", true, Some(&sha));
 		m.preview_pending_from_log = true;
 	});
 	click_probed(&model, cx, "btn-leave-tree");
@@ -1000,7 +1002,8 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 		assert!(m.selected_commit.is_none());
 		assert!(m.commit_view.selected_commit_file.is_none());
 		// Selection phase of a pending rev-file read, before its I/O lands.
-		m.hold_shown_commit_file("a.txt", true);
+		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
+		m.hold_shown_commit_file("a.txt", true, Some(&sha));
 		m.preview_pending_from_log = true;
 		m.preview_loading = true;
 		assert!(m
