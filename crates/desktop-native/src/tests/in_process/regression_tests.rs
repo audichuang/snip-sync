@@ -606,6 +606,21 @@ fn fuzz_regression_an_open_rev_tree_excuses_only_its_own_file(
 	}
 	model.update(cx, |m, _| m.preview.as_mut().unwrap().source = own);
 	assert_eq!(l6(cx), Some(None), "the tree's own file is legal again");
+
+	// The tree's commit, but a file the tree does not list: a leftover.
+	let own_path = model.update(cx, |m, _| {
+		m.preview
+			.as_mut()
+			.unwrap()
+			.path
+			.replace("no/such/file".into())
+	});
+	assert!(
+		l6(cx).unwrap().is_some(),
+		"a preview of a file the tree does not list is caught"
+	);
+	model.update(cx, |m, _| m.preview.as_mut().unwrap().path = own_path);
+	assert_eq!(l6(cx), Some(None), "the listed file is legal again");
 }
 
 /// A fixture with two commits in the open repo, the Log read.
