@@ -2778,7 +2778,10 @@ fn selection_writes_outside_tests(text: &str) -> Vec<usize> {
 			prev = line;
 			continue;
 		}
-		if prev == "#[cfg(test)]" && line.starts_with("mod ") {
+		if prev == "#[cfg(test)]"
+			&& line.starts_with("mod ")
+			&& line.trim_end().ends_with('{')
+		{
 			in_test_mod = true;
 			prev = line;
 			continue;
