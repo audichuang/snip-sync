@@ -89,19 +89,8 @@ fn dir_key(path: &str) -> crate::paste::DirKey {
 /// driver evaluates, which have no model state of their own to break.
 fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 	fn held(m: &mut WorkbenchModel) {
-		m.held_selection = Some(crate::ShownSelection {
-			file: None,
-			source: None,
-			root: None,
-			commit: None,
-			view: Default::default(),
-			log_selected: Vec::new(),
-			range_head: None,
-			compare: None,
-			log_selection_expanded: false,
-			log_branches_all: Vec::new(),
-			commit_file_only: None,
-		});
+		m.held_selection =
+			Some(crate::history::ShownSelection::empty_for_tests());
 	}
 	fn no_selection(m: &mut WorkbenchModel) {
 		m.held_selection = None;

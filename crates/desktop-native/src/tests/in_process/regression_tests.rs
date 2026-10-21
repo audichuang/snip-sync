@@ -917,7 +917,7 @@ fn fuzz_regression_details_landing_on_a_held_selection_survive_its_restore(
 	model.update(cx, |m, _| {
 		let held = m.held_selection.as_ref().expect("still held");
 		assert_eq!(
-			held.view.commit_details.as_ref().map(|d| d.sha.as_str()),
+			held.view().commit_details.as_ref().map(|d| d.sha.as_str()),
 			Some(id.as_str()),
 			"the details landed on the held view"
 		);
@@ -969,7 +969,8 @@ fn fuzz_regression_a_live_tree_file_selection_does_not_hide_the_held_owner(
 		// The selection phase of another rev-file read. No I/O is run so
 		// leaving the tree deterministically happens before it lands.
 		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
-		m.hold_shown_commit_file("a.txt", true, Some(&sha));
+		let root = m.repo_root();
+		m.hold_shown_commit_file("a.txt", true, Some(&sha), root);
 		m.preview_pending_from_log = true;
 	});
 	click_probed(&model, cx, "btn-leave-tree");
@@ -1020,15 +1021,11 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 		assert!(m.commit_view.selection().is_none());
 		// Selection phase of a pending rev-file read, before its I/O lands.
 		let sha = m.rev_tree.as_ref().unwrap().sha.clone();
-		m.hold_shown_commit_file("a.txt", true, Some(&sha));
+		let root = m.repo_root();
+		m.hold_shown_commit_file("a.txt", true, Some(&sha), root);
 		m.preview_pending_from_log = true;
 		m.preview_loading = true;
-		assert!(m
-			.held_selection
-			.as_ref()
-			.unwrap()
-			.commit_file_only
-			.is_some());
+		assert!(m.held_selection.as_ref().unwrap().is_commit_file_only());
 	});
 	click_probed(&model, cx, "btn-leave-tree");
 	settle(cx);
@@ -1041,7 +1038,8 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 			.held_selection
 			.as_ref()
 			.unwrap()
-			.commit_file_only
+			.is_commit_file_only()
+			.then_some(())
 			.is_none());
 	});
 	// The full restore must not retain the pending rev file's ownership.
@@ -1327,6 +1325,181 @@ fn l10_rejects_a_selection_of_another_repo_beside_an_error_page(
 			invariants::eval(L10, m, cx).is_some(),
 			"alpha's selection beside beta's error page must be caught"
 		);
+	});
+}
+
+/// A workspace whose open repo is alpha and whose merged Log also lists
+/// beta's commits `add x` (x.txt) and `add y` (y.txt, y2.txt, newest). The
+/// Log is read and the rows are drawn.
+fn merged_log_with_beta_commits(
+	cx: &mut TestAppContext,
+) -> (
+	tempfile::TempDir,
+	Entity<WorkbenchModel>,
+	&mut VisualTestContext,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	repo(ws.path(), "alpha", &[]);
+	let beta = repo(ws.path(), "beta", &[]);
+	for (subject, files) in [
+		("add x", &["x.txt"][..]),
+		("add y", &["y.txt", "y2.txt"][..]),
+	] {
+		for f in files {
+			fs::write(beta.join(f), *f).unwrap();
+		}
+		git(&beta, &["add", "."]);
+		git(&beta, &["commit", "-q", "-m", subject]);
+	}
+	let (model, cx) =
+		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+	settle_until(cx, "the merged Log", |cx| {
+		model.read_with(cx, |m, _| {
+			m.repos.len() == 2
+				&& !m.is_loading
+				&& m.commits.iter().any(|c| c.subject == "add y")
+		})
+	});
+	click_probed(&model, cx, "btn-log-refresh");
+	(ws, model, cx)
+}
+
+/// The probe id of the merged Log's row of beta's commit `subject`.
+fn beta_row(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	subject: &str,
+) -> String {
+	model.read_with(cx, |m, _| {
+		let sha = m
+			.commits
+			.iter()
+			.find(|c| c.subject == subject)
+			.map(|c| c.sha.get(..7).unwrap_or(&c.sha).to_string())
+			.expect("the commit is in the Log");
+		let id = format!("commit-row:beta:{sha}");
+		assert!(
+			m.probes.as_ref().unwrap().bounds(&id).is_some(),
+			"the Log drew {id}"
+		);
+		id
+	})
+}
+
+/// Clicks the probed control `id` with `mods` held.
+fn click_probed_with(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	id: &str,
+	mods: gpui::Modifiers,
+) {
+	let b = model
+		.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+		.unwrap_or_else(|| panic!("no probed control {id}"));
+	let scale = cx.update(|window, _| window.scale_factor());
+	cx.simulate_click(
+		gpui::point(
+			gpui::px((b[0] + b[2] / 2) as f32 / scale),
+			gpui::px((b[1] + b[3] / 2) as f32 / scale),
+		),
+		mods,
+	);
+	settle(cx);
+}
+
+/// A changed file picked from a commit of another repo than the Project's
+/// belongs to the Log's repo, not to the open one: when its read fails, the
+/// error page is beta's and the selection must say beta too, or L10 calls a
+/// legal error page a stray one (#230).
+#[gpui::test]
+fn fuzz_regression_a_log_file_of_another_repo_records_the_repo_it_was_read_in(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = merged_log_with_beta_commits(cx);
+	let beta_root = fs::canonicalize(ws.path().join("beta")).unwrap();
+	let row = beta_row(&model, cx, "add y");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "beta's commit", |cx| {
+		model.read_with(cx, |m, _| {
+			m.selected_commit.is_some()
+				&& m.preview.is_some()
+				&& !m.preview_loading
+				&& m.commit_view.commit_files.len() == 2
+		})
+	});
+	model.read_with(cx, |m, _| {
+		assert_ne!(
+			m.repo_root().map(|r| fs::canonicalize(r).unwrap()),
+			Some(beta_root.clone()),
+			"the Project stays on alpha"
+		);
+	});
+	fs::remove_dir_all(ws.path().join("beta").join(".git")).unwrap();
+	let other = model.read_with(cx, |m, _| {
+		m.commit_view
+			.commit_files
+			.iter()
+			.map(|(p, _)| p.clone())
+			.find(|p| Some(p.as_str()) != m.commit_view.selected_path())
+			.expect("a second file")
+	});
+	click_probed(&model, cx, &format!("commit-file:{other}"));
+	settle_until(cx, "the file's read to end", |cx| {
+		model.read_with(cx, |m, _| !m.preview_loading)
+	});
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview_error.is_some(), "beta's error page is shown");
+		let sel = m.commit_view.selection().expect("the file is selected");
+		assert_eq!(
+			sel.root.as_ref().map(|r| fs::canonicalize(r).unwrap()),
+			Some(beta_root),
+			"the selection was made in beta"
+		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
+	});
+}
+
+/// The same for a multi-selection of beta's commits: the file read from it
+/// takes its repo from the selection's newest commit, not from the Project.
+#[gpui::test]
+fn fuzz_regression_a_multi_selection_file_of_another_repo_records_its_repo(
+	cx: &mut TestAppContext,
+) {
+	let (ws, model, cx) = merged_log_with_beta_commits(cx);
+	let beta_root = fs::canonicalize(ws.path().join("beta")).unwrap();
+	let newest = beta_row(&model, cx, "add y");
+	let oldest = beta_row(&model, cx, "add x");
+	click_probed(&model, cx, &newest);
+	click_probed_with(&model, cx, &oldest, gpui::Modifiers::shift());
+	settle_until(cx, "the multi-selection's files", |cx| {
+		model.read_with(cx, |m, _| {
+			m.log_selected.len() > 1
+				&& !m.preview_loading
+				&& m.commit_view.commit_files.len() >= 2
+		})
+	});
+	fs::remove_dir_all(ws.path().join("beta").join(".git")).unwrap();
+	let other = model.read_with(cx, |m, _| {
+		m.commit_view
+			.commit_files
+			.iter()
+			.map(|(p, _)| p.clone())
+			.find(|p| Some(p.as_str()) != m.commit_view.selected_path())
+			.expect("a second file")
+	});
+	click_probed(&model, cx, &format!("commit-file:{other}"));
+	settle_until(cx, "the file's read to end", |cx| {
+		model.read_with(cx, |m, _| !m.preview_loading)
+	});
+	model.read_with(cx, |m, cx| {
+		assert!(m.preview_error.is_some(), "beta's error page is shown");
+		let sel = m.commit_view.selection().expect("the file is selected");
+		assert_eq!(
+			sel.root.as_ref().map(|r| fs::canonicalize(r).unwrap()),
+			Some(beta_root),
+			"the selection was made in beta"
+		);
+		invariants::assert_holds(m, cx, &[L2, L3, L6, L9, L10]);
 	});
 }
 

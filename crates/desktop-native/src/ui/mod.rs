@@ -1051,8 +1051,11 @@ fn placed_repos(
 /// Whether the Log panel is shown. Readable everywhere; only `ui` writes it
 /// (`WorkbenchModel::set_log_visible`), which closes the dropdowns a hidden
 /// panel leaves behind (O7 of `invariants`). The compiler enforces that:
-/// the value and its setter are private to this module.
-#[derive(Clone, Copy, Debug)]
+/// the value and its setter are private to this module. Neither `Copy` nor
+/// `Clone` nor `Default`: an old value cannot be kept and written back over
+/// the live one, and the only constructor makes a shown panel (a hidden one
+/// is made through `set_log_visible` alone).
+#[derive(Debug)]
 pub struct LogPanel(bool);
 
 impl LogPanel {
@@ -1060,7 +1063,7 @@ impl LogPanel {
 		Self(true)
 	}
 
-	pub fn get(self) -> bool {
+	pub fn get(&self) -> bool {
 		self.0
 	}
 

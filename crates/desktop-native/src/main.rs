@@ -937,7 +937,7 @@ pub struct WorkbenchModel {
 	/// that may replace it is in flight. It follows the shown content, not
 	/// one request: a read that supersedes another keeps it, and it ends only
 	/// when the preview is replaced, cleared or its reads are dropped.
-	held_selection: Option<ShownSelection>,
+	held_selection: Option<history::ShownSelection>,
 	/// The latest preview read came from the Log (commit, compare,
 	/// multi-selection, commit file or commit tree). Only a Project/Changes
 	/// read or `clear_commit_selection` resets it, so it outlives
@@ -1129,28 +1129,6 @@ pub struct WorkbenchModel {
 }
 
 impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
-
-/// Everything a file read takes from the model while it is in flight, so a
-/// refusal by the retained budget can name the still shown preview again.
-/// The commit view goes back whole: the file list and its origins index
-/// `log_selected`, and a compare's list belongs to its endpoints.
-struct ShownSelection {
-	file: Option<String>,
-	source: Option<SourceKind>,
-	root: Option<PathBuf>,
-	commit: Option<String>,
-	view: crate::history::CommitView,
-	log_selected: Vec<String>,
-	range_head: Option<String>,
-	compare: Option<(String, String)>,
-	log_selection_expanded: bool,
-	log_branches_all: Vec<String>,
-	/// Set aside by a read of the commit view's own file list: only the
-	/// file selection (`file`, `source`, `root`, the view's selected file and
-	/// its multi-selection) is held, the rest of the commit state is still
-	/// on the model. `pending_from_log` is the flag that read replaced.
-	commit_file_only: Option<bool>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Splitter {
@@ -1450,7 +1428,7 @@ impl WorkbenchModel {
 			collapsed_merges: Vec::new(),
 			hidden_commits: Vec::new(),
 			history_walk: None,
-			selected_commit: Default::default(),
+			selected_commit: history::SelectedCommit::none(),
 			range_head: None,
 			log_selected: Vec::new(),
 			log_scroll: gpui::UniformListScrollHandle::new(),
@@ -1486,7 +1464,7 @@ impl WorkbenchModel {
 			details_generation: Default::default(),
 			details_cancel: None,
 			git_user_email: None,
-			commit_view: Default::default(),
+			commit_view: history::CommitView::at_startup(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -4560,121 +4538,6 @@ impl WorkbenchModel {
 				cx.notify();
 			});
 		});
-	}
-
-	/// Names `path` as the selection and sets aside what the shown preview's
-	/// selection was, unless an earlier read already did: its snapshot still
-	/// describes the shown preview, while what is on the model now is only
-	/// what that read left behind.
-	fn hold_shown_selection(&mut self, path: &str, source: &SourceKind) {
-		let file = self.selected_file.replace(path.to_string());
-		let file_source = self.selected_file_source.replace(source.clone());
-		let shown = self.preview.is_some() && self.preview_error.is_none();
-		// A commit file read left the commit state on the model: this read
-		// takes it, and the snapshot keeps that read's file selection.
-		let partial = match self.held_selection.take() {
-			Some(h) if h.commit_file_only.is_some() => Some(h),
-			other => {
-				self.held_selection = other;
-				None
-			}
-		};
-		if self.held_selection.is_some() {
-			// The earlier read took the rest already.
-			return;
-		}
-		let mut held = ShownSelection {
-			file,
-			source: file_source,
-			root: self.selected_file_root.clone(),
-			commit: self.take_selected_commit(),
-			// Taking the view resets it.
-			view: std::mem::take(&mut self.commit_view),
-			log_selected: std::mem::take(&mut self.log_selected),
-			range_head: self.range_head.take(),
-			compare: self.compare.take(),
-			log_selection_expanded: std::mem::take(
-				&mut self.log_selection_expanded,
-			),
-			log_branches_all: std::mem::take(&mut self.log_branches_all),
-			commit_file_only: None,
-		};
-		if let Some(early) = partial {
-			held.file = early.file;
-			held.source = early.source;
-			held.root = early.root;
-			held.view.adopt_file_selection_of(early.view);
-		}
-		self.held_selection = shown.then_some(held);
-	}
-
-	/// Names `path` as the commit view's file and sets aside what the shown
-	/// preview's file selection was, unless an earlier read already did.
-	/// `clear_file` is for a read that leaves the working-file selection
-	/// (a commit tree's file); `tree_sha` is that tree's commit, which owns
-	/// the file from here on. The commit, its list and its details stay: a
-	/// refusal puts the file selection back, a landed read releases it.
-	pub(crate) fn hold_shown_commit_file(
-		&mut self,
-		path: &str,
-		clear_file: bool,
-		tree_sha: Option<&str>,
-	) {
-		let shown = self.preview.is_some() && self.preview_error.is_none();
-		if shown && self.held_selection.is_none() {
-			self.held_selection = Some(ShownSelection {
-				file: self.selected_file.clone(),
-				source: self.selected_file_source.clone(),
-				root: self.selected_file_root.clone(),
-				commit: None,
-				view: self.commit_view.file_selection_only(),
-				log_selected: Vec::new(),
-				range_head: None,
-				compare: None,
-				log_selection_expanded: false,
-				log_branches_all: Vec::new(),
-				commit_file_only: Some(self.preview_pending_from_log),
-			});
-		}
-		if clear_file {
-			self.selected_file = None;
-			self.selected_file_root = None;
-		}
-		let root = self.repo_root();
-		self.set_commit_file_selection(Some(
-			match tree_sha {
-				Some(sha) => {
-					crate::history::CommitFileSel::from_tree(path, sha)
-				}
-				None => path.into(),
-			}
-			.with_root(root),
-		));
-		self.commit_view.commit_file_sel.clear();
-	}
-
-	/// Puts the held selection back; the shown preview is still its own.
-	fn restore_shown_selection(&mut self) {
-		let Some(mut held) = self.held_selection.take() else {
-			return;
-		};
-		self.selected_file = held.file;
-		self.selected_file_source = held.source;
-		self.selected_file_root = held.root;
-		if let Some(pending) = held.commit_file_only {
-			self.commit_view.commit_file_sel =
-				std::mem::take(&mut held.view.commit_file_sel);
-			self.set_commit_file_selection(held.view.into_file_selection());
-			self.preview_pending_from_log = pending;
-			return;
-		}
-		self.restore_selected_commit(held.commit);
-		self.commit_view = held.view;
-		self.log_selected = held.log_selected;
-		self.range_head = held.range_head;
-		self.compare = held.compare;
-		self.log_selection_expanded = held.log_selection_expanded;
-		self.log_branches_all = held.log_branches_all;
 	}
 
 	/// Turns a core `SourcePreview` into the single retained preview.

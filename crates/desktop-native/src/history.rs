@@ -94,7 +94,6 @@ pub use snip_core::gitview::{clip_utf8, CommitDetails};
 /// (`WorkbenchModel::reset_commit_view`) whenever the selection changes, so
 /// no member can outlive the commit it describes: a new member added here is
 /// reset with the others, and `is_reset` will not compile without it.
-#[derive(Default)]
 pub struct CommitView {
 	/// Files of the selected commit or compare.
 	pub commit_files: Vec<(String, Option<snip_core::format::ChangeType>)>,
@@ -127,6 +126,30 @@ pub struct CommitView {
 }
 
 impl CommitView {
+	/// The view of a model that has just started: the model's initial value.
+	pub(crate) fn at_startup() -> Self {
+		Self::blank()
+	}
+
+	/// The reset view. There is no `Default`: a view can be made only here
+	/// and in this module's own moves, so nothing else can swap a fresh one
+	/// over the live selection (`reset_commit_view` does, once). Names every
+	/// field, so a new member is added here too.
+	fn blank() -> Self {
+		Self {
+			commit_files: Vec::new(),
+			commit_file_origin: Vec::new(),
+			commit_file_gitlinks: Vec::new(),
+			commit_files_truncated: false,
+			commit_files_first_parent_same: None,
+			selected_commit_file: None,
+			commit_file_sel: Vec::new(),
+			commit_details: None,
+			selection_details: Vec::new(),
+			log_commit_root: None,
+		}
+	}
+
 	/// True when nothing of a selection is left. Destructures every field
 	/// without `..`: a member added to the struct must be named here.
 	pub fn is_reset(&self) -> bool {
@@ -254,24 +277,21 @@ impl CommitView {
 
 	/// A view holding only this one's file selection (what a read in flight
 	/// sets aside, `ShownSelection::commit_file_only`).
-	pub(crate) fn file_selection_only(&self) -> CommitView {
+	fn file_selection_only(&self) -> CommitView {
 		CommitView {
 			selected_commit_file: self.selected_commit_file.clone(),
 			commit_file_sel: self.commit_file_sel.clone(),
-			..Default::default()
+			..CommitView::blank()
 		}
 	}
 
 	/// Takes the file selection of `from`, a view that is being moved, not
-	/// written: the live selection is set through the model alone.
-	pub(crate) fn adopt_file_selection_of(&mut self, from: CommitView) {
+	/// written. Private: the whole hold and restore of a selection is one
+	/// operation of this module (`hold_shown_selection`,
+	/// `restore_shown_selection`), so no other module can take a part of one.
+	fn adopt_file_selection_of(&mut self, from: CommitView) {
 		self.selected_commit_file = from.selected_commit_file;
 		self.commit_file_sel = from.commit_file_sel;
-	}
-
-	/// The file selection of a view that is being consumed.
-	pub(crate) fn into_file_selection(self) -> Option<CommitFileSel> {
-		self.selected_commit_file
 	}
 
 	/// Path of the selected file.
@@ -294,8 +314,18 @@ impl CommitView {
 /// `drop_commit_selection` and set where a read selects a commit, and a
 /// hand-written `= None` elsewhere that left out one member of the selection
 /// is what Bugs 3, 4, 5 and 7 of #230 were; here it does not compile.
-#[derive(Debug, Default, PartialEq, Eq)]
+///
+/// No `Default`, `Clone` or `Copy`, and no constructor but `none` (the model's
+/// start): another module cannot make a value to put over the live one.
+#[derive(Debug, PartialEq, Eq)]
 pub struct SelectedCommit(Option<String>);
+
+impl SelectedCommit {
+	/// No commit selected: the model's initial value.
+	pub const fn none() -> Self {
+		Self(None)
+	}
+}
 
 impl std::ops::Deref for SelectedCommit {
 	type Target = Option<String>;
@@ -1820,17 +1850,6 @@ impl WorkbenchModel {
 		self.compare = None;
 	}
 
-	/// Moves the lead commit out for a selection that is set aside while a
-	/// read is in flight (`hold_shown_selection`).
-	pub(crate) fn take_selected_commit(&mut self) -> Option<String> {
-		self.selected_commit.0.take()
-	}
-
-	/// Puts back the lead commit `take_selected_commit` moved out.
-	pub(crate) fn restore_selected_commit(&mut self, commit: Option<String>) {
-		self.selected_commit = SelectedCommit(commit);
-	}
-
 	/// For a test that builds a state the product cannot reach.
 	#[cfg(test)]
 	pub(crate) fn set_selected_commit_for_tests(
@@ -1860,7 +1879,7 @@ impl WorkbenchModel {
 	/// The one place the Log selection's view is dropped: every member of
 	/// `CommitView` goes together, so none can outlive the selection.
 	pub(crate) fn reset_commit_view(&mut self) {
-		self.commit_view = CommitView::default();
+		self.commit_view = CommitView::blank();
 	}
 
 	/// The one place the live file selection is written: the field is
@@ -3163,7 +3182,7 @@ impl WorkbenchModel {
 			return;
 		};
 		let task_generation = self.preview_generation.bump();
-		self.hold_shown_commit_file(path, false, None);
+		self.hold_shown_commit_file(path, false, None, self.repo_root());
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -3476,7 +3495,12 @@ impl WorkbenchModel {
 		let host = self.git_host();
 		let identity = self.identity_for(&root);
 
-		self.hold_shown_commit_file(&path, true, Some(&sha));
+		self.hold_shown_commit_file(
+			&path,
+			true,
+			Some(&sha),
+			Some(root.clone()),
+		);
 		self.preview_loading = true;
 		self.preview_pending_from_log = true;
 		self.preview_error = None;
@@ -4403,6 +4427,179 @@ impl WorkbenchModel {
 	}
 }
 
+/// Everything a file read takes from the model while it is in flight, so a
+/// refusal by the retained budget can name the still shown preview again.
+/// The commit view goes back whole: the file list and its origins index
+/// `log_selected`, and a compare's list belongs to its endpoints.
+pub(crate) struct ShownSelection {
+	file: Option<String>,
+	source: Option<crate::SourceKind>,
+	root: Option<PathBuf>,
+	commit: Option<String>,
+	view: CommitView,
+	log_selected: Vec<String>,
+	range_head: Option<String>,
+	compare: Option<(String, String)>,
+	log_selection_expanded: bool,
+	log_branches_all: Vec<String>,
+	/// Set aside by a read of the commit view's own file list: only the
+	/// file selection (`file`, `source`, `root`, the view's selected file and
+	/// its multi-selection) is held, the rest of the commit state is still
+	/// on the model. `pending_from_log` is the flag that read replaced.
+	commit_file_only: Option<bool>,
+}
+
+#[cfg(test)]
+impl ShownSelection {
+	/// A held selection with nothing in it, for a test that builds a state
+	/// the product cannot reach.
+	pub(crate) fn empty_for_tests() -> Self {
+		Self {
+			file: None,
+			source: None,
+			root: None,
+			commit: None,
+			view: CommitView::blank(),
+			log_selected: Vec::new(),
+			range_head: None,
+			compare: None,
+			log_selection_expanded: false,
+			log_branches_all: Vec::new(),
+			commit_file_only: None,
+		}
+	}
+
+	pub(crate) fn is_commit_file_only(&self) -> bool {
+		self.commit_file_only.is_some()
+	}
+
+	pub(crate) fn view(&self) -> &CommitView {
+		&self.view
+	}
+}
+
+impl WorkbenchModel {
+	/// Names `path` as the selection and sets aside what the shown preview's
+	/// selection was, unless an earlier read already did: its snapshot still
+	/// describes the shown preview, while what is on the model now is only
+	/// what that read left behind.
+	pub(crate) fn hold_shown_selection(
+		&mut self,
+		path: &str,
+		source: &crate::SourceKind,
+	) {
+		let file = self.selected_file.replace(path.to_string());
+		let file_source = self.selected_file_source.replace(source.clone());
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		// A commit file read left the commit state on the model: this read
+		// takes it, and the snapshot keeps that read's file selection.
+		let partial = match self.held_selection.take() {
+			Some(h) if h.commit_file_only.is_some() => Some(h),
+			other => {
+				self.held_selection = other;
+				None
+			}
+		};
+		if self.held_selection.is_some() {
+			// The earlier read took the rest already.
+			return;
+		}
+		let mut held = ShownSelection {
+			file,
+			source: file_source,
+			root: self.selected_file_root.clone(),
+			commit: self.selected_commit.0.take(),
+			// Taking the view resets it.
+			view: std::mem::replace(&mut self.commit_view, CommitView::blank()),
+			log_selected: std::mem::take(&mut self.log_selected),
+			range_head: self.range_head.take(),
+			compare: self.compare.take(),
+			log_selection_expanded: std::mem::take(
+				&mut self.log_selection_expanded,
+			),
+			log_branches_all: std::mem::take(&mut self.log_branches_all),
+			commit_file_only: None,
+		};
+		if let Some(early) = partial {
+			held.file = early.file;
+			held.source = early.source;
+			held.root = early.root;
+			held.view.adopt_file_selection_of(early.view);
+		}
+		self.held_selection = shown.then_some(held);
+	}
+
+	/// Names `path` as the commit view's file and sets aside what the shown
+	/// preview's file selection was, unless an earlier read already did.
+	/// `root` is the repo the read is made in (the Log's commit repo, or the
+	/// open tree's), never inferred from the Project's. `clear_file` is for a read that leaves the working-file selection
+	/// (a commit tree's file); `tree_sha` is that tree's commit, which owns
+	/// the file from here on. The commit, its list and its details stay: a
+	/// refusal puts the file selection back, a landed read releases it.
+	pub(crate) fn hold_shown_commit_file(
+		&mut self,
+		path: &str,
+		clear_file: bool,
+		tree_sha: Option<&str>,
+		root: Option<PathBuf>,
+	) {
+		let shown = self.preview.is_some() && self.preview_error.is_none();
+		if shown && self.held_selection.is_none() {
+			self.held_selection = Some(ShownSelection {
+				file: self.selected_file.clone(),
+				source: self.selected_file_source.clone(),
+				root: self.selected_file_root.clone(),
+				commit: None,
+				view: self.commit_view.file_selection_only(),
+				log_selected: Vec::new(),
+				range_head: None,
+				compare: None,
+				log_selection_expanded: false,
+				log_branches_all: Vec::new(),
+				commit_file_only: Some(self.preview_pending_from_log),
+			});
+		}
+		if clear_file {
+			self.selected_file = None;
+			self.selected_file_root = None;
+		}
+		self.set_commit_file_selection(Some(
+			match tree_sha {
+				Some(sha) => CommitFileSel::from_tree(path, sha),
+				None => path.into(),
+			}
+			.with_root(root),
+		));
+		self.commit_view.commit_file_sel.clear();
+	}
+
+	/// Puts the held selection back; the shown preview is still its own.
+	pub(crate) fn restore_shown_selection(&mut self) {
+		let Some(mut held) = self.held_selection.take() else {
+			return;
+		};
+		self.selected_file = held.file;
+		self.selected_file_source = held.source;
+		self.selected_file_root = held.root;
+		if let Some(pending) = held.commit_file_only {
+			self.commit_view.commit_file_sel =
+				std::mem::take(&mut held.view.commit_file_sel);
+			self.set_commit_file_selection(
+				held.view.selected_commit_file.take(),
+			);
+			self.preview_pending_from_log = pending;
+			return;
+		}
+		self.selected_commit = SelectedCommit(held.commit);
+		self.commit_view = held.view;
+		self.log_selected = held.log_selected;
+		self.range_head = held.range_head;
+		self.compare = held.compare;
+		self.log_selection_expanded = held.log_selection_expanded;
+		self.log_branches_all = held.log_branches_all;
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	/// The owner of a tree file is a part of the selection value: with no
@@ -4411,7 +4608,7 @@ mod tests {
 	/// from the open, and taking the selection takes the owner.
 	#[test]
 	fn no_selection_means_no_owner() {
-		let mut view = CommitView::default();
+		let mut view = CommitView::blank();
 		assert_eq!(view.rev_owner(), None, "nothing selected, nothing owned");
 		assert!(view.is_reset());
 		view.selected_commit_file = Some("a.txt".into());
