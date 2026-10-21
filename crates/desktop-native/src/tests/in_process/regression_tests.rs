@@ -394,12 +394,11 @@ fn fuzz_regression_the_repo_left_while_loading_is_read_by_the_changes_queue(
 		m.select_repo(1, cx);
 		m.select_repo(2, cx);
 	});
-	settle_until(cx, "the Changes of the repo that was left", |cx| {
-		model.read_with(cx, |m, _| {
-			m.change_repos
-				.iter()
-				.all(|r| r.state != crate::ChangeRepoState::Loading)
-		})
+	// Bounded on the queue going idle, not on the node leaving Loading: a
+	// repo nothing reads stays Loading for good, and R6 must say so rather
+	// than the wait timing out.
+	settle_until(cx, "the Changes queue to drain", |cx| {
+		model.read_with(cx, |m, _| m.changes_queue.is_idle())
 	});
 	model.read_with(cx, |m, cx| {
 		invariants::assert_holds(m, cx, &[R6]);
