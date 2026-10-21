@@ -1771,15 +1771,56 @@ impl WorkbenchModel {
 		self.compare = None;
 		let details = self.commit_view.commit_details.take();
 		let root = self.commit_view.log_commit_root.take();
+		let kept = self.shown_tree_file_selection();
 		self.reset_commit_view();
 		self.commit_view.commit_details = details;
 		self.commit_view.log_commit_root = root;
+		self.set_commit_file_selection(kept);
 	}
 
 	/// The one place the Log selection's view is dropped: every member of
 	/// `CommitView` goes together, so none can outlive the selection.
 	pub(crate) fn reset_commit_view(&mut self) {
 		self.commit_view = CommitView::default();
+	}
+
+	/// The one place the live file selection is written (`a_commit_file_
+	/// selection_is_written_in_one_place` keeps it so). The selection and the
+	/// commit-file preview it names are one thing: a path that keeps the
+	/// preview keeps this value whole, owner included
+	/// (`drop_commit_selection_keeping_tree_file`), and a path that drops the
+	/// value drops the preview with it (`clear_commit_selection`).
+	pub(crate) fn set_commit_file_selection(
+		&mut self,
+		sel: Option<CommitFileSel>,
+	) {
+		self.commit_view.selected_commit_file = sel;
+	}
+
+	/// The selection of the rev tree's file the shown preview is: owned, and
+	/// the preview is that commit's file at that path. The only selection a
+	/// reload may keep, because the preview it names stays too.
+	fn shown_tree_file_selection(&self) -> Option<CommitFileSel> {
+		let sel = self.commit_view.selected_commit_file.as_ref()?;
+		let owner = sel.rev_owner.as_deref()?;
+		let preview = self.preview.as_ref()?;
+		(self.preview_error.is_none()
+			&& preview.path.as_deref() == Some(sel.path.as_str())
+			&& matches!(
+				&preview.source,
+				PreviewSource::CommitFile { sha } if sha == owner
+			))
+		.then(|| sel.clone())
+	}
+
+	/// [`Self::drop_commit_selection`] for a reload that keeps the shown
+	/// preview: the tree file it shows keeps its selection, with the owner.
+	/// Dropping it whole left the preview of a file no commit selects, and
+	/// "Back to Working" then found it owned by nobody (#230).
+	pub(crate) fn drop_commit_selection_keeping_tree_file(&mut self) {
+		let kept = self.shown_tree_file_selection();
+		self.drop_commit_selection();
+		self.set_commit_file_selection(kept);
 	}
 
 	/// After a read of the Log failed: a selection whose commit is no longer
@@ -2935,8 +2976,9 @@ impl WorkbenchModel {
 							total > MAX_COMMIT_FILES;
 						match first {
 							Some((path, p)) => {
-								model.commit_view.selected_commit_file =
-									Some(path.clone().into());
+								model.set_commit_file_selection(Some(
+									path.clone().into(),
+								));
 								model.commit_view.commit_file_sel.clear();
 								model.apply_source_preview(
 									path,

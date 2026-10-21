@@ -73,6 +73,10 @@ pub(crate) enum Invariant {
 	L7,
 	/// The details belong to the selected commit. Guard: #230 PR-0.
 	L8,
+	/// A shown commit-file preview and the file selection are one thing: the
+	/// preview's path is the selected one. Guard: #230 (Refresh kept a tree
+	/// file's preview and dropped its selection, owner included).
+	L9,
 	// Preview and paste preview.
 	/// A running preview read can be cancelled: its token is alive while the
 	/// workspace accepts work. Guard: #230 PR-0 (a Log click during a drain).
@@ -211,7 +215,7 @@ pub(crate) enum Family {
 pub(crate) fn all() -> Vec<Invariant> {
 	use Invariant::*;
 	let mut all = vec![
-		L1, L2, L3, L4, L5, L6, L7, L8, P1, P2, P3, P4, P5, P6, P7, P8, P9,
+		L1, L2, L3, L4, L5, L6, L7, L8, L9, P1, P2, P3, P4, P5, P6, P7, P8, P9,
 		P10, R1, R2, R3, R4, R5, R6, B1, Q1, Q2, Q3, Q4, Q5, Q6, Q7, M2, M3,
 		D1, O7, O8,
 	];
@@ -227,8 +231,8 @@ impl Invariant {
 			| Q4 | Q5 | Q6 | Q7 | M2 | D1 | O7 | O8 => When::Quiescent,
 			// M3 holds at any time, but only the driver knows the history it
 			// needs.
-			L1 | L2 | L3 | L4 | L5 | L6 | L8 | P1 | P3 | P5 | P7 | P8 | P9
-			| P10 | B1 | M3 => When::Always,
+			L1 | L2 | L3 | L4 | L5 | L6 | L8 | L9 | P1 | P3 | P5 | P7 | P8
+			| P9 | P10 | B1 | M3 => When::Always,
 			O(o) if o.quiescent_only() => When::Quiescent,
 			O(_) => When::Always,
 		}
@@ -237,10 +241,10 @@ impl Invariant {
 	pub(crate) fn status(self) -> Status {
 		use Invariant::*;
 		match self {
-			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | P1 | P2 | P3 | P4 | P5
-			| P6 | P7 | P8 | P9 | P10 | R1 | R2 | R3 | R4 | R5 | R6 | B1
-			| Q1 | Q2 | Q3 | Q4 | Q5 | Q6 | Q7 | M2 | M3 | D1 | O(_) | O7
-			| O8 => Status::Active,
+			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | P1 | P2 | P3 | P4
+			| P5 | P6 | P7 | P8 | P9 | P10 | R1 | R2 | R3 | R4 | R5 | R6
+			| B1 | Q1 | Q2 | Q3 | Q4 | Q5 | Q6 | Q7 | M2 | M3 | D1 | O(_)
+			| O7 | O8 => Status::Active,
 		}
 	}
 
@@ -254,7 +258,7 @@ impl Invariant {
 	pub(crate) fn family(self) -> Family {
 		use Invariant::*;
 		match self {
-			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 => Family::LogSelection,
+			L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 => Family::LogSelection,
 			P1 | P2 | P3 | P4 => Family::Preview,
 			P5 | P6 | P7 | P8 | P9 | P10 | R4 => Family::PastePanel,
 			R1 | R2 | R5 | R6 => Family::RepoSet,
@@ -386,7 +390,7 @@ pub(crate) fn eval(
 	use Invariant::*;
 	// The selection a read holds aside is not on the model: the L members
 	// say nothing then (see the module doc).
-	if matches!(id, L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8)
+	if matches!(id, L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9)
 		&& m.held_selection.is_some()
 	{
 		return None;
@@ -525,6 +529,19 @@ pub(crate) fn eval(
 				format!(
 					"details of {} for the selection {:?}",
 					details.sha, m.selected_commit
+				)
+			})
+		}
+		L9 => {
+			let p = m.preview.as_ref()?;
+			if !matches!(p.source, PreviewSource::CommitFile { .. }) {
+				return None;
+			}
+			let shown = p.path.as_deref()?;
+			(view.selected_path() != Some(shown)).then(|| {
+				format!(
+					"the preview shows commit file {shown:?}, the selection is {:?}",
+					view.selected_path()
 				)
 			})
 		}

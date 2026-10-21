@@ -4127,7 +4127,7 @@ impl WorkbenchModel {
 		// the repo is read again.
 		match anchor_commit.clone() {
 			Some(commit) => self.keep_commit_selection_for_reload(commit),
-			None => self.drop_commit_selection(),
+			None => self.drop_commit_selection_keeping_tree_file(),
 		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
@@ -4642,10 +4642,10 @@ impl WorkbenchModel {
 			self.selected_file = None;
 			self.selected_file_root = None;
 		}
-		self.commit_view.selected_commit_file = Some(match tree_sha {
+		self.set_commit_file_selection(Some(match tree_sha {
 			Some(sha) => crate::history::CommitFileSel::from_tree(path, sha),
 			None => path.into(),
-		});
+		}));
 		self.commit_view.commit_file_sel.clear();
 	}
 
@@ -4658,8 +4658,7 @@ impl WorkbenchModel {
 		self.selected_file_source = held.source;
 		self.selected_file_root = held.root;
 		if let Some(pending) = held.commit_file_only {
-			self.commit_view.selected_commit_file =
-				held.view.selected_commit_file;
+			self.set_commit_file_selection(held.view.selected_commit_file);
 			self.commit_view.commit_file_sel = held.view.commit_file_sel;
 			self.preview_pending_from_log = pending;
 			return;

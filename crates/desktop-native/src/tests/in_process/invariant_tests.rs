@@ -169,6 +169,17 @@ fn breaker(id: Invariant) -> Option<fn(&mut WorkbenchModel)> {
 					branches_more: false,
 				});
 		},
+		L9 => |m| {
+			m.held_selection = None;
+			m.commit_view.selected_commit_file = None;
+			m.preview = Some(crate::reader::Preview::new(
+				crate::reader::PreviewSource::CommitFile { sha: "abc".into() },
+				Some("f.txt".into()),
+				"text".into(),
+				false,
+				crate::syntax::Language::Plain,
+			));
+		},
 		P1 => |m| {
 			m.preview_loading = true;
 			m.preview_cancel = None;
@@ -2741,6 +2752,56 @@ fn a_commit_selection_is_dropped_in_one_place() {
 		hits.len(),
 		1,
 		"`selected_commit = None` only in drop_commit_selection: {hits:#?}"
+	);
+	assert!(hits[0].contains("history.rs"), "{hits:?}");
+}
+
+/// L9: the live file selection of the commit view is written in
+/// `set_commit_file_selection` alone. The selection and the commit-file
+/// preview it names live and die together, and a write that went around that
+/// function (a reload that reset the view and kept the preview) is how Refresh
+/// once left a tree file's preview with no selection (#230). Whole-view moves
+/// (`reset_commit_view`, hold and restore of a `CommitView`) stay with their
+/// own functions; this counts only the field's own assignments.
+#[test]
+fn a_commit_file_selection_is_written_in_one_place() {
+	fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+		for entry in std::fs::read_dir(dir).expect("the source dir") {
+			let path = entry.expect("an entry").path();
+			if path.is_dir() {
+				if path.file_name().is_some_and(|n| n == "tests") {
+					continue;
+				}
+				walk(&path, hits);
+			} else if path.extension().is_some_and(|e| e == "rs")
+				&& !path
+					.file_name()
+					.is_some_and(|n| n.to_string_lossy().ends_with("_tests.rs"))
+			{
+				let text = std::fs::read_to_string(&path).expect("a source");
+				for (i, line) in text.lines().enumerate() {
+					let code = line.split("//").next().unwrap_or("");
+					if code.contains("commit_view.selected_commit_file =")
+						&& !code.contains("commit_view.selected_commit_file ==")
+						&& !code.trim_start().starts_with("m.")
+						&& !code.contains("model.commit_view")
+						&& !code.contains(" m.commit_view")
+					{
+						hits.push(format!("{}:{}", path.display(), i + 1));
+					}
+				}
+			}
+		}
+	}
+	let mut hits = Vec::new();
+	walk(
+		&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+		&mut hits,
+	);
+	assert_eq!(
+		hits.len(),
+		1,
+		"`commit_view.selected_commit_file =` only in set_commit_file_selection: {hits:#?}"
 	);
 	assert!(hits[0].contains("history.rs"), "{hits:?}");
 }
