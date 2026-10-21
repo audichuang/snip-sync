@@ -118,11 +118,30 @@ fn commit_shown(
 	Entity<WorkbenchModel>,
 	&mut VisualTestContext,
 ) {
+	commit_shown_with(cx, false)
+}
+
+/// `commit_shown`, and with `b_on_top` a newer commit that changes only
+/// `b.txt`: the shown commit's change list then lacks `a.txt`, which its
+/// tree still has.
+fn commit_shown_with(
+	cx: &mut TestAppContext,
+	b_on_top: bool,
+) -> (
+	tempfile::TempDir,
+	Entity<WorkbenchModel>,
+	&mut VisualTestContext,
+) {
 	let ws = tempfile::tempdir().unwrap();
 	let alpha = repo(ws.path(), "alpha", &[]);
 	fs::write(alpha.join("a.txt"), "one").unwrap();
 	git(&alpha, &["add", "."]);
 	git(&alpha, &["commit", "-q", "-m", "add a"]);
+	if b_on_top {
+		fs::write(alpha.join("b.txt"), "two").unwrap();
+		git(&alpha, &["add", "."]);
+		git(&alpha, &["commit", "-q", "-m", "add b"]);
+	}
 	repo(ws.path(), "beta", &[]);
 	let (model, cx) =
 		open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
@@ -132,12 +151,21 @@ fn commit_shown(
 	// Probes on, then the first row the Log drew.
 	click_probed(&model, cx, "btn-log-refresh");
 	let row = model.read_with(cx, |m, _| {
+		// The newest commit's row, when the fixture has a `b.txt` one.
+		let wanted = m
+			.commits
+			.iter()
+			.find(|c| b_on_top && c.subject == "add b")
+			.map(|c| c.sha.get(..7).unwrap_or(&c.sha).to_string());
 		m.probes
 			.as_ref()
 			.unwrap()
 			.drawn()
 			.into_iter()
-			.find(|id| id.starts_with("commit-row:"))
+			.find(|id| {
+				id.starts_with("commit-row:")
+					&& wanted.as_ref().is_none_or(|w| id.ends_with(w.as_str()))
+			})
 			.expect("the Log drew a row")
 	});
 	click_probed(&model, cx, &row);
@@ -1001,5 +1029,102 @@ fn fuzz_regression_a_partial_hold_promoted_to_full_drops_the_tree_file_owner(
 	model.read_with(cx, |m, cx| {
 		assert!(m.commit_view.selected_commit_file.is_none());
 		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+}
+
+/// Opens the tree of the shown commit (the one that changed only `b.txt`) and
+/// the file `a.txt` in it, which that commit did not change.
+fn open_unchanged_tree_file(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+) {
+	let drawn_with = |cx: &mut VisualTestContext, id: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|d| d == id)
+		})
+	};
+	let browse = model
+		.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with("btn-browse-tree:"))
+		})
+		.expect("the tree");
+	click_probed(model, cx, &browse);
+	settle_until(cx, "a.txt in the tree", |cx| {
+		drawn_with(cx, "rev-row:a.txt").is_some()
+	});
+	model.read_with(cx, |m, _| {
+		assert!(
+			!m.commit_view.commit_files.iter().any(|(p, _)| p == "a.txt"),
+			"the commit did not change a.txt"
+		);
+	});
+	click_probed(model, cx, "rev-row:a.txt");
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| {
+			m.preview.is_some()
+				&& !m.preview_loading
+				&& m.commit_view.selected_path() == Some("a.txt")
+		})
+	});
+}
+
+/// L2/L6: a file the commit did not change, opened from its tree, belongs to
+/// the tree's commit from the moment it is opened: the commit stays selected,
+/// so nothing "adds" the owner when "Back to Working" removes the tree, and
+/// the tab's preview is still not a leftover.
+#[gpui::test]
+fn fuzz_regression_an_unchanged_tree_file_is_owned_from_the_open(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown_with(cx, true);
+	open_unchanged_tree_file(&model, cx);
+	let tree_sha = model.read_with(cx, |m, _| {
+		m.rev_tree.as_ref().expect("the tree").sha.clone()
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.selected_commit.is_some(), "the commit stays selected");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+		assert_eq!(m.commit_view.rev_owner(), Some(tree_sha.as_str()));
+	});
+}
+
+/// The same file when a working-file read holds the selection aside in part
+/// (the tree file's selection only, the commit stays live) and the tree is
+/// left before the read is refused: the restored selection is still owned.
+#[gpui::test]
+fn fuzz_regression_a_restored_unchanged_tree_file_keeps_its_owner(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown_with(cx, true);
+	open_unchanged_tree_file(&model, cx);
+	model.update(cx, |m, _| {
+		m.e2e_read_delay = Some(std::time::Duration::from_secs(60))
+	});
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.held_selection.is_some(), "the selection is held");
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	model.update(cx, |m, _| m.restore_shown_selection());
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+		assert!(m.commit_view.rev_owner().is_some(), "the owner came back");
 	});
 }
