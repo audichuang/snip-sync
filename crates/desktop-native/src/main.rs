@@ -4127,7 +4127,13 @@ impl WorkbenchModel {
 		// the repo is read again.
 		match anchor_commit.clone() {
 			Some(commit) => self.keep_commit_selection_for_reload(commit),
-			None => self.drop_commit_selection_keeping_tree_file(),
+			// Only a reload that keeps the shown preview keeps the tree file
+			// it shows; a plain switch clears the preview below, so the
+			// selection and its owner go with it (#230).
+			None if preserve_anchors => {
+				self.drop_commit_selection_keeping_tree_file()
+			}
+			None => self.drop_commit_selection(),
 		}
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands.
