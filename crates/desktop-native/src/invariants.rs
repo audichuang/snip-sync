@@ -485,7 +485,13 @@ pub(crate) fn eval(
 					matches!(
 						&p.source,
 						PreviewSource::CommitFile { sha } if *sha == tree.sha
-					) && p.path.is_some()
+					) && p.path.as_deref().is_some_and(|path| {
+						// Listed by the tree, or the file the tree opened
+						// (a listing the budget evicted does not answer).
+						tree.lists_file(path)
+							|| view.selected_commit_file.as_deref()
+								== Some(path)
+					})
 				});
 				from_log && !tree_own
 			});
