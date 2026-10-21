@@ -523,6 +523,56 @@ fn fuzz_regression_a_rev_tree_file_is_not_a_commit_view_left_behind(
 	});
 }
 
+/// L2/L6: a working-file read that is still in flight holds the commit view
+/// (with the tree's open file) aside. "Back to Working" then leaves the tree
+/// while the live view is empty, and the ownership of the file has to be
+/// recorded on the held view, or a refusal of the read (the retained budget)
+/// restores a view nothing owns.
+#[gpui::test]
+fn fuzz_regression_leaving_a_rev_tree_while_its_file_is_held_keeps_the_owner(
+	cx: &mut TestAppContext,
+) {
+	let (_ws, model, cx) = commit_shown(cx);
+	let drawn_with = |cx: &mut VisualTestContext, prefix: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with(prefix))
+		})
+	};
+	let browse = drawn_with(cx, "btn-browse-tree:").expect("the tree");
+	click_probed(&model, cx, &browse);
+	settle_until(cx, "the tree", |cx| drawn_with(cx, "rev-row:").is_some());
+	model.update_in(cx, |m, _, cx| m.close_tab(0, cx));
+	settle(cx);
+	let row = drawn_with(cx, "rev-row:").expect("a file of the tree");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the file", |cx| {
+		model.read_with(cx, |m, _| m.preview.is_some() && !m.preview_loading)
+	});
+	// A working-file read starts and is held: it sets the selection aside.
+	model.update(cx, |m, _| {
+		m.e2e_read_delay = Some(std::time::Duration::from_secs(60))
+	});
+	model.update_in(cx, |m, _, cx| {
+		m.select_file_with_source("a.txt", crate::SourceKind::File, cx);
+		assert!(m.held_selection.is_some(), "the selection is held");
+		assert!(m.commit_view.selected_commit_file.is_none());
+	});
+	click_probed(&model, cx, "btn-leave-tree");
+	settle(cx);
+	// The read is refused by the retained budget and gives the selection back.
+	model.update(cx, |m, _| m.restore_shown_selection());
+	model.read_with(cx, |m, cx| {
+		assert!(m.rev_tree.is_none(), "the tree is left");
+		assert!(m.preview.is_some(), "the file's tab stays open");
+		invariants::assert_holds(m, cx, &[L2, L3, L6]);
+	});
+}
+
 /// L2/L6: the file a left rev tree kept is the tab's, and the tab alone
 /// excuses it: another commit takes it with the rest of the view, and a view
 /// that lost its owner but kept the preview is still caught.
