@@ -574,8 +574,11 @@ pub(crate) fn eval(
 			// built from the selection); only its repo can be wrong.
 			let error_page =
 				m.preview.is_none() && m.preview_error.is_some() && {
+					// A tree file was opened in the current repo and a
+					// repo switch ends its selection, so the tree being
+					// open or left does not matter.
 					let home = if sel.rev_owner.is_some() {
-						m.rev_tree.as_ref().and_then(|_| m.repo_root())
+						m.repo_root()
 					} else {
 						view.log_commit_root.clone()
 					};
