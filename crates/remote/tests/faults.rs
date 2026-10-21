@@ -357,6 +357,9 @@ fn expect(fault: &Fault, reused: bool) -> Expect {
 fn every_read_survives_every_fault_and_the_client_stays_usable() {
 	let fx = Fixture::new();
 	let limit = scaled(Duration::from_secs(10));
+	// A worker slow enough that a heartbeat precedes the work's reply (a
+	// loaded machine, reproduced: work past the one-second heartbeat).
+	fx.worker.set_heartbeat_for_tests(Duration::from_millis(1));
 	let faults = [
 		Fault::Refuse(ErrorCode::Busy),
 		Fault::Refuse(ErrorCode::NotFound),

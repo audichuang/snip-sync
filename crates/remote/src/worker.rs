@@ -104,6 +104,9 @@ struct State {
 	max_protocol: Option<u32>,
 	git_requests: AtomicUsize,
 	deadlines: Mutex<(Duration, Duration)>,
+	/// How often work says it is alive; [`crate::jobs::HEARTBEAT`] unless a
+	/// test set it.
+	heartbeat: Mutex<Duration>,
 	/// A ListDir reply's entry cap; [`MAX_DIR_ENTRIES`] unless a test
 	/// shrank it.
 	dir_cap: AtomicUsize,
@@ -139,6 +142,7 @@ impl Worker {
 					crate::jobs::VIEW_DEADLINE,
 					crate::jobs::SCAN_DEADLINE,
 				)),
+				heartbeat: Mutex::new(crate::jobs::HEARTBEAT),
 				dir_cap: AtomicUsize::new(MAX_DIR_ENTRIES),
 				jobs: crate::jobs::Jobs::new(),
 				repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
@@ -239,6 +243,15 @@ impl Worker {
 	#[doc(hidden)]
 	pub fn set_deadlines_for_tests(&self, view: Duration, scan: Duration) {
 		*lock(&self.state.deadlines) = (view, scan);
+	}
+
+	/// How often work behind a request sends a heartbeat. The grid of faults
+	/// sets it far above any work (no heartbeat is ever heard) or far below
+	/// (one is heard before a quick reply), so the machine's speed does not
+	/// decide which case a cell is.
+	#[doc(hidden)]
+	pub fn set_heartbeat_for_tests(&self, every: Duration) {
+		*lock(&self.state.heartbeat) = every;
 	}
 
 	/// Inject only scan failures, after a normal hello/open/list: the first
@@ -598,7 +611,9 @@ fn serve(
 			)
 			| None => {}
 		}
-		let mut answer = crate::jobs::Answer::new(&mut writer, fault);
+		let every = *lock(&state.heartbeat);
+		let mut answer =
+			crate::jobs::Answer::new(&mut writer, fault).with_heartbeat(every);
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
@@ -1047,7 +1062,7 @@ fn serve_copy(
 	};
 	crate::jobs::run_job_with(
 		answer,
-		crate::jobs::HEARTBEAT,
+		answer.heartbeat_interval(),
 		deadline,
 		cancel,
 		reply,

@@ -249,6 +249,8 @@ pub(crate) struct Answer<'w, W: Write> {
 	out: &'w mut W,
 	fault: Option<crate::fault::Fault>,
 	hang_up: bool,
+	/// How often work running under this answer says it is alive.
+	heartbeat: Duration,
 }
 
 impl<'w, W: Write> Answer<'w, W> {
@@ -260,7 +262,20 @@ impl<'w, W: Write> Answer<'w, W> {
 			out,
 			fault,
 			hang_up: false,
+			heartbeat: HEARTBEAT,
 		}
+	}
+
+	/// This answer's work heartbeats every `d` instead of [`HEARTBEAT`]
+	/// (a test sets the worker's, so a slow machine cannot decide whether a
+	/// heartbeat came before the reply).
+	pub(crate) fn with_heartbeat(mut self, d: Duration) -> Self {
+		self.heartbeat = d;
+		self
+	}
+
+	pub(crate) fn heartbeat_interval(&self) -> Duration {
+		self.heartbeat
 	}
 
 	/// One `Pending` frame, flushed.
@@ -522,9 +537,10 @@ pub(crate) fn run_inline<W: Write>(
 			page_delay,
 		}));
 	}
+	let heartbeat = answer.heartbeat_interval();
 	run_job_with(
 		answer,
-		HEARTBEAT,
+		heartbeat,
 		deadline,
 		CancelToken::new(),
 		DeadlineReply::Fail,
@@ -549,7 +565,8 @@ pub(crate) fn run_job<W: Write>(
 	cancel: CancelToken,
 	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
 ) -> io::Result<()> {
-	run_job_with(w, HEARTBEAT, deadline, cancel, DeadlineReply::Fail, op)
+	let heartbeat = w.heartbeat_interval();
+	run_job_with(w, heartbeat, deadline, cancel, DeadlineReply::Fail, op)
 }
 
 /// What the caller answers once a job runs past its deadline.
